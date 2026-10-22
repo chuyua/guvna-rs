@@ -192,3 +192,89 @@ quarantine:
         assert!(pool.acquire(&HashSet::new()).is_none());
     }
 }
+
+#[cfg(test)]
+mod contention_tests {
+    use super::*;
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::thread;
+
+    fn one_key_pool() -> Arc<KeyPool> {
+        let provider: Provider = serde_yaml::from_str(
+            "name: p\ntype: openai\nbase_url: https://example.org\nkey_env: A\n",
+        )
+        .unwrap();
+        Arc::new(
+            KeyPool::new(
+                &provider,
+                &HashMap::from([("A".into(), "only-local-test-key".into())]),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// 128 in-flight failures for one lease MUST produce only one quarantine.
+    /// Repeat to detect races rather than relying on one fortunate schedule.
+    #[test]
+    fn concurrent_late_failures_cannot_extend_quarantine() {
+        for _ in 0..12 {
+            let pool = one_key_pool();
+            let lease = pool.acquire(&HashSet::new()).unwrap();
+            let gate = Arc::new(Barrier::new(64));
+            let accepted = Arc::new(AtomicUsize::new(0));
+            thread::scope(|scope| {
+                for _ in 0..64 {
+                    let pool = pool.clone();
+                    let gate = gate.clone();
+                    let lease = lease.clone();
+                    let accepted = accepted.clone();
+                    scope.spawn(move || {
+                        gate.wait();
+                        if pool.record(&lease, Outcome::RateLimited) {
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                        }
+                        pool.record_success(&lease); // stale successes must never reopen
+                    });
+                }
+            });
+            assert_eq!(
+                accepted.load(Ordering::SeqCst),
+                1,
+                "only one generation may apply quarantine"
+            );
+            assert!(pool.acquire(&HashSet::new()).is_none());
+        }
+    }
+
+    #[test]
+    fn ten_thousand_parallel_key_selections_do_not_lose_updates() {
+        let p: Provider = serde_yaml::from_str(
+            "name: p\ntype: openai\nbase_url: https://example.org\nkey_envs: [A, B, C, D]\nrotation: round_robin\n"
+        ).unwrap();
+        let mut inputs = HashMap::new();
+        for key in ["A", "B", "C", "D"] {
+            inputs.insert(key.to_string(), "fake".to_string());
+        }
+        let pool = Arc::new(KeyPool::new(&p, &inputs).unwrap());
+        let counts = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        thread::scope(|scope| {
+            for _ in 0..32 {
+                let pool = pool.clone();
+                let counts = counts.clone();
+                scope.spawn(move || {
+                    for _ in 0..320 {
+                        let lease = pool.acquire(&HashSet::new()).unwrap();
+                        *counts.lock().unwrap().entry(lease.env).or_default() += 1;
+                    }
+                });
+            }
+        });
+        let counts = counts.lock().unwrap();
+        assert_eq!(counts.values().sum::<usize>(), 10240);
+        // 10,240 is divisible by four; serialized RR state must distribute exactly.
+        assert!(counts.values().all(|c| *c == 2560), "{counts:?}");
+    }
+}

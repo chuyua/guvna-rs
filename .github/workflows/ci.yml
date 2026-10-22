@@ -20,3 +20,21 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --release --locked
       - run: target/release/guvna --version
+
+  adversarial-resource-gate:
+    name: Adversarial Linux resource gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Enforce idle RSS, CPU, leak and local chaos pressure gates
+        run: python3 scripts/quality_gate.py --binary target/release/guvna --requests 2000 --clients 64 --idle-seconds 10 --max-idle-rss-mib 16 --max-peak-rss-mib 48 --max-rss-growth-mib 6 --out quality-results.json
+      - name: Upload full quality results, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guvna-linux-resource-gate
+          path: quality-results.json
+          if-no-files-found: warn

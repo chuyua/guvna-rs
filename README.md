@@ -40,3 +40,14 @@ See [Go audit migration gates](docs/audit/MIGRATION_GATES.md) and the
 [source provenance](docs/audit/SOURCE.md). Reported issues are historical
 findings, not proof that current Go main still contains those defects.
 All P0 gates must have deterministic regression tests before release.
+
+## Performance and fault-injection quality gates
+
+[Linux resource and pressure acceptance criteria](docs/QUALITY_GATES.md) are
+checked on each PR against the real Release binary. CI measures idle RSS,
+idle CPU, peak RSS across two load waves, post-load memory recovery,
+thread/file-descriptor leaks, per-wave P95/P99 and injected upstream
+failover. No live provider key or production server is needed.
+
+The Linux x86_64 **idle RSS hard limit is 16 MiB**, with a 12 MiB
+optimization goal. These are budgets to verify, not performance claims.
