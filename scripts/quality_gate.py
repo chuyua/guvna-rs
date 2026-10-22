@@ -31,11 +31,16 @@ class Stub(ThreadingHTTPServer):
         self.role = role
         self.lock = threading.Lock()
         self.calls = 0
+        self.faults = {"503": 0, "invalid_200": 0, "truncated_200": 0}
         super().__init__(("127.0.0.1", 0), StubHandler)
 
     def count(self):
         with self.lock:
             self.calls += 1
+
+    def record_fault(self, name):
+        with self.lock:
+            self.faults[name] += 1
 
 
 class StubHandler(BaseHTTPRequestHandler):
@@ -55,7 +60,18 @@ class StubHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if self.server.role == "primary":
-            status, result = 503, {"error": "injected_primary_failure"}
+            seed = int(query.get("seed", 0))
+            if seed % 17 == 0:
+                self.server.record_fault("truncated_200")
+                status, result = 200, {"choices": [
+                    {"index": 0, "message": {"role": "assistant", "content": "partial"},
+                     "finish_reason": "stop"}]}
+            elif seed % 13 == 0:
+                self.server.record_fault("invalid_200")
+                status, result = 200, {"choices": []}
+            else:
+                self.server.record_fault("503")
+                status, result = 503, {"error": "injected_primary_failure"}
         else:
             status, result = 200, {
                 "id": "mock", "object": "chat.completion",
@@ -66,7 +82,8 @@ class StubHandler(BaseHTTPRequestHandler):
         payload = json.dumps(result, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
+        short = self.server.role == "primary" and int(query.get("seed", 0)) % 17 == 0
+        self.send_header("Content-Length", str(len(payload) + (37 if short else 0)))
         self.end_headers()
         try:
             self.wfile.write(payload)
@@ -286,6 +303,9 @@ chains:
                 check(mock2.calls == a.requests * 2,
                       f"healthy provider call count {mock2.calls} != {a.requests * 2}")
                 summary["upstream_calls"] = {"primary": mock1.calls, "healthy": mock2.calls}
+                summary["faults"] = mock1.faults
+                check(all(count > 0 for count in mock1.faults.values()),
+                      "fault injection did not cover every variant")
                 summary["passed"] = True
             finally:
                 proc.terminate()

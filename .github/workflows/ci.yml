@@ -30,7 +30,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked
       - name: Enforce idle RSS, CPU, leak and local chaos pressure gates
-        run: python3 scripts/quality_gate.py --binary target/release/guvna --requests 1000 --clients 32 --idle-seconds 10 --max-idle-rss-mib 32 --max-peak-rss-mib 96 --max-rss-growth-mib 6 --out quality-results.json
+        run: python3 scripts/quality_gate.py --binary target/release/guvna --requests 2000 --clients 64 --idle-seconds 10 --max-idle-rss-mib 16 --max-peak-rss-mib 48 --max-rss-growth-mib 6 --out quality-results.json
       - name: Upload full quality results, including failures
         if: always()
         uses: actions/upload-artifact@v4

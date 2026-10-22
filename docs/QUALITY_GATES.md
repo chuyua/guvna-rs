@@ -24,10 +24,10 @@ production baseline until protocol parity and resource gates pass.
 
 | Measure | Block merge when | Long-term goal |
 |---|---:|---:|
-| Idle RSS after warmup | >32 MiB | <=16 MiB |
-| After two load waves, RSS | >32 MiB | <=16 MiB |
+| Idle RSS after warmup | >16 MiB | <=12 MiB |
+| After two load waves, RSS | >16 MiB | <=12 MiB |
 | Post-wave2 idle RSS increase from post-wave1 | >6 MiB | <=2 MiB |
-| Peak RSS across both 2,000-request waves | >96 MiB | <=48 MiB |
+| Peak RSS across both 4,000-request waves | >48 MiB | <=24 MiB |
 | Idle CPU (single-core percentage) | >1% averaged over 10 s | ~0% |
 | Initial startup/health response | >2 s | <=1 s |
 | No-leak steady state | FD or thread growth >8 from post-wave1 to post-wave2 | 0 growth |
@@ -42,7 +42,7 @@ is a reviewed, documented technical decision to change the limit. Never
 quietly relax the threshold in code. Measure PSS separately where
 available, but RSS is the hard portable Linux criterion.
 
-The PR test uses small real payloads and 16-client concurrency for
+The PR test uses small real payloads and 64-client concurrency for
 deterministic quality control. It is NOT a substitute for 1,000+
 concurrent clients, large-body fuzzing, prolonged soak, or live upstream
 compatibility. Those are separate extended/nightly gates and must report

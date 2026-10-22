@@ -49,5 +49,5 @@ idle CPU, peak RSS across two load waves, post-load memory recovery,
 thread/file-descriptor leaks, per-wave P95/P99 and injected upstream
 failover. No live provider key or production server is needed.
 
-The initial Linux x86_64 **idle RSS hard limit is 32 MiB**, with a 16 MiB
+The Linux x86_64 **idle RSS hard limit is 16 MiB**, with a 12 MiB
 optimization goal. These are budgets to verify, not performance claims.
