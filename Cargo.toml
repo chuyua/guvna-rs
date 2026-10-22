@@ -1,0 +1,20 @@
+[package]
+name = "guvna"
+version = "0.1.0"
+edition = "2024"
+description = "A small single-user AI gateway, rewritten from first principles in Rust"
+license = "MIT"
+rust-version = "1.88"
+
+[dependencies]
+axum = "0.8.9"
+bytes = "1"
+futures-util = "0.3.34"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
+serde_yaml = { package = "serde_yaml_ng", version = "0.10.0" }
+tokio = { version = "1.53.1", features = ["full"] }
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
