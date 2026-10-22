@@ -1,6 +1,6 @@
 use axum::{
     Router,
-    body::{Body, to_bytes},
+    body::{Body, Bytes, to_bytes},
     extract::State,
     http::{Request, StatusCode},
     response::IntoResponse,
@@ -149,13 +149,87 @@ async fn failover_skips_bad_provider_and_key_and_preserves_large_integers() {
 }
 
 #[tokio::test]
-async fn reject_bad_key_and_unsupported_stream_without_calling_upstream() {
+async fn reject_bad_key_and_invalid_stream_n_without_calling_upstream() {
     let (a, calls) = start_upstream(StatusCode::OK).await;
     let router = make_app(&a, &a);
     let (status, _) = call(router.clone(), request("demo", "", "wrong")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let (status, result) = call(router, request("demo", r#","stream":true"#, "client")).await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(result["error"]["code"], "migration_pending");
+    let (status, result) = call(router, request("demo", r#","stream":true,"n":0"#, "client")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(result["error"]["code"], "invalid_n");
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[derive(Clone)]
+struct SseUpstream {
+    hits: Arc<AtomicUsize>,
+    chunks: Vec<Bytes>,
+}
+
+async fn serve_sse(State(state): State<SseUpstream>) -> impl IntoResponse {
+    state.hits.fetch_add(1, Ordering::SeqCst);
+    let chunks = state.chunks.clone();
+    let output = futures_util::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+        Body::from_stream(output),
+    )
+}
+
+async fn start_sse(chunks: Vec<&'static [u8]>) -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let state = SseUpstream {
+        hits: hits.clone(),
+        chunks: chunks.into_iter().map(Bytes::from_static).collect(),
+    };
+    let router = Router::new()
+        .route("/v1/chat/completions", post(serve_sse))
+        .with_state(state);
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(socket, router).await.unwrap();
+    });
+    (format!("http://{addr}"), hits)
+}
+
+const SSE_START: &[u8] = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
+const SSE_END: &[u8] =
+    b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+const SSE_DONE: &[u8] = b"data: [DONE]\n\n";
+
+#[tokio::test]
+async fn chat_stream_fails_over_before_first_valid_event() {
+    let (a, bad_hits) = start_sse(vec![b"data: {\"choices\":[]}\n\n"]).await;
+    let (b, good_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let router = make_app(&a, &b);
+    let response = router
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    assert_eq!(bad_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(good_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn incomplete_stream_never_fails_over_after_first_event() {
+    let (a, first_hits) = start_sse(vec![SSE_START]).await;
+    let (b, backup_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let router = make_app(&a, &b);
+    let response = router
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("[DONE]"), "{text}");
+    assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
 }

@@ -1,7 +1,7 @@
 //! Public API; Chat and Embeddings share the same candidate walk.
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -10,16 +10,17 @@ use axum::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
 
 use crate::{
     config::Config,
-    keypool::KeyPool,
+    keypool::{KeyPool, Lease},
     outcome::{Outcome, classify},
     routing,
+    sse::ChatSse,
 };
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -193,11 +194,12 @@ async fn dispatch(
             "Expected JSON object",
         );
     }
-    if request.get("stream").and_then(Value::as_bool) == Some(true) {
+    let streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
+    if streaming && !matches!(endpoint, Endpoint::Chat) {
         return error(
             StatusCode::NOT_IMPLEMENTED,
             "migration_pending",
-            "Streaming is not implemented in this milestone",
+            "Only Chat Completions streaming is supported",
         );
     }
     let Some(model) = request.get("model").and_then(Value::as_str) else {
@@ -207,6 +209,14 @@ async fn dispatch(
             "model must be a string",
         );
     };
+    let expected = request.get("n").map_or(1, |v| v.as_u64().unwrap_or(0));
+    if streaming && ChatSse::new(expected).is_err() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_n",
+            "stream n must be 1..64",
+        );
+    }
     let steps = match routing::resolve(&state.config, model) {
         Ok(steps) => steps,
         Err(_) => {
@@ -221,8 +231,8 @@ async fn dispatch(
     // Exactly ONE candidate loop for chat + embedding. Key failover is confined to this loop.
     for step in steps {
         let provider = &state.config.providers[step.provider_index];
-        if provider.stream_only {
-            continue; // Explicitly unsupported stream-only aggregation in M1.
+        if provider.stream_only && !streaming {
+            continue; // A stream-only upstream cannot serve non-streaming requests.
         }
         let mut payload = request.clone();
         let object = payload.as_object_mut().expect("checked above");
@@ -254,6 +264,20 @@ async fn dispatch(
                 continue; // try a different key; each key is attempted once
             }
             if outcome == Outcome::Success {
+                if streaming {
+                    match start_chat_stream(
+                        upstream,
+                        expected,
+                        state.clone(),
+                        step.provider_index,
+                        lease.clone(),
+                    )
+                    .await
+                    {
+                        Ok(stream_response) => return stream_response,
+                        Err(_) => break, // Fail over only BEFORE any bytes reach the client.
+                    }
+                }
                 match bounded_json(upstream).await {
                     Ok(value) if valid_result(endpoint, &payload, &value) => {
                         state.pools[step.provider_index].record_success(&lease);
@@ -270,6 +294,97 @@ async fn dispatch(
         "upstream_unavailable",
         "No upstream returned a valid response",
     )
+}
+
+struct ChatStreamState {
+    owner: Arc<AppState>,
+    provider_index: usize,
+    lease: Lease,
+    upstream: reqwest::Response,
+    parser: ChatSse,
+    pending: VecDeque<Bytes>,
+    terminated: bool,
+}
+
+fn stream_error() -> Bytes {
+    Bytes::from_static(b"data: {\"error\":{\"type\":\"gateway_error\",\"code\":\"upstream_stream_incomplete\"}}\n\n")
+}
+
+async fn start_chat_stream(
+    upstream: reqwest::Response,
+    expected: u64,
+    owner: Arc<AppState>,
+    provider_index: usize,
+    lease: Lease,
+) -> Result<Response, ()> {
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    if !content_type.starts_with("text/event-stream") {
+        return Err(());
+    }
+    let mut state = ChatStreamState {
+        owner,
+        provider_index,
+        lease,
+        upstream,
+        parser: ChatSse::new(expected).map_err(|_| ())?,
+        pending: VecDeque::new(),
+        terminated: false,
+    };
+    preflight_stream(&mut state).await?;
+    Ok(stream_response(state))
+}
+
+async fn preflight_stream(state: &mut ChatStreamState) -> Result<(), ()> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let chunk = state.upstream.chunk().await.map_err(|_| ())?.ok_or(())?;
+            let events = state.parser.push(&chunk).map_err(|_| ())?;
+            state.pending.extend(events);
+            if !state.pending.is_empty() {
+                return Ok(());
+            }
+        }
+    })
+    .await
+    .map_err(|_| ())?
+}
+
+fn stream_response(state: ChatStreamState) -> Response {
+    let output = futures_util::stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(event) = state.pending.pop_front() {
+                if event == Bytes::from_static(b"data: [DONE]\n\n") {
+                    state.owner.pools[state.provider_index].record_success(&state.lease);
+                }
+                return Some((Ok::<Bytes, std::io::Error>(event), state));
+            }
+            if state.terminated {
+                return None;
+            }
+            if state.parser.is_done() {
+                return None;
+            }
+            match state.upstream.chunk().await {
+                Ok(Some(bytes)) => match state.parser.push(&bytes) {
+                    Ok(events) => state.pending.extend(events),
+                    Err(_) => state.terminated = true,
+                },
+                Ok(None) | Err(_) => state.terminated = true,
+            }
+            if state.terminated {
+                return Some((Ok(stream_error()), state));
+            }
+        }
+    });
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(output))
+        .expect("static response headers")
 }
 
 async fn bounded_json(response: reqwest::Response) -> Result<Value, ()> {
