@@ -357,13 +357,15 @@ fn stream_response(state: ChatStreamState) -> Response {
     let output = futures_util::stream::unfold(state, |mut state| async move {
         loop {
             if let Some(event) = state.pending.pop_front() {
+                if event == Bytes::from_static(b"data: [DONE]\n\n") {
+                    state.owner.pools[state.provider_index].record_success(&state.lease);
+                }
                 return Some((Ok::<Bytes, std::io::Error>(event), state));
             }
             if state.terminated {
                 return None;
             }
             if state.parser.is_done() {
-                state.owner.pools[state.provider_index].record_success(&state.lease);
                 return None;
             }
             match state.upstream.chunk().await {
