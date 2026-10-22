@@ -17,9 +17,16 @@ duplicated routing state machines.
 - One candidate walk shared by Chat and Embeddings.
 - Bounded 32 MiB upstream body buffering, no credential-bearing redirects.
 
-Not yet shipped: SSE, Responses translation, Auto, CLI management, persistent
-chain mutation, telemetry, all Go protocol validation rules, production parity.
-Streaming requests and Responses return 501 instead of false success.
+Chat Completions SSE now supports bounded incremental framing, finish-reason
+and [DONE] checks, and fallback before the first valid event. After the first
+event, an upstream failure sends an explicit SSE error (without [DONE]); the
+gateway cannot replay a partially delivered response on another provider.
+Disconnecting the client drops the upstream stream. The first event must
+arrive within 15 seconds; a stream event is limited to 1 MiB.
+
+Not yet shipped: Responses translation, Auto, CLI management, persistent chain
+mutation, telemetry, complete streaming tool-call validation, Go protocol
+parity. Responses still return 501; this is not a production replacement.
 
 ## Development
 

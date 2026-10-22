@@ -4,3 +4,4 @@ pub mod gateway;
 pub mod keypool;
 pub mod outcome;
 pub mod routing;
+pub mod sse;
