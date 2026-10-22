@@ -255,7 +255,7 @@ async fn dispatch(
             }
             if outcome == Outcome::Success {
                 match bounded_json(upstream).await {
-                    Ok(value) if valid_result(endpoint, &request, &value) => {
+                    Ok(value) if valid_result(endpoint, &payload, &value) => {
                         state.pools[step.provider_index].record_success(&lease);
                         return (StatusCode::OK, Json(value)).into_response();
                     }
@@ -287,45 +287,164 @@ async fn bounded_json(response: reqwest::Response) -> Result<Value, ()> {
 
 fn valid_result(endpoint: Endpoint, request: &Value, response: &Value) -> bool {
     match endpoint {
-        Endpoint::Chat => {
-            let Some(choices) = response.get("choices").and_then(Value::as_array) else {
-                return false;
-            };
-            !choices.is_empty()
-                && choices.iter().all(|choice| {
-                    choice.get("message").is_some_and(Value::is_object)
-                        && choice
-                            .get("finish_reason")
-                            .and_then(Value::as_str)
-                            .is_some_and(|x| {
-                                [
-                                    "stop",
-                                    "length",
-                                    "tool_calls",
-                                    "function_call",
-                                    "content_filter",
-                                ]
-                                .contains(&x)
-                            })
-                })
+        Endpoint::Chat => validate_chat(request, response),
+        Endpoint::Embeddings => validate_embeddings(request, response),
+    }
+}
+
+// A result is only usable when every choice completed; a partial 2xx is NOT success.
+fn validate_chat(request: &Value, response: &Value) -> bool {
+    let Some(choices) = response.get("choices").and_then(Value::as_array) else {
+        return false;
+    };
+    if choices.is_empty() {
+        return false;
+    }
+    let expected = request.get("n").and_then(Value::as_u64).unwrap_or(1);
+    if expected > 1 && choices.len() as u64 != expected {
+        return false;
+    }
+    let mut indices = HashSet::new();
+    for choice in choices {
+        let index = match choice.get("index") {
+            Some(index) => match index.as_u64() {
+                Some(x) => x,
+                None => return false,
+            },
+            None if choices.len() == 1 => 0,
+            None => return false,
+        };
+        if index >= choices.len() as u64 || !indices.insert(index) {
+            return false;
         }
-        Endpoint::Embeddings => {
-            let Some(data) = response.get("data").and_then(Value::as_array) else {
+        let Some(message) = choice.get("message").and_then(Value::as_object) else {
+            return false;
+        };
+        if !choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|x| {
+                [
+                    "stop",
+                    "length",
+                    "tool_calls",
+                    "function_call",
+                    "content_filter",
+                ]
+                .contains(&x)
+            })
+        {
+            return false;
+        }
+        if let Some(tool_calls) = message.get("tool_calls") {
+            let Some(calls) = tool_calls.as_array() else {
                 return false;
             };
-            let expected = match request.get("input") {
-                Some(Value::String(_)) => 1,
-                Some(Value::Array(items)) if !items.is_empty() => items.len(),
-                _ => return false,
-            };
-            data.len() == expected
-                && data.iter().all(|entry| match entry.get("embedding") {
-                    Some(Value::Array(xs)) => !xs.is_empty() && xs.iter().all(Value::is_number),
-                    Some(Value::String(s)) => !s.is_empty(),
-                    _ => false,
-                })
+            for call in calls {
+                let valid = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+                    && call.get("type").and_then(Value::as_str) == Some("function")
+                    && call
+                        .pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty())
+                    && call
+                        .pointer("/function/arguments")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| serde_json::from_str::<Value>(s).is_ok());
+                if !valid {
+                    return false;
+                }
+            }
         }
     }
+    true
+}
+
+// Do not accept duplicate / missing embeddings, mixed dimensions or corrupt vectors.
+fn validate_embeddings(request: &Value, response: &Value) -> bool {
+    let expected = match request.get("input") {
+        Some(Value::String(_)) => 1,
+        Some(Value::Array(items)) if !items.is_empty() => items.len(),
+        _ => return false,
+    };
+    let Some(data) = response.get("data").and_then(Value::as_array) else {
+        return false;
+    };
+    if data.len() != expected {
+        return false;
+    }
+    let desired_dim = request
+        .get("dimensions")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| *n > 0);
+    let encoding = request.get("encoding_format").and_then(Value::as_str);
+    let mut observed_dimension = None;
+    let mut observed_format = None;
+    let mut indices = HashSet::new();
+    for entry in data {
+        let index = match entry.get("index") {
+            Some(index) => match index.as_u64() {
+                Some(x) => x,
+                None => return false,
+            },
+            None if expected == 1 => 0,
+            None => return false,
+        };
+        if index >= expected as u64 || !indices.insert(index) {
+            return false;
+        }
+        let Some(vector) = entry.get("embedding") else {
+            return false;
+        };
+        let (format, dimension) = match vector {
+            Value::Array(numbers) if !numbers.is_empty() => {
+                if numbers
+                    .iter()
+                    .all(|n| n.as_f64().is_some_and(f64::is_finite))
+                {
+                    ("float", numbers.len())
+                } else {
+                    return false;
+                }
+            }
+            Value::String(data) if !data.is_empty() => {
+                use base64::{Engine, engine::general_purpose::STANDARD};
+                let Ok(raw) = STANDARD.decode(data) else {
+                    return false;
+                };
+                if raw.is_empty()
+                    || raw.len() % 4 != 0
+                    || !raw
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|part| f32::from_le_bytes(*part).is_finite())
+                {
+                    return false;
+                }
+                ("base64", raw.len() / 4)
+            }
+            _ => return false,
+        };
+        if encoding.is_some_and(|e| e == "float" || e == "base64") && encoding != Some(format) {
+            return false;
+        }
+        if desired_dim.is_some_and(|wanted| wanted != dimension) {
+            return false;
+        }
+        if observed_dimension.is_some_and(|previous| previous != dimension)
+            || observed_format.is_some_and(|previous| previous != format)
+        {
+            return false;
+        }
+        observed_dimension = Some(dimension);
+        observed_format = Some(format);
+    }
+    true
 }
 
 #[cfg(test)]
@@ -350,6 +469,99 @@ mod tests {
             &json!({
                 "data":[{"embedding":[]}]
             })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod response_contract_tests {
+    use super::*;
+
+    fn assistant(index: u64) -> Value {
+        json!({"index":index,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"})
+    }
+
+    #[test]
+    fn chat_requires_all_choices_and_unique_indices() {
+        let request = json!({"n":2});
+        let good = json!({"choices":[assistant(1),assistant(0)]});
+        assert!(validate_chat(&request, &good));
+        assert!(!validate_chat(&request, &json!({"choices":[assistant(0)]})));
+        assert!(!validate_chat(
+            &request,
+            &json!({"choices":[assistant(0),assistant(0)]})
+        ));
+        assert!(!validate_chat(
+            &request,
+            &json!({"choices":[assistant(0),assistant(2)]})
+        ));
+        assert!(!validate_chat(
+            &request,
+            &json!({"choices":[{"index":0,"message":{},"finish_reason":null},assistant(1)]})
+        ));
+    }
+
+    #[test]
+    fn completed_tool_calls_require_valid_json_arguments() {
+        let request = json!({"n":1});
+        let item = |args: &str| {
+            json!({"choices":[{
+                "index":0,"message":{"tool_calls":[{
+                    "id":"call_1","type":"function","function":{"name":"read","arguments":args}
+                }]},"finish_reason":"tool_calls"
+            }]})
+        };
+        assert!(validate_chat(&request, &item(r#"{"path":"/tmp"}"#)));
+        assert!(!validate_chat(&request, &item(r#"{"path":"#)));
+    }
+
+    #[test]
+    fn embeddings_require_complete_unique_finite_vectors_and_equal_dimensions() {
+        let request = json!({"input":["a","b"],"dimensions":2,"encoding_format":"float"});
+        let good = json!({"data":[
+            {"index":1,"embedding":[0.1,0.2]},
+            {"index":0,"embedding":[0.3,0.4]}
+        ]});
+        assert!(validate_embeddings(&request, &good));
+        assert!(!validate_embeddings(
+            &request,
+            &json!({"data":[
+                {"index":0,"embedding":[0.1,0.2]},
+                {"index":0,"embedding":[0.3,0.4]}
+            ]})
+        ));
+        assert!(!validate_embeddings(
+            &request,
+            &json!({"data":[
+                {"index":0,"embedding":[0.1,0.2]},
+                {"index":1,"embedding":[0.3]}
+            ]})
+        ));
+        assert!(!validate_embeddings(
+            &request,
+            &json!({"data":[
+                {"index":0,"embedding":[0.1,0.2]}
+            ]})
+        ));
+    }
+
+    #[test]
+    fn base64_embeddings_reject_invalid_payload_and_nonfinite_float32() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let request = json!({"input":"a","dimensions":1,"encoding_format":"base64"});
+        let good = STANDARD.encode(1.25_f32.to_le_bytes());
+        assert!(validate_embeddings(
+            &request,
+            &json!({"data":[{"embedding":good}]})
+        ));
+        assert!(!validate_embeddings(
+            &request,
+            &json!({"data":[{"embedding":"not-base64!"}]})
+        ));
+        let nan = STANDARD.encode(f32::NAN.to_le_bytes());
+        assert!(!validate_embeddings(
+            &request,
+            &json!({"data":[{"embedding":nan}]})
         ));
     }
 }
