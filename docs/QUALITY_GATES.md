@@ -100,6 +100,32 @@ completions, reconciles metrics, and checks bounded RSS/FD/thread counts.
 Local warning JSON-line stderr events are restricted to fixed metadata
 fields, contain no API key values and are rate limited to ten lines.
 
+## SSE-only aggregation capability + failure classification
+
+SSE->JSON synthesis is bounded to n=1..64, while native Chat JSON candidates
+may support larger n. In the shared candidate loop, unsupported SSE-only n
+skips the provider before acquiring any key or issuing HTTP traffic; a
+JSON-capable fallback is still attempted. When all candidates are SSE-only,
+the gateway returns HTTP 422 aggregate_n_unsupported instead of a misleading
+502 upstream failure. Regression covers n=0, 65, 512, Auto, JSON fallback,
+and the accepted 64-choice upper boundary. Invalid requests must not consume
+upstream attempts.
+
+With GUVNA_LOG_EVENTS=1, local stderr aggregation failures are subdivided
+into invalid_sse, idle_timeout, transport_failure and resource_limit; each
+fixed event name uses independent sampling so rare classes are not lost in
+a high-volume success stream. No user information or provider identifiers are
+logged, and no new remote management interface is introduced.
+
+In addition to the Rust integration cases, the real Linux Release quality
+gate now sends a direct SSE-only n=65 request and requires HTTP 422 with
+zero upstream HTTP calls. The sampled local event gate is deliberately
+strict: deterministic failure injection must produce exactly eight samples
+in each of aggregation_invalid_sse, aggregation_failed, and
+aggregation_completed, with independent sequence numbers starting at
+one. The gate checks approved log fields and secret redaction; it does not
+merely increase the old generic log count ceiling.
+
 ## SSE-only provider: bounded JSON synthesis and local logging
 
 The Linux --release gate runs 64 JSON Chat requests against a fixture that

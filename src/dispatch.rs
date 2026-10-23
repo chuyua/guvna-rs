@@ -144,6 +144,7 @@ pub(super) async fn dispatch(
     let mut bypassed_circuit = false;
     let mut aggregation_busy = false;
     let mut unsupported_aggregate_logprobs = false;
+    let mut unsupported_aggregate_n = false;
     // Propagate a useful downstream Retry-After only when *all* eligible
     // provider candidates are unavailable solely due to 429 credential
     // cooldown. A 5xx, invalid body, transport error, open breaker, missing
@@ -156,6 +157,15 @@ pub(super) async fn dispatch(
         if provider.stream_only && !streaming && !matches!(endpoint, Endpoint::Chat) {
             all_candidates_rate_limited = false;
             continue; // Only Chat has a validated SSE-to-JSON adapter.
+        }
+        // The streaming validator and bounded aggregator intentionally cap
+        // choice count at 64. Skip incapable SSE-only providers BEFORE any
+        // credential lease or HTTP call; JSON-capable backups may still handle
+        // a wider or invalid caller-supplied n under their own contract.
+        if provider.stream_only && !streaming && ChatSse::new(expected).is_err() {
+            unsupported_aggregate_n = true;
+            all_candidates_rate_limited = false;
+            continue;
         }
         // Ordinary Chat JSON can carry token log-probabilities, but this
         // bounded SSE synthesizer does not aggregate them. Prefer another
@@ -310,6 +320,11 @@ pub(super) async fn dispatch(
                         ),
                     )
                     .await
+                    .map(|value| {
+                        value.map_err(|error| {
+                            ops_log::warn(error.log_event());
+                        })
+                    })
                 } else {
                     tokio::time::timeout_at(deadline, bounded_json(upstream)).await
                 };
@@ -378,6 +393,13 @@ pub(super) async fn dispatch(
         Metrics::inc(&state.metrics.rate_limit_exhaustions);
         ops_log::warn("rate_limit_exhausted");
         return response;
+    }
+    if unsupported_aggregate_n && !attempted_network {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "aggregate_n_unsupported",
+            "SSE-only Chat aggregation supports n in the range 1..64; configure a JSON-capable fallback",
+        );
     }
     if unsupported_aggregate_logprobs && !attempted_network {
         return error(
