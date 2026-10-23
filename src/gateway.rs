@@ -198,6 +198,18 @@ async fn responses(
             "stream must be a boolean",
         );
     }
+    let Some(logical_model) = value
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned)
+    else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "missing_model",
+            "model must be a nonempty string",
+        );
+    };
     let Some(input) = value.get("input").cloned() else {
         return error(
             StatusCode::BAD_REQUEST,
@@ -252,12 +264,35 @@ async fn responses(
         "safety_identifier",
         "prompt",
         "prompt_cache_key",
+        "messages",
+        "max_tokens",
+        "n",
     ] {
         if object.contains_key(key) {
             return error(
                 StatusCode::NOT_IMPLEMENTED,
                 "responses_feature_unsupported",
                 "This Responses feature is not yet supported",
+            );
+        }
+    }
+    // Allow only parameters whose Chat Completions semantics are equivalent.
+    for key in object.keys() {
+        if ![
+            "model",
+            "input",
+            "stream",
+            "max_output_tokens",
+            "temperature",
+            "top_p",
+            "user",
+        ]
+        .contains(&key.as_str())
+        {
+            return error(
+                StatusCode::NOT_IMPLEMENTED,
+                "responses_parameter_unsupported",
+                "Unsupported Responses parameter",
             );
         }
     }
@@ -305,11 +340,21 @@ async fn responses(
             "Only text chat responses can be translated",
         );
     };
+    let usage = &chat["usage"];
+    let input_tokens = usage["prompt_tokens"].as_u64();
+    let output_tokens = usage["completion_tokens"].as_u64();
+    let total_tokens = usage["total_tokens"].as_u64();
+    let translated_usage = match (input_tokens, output_tokens, total_tokens) {
+        (Some(input), Some(output), Some(total)) => {
+            json!({"input_tokens":input,"output_tokens":output,"total_tokens":total})
+        }
+        _ => Value::Null,
+    };
     (StatusCode::OK, Json(json!({
-        "id":chat["id"], "object":"response", "status":"completed", "model":chat["model"],
+        "id":chat["id"], "object":"response", "status":"completed", "model":logical_model,
         "output":[{"id":format!("msg_{}",chat["id"].as_str().unwrap_or("generated")), "type":"message", "status":"completed", "role":"assistant", "content":[{"type":"output_text","text":content,"annotations":[]}]}],
         "output_text":content,
-        "usage": {"input_tokens":chat["usage"]["prompt_tokens"], "output_tokens":chat["usage"]["completion_tokens"], "total_tokens":chat["usage"]["total_tokens"]}
+        "usage": translated_usage
     }))).into_response()
 }
 #[derive(Clone, Copy)]
