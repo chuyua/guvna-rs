@@ -318,7 +318,17 @@ async fn responses(
                             "Function call id is already pending",
                         );
                     }
-                    messages.push(json!({"role":"assistant","content":Value::Null,"tool_calls":[{"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}}]}));
+                    let tool_call = json!({"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}});
+                    if let Some(last) = messages.last_mut().filter(|message: &&mut Value| {
+                        message["role"] == "assistant" && message["tool_calls"].is_array()
+                    }) {
+                        last["tool_calls"]
+                            .as_array_mut()
+                            .expect("checked above")
+                            .push(tool_call);
+                    } else {
+                        messages.push(json!({"role":"assistant","content":Value::Null,"tool_calls":[tool_call]}));
+                    }
                     continue;
                 }
                 if !pending_calls.is_empty() {
@@ -367,13 +377,22 @@ async fn responses(
                     }
                     let mut text = String::new();
                     for part in parts {
-                        if part.get("type").and_then(Value::as_str) != Some("input_text")
-                            || part.as_object().is_none_or(|obj| obj.len() != 2)
+                        if !matches!(
+                            part.get("type").and_then(Value::as_str),
+                            Some("input_text") | Some("output_text")
+                        ) || part.as_object().is_none_or(|obj| obj.len() != 2)
                         {
                             return error(
                                 StatusCode::NOT_IMPLEMENTED,
                                 "responses_input_unsupported",
-                                "Only input_text content parts are supported",
+                                "Only input_text or output_text content parts are supported",
+                            );
+                        }
+                        if part["type"] == "output_text" && role != "assistant" {
+                            return error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_output_text_role",
+                                "output_text parts require assistant role",
                             );
                         }
                         let Some(fragment) = part.get("text").and_then(Value::as_str) else {

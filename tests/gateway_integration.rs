@@ -45,6 +45,25 @@ async fn upstream(State(state): State<UpstreamState>, request: Request<Body>) ->
     }
     let body = to_bytes(request.into_body(), 1 << 20).await.unwrap();
     let value: Value = serde_json::from_slice(&body).unwrap();
+    if value["messages"]
+        .as_array()
+        .is_some_and(|messages| messages.iter().any(|m| m["content"] == "parallelcheck"))
+    {
+        let messages = value["messages"].as_array().unwrap();
+        let valid = messages.iter().any(|m| {
+            m["role"] == "assistant"
+                && m["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| calls.len() == 2)
+        }) && messages.iter().filter(|m| m["role"] == "tool").count() == 2;
+        if !valid {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"error":"parallel tool calls not grouped"})),
+            )
+                .into_response();
+        }
+    }
     let model = value["model"].as_str().unwrap_or_default();
     (
         StatusCode::OK,
@@ -688,7 +707,26 @@ async fn responses_text_bridge_and_unsupported_modes() {
     let (status, _) = call(router.clone(), req(json!({"model":"demo","input":[{"type":"function_call_output","call_id":"call_123","output":7}]}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(hits.load(Ordering::SeqCst), 11);
+    let (status, parallel_history) = call(
+        router.clone(),
+        req(json!({"model":"demo","input":[
+            {"role":"user","content":"parallelcheck"},
+            {"type":"function_call","call_id":"p1","name":"lookup","arguments":"{}"},
+            {"type":"function_call","call_id":"p2","name":"lookup","arguments":"{}"},
+            {"type":"function_call_output","call_id":"p2","output":"second"},
+            {"type":"function_call_output","call_id":"p1","output":"first"}
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parallel_history["output_text"], "success");
+    assert_eq!(hits.load(Ordering::SeqCst), 12);
+    let (status, assistant_text) = call(router.clone(), req(json!({"model":"demo","input":[{"role":"assistant","content":[{"type":"output_text","text":"previous response"}]},{"role":"user","content":"follow up"}]}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(assistant_text["output_text"], "success");
+    assert_eq!(hits.load(Ordering::SeqCst), 13);
     for invalid_input in [
+        json!([{"role":"user","content":[{"type":"output_text","text":"wrong role"}]}]),
         json!([{"type":"function_call_output","call_id":"orphan","output":"x"}]),
         json!([{"type":"function_call","call_id":"dup","name":"lookup","arguments":"{}"},{"type":"function_call","call_id":"dup","name":"lookup","arguments":"{}"}]),
         json!([{"type":"function_call","call_id":"missing","name":"lookup","arguments":"{}"}]),
@@ -701,7 +739,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
-    assert_eq!(hits.load(Ordering::SeqCst), 11);
+    assert_eq!(hits.load(Ordering::SeqCst), 13);
     for bad_request in [
         json!({"model":"demo","input":"hello","tools":[{"type":"function","name":"lookup"},{"type":"function","name":"lookup"}]}),
         json!({"model":"demo","input":"hello","tools":[{"type":"function","name":"lookup","parameters":7}]}),
@@ -713,7 +751,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
         let (status, _) = call(router.clone(), req(bad_request)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
-    assert_eq!(hits.load(Ordering::SeqCst), 11);
+    assert_eq!(hits.load(Ordering::SeqCst), 13);
     for payload in [
         json!({"model":"demo","input":"hello","stream":true}),
         json!({"model":"demo","input":"hello","tools":[{"type":"web_search"}]}),
@@ -736,5 +774,5 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = call(router, req(json!({"input":"hello"}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(hits.load(Ordering::SeqCst), 11);
+    assert_eq!(hits.load(Ordering::SeqCst), 13);
 }
