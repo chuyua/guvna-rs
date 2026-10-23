@@ -198,6 +198,27 @@ async fn dispatch(
             "Expected JSON object",
         );
     }
+    if request
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(str::is_empty)
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_model",
+            "model must not be empty",
+        );
+    }
+    if request
+        .get("stream")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_stream",
+            "stream must be a boolean",
+        );
+    }
     let streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
     if streaming && !matches!(endpoint, Endpoint::Chat) {
         return error(
@@ -263,7 +284,7 @@ async fn dispatch(
         }
 
         // Serialize once per candidate, not once for every credential retry.
-        let payload_json = payload.to_string();
+        let payload_json = Bytes::from(payload.to_string());
         let mut tried = HashSet::new();
         while let Some(lease) = state.pools[step.provider_index].acquire(&tried) {
             tried.insert(lease.env.clone());
