@@ -10,6 +10,32 @@ pub struct ResolvedStep {
     pub params: BTreeMap<String, Value>,
 }
 
+/// Calculate the same encoded JSON byte length used by Auto V1 without
+/// allocating a second potentially multi-megabyte copy of the messages.
+/// No content is logged, cached, tokenized or sent to another service.
+pub fn auto_input_bytes(messages: Option<&Value>) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let Some(messages) = messages else {
+        return 0;
+    };
+    let mut counter = Counter(0);
+    if serde_json::to_writer(&mut counter, messages).is_err() {
+        // A Value cannot contain an invalid JSON number, but fail closed
+        // rather than accidentally classify a huge request as a short one.
+        return usize::MAX;
+    }
+    counter.0
+}
+
 /// A small, transparent Auto V1: fixed configured priorities and a bounded
 /// length heuristic, not a black-box performance claim or remote-model ranking.
 /// The returned candidates use the SAME dispatch/failover loop as named chains.
@@ -102,6 +128,21 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
 mod tests {
     use super::*;
     use crate::config::Config;
+    #[test]
+    fn auto_context_size_matches_original_serialization_without_copying() {
+        let samples = [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!([{"role":"user","content":"中文 \\n \\\" \\u{1f642}"}]),
+            serde_json::json!([{"role":"assistant","tool_calls":[{"arguments":"{\\\"x\\\":1}"}]}]),
+            serde_json::json!([{"role":"user","content":"a".repeat(1024 * 1024)}]),
+        ];
+        assert_eq!(auto_input_bytes(None), 0);
+        for sample in &samples {
+            assert_eq!(auto_input_bytes(Some(sample)), sample.to_string().len());
+        }
+    }
+
     #[test]
     fn chain_and_namespaced_passthrough() {
         let cfg: Config = serde_yaml::from_str(
