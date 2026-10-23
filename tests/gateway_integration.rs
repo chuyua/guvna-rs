@@ -1919,7 +1919,8 @@ async fn metrics_auth_privacy_retry_fallback_and_credential_quarantine() {
     assert_eq!(metric_value(&after, "upstream_invalid_responses_total"), 0);
     assert!(!after.contains("secret"));
     assert!(!after.contains("BAD"));
-    assert_eq!(after.matches("# TYPE guvna_").count(), 25);
+    assert_eq!(after.matches("# TYPE guvna_").count(), 26);
+    assert_eq!(metric_value(&after, "walk_deadline_exhaustions_total"), 0);
     assert_eq!(metric_value(&after, "circuit_open_providers"), 0);
     assert_eq!(metric_value(&after, "circuit_bypasses_total"), 0);
     assert_eq!(metric_value(&after, "circuit_openings_total"), 0);
@@ -3071,10 +3072,19 @@ async fn start_progressing_aggregation(terminal: bool) -> (String, Arc<AtomicUsi
 async fn drive_aggregating_progress(
     terminal: bool,
     walk: &str,
-) -> (StatusCode, Value, std::time::Duration, usize, usize) {
+) -> (
+    StatusCode,
+    Value,
+    std::time::Duration,
+    usize,
+    usize,
+    u64,
+    u64,
+) {
     let (primary, primary_hits) = start_progressing_aggregation(terminal).await;
     let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
     let app = app_with_stream_only_and_auto_walk(&primary, &backup, false, walk);
+    let metrics_app = app.clone();
     let task = tokio::spawn(async move { call(app, request("ordered", "", "client")).await });
     // Keep real time running through the TCP connect and HTTP headers.
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -3108,18 +3118,22 @@ async fn drive_aggregating_progress(
         .await
         .expect("progressing SSE aggregation must resolve within its bounded deadline")
         .unwrap();
+    let (_, metrics) = get_metrics(metrics_app, Some("client")).await;
     (
         status,
         payload,
         elapsed,
         primary_hits.load(Ordering::SeqCst),
         backup_hits.load(Ordering::SeqCst),
+        metric_value(&metrics, "walk_deadline_exhaustions_total"),
+        metric_value(&metrics, "active_requests"),
     )
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn sse_only_aggregation_survives_ninety_seconds_of_valid_progress() {
-    let (status, result, elapsed, primary, backup) = drive_aggregating_progress(true, "12m").await;
+    let (status, result, elapsed, primary, backup, deadline_exhaustions, active) =
+        drive_aggregating_progress(true, "12m").await;
     assert!(elapsed > std::time::Duration::from_secs(90), "{elapsed:?}");
     assert!(elapsed < std::time::Duration::from_secs(10 * 60));
     assert_eq!(status, StatusCode::OK, "{result}");
@@ -3127,11 +3141,14 @@ async fn sse_only_aggregation_survives_ninety_seconds_of_valid_progress() {
     assert_eq!(result["choices"][0]["finish_reason"], "stop");
     assert_eq!(primary, 1);
     assert_eq!(backup, 0, "successful progress must not replay to backup");
+    assert_eq!(deadline_exhaustions, 0, "wrong total-walk deadline outcome");
+    assert_eq!(active, 0, "aggregation admission permit was not released");
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn sse_only_infinite_heartbeat_expires_and_uses_healthy_json_backup() {
-    let (status, result, elapsed, primary, backup) = drive_aggregating_progress(false, "12m").await;
+    let (status, result, elapsed, primary, backup, deadline_exhaustions, active) =
+        drive_aggregating_progress(false, "12m").await;
     assert!(
         elapsed >= std::time::Duration::from_secs(9 * 60),
         "{elapsed:?}"
@@ -3144,6 +3161,8 @@ async fn sse_only_infinite_heartbeat_expires_and_uses_healthy_json_backup() {
     assert_eq!(result["choices"][0]["message"]["content"], "success");
     assert_eq!(primary, 1, "no repeated attempts on a drip-fed primary");
     assert_eq!(backup, 1, "hard deadline must allow exactly one fallback");
+    assert_eq!(deadline_exhaustions, 0, "wrong total-walk deadline outcome");
+    assert_eq!(active, 0, "aggregation admission permit was not released");
 }
 
 // Issue #65's shared walk budget is authoritative even if an SSE-only
@@ -3151,7 +3170,7 @@ async fn sse_only_infinite_heartbeat_expires_and_uses_healthy_json_backup() {
 // non-streaming slot for the entire 10min per-stream cap.
 #[tokio::test(flavor = "current_thread")]
 async fn sse_only_progressing_heartbeat_cannot_bypass_shared_walk_budget() {
-    let (status, result, elapsed, primary, backup) =
+    let (status, result, elapsed, primary, backup, deadline_exhaustions, active) =
         drive_aggregating_progress(false, "100s").await;
     assert!(elapsed >= std::time::Duration::from_secs(90), "{elapsed:?}");
     assert!(elapsed < std::time::Duration::from_secs(150), "{elapsed:?}");
@@ -3159,6 +3178,8 @@ async fn sse_only_progressing_heartbeat_cannot_bypass_shared_walk_budget() {
     assert_eq!(result["error"]["code"], "upstream_walk_timeout");
     assert_eq!(primary, 1, "do not replay a drip-fed candidate");
     assert_eq!(backup, 0, "no fallback after exhausting the shared budget");
+    assert_eq!(deadline_exhaustions, 1, "wrong total-walk deadline outcome");
+    assert_eq!(active, 0, "aggregation admission permit was not released");
 }
 
 #[tokio::test]
@@ -3921,6 +3942,11 @@ async fn issue65_total_walk_budget_cancels_slow_fallback_before_a_late_success()
     assert!(second_hits.load(Ordering::SeqCst) <= 1);
     let (_, metrics) = get_metrics(router, Some("client")).await;
     assert_eq!(metric_value(&metrics, "active_requests"), 0);
+    assert_eq!(metric_value(&metrics, "walk_deadline_exhaustions_total"), 1);
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        0
+    );
 }
 
 #[tokio::test]

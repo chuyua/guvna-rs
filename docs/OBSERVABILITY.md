@@ -58,6 +58,11 @@ Long-running SSE streams retain their permits until completion/cancellation.
   single half-open recovery probe outcomes.
 - guvna_circuit_open_providers: per-process number of open/half-open
   circuits; a gauge without provider labels.
+- guvna_walk_deadline_exhaustions_total: non-streaming requests that
+  exhausted the configured TOTAL candidate/key/failover time budget.
+  Incremented exactly once on terminal 504, independent of upstream
+  invalid-response, transport and credential failures. Includes SSE-only
+  upstream aggregation into JSON; normal client-facing SSE is exempt.
 - guvna_active_requests: currently acquired admission permits.
 
 Chat stream counters also include the upstream Chat SSE part of a Responses
