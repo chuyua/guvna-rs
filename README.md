@@ -48,7 +48,7 @@ Unsupported reasoning, image, audio, stateful continuation, and other
 advanced Responses modes remain explicitly unsupported. The gateway must not
 be treated as full OpenAI Responses parity or a production drop-in replacement.
 
-Not yet shipped: advanced Auto learning/cache, remote management,
+Not yet shipped: advanced Auto learning/cache,
 complete Go protocol parity and full multi-modal streaming.
 
 POST /v1/chat/completions, /v1/embeddings and /v1/responses authenticate
@@ -65,9 +65,44 @@ An opt-in Auto V1 selects model candidates using configured priority
 and a bounded encoded-input-length filter. POST /v1/auto or Chat model
 auto delegates to existing failover and circuit logic; Auto is off by default.
 
-Set GUVNA_LOG_EVENTS=1 for sparse local stderr warning lines with no prompt,
-provider URL, client IP or API key. No remote management port, telemetry
-database or external API is added. See docs/AUTO_V1.md.
+Set GUVNA_LOG_EVENTS=1 for sparse local stderr JSON-lines, including
+sampled SSE aggregation successes and failures, without prompt, provider URL,
+client IP or API key. Logs can be collected by the host journal for soak
+testing. No remote management endpoint, control socket, telemetry database
+or additional externally exposed interface is created. See docs/AUTO_V1.md.
+
+## SSE-only providers: non-streaming client compatibility
+
+A provider can be configured with stream_only: true (disabled by default).
+For non-streaming Chat requests to that provider, the shared dispatcher sends
+stream:true upstream, validates the complete Chat SSE stream, and returns one
+standard application/json Chat Completion. A caller's stream:true request
+continues using incremental Chat SSE passthrough.
+
+The synthesis is bounded: at most 4 parallel aggregations, 8 MiB of received
+SSE data per attempt, 2 MiB of generated text and tool arguments, a 15-second
+upstream idle limit and a 90-second total attempt deadline. Invalid, truncated
+or stalled streams fail closed and use the existing next-chain candidate
+before any downstream JSON response is emitted. Results must pass the same
+upstream Chat contract checks as ordinary JSON Chat completions.
+
+Set GUVNA_LOG_EVENTS=1 for sampled local stderr JSON-lines containing
+aggregation_completed or aggregation_failed with no user content, secret,
+provider name or client address. Existing read-only authenticated metrics
+also count successes and saturation. No remote management or telemetry DB.
+
+## Manual Linux executable build
+
+GitHub Actions -> Manual Linux x86_64 binary -> Run workflow (main) builds
+an actual Linux x86_64 executable after fmt, strict Clippy and Rust tests,
+then runs the Release binary through the adversarial resource gate.
+The downloadable artifact contains the ELF file guvna-linux-x86_64,
+its SHA256 checksum, build metadata and the quality report. It is not a
+GitHub auto-generated source code archive.
+
+Verify the binary with sha256sum -c guvna-linux-x86_64.sha256 and check
+binary-info.txt for glibc dependencies before using a Linux host.
+This workflow does not change deployed services or use remote management.
 
 ## Local runtime chain management (offline)
 

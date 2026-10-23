@@ -46,12 +46,16 @@ Interfaces:
 Set GUVNA_LOG_EVENTS=1 in the service environment to emit warning JSON-lines
 to standard error. Fields: ts_unix_ms, level, event, sequence. All event
 names are fixed; no prompt, model, provider, client IP, URL or API key is
-written. Only the first eight warnings and every 128th later warning are
-emitted, preventing continuous upstream failure from flooding the journal.
-Warnings are disabled by default.
+written. Only the first eight events per aggregate outcome category and every 128th
+later event are emitted (other failures share a global counter). This bounded,
+fixed-cardinality scheme keeps rare aggregation failures visible even when
+successes vastly outnumber them.
+Logs are disabled by default.
 
-Known warning kinds: transport_failure, provider_http_failure,
-upstream_invalid, stream_preflight_failure, provider_circuit_open.
+Warning kinds: transport_failure, provider_http_failure, upstream_invalid,
+stream_preflight_failure, provider_circuit_open, aggregate_capacity and
+aggregation_failed. Informational event: aggregation_completed. All
+events are local-only and sampled; no per-user or per-provider data is logged.
 
 The pre-existing authenticated /metrics endpoint still works but this
 feature adds no endpoints or telemetry databases. systemd/journald can

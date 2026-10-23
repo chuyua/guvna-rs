@@ -31,6 +31,7 @@ class Stub(ThreadingHTTPServer):
         self.role = role
         self.lock = threading.Lock()
         self.calls = 0
+        self.streaming_seen = 0
         self.faults = {"503": 0, "invalid_200": 0, "truncated_200": 0}
         self.structured = []
         super().__init__(("127.0.0.1", 0), StubHandler)
@@ -63,6 +64,43 @@ class StubHandler(BaseHTTPRequestHandler):
         requested_format = query.get("response_format")
         json_mode = isinstance(requested_format, dict) and (
             requested_format.get("type") in ("json_object", "json_schema"))
+        if self.server.role == "stream_only":
+            # This simulated provider has no JSON Chat response capability:
+            # it rejects every request without stream:true. Invalid terminal
+            # streams must be handled by the next candidate, not fabricated
+            # into a successful JSON response.
+            if query.get("stream") is not True:
+                self.send_response(400)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            with self.server.lock:
+                self.server.streaming_seen += 1
+            number = int(query.get("seed", 0))
+            first = {"id": "stream-only-test", "object": "chat.completion.chunk",
+                     "created": 10, "model": "synthetic",
+                     "choices": [{"index":0, "delta":{"role":"assistant",
+                     "content":"stream-ok"}, "finish_reason":None}]}
+            finish = {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+            if number % 7 == 0:
+                # Premature DONE before finish_reason: must fail closed.
+                payload = ("data: " + json.dumps(first) +
+                           "\n\ndata: [DONE]\n\n").encode()
+            else:
+                payload = ("data: " + json.dumps(first) + "\n\ndata: " +
+                           json.dumps(finish) + "\n\ndata: [DONE]\n\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            try:
+                midpoint = len(payload) // 3
+                self.wfile.write(payload[:midpoint])
+                self.wfile.flush()
+                self.wfile.write(payload[midpoint:])
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+            return
         if self.server.role == "healthy" and json_mode:
             with self.server.lock:
                 self.server.structured.append(requested_format)
@@ -423,6 +461,160 @@ def exercise_opt_in_circuit_gate(binary: str, config: Path, root: str, env: dict
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate(timeout=5)
+
+def verify_release_stream_only_aggregation(binary: str, root: str,
+                                           env: dict, live_stub: Stub) -> dict:
+    """64 real Linux release JSON requests through a strict SSE-only source.
+    10 intentionally truncated/invalid streams must take normal failover,
+    without returning partial content, leaking secrets or retaining buffers.
+    """
+    upstream = Stub("stream_only")
+    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    thread.start()
+    gateway_port = port()
+    config = Path(root) / "sse-only-enabled.yaml"
+    config.write_text(f"""port: {gateway_port}
+providers:
+  - name: streaming
+    type: openai
+    base_url: http://127.0.0.1:{upstream.server_address[1]}
+    key_env: STREAM_ONLY_KEY
+    stream_only: true
+  - name: backup
+    type: openai
+    base_url: http://127.0.0.1:{live_stub.server_address[1]}
+    key_env: LIVE_KEY
+chains:
+  - name: aggregate
+    steps:
+      - provider: streaming
+        model: only-stream
+      - provider: backup
+        model: regular-json
+""", encoding="utf-8")
+    data = Path(root) / "aggregate-data"
+    data.mkdir()
+    gateway_env = dict(env, GUVNA_LOG_EVENTS="1", STREAM_ONLY_KEY="fake-stream-key")
+    proc = subprocess.Popen(
+        [str(Path(binary).resolve()), "serve", "-config", str(config),
+         "-data", str(data)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=gateway_env)
+    captured = b""
+    try:
+        health = f"http://127.0.0.1:{gateway_port}/healthz"
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            check(proc.poll() is None, "SSE-only gateway stopped during startup")
+            if get_status(health, timeout=0.15) == 200:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("SSE-only release gateway did not start")
+
+        baseline_live = live_stub.calls
+        api = f"http://127.0.0.1:{gateway_port}/v1/chat/completions"
+
+        def call_seed(seed: int) -> tuple[int, str]:
+            payload = json.dumps({
+                "model": "aggregate",
+                "messages": [{"role": "user", "content": "ping"}],
+                "seed": seed,
+            }).encode()
+            req = Request(api, data=payload, method="POST", headers={
+                "Authorization": "Bearer only-for-local-test",
+                "Content-Type": "application/json"
+            })
+            with urlopen(req, timeout=12) as resp:
+                check(resp.headers.get_content_type() == "application/json",
+                      "non-stream consumer received upstream SSE framing")
+                answer = json.load(resp)
+                choice = answer["choices"][0]
+                return resp.status, choice["message"]["content"]
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            observed = list(executor.map(call_seed, range(64)))
+        failures = sum(seed % 7 == 0 for seed in range(64))
+        check(all(code == 200 for code, _ in observed),
+              "SSE-only aggregate returned a non-200 JSON response")
+        for seed, (code, content) in enumerate(observed):
+            expected = "ok" if seed % 7 == 0 else "stream-ok"
+            check(content == expected,
+                  f"SSE-only conversion/fallback corrupted seed {seed}: {content}")
+
+        upstream_attempts = upstream.calls
+        upstream_streamed = upstream.streaming_seen
+        live_fallback = live_stub.calls - baseline_live
+        check(upstream_attempts == 64 and upstream_streamed == 64,
+              f"SSE-only adapter did not request stream:true: "
+              f"attempts={upstream_attempts} streaming={upstream_streamed}")
+        check(live_fallback == failures,
+              f"invalid upstream stream did not fail over: "
+              f"fallback={live_fallback} expected={failures}")
+
+        metrics_request = Request(
+            f"http://127.0.0.1:{gateway_port}/metrics",
+            headers={"Authorization":"Bearer only-for-local-test"})
+        with urlopen(metrics_request, timeout=3) as response:
+            raw = response.read(10 << 10).decode()
+        metrics = {}
+        for line in raw.splitlines():
+            if line.startswith("guvna_"):
+                name, _, value = line.partition(" ")
+                metrics[name] = int(value)
+        expected = {
+            "guvna_requests_dispatched_total": 64,
+            "guvna_upstream_attempts_total": 64 + failures,
+            "guvna_upstream_success_total": 64,
+            "guvna_upstream_invalid_responses_total": failures,
+            "guvna_candidate_fallbacks_total": failures,
+            "guvna_aggregation_completed_total": 64 - failures,
+            "guvna_aggregation_busy_total": 0,
+            "guvna_active_requests": 0,
+        }
+        for metric, want in expected.items():
+            check(metrics.get(metric) == want,
+                  f"SSE-only metric {metric}={metrics.get(metric)}, wanted {want}")
+        usage = proc_info(proc.pid)
+        check(usage["VmRSS"] <= 16 * 1024,
+              "SSE-to-JSON adapter exceeds 16 MiB RSS in own release process")
+        check(usage["fd"] <= 20, "SSE-to-JSON adapter leaked file descriptors")
+        check(usage["Threads"] <= 12, "SSE-to-JSON adapter leaked threads")
+        return {
+            "passed": True, "requests": 64,
+            "stream_only_attempts": upstream_attempts,
+            "successful_aggregations": 64 - failures,
+            "malformed_stream_fallbacks": failures,
+            "rss_kib": usage["VmRSS"],
+            "fd": usage["fd"], "threads": usage["Threads"],
+        }
+    finally:
+        proc.terminate()
+        try:
+            _unused, captured = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _unused, captured = proc.communicate(timeout=5)
+        upstream.shutdown()
+        thread.join(timeout=3)
+        text = captured.decode("utf-8", "replace")
+        events = [line for line in text.splitlines() if line.startswith("{")]
+        check(2 <= len(events) <= 16,
+              f"SSE-only local per-category log sampling failed: {len(events)}")
+        kinds = set()
+        for line in events:
+            record = json.loads(line)
+            check(set(record) == {"ts_unix_ms", "level", "event", "sequence"},
+                  "SSE-only local log contains unapproved metadata")
+            check(record["event"] in {"aggregation_failed", "aggregation_completed"},
+                  f"unexpected aggregate diagnostic event: {record}")
+            kinds.add(record["event"])
+        check(kinds == {"aggregation_failed", "aggregation_completed"},
+              "SSE-only logs cannot distinguish success from failure")
+        check(all(token not in text for token in
+                  ("fake-stream-key", "fake-live-key", "only-for-local-test",
+                   "stream-ok")),
+              "SSE-only logs exposed credentials or generated content")
+
 
 def verify_release_chain_management(binary: str, config: Path, directory: str) -> dict:
     """Proof of local CLI persistence/recovery on the actual Linux release binary."""
@@ -856,6 +1048,8 @@ chains:
                 summary["faults"] = mock1.faults
                 check(all(count > 0 for count in mock1.faults.values()),
                       "fault injection did not cover every variant")
+                summary["sse_only_json_gate"] = verify_release_stream_only_aggregation(
+                    a.binary, directory, env, mock2)
                 summary["opt_in_circuit_gate"] = exercise_opt_in_circuit_gate(
                     a.binary, cfg, directory, env, mock1, mock2)
                 summary["auto_and_local_log_gate"] = verify_release_auto_and_local_logs(

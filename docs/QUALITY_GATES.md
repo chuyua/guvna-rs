@@ -100,6 +100,20 @@ completions, reconciles metrics, and checks bounded RSS/FD/thread counts.
 Local warning JSON-line stderr events are restricted to fixed metadata
 fields, contain no API key values and are rate limited to ten lines.
 
+## SSE-only provider: bounded JSON synthesis and local logging
+
+The Linux --release gate runs 64 JSON Chat requests against a fixture that
+rejects every upstream request unless stream:true is sent. It returns
+valid fragmented SSE for 54 requests and premature DONE for 10 requests.
+Guvna must return normal JSON for all 64, aggregate 54 without a fallback,
+and fail over for exactly 10 invalid streams. The gate reconciles upstream
+calls, success/fallback/invalid/aggregate counters and RSS/FD/thread limits,
+and audits sampled local diagnostic logs for credentials and prompt leakage.
+
+manual-linux-build.yml is explicitly dispatched from main and uploads a
+real Linux executable with SHA256, ELF/glibc metadata and the same quality
+report. CI is necessary but not sufficient to prove real-provider behavior.
+
 ## Planned broader gates
 
 - Deterministic random fault matrix (429/5xx/invalid JSON/stalled response/

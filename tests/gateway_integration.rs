@@ -1713,7 +1713,7 @@ async fn metrics_auth_privacy_retry_fallback_and_credential_quarantine() {
     assert_eq!(metric_value(&after, "upstream_invalid_responses_total"), 0);
     assert!(!after.contains("secret"));
     assert!(!after.contains("BAD"));
-    assert_eq!(after.matches("# TYPE guvna_").count(), 22);
+    assert_eq!(after.matches("# TYPE guvna_").count(), 24);
     assert_eq!(metric_value(&after, "circuit_open_providers"), 0);
     assert_eq!(metric_value(&after, "circuit_bypasses_total"), 0);
     assert_eq!(metric_value(&after, "circuit_openings_total"), 0);
@@ -2678,4 +2678,328 @@ auto:
     let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
     assert!(bytes.ends_with(b"data: [DONE]\n\n"), "{bytes:?}");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[derive(Clone)]
+struct StreamOnlyFixture {
+    hits: Arc<AtomicUsize>,
+    streaming_flag: Arc<AtomicUsize>,
+    chunks: Vec<Bytes>,
+}
+
+async fn strict_stream_only(
+    State(state): State<StreamOnlyFixture>,
+    request: Request<Body>,
+) -> impl IntoResponse {
+    state.hits.fetch_add(1, Ordering::SeqCst);
+    let body = to_bytes(request.into_body(), 1 << 20).await.unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    if payload["stream"] != true {
+        return (StatusCode::BAD_REQUEST, "upstream requires stream:true").into_response();
+    }
+    state.streaming_flag.fetch_add(1, Ordering::SeqCst);
+    let bytes = state.chunks.clone();
+    let output = futures_util::stream::iter(bytes.into_iter().map(Ok::<Bytes, std::io::Error>));
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+        Body::from_stream(output),
+    )
+        .into_response()
+}
+
+async fn start_strict_stream_only(
+    frames: Vec<Vec<u8>>,
+) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let streaming = Arc::new(AtomicUsize::new(0));
+    let state = StreamOnlyFixture {
+        hits: hits.clone(),
+        streaming_flag: streaming.clone(),
+        chunks: frames.into_iter().map(Bytes::from).collect(),
+    };
+    let router = Router::new()
+        .route("/v1/chat/completions", post(strict_stream_only))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (format!("http://{addr}"), hits, streaming)
+}
+
+fn app_with_stream_only_and_auto(streaming_url: &str, healthy_url: &str, auto: bool) -> Router {
+    let auto_yaml = if auto {
+        r#"
+auto:
+  enabled: true
+  candidates:
+    - provider: streaming
+      model: stream-model
+      priority: 1
+    - provider: backup
+      model: backup-model
+      priority: 2
+"#
+    } else {
+        ""
+    };
+    let yaml = format!(
+        r#"
+providers:
+  - name: streaming
+    type: openai
+    base_url: {streaming_url}
+    key_env: STREAM_KEY
+    stream_only: true
+  - name: backup
+    type: openai
+    base_url: {healthy_url}
+    key_env: BACKUP_KEY
+chains:
+  - name: ordered
+    steps:
+      - provider: streaming
+        model: stream-model
+      - provider: backup
+        model: backup-model
+{auto_yaml}
+"#
+    );
+    let config: Config = serde_yaml::from_str(&yaml).unwrap();
+    app(AppState::new(
+        config,
+        HashMap::from([
+            ("STREAM_KEY".into(), "stream-secret".into()),
+            ("BACKUP_KEY".into(), "backup-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap())
+}
+
+#[tokio::test]
+async fn stream_only_provider_completes_nonstream_chat_with_fragmented_sse_and_tool_arguments() {
+    let frames = vec![
+        br#"data: {"id":"chat-123","model":"stream-model","created":45,"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}
+
+"#.to_vec(),
+        br#"data: {"choices":[{"index":0,"delta":{"content":" there","tool_calls":[{"index":0,"id":"call_42","type":"function","function":{"name":"lookup","arguments":"{"}}]},"finish_reason":null}]}
+
+"#.to_vec(),
+        br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"q\":1}"}}]},"finish_reason":"tool_calls"}]}
+
+"#.to_vec(),
+        br#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}
+
+data: [DONE]
+
+"#.to_vec(),
+    ];
+    let (a, hits, streaming) = start_strict_stream_only(frames).await;
+    let (b, backup) = start_upstream(StatusCode::OK).await;
+    let router = app_with_stream_only_and_auto(&a, &b, false);
+    let (status, result) = call(router, request("ordered", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["choices"][0]["message"]["content"], "hi there");
+    assert_eq!(result["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(
+        result["choices"][0]["message"]["tool_calls"][0]["id"],
+        "call_42"
+    );
+    assert_eq!(
+        result["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "lookup"
+    );
+    assert_eq!(
+        result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        r#"{"q":1}"#
+    );
+    assert_eq!(result["usage"]["total_tokens"], 8);
+    assert_eq!(result["id"], "chat-123");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(streaming.load(Ordering::SeqCst), 1);
+    assert_eq!(backup.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn stream_only_invalid_or_missing_done_falls_back_before_returning_json() {
+    let invalid = vec![
+        vec![SSE_START.to_vec()],
+        vec![SSE_START.to_vec(), b"data: [DONE]\n\n".to_vec()],
+        vec![SSE_START.to_vec(), SSE_END.to_vec(), b"data: {bad}\n\n".to_vec()],
+        vec![b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"user\"},\"finish_reason\":null}]}\n\n".to_vec()],
+    ];
+    for frames in invalid {
+        let (a, hits, streaming) = start_strict_stream_only(frames).await;
+        let (b, backup_hits) = start_upstream(StatusCode::OK).await;
+        let router = app_with_stream_only_and_auto(&a, &b, false);
+        let (status, result) = call(router, request("ordered", "", "client")).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["choices"][0]["message"]["content"], "success");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(streaming.load(Ordering::SeqCst), 1);
+        assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn auto_basic_uses_ordered_chain_without_remote_management_or_scoring() {
+    let frames = vec![SSE_START.to_vec(), SSE_END.to_vec(), SSE_DONE.to_vec()];
+    let (a, hits, streaming) = start_strict_stream_only(frames).await;
+    let (b, backup) = start_upstream(StatusCode::OK).await;
+    let router = app_with_stream_only_and_auto(&a, &b, true);
+    let req = |path: &str, payload: Value| {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    };
+    let (status, first) = call(
+        router.clone(),
+        req(
+            "/v1/auto",
+            json!({
+                "messages":[{"role":"user","content":"test"}],
+                "model":"auto"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["choices"][0]["message"]["content"], "hi");
+    let (status, second) = call(
+        router.clone(),
+        req(
+            "/v1/chat/completions",
+            json!({
+                "model":"auto","messages":[{"role":"user","content":"test"}]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(streaming.load(Ordering::SeqCst), 2);
+    assert_eq!(backup.load(Ordering::SeqCst), 0);
+    let (status, models) = call(
+        router.clone(),
+        Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", "Bearer client")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == "auto")
+    );
+
+    let noauto = app_with_stream_only_and_auto(&a, &b, false);
+    let (status, output) = call(
+        noauto,
+        req(
+            "/v1/auto",
+            json!({
+                "messages":[{"role":"user","content":"test"}]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(output["error"]["code"], "auto_disabled");
+}
+async fn start_aggregation_stall() -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_server = hits.clone();
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let hits = hits_for_server.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let output = futures_util::stream::unfold(0_u8, |index| async move {
+                    if index == 0 {
+                        Some((
+                            Ok::<Bytes, std::io::Error>(Bytes::from_static(SSE_START)),
+                            1,
+                        ))
+                    } else {
+                        std::future::pending::<Option<(Result<Bytes, std::io::Error>, u8)>>().await
+                    }
+                });
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(output),
+                )
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(socket, router).await.unwrap() });
+    (format!("http://{addr}"), hits)
+}
+
+#[tokio::test]
+async fn four_aggregation_slots_bound_memory_and_busy_candidate_uses_backup() {
+    let (a, hits) = start_aggregation_stall().await;
+    let (b, backup_hits) = start_upstream(StatusCode::OK).await;
+    let router = app_with_stream_only_and_auto(&a, &b, true);
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        let router = router.clone();
+        held.push(tokio::spawn(async move {
+            call(router, request("ordered", "", "client")).await
+        }));
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while hits.load(Ordering::SeqCst) < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("four requests should own four aggregation permits");
+
+    // Another caller waits a bounded two seconds for space, then falls back.
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        call(router.clone(), request("auto", "", "client")),
+    )
+    .await
+    .expect("capacity must not cause indefinite stalls");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["choices"][0]["message"]["content"], "success");
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+    let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(metric_value(&metrics, "aggregation_busy_total"), 1);
+
+    // Releasing in-progress clients releases the semaphore reservations.
+    for task in held {
+        task.abort();
+        let _ = task.await;
+    }
+    let handle = tokio::spawn({
+        let router = router.clone();
+        async move { call(router, request("ordered", "", "client")).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while hits.load(Ordering::SeqCst) < 5 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a new request must reacquire the released permit");
+    handle.abort();
+    let _ = handle.await;
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "active_requests"), 0);
 }
