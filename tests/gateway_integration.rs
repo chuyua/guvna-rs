@@ -36,6 +36,7 @@ async fn upstream(State(state): State<UpstreamState>, request: Request<Body>) ->
     {
         return (
             StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, "3600")],
             axum::Json(json!({"error":"quota"})),
         )
             .into_response();
@@ -222,6 +223,51 @@ async fn reject_bad_key_and_invalid_stream_n_without_calling_upstream() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(result["error"]["code"], "invalid_n");
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn retry_after_429_suppresses_early_retries_without_suppressing_healthy_keys() {
+    let (url, calls) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: only
+    type: openai
+    base_url: {url}
+    key_envs: [BAD, GOOD]
+    rotation: sequential
+    quarantine:
+      rate_limit: 100ms
+chains:
+  - name: demo
+    steps:
+      - provider: only
+        model: one
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("BAD".into(), "bad".into()), ("GOOD".into(), "good".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    assert_eq!(
+        call(router.clone(), request("demo", "", "client")).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2); // BAD 429, then GOOD success
+
+    // Longer than the configured 100ms, but much shorter than Retry-After: 3600.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        call(router.clone(), request("demo", "", "client")).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3); // Only GOOD, no premature BAD retry
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 1);
+    assert_eq!(metric_value(&metrics, "upstream_attempts_total"), 3);
 }
 
 #[tokio::test]
