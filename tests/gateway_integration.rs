@@ -253,6 +253,70 @@ const SSE_END: &[u8] =
     b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
 const SSE_DONE: &[u8] = b"data: [DONE]\n\n";
 
+#[tokio::test(flavor = "current_thread")]
+async fn healthy_stream_survives_ninety_seconds_of_regular_progress() {
+    use std::time::Duration;
+
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let chunks = futures_util::stream::unfold(0u8, |index| async move {
+                match index {
+                    0 => Some((Ok::<_, std::io::Error>(Bytes::from_static(SSE_START)), 1)),
+                    1..=20 => {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        Some((
+                            Ok(Bytes::from_static(b": upstream heartbeat\n\n")),
+                            index + 1,
+                        ))
+                    }
+                    21 => Some((Ok(Bytes::from_static(SSE_END)), 22)),
+                    22 => Some((Ok(Bytes::from_static(SSE_DONE)), 23)),
+                    _ => None,
+                }
+            });
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                Body::from_stream(chunks),
+            )
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(socket, upstream).await.unwrap() });
+    let url = format!("http://{addr}");
+    let response = make_app(&url, &url)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Pause only after the first SSE event has passed preflight. Advance the
+    // Tokio clock in small increments so each upstream heartbeat is consumed.
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let collected = tokio::spawn(async move { to_bytes(response.into_body(), 1 << 20).await });
+    for _ in 0..60 {
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        if collected.is_finished() {
+            break;
+        }
+    }
+    assert!(started.elapsed() > Duration::from_secs(90));
+    tokio::time::resume();
+    let bytes = tokio::time::timeout(Duration::from_secs(2), collected)
+        .await
+        .expect("healthy SSE stream should complete")
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    assert!(!text.contains("upstream_stream_incomplete"), "{text}");
+}
+
 #[tokio::test]
 async fn chat_stream_fails_over_before_first_valid_event() {
     let (a, bad_hits) = start_sse(vec![b"data: {\"choices\":[]}\n\n"]).await;
