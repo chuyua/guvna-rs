@@ -90,6 +90,16 @@ symlinked runtime files. Validation cannot rewrite the rejected input.
 Bounded O_NOFOLLOW reads prevent symlink following and excessive reads;
 atomic replace keeps runtime reader snapshots complete.
 
+## Auto and local logging release gate
+
+An independent Linux --release gateway instance runs with Auto enabled,
+64 mixed primary-fault injections and healthy fallback requests through
+/v1/auto, while the original 4,000+200 baseline remains unchanged. The
+gate requires exactly 64 primary attempts and 64 successful fallback
+completions, reconciles metrics, and checks bounded RSS/FD/thread counts.
+Local warning JSON-line stderr events are restricted to fixed metadata
+fields, contain no API key values and are rate limited to ten lines.
+
 ## Planned broader gates
 
 - Deterministic random fault matrix (429/5xx/invalid JSON/stalled response/

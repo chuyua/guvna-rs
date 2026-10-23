@@ -48,7 +48,7 @@ Unsupported reasoning, image, audio, stateful continuation, and other
 advanced Responses modes remain explicitly unsupported. The gateway must not
 be treated as full OpenAI Responses parity or a production drop-in replacement.
 
-Not yet shipped: Auto, general remote management,
+Not yet shipped: advanced Auto learning/cache, remote management,
 complete Go protocol parity and full multi-modal streaming.
 
 POST /v1/chat/completions, /v1/embeddings and /v1/responses authenticate
@@ -58,6 +58,16 @@ invalid credentials are rejected without consuming a slow or unbounded body.
 Authorized requests acquire a shared admission permit before reading the
 request body, preventing slow uploads from evading the global 128-request
 limit. Permits remain held through dispatch and streamed response delivery.
+
+## Basic Auto routing and local diagnostics
+
+An opt-in Auto V1 selects model candidates using configured priority
+and a bounded encoded-input-length filter. POST /v1/auto or Chat model
+auto delegates to existing failover and circuit logic; Auto is off by default.
+
+Set GUVNA_LOG_EVENTS=1 for sparse local stderr warning lines with no prompt,
+provider URL, client IP or API key. No remote management port, telemetry
+database or external API is added. See docs/AUTO_V1.md.
 
 ## Local runtime chain management (offline)
 

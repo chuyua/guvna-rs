@@ -7,6 +7,7 @@ use super::{
 };
 use crate::{
     metrics::Metrics,
+    ops_log,
     outcome::{Outcome, classify},
     routing,
     sse::ChatSse,
@@ -108,7 +109,15 @@ pub(super) async fn dispatch(
             "stream n must be 1..64",
         );
     }
-    let steps = match routing::resolve(&state.config, model) {
+    let auto_enabled = model == "auto" && state.config.auto.enabled;
+    // Bytes of encoded message content are a deterministic bounded proxy
+    // for context size; no remote tokenizer or prompt logging is involved.
+    let steps = match if auto_enabled {
+        let input_bytes = request.get("messages").map_or(0, |m| m.to_string().len());
+        routing::resolve_auto(&state.config, input_bytes)
+    } else {
+        routing::resolve(&state.config, model)
+    } {
         Ok(steps) => steps,
         Err(_) => {
             return error(
@@ -118,6 +127,14 @@ pub(super) async fn dispatch(
             );
         }
     };
+
+    if auto_enabled && steps.is_empty() {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "auto_no_eligible_candidate",
+            "No configured Auto candidate accepts this input size",
+        );
+    }
 
     let mut permit = Some(admission);
 
@@ -176,6 +193,7 @@ pub(super) async fn dispatch(
                 Ok(result) => result,
                 Err(_) => {
                     Metrics::inc(&state.metrics.upstream_transport_failures);
+                    ops_log::warn("transport_failure");
                     record_circuit_failure(&mut circuit_ticket, &state.metrics);
                     break;
                 }
@@ -184,6 +202,7 @@ pub(super) async fn dispatch(
                 Ok(response) => response,
                 Err(_) => {
                     Metrics::inc(&state.metrics.upstream_transport_failures);
+                    ops_log::warn("transport_failure");
                     record_circuit_failure(&mut circuit_ticket, &state.metrics);
                     break;
                 } // key-neutral
@@ -192,6 +211,7 @@ pub(super) async fn dispatch(
             let outcome = classify(Some(status));
             if outcome.quarantine_credential() {
                 Metrics::inc(&state.metrics.upstream_http_failures);
+                ops_log::warn("provider_http_failure");
                 let retry_after = if outcome == Outcome::RateLimited {
                     retry_after_delay(upstream.headers(), SystemTime::now())
                 } else {
@@ -222,6 +242,7 @@ pub(super) async fn dispatch(
                         Ok(stream_response) => return stream_response,
                         Err(_) => {
                             Metrics::inc(&state.metrics.upstream_invalid_responses);
+                            ops_log::warn("stream_preflight_failure");
                             record_circuit_failure(&mut circuit_ticket, &state.metrics);
                             break;
                         } // preflight rejected
@@ -238,12 +259,14 @@ pub(super) async fn dispatch(
                     }
                     _ => {
                         Metrics::inc(&state.metrics.upstream_invalid_responses);
+                        ops_log::warn("upstream_invalid");
                         record_circuit_failure(&mut circuit_ticket, &state.metrics);
                         break;
                     } // next step
                 }
             }
             Metrics::inc(&state.metrics.upstream_http_failures);
+            ops_log::warn("provider_http_failure");
             if outcome == Outcome::ProviderTransient
                 && let Some(ticket) = &mut circuit_ticket
             {
@@ -259,6 +282,7 @@ pub(super) async fn dispatch(
         }
     }
     if bypassed_circuit && !attempted_network {
+        ops_log::warn("provider_circuit_open");
         let mut response = error(
             StatusCode::SERVICE_UNAVAILABLE,
             "provider_circuit_open",

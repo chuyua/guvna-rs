@@ -23,6 +23,33 @@ pub struct Config {
     pub chains: Vec<Chain>,
     #[serde(default)]
     pub default_chain: String,
+    #[serde(default)]
+    pub auto: AutoConfig,
+}
+
+/// Deterministic, opt-in Auto routing. No remote control, external cache,
+/// provider identifiers in metrics, or mutable cross-request rankings.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoConfig {
+    pub enabled: bool,
+    pub candidates: Vec<AutoCandidate>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoCandidate {
+    pub provider: String,
+    pub model: String,
+    #[serde(default = "default_auto_priority")]
+    pub priority: u16,
+    #[serde(default)]
+    pub min_input_bytes: usize,
+    pub max_input_bytes: Option<usize>,
+}
+
+fn default_auto_priority() -> u16 {
+    100
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -262,6 +289,34 @@ impl Config {
                 if prefix.is_empty() || !prefixes.insert(prefix.to_owned()) {
                     return Err(format!("duplicate/empty provider prefix: {prefix:?}"));
                 }
+            }
+        }
+        if self.auto.enabled {
+            if self.auto.candidates.is_empty() || self.auto.candidates.len() > 32 {
+                return Err("auto enabled requires 1..32 configured candidates".into());
+            }
+            if self.chains.iter().any(|chain| chain.name == "auto") {
+                return Err("configured chain name auto is reserved when Auto is enabled".into());
+            }
+        } else if !self.auto.candidates.is_empty() {
+            return Err("auto candidates require enabled: true".into());
+        }
+        let mut auto_keys = HashSet::new();
+        for candidate in &self.auto.candidates {
+            if candidate.model.is_empty()
+                || !self.providers.iter().any(|p| p.name == candidate.provider)
+            {
+                return Err("auto candidate has missing provider or empty model".into());
+            }
+            if candidate
+                .max_input_bytes
+                .is_some_and(|v| v < candidate.min_input_bytes)
+                || candidate.max_input_bytes == Some(0)
+            {
+                return Err("auto candidate invalid input length range".into());
+            }
+            if !auto_keys.insert((candidate.provider.as_str(), candidate.model.as_str())) {
+                return Err("auto has duplicate provider/model candidates".into());
             }
         }
         let mut names = HashSet::new();
