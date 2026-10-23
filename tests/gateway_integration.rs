@@ -741,6 +741,16 @@ async fn responses_text_bridge_and_unsupported_modes() {
     }
     assert_eq!(hits.load(Ordering::SeqCst), 13);
     for bad_request in [
+        json!({"model":"demo","input":"hello","temperature":-0.1}),
+        json!({"model":"demo","input":"hello","temperature":2.1}),
+        json!({"model":"demo","input":"hello","top_p":-0.01}),
+        json!({"model":"demo","input":"hello","top_p":1.1}),
+        json!({"model":"demo","input":"hello","top_p":"0.9"}),
+        json!({"model":"demo","input":"hello","max_output_tokens":0}),
+        json!({"model":"demo","input":"hello","max_output_tokens":-1}),
+        json!({"model":"demo","input":"hello","max_output_tokens":2.5}),
+        json!({"model":"demo","input":"hello","user":true}),
+        json!({"model":"demo","input":"hello","instructions":[]}),
         json!({"model":"demo","input":"hello","tools":[{"type":"function","name":"lookup"},{"type":"function","name":"lookup"}]}),
         json!({"model":"demo","input":"hello","tools":[{"type":"function","name":"lookup","parameters":7}]}),
         json!({"model":"demo","input":"hello","parallel_tool_calls":1}),
