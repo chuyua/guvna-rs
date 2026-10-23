@@ -15,6 +15,7 @@ static AGGREGATION_INVALID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static AGGREGATION_TIMEOUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static AGGREGATION_TRANSPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static AGGREGATION_LIMIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static AGGREGATION_LIFETIME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn enabled() -> bool {
     *ENABLED.get_or_init(|| {
@@ -53,6 +54,7 @@ fn emit(level: &'static str, event: &'static str) {
         "aggregation_idle_timeout" => &AGGREGATION_TIMEOUT_SEQUENCE,
         "aggregation_transport_failure" => &AGGREGATION_TRANSPORT_SEQUENCE,
         "aggregation_resource_limit" => &AGGREGATION_LIMIT_SEQUENCE,
+        "aggregation_lifetime_timeout" => &AGGREGATION_LIFETIME_SEQUENCE,
         _ => &SEQUENCE,
     };
     let sequence = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -87,6 +89,7 @@ mod tests {
             "aggregation_idle_timeout",
             "aggregation_transport_failure",
             "aggregation_resource_limit",
+            "aggregation_lifetime_timeout",
         ] {
             assert!(category.starts_with("aggregation_"));
             assert!(

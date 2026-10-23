@@ -173,6 +173,17 @@ file extraction; HTTP behavior, retry/fallback and existing streaming
 adapters remain unchanged. See docs/GATEWAY_MODULES.md for the exact
 boundaries and invariants.
 
+## SSE-only provider aggregation safety
+
+SSE-only upstream Chat providers can supply ordinary JSON completions via
+the existing bounded Chat stream aggregator. It enforces 15-second idle
+timeout, a separate 10-minute overall aggregation limit and a 2 MiB combined
+output/metadata budget. Ordinary non-streaming JSON reads still use their
+90-second total deadline. Invalid or incomplete SSE fails over before
+returning JSON; no partially synthesized result is returned as success.
+Local opt-in stderr events report fixed aggregation failure categories.
+See docs/QUALITY_GATES.md for real Linux stress checks.
+
 ## Development
 
 ```sh

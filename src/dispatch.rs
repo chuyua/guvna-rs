@@ -319,8 +319,14 @@ pub(super) async fn dispatch(
                     }
                 }
                 let result = if upstream_stream && !streaming {
-                    tokio::time::timeout_at(
-                        deadline,
+                    // JSON-capable providers keep the 90s absolute timeout.
+                    // SSE-only generations may continue making valid progress
+                    // beyond 90s; guard them independently with a 15s idle
+                    // timeout (in aggregate()) and an explicit 10min cap.
+                    let lifetime =
+                        tokio::time::Instant::now() + chat_aggregate::MAX_AGGREGATION_LIFETIME;
+                    let aggregated = tokio::time::timeout_at(
+                        lifetime,
                         chat_aggregate::aggregate(
                             upstream,
                             effective_n,
@@ -328,8 +334,11 @@ pub(super) async fn dispatch(
                             payload.get("tool_choice"),
                         ),
                     )
-                    .await
-                    .map(|value| {
+                    .await;
+                    if aggregated.is_err() {
+                        ops_log::warn("aggregation_lifetime_timeout");
+                    }
+                    aggregated.map(|value| {
                         value.map_err(|error| {
                             ops_log::warn(error.log_event());
                         })

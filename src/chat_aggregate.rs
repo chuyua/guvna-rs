@@ -16,6 +16,10 @@ const MAX_TOTAL_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AGGREGATED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EVENTS: usize = 16_384;
 const STREAM_IDLE: Duration = Duration::from_secs(15);
+// Long generations from SSE-only providers must not inherit the ordinary
+// 90-second JSON-body deadline. The idle timer still rejects stalled streams,
+// and this separate hard cap prevents indefinite drip-fed connections.
+pub(super) const MAX_AGGREGATION_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 // Error classes are fixed, local-only log keys. Never attach prompt/model,
 // provider URL, API key, response data or client identity to these events.
@@ -62,17 +66,22 @@ struct Choice {
     finish_reason: Option<String>,
 }
 
+fn account_bounded(used: &mut usize, size: usize) -> Result<(), AggregateError> {
+    *used = used
+        .checked_add(size)
+        .ok_or(AggregateError::ResourceLimit)?;
+    if *used > MAX_AGGREGATED_OUTPUT_BYTES {
+        return Err(AggregateError::ResourceLimit);
+    }
+    Ok(())
+}
+
 fn append_bounded(
     into: &mut String,
     fragment: &str,
     used: &mut usize,
 ) -> Result<(), AggregateError> {
-    *used = used
-        .checked_add(fragment.len())
-        .ok_or(AggregateError::ResourceLimit)?;
-    if *used > MAX_AGGREGATED_OUTPUT_BYTES {
-        return Err(AggregateError::ResourceLimit);
-    }
+    account_bounded(used, fragment.len())?;
     into.push_str(fragment);
     Ok(())
 }
@@ -92,6 +101,7 @@ fn apply_event(
             return Err(AggregateError::InvalidStream);
         }
         if id.is_none() {
+            account_bounded(used, current.len())?;
             *id = Some(current.to_owned());
         }
     }
@@ -108,6 +118,7 @@ fn apply_event(
             return Err(AggregateError::InvalidStream);
         }
         if model.is_none() {
+            account_bounded(used, current.len())?;
             *model = Some(current.to_owned());
         }
     }
@@ -130,6 +141,10 @@ fn apply_event(
         if prompt.checked_add(completion) != Some(total) {
             return Err(AggregateError::InvalidStream);
         }
+        // Usage extras are client-visible JSON as well. The original limit
+        // only counted text and tool arguments, allowing a large usage object
+        // to bypass the advertised bounded output budget.
+        account_bounded(used, value_usage.to_string().len())?;
         *usage = value_usage.clone();
     }
     for event_choice in value.get("choices").and_then(Value::as_array).ok_or(())? {
@@ -186,6 +201,9 @@ fn apply_event(
                     if slot.id.as_deref().is_some_and(|old| old != call_id) {
                         return Err(AggregateError::InvalidStream);
                     }
+                    if slot.id.is_none() {
+                        account_bounded(used, call_id.len())?;
+                    }
                     slot.id = Some(call_id.to_owned());
                 }
                 if let Some(function) = tool_call.get("function") {
@@ -193,6 +211,9 @@ fn apply_event(
                         let name = name.as_str().filter(|name| !name.is_empty()).ok_or(())?;
                         if slot.name.as_deref().is_some_and(|old| old != name) {
                             return Err(AggregateError::InvalidStream);
+                        }
+                        if slot.name.is_none() {
+                            account_bounded(used, name.len())?;
                         }
                         slot.name = Some(name.to_owned());
                     }
@@ -210,6 +231,7 @@ fn apply_event(
             if choice.finish_reason.is_some() {
                 return Err(AggregateError::InvalidStream);
             }
+            account_bounded(used, reason.len())?;
             choice.finish_reason = Some(reason.to_owned());
         }
     }
@@ -343,6 +365,90 @@ pub(super) async fn aggregate(
         "choices":choices,
         "usage":usage,
     }))
+}
+
+#[cfg(test)]
+mod output_budget_tests {
+    use super::*;
+    fn with_event(value: Value, used: &mut usize) -> Result<(), AggregateError> {
+        let mut choices = vec![Choice::default()];
+        let mut usage = Value::Null;
+        let mut id = None;
+        let mut created = None;
+        let mut model = None;
+        apply_event(
+            &value,
+            &mut choices,
+            used,
+            &mut usage,
+            &mut id,
+            &mut created,
+            &mut model,
+        )
+    }
+
+    #[test]
+    fn usage_metadata_and_identifiers_share_the_content_memory_budget() {
+        let mut used = MAX_AGGREGATED_OUTPUT_BYTES - 100;
+        let usage = json!({
+            "prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5,
+            "provider_specific": "z".repeat(128)
+        });
+        assert!(matches!(
+            with_event(json!({"choices":[],"usage":usage}), &mut used),
+            Err(AggregateError::ResourceLimit)
+        ));
+
+        for event in [
+            json!({"id":"x".repeat(128),"choices":[]}),
+            json!({"model":"x".repeat(128),"choices":[]}),
+            json!({"choices":[{"index":0, "delta":{}, "finish_reason":"x".repeat(128)}]}),
+            json!({"choices":[{"index":0, "delta":{"tool_calls":[{
+                "index":0, "id":"x".repeat(128)}]}, "finish_reason":null}]}),
+            json!({"choices":[{"index":0, "delta":{"tool_calls":[{
+                "index":0, "function":{"name":"x".repeat(128)}}]},
+                "finish_reason":null}]}),
+        ] {
+            let mut used = MAX_AGGREGATED_OUTPUT_BYTES - 100;
+            assert!(matches!(
+                with_event(event, &mut used),
+                Err(AggregateError::ResourceLimit)
+            ));
+        }
+    }
+
+    #[test]
+    fn stable_metadata_in_repeated_events_is_only_accounted_once() {
+        let mut choices = vec![Choice::default()];
+        let mut used = 0;
+        let mut usage = Value::Null;
+        let mut id = None;
+        let mut created = None;
+        let mut model = None;
+        let first = json!({"id":"id1","model":"model1",
+            "choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}]});
+        for _ in 0..1000 {
+            apply_event(
+                &first,
+                &mut choices,
+                &mut used,
+                &mut usage,
+                &mut id,
+                &mut created,
+                &mut model,
+            )
+            .unwrap();
+        }
+        // No count inflation for stable id/model repeated by the provider.
+        assert_eq!(used, 3 + 6 + 1000);
+    }
+
+    #[test]
+    fn lifetime_is_longer_than_header_timeout_but_not_unbounded() {
+        assert!(MAX_AGGREGATION_LIFETIME > Duration::from_secs(90));
+        assert!(MAX_AGGREGATION_LIFETIME <= Duration::from_secs(15 * 60));
+        assert!(STREAM_IDLE < MAX_AGGREGATION_LIFETIME);
+    }
 }
 
 #[cfg(test)]
