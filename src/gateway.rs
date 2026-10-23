@@ -435,6 +435,7 @@ async fn responses(
         }
     };
     let created_at = chat["created"].as_i64();
+    let output_status = response_status;
     let usage = &chat["usage"];
     let input_tokens = usage["prompt_tokens"].as_u64();
     let output_tokens = usage["completion_tokens"].as_u64();
@@ -447,7 +448,7 @@ async fn responses(
     };
     (StatusCode::OK, Json(json!({
         "id":chat["id"], "object":"response", "status":response_status, "incomplete_details":incomplete_details, "created_at":created_at, "model":logical_model,
-        "output":[{"id":format!("msg_{}",chat["id"].as_str().unwrap_or("generated")), "type":"message", "status":"completed", "role":"assistant", "content":[{"type":"output_text","text":content,"annotations":[]}]}],
+        "output":[{"id":format!("msg_{}",chat["id"].as_str().unwrap_or("generated")), "type":"message", "status":output_status, "role":"assistant", "content":[{"type":"output_text","text":content,"annotations":[]}]}],
         "output_text":content,
         "usage": translated_usage
     }))).into_response()
