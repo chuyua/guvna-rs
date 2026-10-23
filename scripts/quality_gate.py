@@ -83,10 +83,22 @@ class StubHandler(BaseHTTPRequestHandler):
                      "content":"stream-ok"}, "finish_reason":None}]}
             finish = {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
             if number % 7 == 0:
-                # Premature DONE before finish_reason: must fail closed.
-                payload = ("data: " + json.dumps(first) +
-                           "\n\ndata: [DONE]\n\n").encode()
+                if number % 2 == 0:
+                    # Audio cannot be represented in JSON Chat text fields.
+                    # Must fail over, not fabricate a successful completion.
+                    first["choices"][0]["delta"]["audio"] = {"data": "fake-audio"}
+                    payload = ("data: " + json.dumps(first) + "\n\ndata: " +
+                               json.dumps(finish) + "\n\ndata: [DONE]\n\n").encode()
+                else:
+                    # Premature DONE before finish_reason: fail closed.
+                    payload = ("data: " + json.dumps(first) +
+                               "\n\ndata: [DONE]\n\n").encode()
             else:
+                if number % 11 == 0:
+                    first["choices"][0]["delta"]["content"] = None
+                    first["choices"][0]["delta"]["refusal"] = "request declined"
+                elif number % 13 == 0:
+                    first["choices"][0]["delta"]["reasoning_content"] = "private reasoning"
                 payload = ("data: " + json.dumps(first) + "\n\ndata: " +
                            json.dumps(finish) + "\n\ndata: [DONE]\n\n").encode()
             self.send_response(200)
@@ -529,17 +541,26 @@ chains:
                       "non-stream consumer received upstream SSE framing")
                 answer = json.load(resp)
                 choice = answer["choices"][0]
-                return resp.status, choice["message"]["content"]
+                msg = choice["message"]
+                return (resp.status, msg["content"],
+                        msg.get("reasoning_content"), msg.get("refusal"))
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             observed = list(executor.map(call_seed, range(64)))
         failures = sum(seed % 7 == 0 for seed in range(64))
-        check(all(code == 200 for code, _ in observed),
+        check(all(code == 200 for code, *_ in observed),
               "SSE-only aggregate returned a non-200 JSON response")
-        for seed, (code, content) in enumerate(observed):
-            expected = "ok" if seed % 7 == 0 else "stream-ok"
-            check(content == expected,
+        for seed, (code, content, reasoning, refusal) in enumerate(observed):
+            failed = seed % 7 == 0
+            declined = not failed and seed % 11 == 0
+            expects_reasoning = not failed and not declined and seed % 13 == 0
+            expected_content = "ok" if failed else None if declined else "stream-ok"
+            check(content == expected_content,
                   f"SSE-only conversion/fallback corrupted seed {seed}: {content}")
+            check(refusal == ("request declined" if declined else None),
+                  f"SSE-only refusal text was lost for seed {seed}")
+            check(reasoning == ("private reasoning" if expects_reasoning else None),
+                  f"SSE-only reasoning text was lost for seed {seed}")
 
         upstream_attempts = upstream.calls
         upstream_streamed = upstream.streaming_seen
@@ -612,7 +633,7 @@ chains:
               "SSE-only logs cannot distinguish success from failure")
         check(all(token not in text for token in
                   ("fake-stream-key", "fake-live-key", "only-for-local-test",
-                   "stream-ok")),
+                   "stream-ok", "request declined", "private reasoning", "fake-audio")),
               "SSE-only logs exposed credentials or generated content")
 
 

@@ -86,6 +86,16 @@ or stalled streams fail closed and use the existing next-chain candidate
 before any downstream JSON response is emitted. Results must pass the same
 upstream Chat contract checks as ordinary JSON Chat completions.
 
+For text-compatible upstream extensions, the synthesized JSON preserves
+refusal, reasoning and reasoning_content fields within the existing shared 2 MiB
+output limit. Unsupported audio chunks and invalid field types fail
+closed and use the existing candidate fallback path; a mismatched named
+tool call is rejected at the first invalid SSE delta. The adapter does
+not currently synthesize token logprobs, so a non-streaming request for
+logprobs bypasses SSE-only providers in favor of a compatible native-JSON
+candidate, whose returned logprobs must also be validated. This is a
+documented capability boundary, not silent data loss.
+
 Set GUVNA_LOG_EVENTS=1 for sampled local stderr JSON-lines containing
 aggregation_completed or aggregation_failed with no user content, secret,
 provider name or client address. Existing read-only authenticated metrics

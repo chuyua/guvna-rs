@@ -56,6 +56,14 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
         {
             return false;
         }
+        // Logprobs are a requested output, not optional metadata that can
+        // disappear silently when the upstream ignores the flag. A native
+        // JSON fallback must also honor it before becoming a valid success.
+        if request.get("logprobs") == Some(&Value::Bool(true))
+            && !choice.get("logprobs").is_some_and(Value::is_object)
+        {
+            return false;
+        }
         let calls = match message.get("tool_calls") {
             None => None,
             Some(value) => match value.as_array() {
@@ -256,6 +264,21 @@ mod response_contract_tests {
             &request,
             &json!({"choices":[{"index":0,"message":{},"finish_reason":null},assistant(1)]})
         ));
+    }
+
+    #[test]
+    fn chat_logprobs_opt_in_requires_payload_from_upstream() {
+        let request = json!({"logprobs": true});
+        let missing = json!({"choices":[assistant(0)]});
+        assert!(!validate_chat(&request, &missing));
+        let mut valid = missing.clone();
+        valid["choices"][0]["logprobs"] = json!({
+            "content": [{"token":"ok","logprob":-0.02,"bytes":[111,107],"top_logprobs":[]}],
+            "refusal": null
+        });
+        assert!(validate_chat(&request, &valid));
+        // The opt-out response must retain preexisting compatibility.
+        assert!(validate_chat(&json!({}), &missing));
     }
 
     #[test]

@@ -27,6 +27,12 @@ struct Tool {
 #[derive(Default)]
 struct Choice {
     content: String,
+    // Some providers emit these Chat delta extensions. Preserve them so
+    // non-stream clients never receive a synthetic answer missing refusal
+    // or reasoning fields from the upstream completion.
+    refusal: Option<String>,
+    reasoning: Option<String>,
+    reasoning_content: Option<String>,
     tools: BTreeMap<u64, Tool>,
     finish_reason: Option<String>,
 }
@@ -54,7 +60,9 @@ fn apply_event(
         if id.as_deref().is_some_and(|old| old != current) {
             return Err(());
         }
-        *id = Some(current.to_owned());
+        if id.is_none() {
+            *id = Some(current.to_owned());
+        }
     }
     if let Some(raw) = value.get("created") {
         let current = raw.as_u64().ok_or(())?;
@@ -68,7 +76,9 @@ fn apply_event(
         if model.as_deref().is_some_and(|old| old != current) {
             return Err(());
         }
-        *model = Some(current.to_owned());
+        if model.is_none() {
+            *model = Some(current.to_owned());
+        }
     }
     if let Some(value_usage) = value.get("usage").filter(|usage| !usage.is_null()) {
         if !value_usage.is_object() || !usage.is_null() {
@@ -105,6 +115,21 @@ fn apply_event(
             .ok_or(())?;
         if let Some(content) = delta.get("content").filter(|content| !content.is_null()) {
             append_bounded(&mut choice.content, content.as_str().ok_or(())?, used)?;
+        }
+        for (field, slot) in [
+            ("refusal", &mut choice.refusal),
+            ("reasoning", &mut choice.reasoning),
+            ("reasoning_content", &mut choice.reasoning_content),
+        ] {
+            if let Some(fragment) = delta.get(field).filter(|value| !value.is_null()) {
+                let fragment = fragment.as_str().ok_or(())?;
+                append_bounded(slot.get_or_insert_with(String::new), fragment, used)?;
+            }
+        }
+        // Audio chunks cannot be represented by an ordinary text Chat
+        // Completion. Fail over instead of returning an incomplete 200.
+        if delta.get("audio").is_some_and(|value| !value.is_null()) {
+            return Err(());
         }
         if let Some(tool_calls) = delta.get("tool_calls") {
             for tool_call in tool_calls.as_array().ok_or(())? {
@@ -167,6 +192,7 @@ pub(super) async fn aggregate(
     mut upstream: reqwest::Response,
     expected: u64,
     requested_model: &str,
+    tool_choice: Option<&Value>,
 ) -> Result<Value, ()> {
     let mime = upstream
         .headers()
@@ -180,7 +206,12 @@ pub(super) async fn aggregate(
     {
         return Err(());
     }
-    let mut parser = ChatSse::new(expected).map_err(|_| ())?;
+    // Apply the same named/required/none tool contract as direct Chat SSE.
+    // Reject an incompatible first tool delta immediately rather than
+    // holding the aggregation semaphore until the 15-second idle timeout.
+    let mut parser = ChatSse::new(expected)
+        .map_err(|_| ())?
+        .with_tool_choice(tool_choice);
     let mut choices = (0..expected).map(|_| Choice::default()).collect::<Vec<_>>();
     let mut used = 0_usize;
     let mut total_received = 0_usize;
@@ -244,6 +275,15 @@ pub(super) async fn aggregate(
         };
         let content = if choice.content.is_empty() { Value::Null } else { Value::String(choice.content) };
         let mut message = json!({"role":"assistant","content":content});
+        if let Some(refusal) = choice.refusal {
+            message["refusal"] = Value::String(refusal);
+        }
+        if let Some(reasoning) = choice.reasoning {
+            message["reasoning"] = Value::String(reasoning);
+        }
+        if let Some(reasoning_content) = choice.reasoning_content {
+            message["reasoning_content"] = Value::String(reasoning_content);
+        }
         if let Some(calls) = calls {
             message["tool_calls"] = json!(calls);
         }
