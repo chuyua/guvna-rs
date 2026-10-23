@@ -55,9 +55,13 @@ pub(crate) fn wrap(
     model: String,
     metadata: Value,
     metrics: Arc<Metrics>,
+    json_mode: Option<bool>,
 ) -> Response {
     let source = response.into_body().into_data_stream();
-    let translator = ResponsesSse::new(model, metadata);
+    let mut translator = ResponsesSse::new(model, metadata);
+    // Some(true) requires a JSON object; Some(false) requires valid JSON
+    // for the configured schema mode. Omit this for default text/tool streams.
+    translator.json_mode = json_mode;
     let guard = StreamGuard {
         metrics,
         terminal_reported: false,
@@ -104,6 +108,7 @@ pub(crate) fn wrap(
 struct ResponsesSse {
     model: String,
     metadata: Value,
+    json_mode: Option<bool>,
     buffer: Vec<u8>,
     scan_from: usize,
     id: Option<String>,
@@ -123,6 +128,7 @@ impl ResponsesSse {
         Self {
             model,
             metadata,
+            json_mode: None,
             buffer: Vec::new(),
             scan_from: 0,
             id: None,
@@ -362,6 +368,19 @@ impl ResponsesSse {
             if self.finish_reason.is_none() || self.id.is_none() {
                 return Err(());
             }
+            if self.finish_reason.as_deref() == Some("stop")
+                && let Some(only_object) = self.json_mode
+            {
+                // A model may ignore response_format even after a valid 200
+                // streaming handshake. Check the bounded assembled text
+                // before ever emitting a completed terminal event. Once any
+                // delta has been sent we cannot replay another provider.
+                let valid = serde_json::from_str::<Value>(&self.text)
+                    .is_ok_and(|parsed| !only_object || parsed.is_object());
+                if !valid {
+                    return Err(());
+                }
+            }
             self.complete(pending);
             self.done = true;
             return Ok(());
@@ -563,6 +582,50 @@ mod tests {
         assert!(completed.contains("input_tokens"));
         assert!(completed.contains("trace"));
     }
+    #[test]
+    fn json_output_mode_must_not_complete_unparseable_upstream_text() {
+        for (fragment, object_only, accepted) in [
+            (r#"{"ok":true}"#, true, true),
+            ("plain prose", true, false),
+            ("[1]", true, false),
+            ("[1]", false, true),
+            ("not JSON", false, false),
+        ] {
+            let mut t = ResponsesSse::new("logical".into(), Value::Null);
+            t.json_mode = Some(object_only);
+            let mut q = VecDeque::new();
+            t.feed(
+                &frame(json!({"id":"t","choices":[{"index":0,
+                    "delta":{"content":fragment},"finish_reason":"stop"}]})),
+                &mut q,
+            )
+            .unwrap();
+            let result = t.feed(b"data: [DONE]\n\n", &mut q);
+            assert_eq!(result.is_ok(), accepted, "{fragment}");
+            assert_eq!(t.done, accepted);
+            assert_eq!(
+                q.iter()
+                    .any(|frame| frame.starts_with(b"event: response.completed")),
+                accepted
+            );
+            if !accepted {
+                assert!(String::from_utf8_lossy(&t.failed()).contains("response.failed"));
+            }
+        }
+        // Truncated JSON is incomplete, not an erroneous completed event.
+        let mut t = ResponsesSse::new("logical".into(), Value::Null);
+        t.json_mode = Some(true);
+        let mut q = VecDeque::new();
+        t.feed(
+            &frame(json!({"id":"t","choices":[{"index":0,
+            "delta":{"content":"{"},"finish_reason":"length"}]})),
+            &mut q,
+        )
+        .unwrap();
+        t.feed(b"data: [DONE]\n\n", &mut q).unwrap();
+        assert!(String::from_utf8_lossy(q.back().unwrap()).contains("response.incomplete"));
+    }
+
     #[test]
     fn length_and_failed_streams_are_distinct() {
         let mut t = ResponsesSse::new("logical".into(), Value::Null);

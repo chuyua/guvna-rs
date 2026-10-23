@@ -10,6 +10,7 @@ gateway::app(AppState) API and all endpoint paths remain unchanged.
 | --- | --- |
 | src/gateway.rs | Router, public AppState, auth before body buffering, request admission, /models, /healthz and /metrics, common error and circuit helpers |
 | src/responses.rs | Strict /v1/responses validation, separate translate_input and translate_chat_result functions, and unchanged Responses SSE delegation |
+| src/responses_format.rs | Lossless, strict Responses text.format mapping to Chat response_format, with JSON schema field preservation and fail-closed unknown options |
 | src/dispatch.rs | ONE candidate traversal for Chat/Embeddings and the Responses bridge, credential attempts, fallback, circuits, timeout and bounded JSON transport |
 | src/chat_stream.rs | Chat SSE preflight, incremental frame delivery, terminal metrics, ownership and cancellation |
 | src/response_validation.rs | Pure Chat/Embeddings upstream 2xx contract checks with their unit tests |
@@ -32,7 +33,11 @@ among them. No new publicly reachable module functions are introduced.
   event. Frame bounds, DONE and terminal/error metrics stay in chat_stream.rs.
 - Response validation never mutates provider state or calls the network.
 - Responses remains stateless, unsupported modes fail closed and its streaming
-  converter remains the existing responses_sse.rs.
+  converter stays in responses_sse.rs. Structured text output mapping lives
+  in responses_format.rs; invalid non-streaming JSON triggers provider failover,
+  while invalid JSON after streamed deltas yields response.failed, never a
+  fabricated completed response or a replay. Upstream must enforce full
+  JSON-schema semantics beyond parseability.
 - Preserve HTTP statuses, error codes, model resolution, function arguments,
   usage, event ordering and cancellation/retry behavior during extraction.
 
