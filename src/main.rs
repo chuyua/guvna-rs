@@ -21,6 +21,8 @@ async fn run() -> Result<(), String> {
         .unwrap_or_else(|| PathBuf::from(".guvna"));
     let mut healthcheck = false;
     let mut status = false;
+    let mut logs = false;
+    let mut tail: usize = 100;
     let mut chains_action: Option<String> = None;
     let mut chains_file: Option<PathBuf> = None;
     let mut chains_name: Option<String> = None;
@@ -32,6 +34,9 @@ async fn run() -> Result<(), String> {
             args.next()
                 .ok_or("chains requires list|validate|set|delete|recover")?,
         );
+    } else if args.peek().is_some_and(|s| s == "logs") {
+        args.next();
+        logs = true;
     } else if args.peek().is_some_and(|s| s == "status") {
         args.next();
         status = true;
@@ -45,6 +50,16 @@ async fn run() -> Result<(), String> {
             }
             "-data" | "--data" => {
                 data_dir = PathBuf::from(args.next().ok_or("missing -data value")?);
+            }
+            "--tail" if logs => {
+                tail = args
+                    .next()
+                    .ok_or("missing --tail value")?
+                    .parse()
+                    .map_err(|_| "invalid --tail value")?;
+                if !(1..=1000).contains(&tail) {
+                    return Err("--tail must be 1..=1000".into());
+                }
             }
             "-healthcheck" | "--healthcheck" => healthcheck = true,
             "-file" | "--file" if chains_action.is_some() => {
@@ -62,7 +77,7 @@ async fn run() -> Result<(), String> {
             }
             "--help" | "-h" | "help" => {
                 println!(
-                    "guvna serve [-config config.yaml] [-data DIR]\nguvna status [-config config.yaml]\n  --healthcheck probes /healthz\nguvna chains list|validate [-config FILE] [-data DIR]\nguvna chains set -file CHAIN.yaml [-config FILE] [-data DIR]\nguvna chains delete -name NAME [-config FILE] [-data DIR]\nguvna chains recover [-from BACKUP] [-config FILE] [-data DIR]\n  --version"
+                    "guvna serve [-config config.yaml] [-data DIR]\nguvna status [-config config.yaml]\nguvna logs [--tail 100]\n  --healthcheck probes /healthz\nguvna chains list|validate [-config FILE] [-data DIR]\nguvna chains set -file CHAIN.yaml [-config FILE] [-data DIR]\nguvna chains delete -name NAME [-config FILE] [-data DIR]\nguvna chains recover [-from BACKUP] [-config FILE] [-data DIR]\n  --version"
                 );
                 return Ok(());
             }
@@ -70,6 +85,28 @@ async fn run() -> Result<(), String> {
         }
     }
 
+    if logs {
+        #[cfg(target_os = "linux")]
+        {
+            let result = std::process::Command::new("journalctl")
+                .args([
+                    "--user",
+                    "-u",
+                    "guvna.service",
+                    "--no-pager",
+                    "-n",
+                    &tail.to_string(),
+                ])
+                .status()
+                .map_err(|e| format!("journalctl unavailable: {e}"))?;
+            if !result.success() {
+                return Err(format!("journalctl exited: {result}"));
+            }
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err("logs requires Linux systemd journal".into());
+    }
     let real_path = std::fs::canonicalize(&config_path)
         .map_err(|e| format!("config path {}: {e}", config_path.display()))?;
     if let Some(action) = chains_action {
