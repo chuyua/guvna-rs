@@ -421,6 +421,20 @@ async fn responses(
             "Only text chat responses can be translated",
         );
     };
+    // A truncated chat completion must never be reported as a completed Response.
+    let finish_reason = chat["choices"][0]["finish_reason"].as_str();
+    let (response_status, incomplete_details) = match finish_reason {
+        Some("stop") => ("completed", Value::Null),
+        Some("length") => ("incomplete", json!({"reason":"max_output_tokens"})),
+        _ => {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "unsupported_chat_finish",
+                "Upstream completion did not finish normally",
+            );
+        }
+    };
+    let created_at = chat["created"].as_i64();
     let usage = &chat["usage"];
     let input_tokens = usage["prompt_tokens"].as_u64();
     let output_tokens = usage["completion_tokens"].as_u64();
@@ -432,7 +446,7 @@ async fn responses(
         _ => Value::Null,
     };
     (StatusCode::OK, Json(json!({
-        "id":chat["id"], "object":"response", "status":"completed", "model":logical_model,
+        "id":chat["id"], "object":"response", "status":response_status, "incomplete_details":incomplete_details, "created_at":created_at, "model":logical_model,
         "output":[{"id":format!("msg_{}",chat["id"].as_str().unwrap_or("generated")), "type":"message", "status":"completed", "role":"assistant", "content":[{"type":"output_text","text":content,"annotations":[]}]}],
         "output_text":content,
         "usage": translated_usage

@@ -51,7 +51,7 @@ async fn upstream(State(state): State<UpstreamState>, request: Request<Body>) ->
         axum::Json(json!({
             "id":"mock","object":"chat.completion","model":model,
             "choices":[{"index":0,"message":{"role":"assistant","content":"success"},
-            "finish_reason":"stop"}],
+            "finish_reason":if value["messages"][0]["content"] == "truncate" { "length" } else { "stop" }}],
             "debug_seed": value["seed"]
         })),
     )
@@ -602,6 +602,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["object"], "response");
     assert_eq!(value["status"], "completed");
+    assert!(value["incomplete_details"].is_null());
     assert_eq!(value["output"][0]["content"][0]["text"], "success");
     assert_eq!(value["output_text"], "success");
     assert_eq!(value["model"], "demo");
@@ -619,6 +620,18 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(instructed["output_text"], "success");
     assert_eq!(hits.load(Ordering::SeqCst), 3);
+    let (status, truncated) = call(
+        router.clone(),
+        req(json!({"model":"demo","input":"truncate"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(truncated["status"], "incomplete");
+    assert_eq!(
+        truncated["incomplete_details"]["reason"],
+        "max_output_tokens"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
     for payload in [
         json!({"model":"demo","input":"hello","stream":true}),
         json!({"model":"demo","input":"hello","tools":[]}),
@@ -641,5 +654,5 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = call(router, req(json!({"input":"hello"}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
 }
