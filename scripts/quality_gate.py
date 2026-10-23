@@ -32,6 +32,7 @@ class Stub(ThreadingHTTPServer):
         self.lock = threading.Lock()
         self.calls = 0
         self.faults = {"503": 0, "invalid_200": 0, "truncated_200": 0}
+        self.structured = []
         super().__init__(("127.0.0.1", 0), StubHandler)
 
     def count(self):
@@ -59,9 +60,20 @@ class StubHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        requested_format = query.get("response_format")
+        json_mode = isinstance(requested_format, dict) and (
+            requested_format.get("type") in ("json_object", "json_schema"))
+        if self.server.role == "healthy" and json_mode:
+            with self.server.lock:
+                self.server.structured.append(requested_format)
+        messages = query.get("messages") or []
+        first_text = (messages[0].get("content") if messages and
+                      isinstance(messages[0], dict) else None)
+        scripted_content = ("not JSON" if first_text == "badjson" else
+                            '{"ok":true}' if json_mode else "ok")
         if self.server.role == "healthy" and query.get("stream") is True:
             first = {"id": "quality-stream", "created": 1, "choices": [{
-                "index": 0, "delta": {"role": "assistant", "content": "ok"},
+                "index": 0, "delta": {"role": "assistant", "content": scripted_content},
                 "finish_reason": None}]}
             finish = {"id": "quality-stream", "choices": [{
                 "index": 0, "delta": {}, "finish_reason": "stop"}]}
@@ -110,7 +122,7 @@ class StubHandler(BaseHTTPRequestHandler):
             status, result = 200, {
                 "id": "mock", "object": "chat.completion",
                 "choices": [{"index": 0, "message": {
-                    "role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "role": "assistant", "content": scripted_content}, "finish_reason": "stop"}],
                 "seed": query.get("seed"),
             }
         payload = json.dumps(result, separators=(",", ":")).encode("utf-8")
@@ -558,6 +570,75 @@ def idle(pid: int, seconds: float):
     }
 
 
+def verify_structured_output_on_release(endpoint: str, healthy_stub: Stub) -> dict:
+    """Public Responses handler -> shared dispatch -> real mock HTTP upstream."""
+    def submit(payload: dict, *, streaming=False) -> tuple[int, str]:
+        body = json.dumps(payload, separators=(",", ":")).encode()
+        request = Request(endpoint, data=body, method="POST", headers={
+            "Authorization": "Bearer only-for-local-test",
+            "Content-Type": "application/json",
+        })
+        try:
+            with urlopen(request, timeout=8) as reply:
+                return reply.status, reply.read().decode()
+        except HTTPError as err:
+            return err.code, err.read().decode()
+
+    before = healthy_stub.calls
+    common = {"model": "healthy", "input": "hello"}
+    invalid = dict(common, text={"format":{"type":"json_schema",
+                        "name":"bad name","schema":{"type":"object"}}})
+    code, raw = submit(invalid)
+    check(code == 400 and json.loads(raw)["error"]["code"] == "invalid_text_format",
+          f"Release accepted invalid structured format: {code}, {raw}")
+    check(healthy_stub.calls == before, "invalid format contacted upstream")
+
+    schema = {"type":"json_schema","name":"shape_1","strict":True,
+              "schema":{"type":"object","properties":{
+                  "big":{"const":12345678901234567890}}}}
+    for format in ({"type":"json_object"}, schema):
+        code, raw = submit(dict(common, text={"format":format}))
+        check(code == 200, f"Release failed structured output request: {code}, {raw}")
+        result = json.loads(raw)
+        check(result["status"] == "completed" and result["output_text"] == '{"ok":true}',
+              f"Release corrupted JSON output: {result}")
+
+        code, raw = submit(dict(common, stream=True, text={"format":format}), streaming=True)
+        check(code == 200, f"Release failed structured SSE request: {code}, {raw}")
+        check(raw.count("event: response.completed") == 1 and
+              "event: response.failed" not in raw,
+              f"Release lost JSON structured SSE terminal state: {raw[:1200]}")
+        check('"output_text":"{\\"ok\\":true}"' in raw or
+              '"output_text": "{\\"ok\\":true}"' in raw,
+              "Release structured output text missing from SSE")
+
+    # A 200 from the provider is *not* successful if JSON output was ignored.
+    code, raw = submit(dict(common, input="badjson",
+                            text={"format":{"type":"json_object"}}))
+    check(code == 502 and json.loads(raw)["error"]["code"] == "upstream_unavailable",
+          f"ignored JSON mode was reported as completed: {code}, {raw}")
+    code, raw = submit(dict(common, input="badjson", stream=True,
+                            text={"format":{"type":"json_object"}}), streaming=True)
+    check(code == 200 and raw.count("event: response.failed") == 1
+          and "event: response.completed" not in raw,
+          f"ignored streaming JSON mode claimed completed: {code}, {raw[:1200]}")
+
+    with healthy_stub.lock:
+        observed = list(healthy_stub.structured)
+        count = healthy_stub.calls
+    check(len(observed) == 6 and count == before + 6,
+          f"structured requests lost or retried: observed={len(observed)} calls={count-before}")
+    check(observed[0] == {"type":"json_object"} and observed[1] == {"type":"json_object"},
+          "Chat JSON object response_format mapping differs from contract")
+    mapped = {"type":"json_schema", "json_schema":{
+        "name":"shape_1","strict":True,"schema":schema["schema"]}}
+    check(observed[2] == mapped and observed[3] == mapped,
+          f"schema fields lost or numbers rounded: {observed[2]}")
+    return {"passed": True, "release_requests": 7,
+            "rejected_pre_network": 1, "structured_upstream_attempts": 6,
+            "json_number_preserved": True, "stream_fail_closed": True}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", required=True)
@@ -679,6 +760,17 @@ chains:
                       "fault injection did not cover every variant")
                 summary["opt_in_circuit_gate"] = exercise_opt_in_circuit_gate(
                     a.binary, cfg, directory, env, mock1, mock2)
+                summary["structured_output_gate"] = verify_structured_output_on_release(
+                    response_endpoint, mock2)
+                summary["post_structured_idle"] = idle(proc.pid, a.idle_seconds)
+                check(summary["post_structured_idle"]["rss_kib_max"] <=
+                      a.max_idle_rss_mib * 1024, "structured output idle RSS exceeded")
+                check(summary["post_structured_idle"]["fds"] -
+                      summary["post_sse_idle"]["fds"] <= 8,
+                      "structured output handler leaked file descriptors")
+                check(summary["post_structured_idle"]["threads"] -
+                      summary["post_sse_idle"]["threads"] <= 8,
+                      "structured output handler leaked threads")
                 summary["passed"] = True
             finally:
                 proc.terminate()
