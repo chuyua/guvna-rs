@@ -144,10 +144,17 @@ pub(super) async fn dispatch(
     let mut bypassed_circuit = false;
     let mut aggregation_busy = false;
     let mut unsupported_aggregate_logprobs = false;
+    // Propagate a useful downstream Retry-After only when *all* eligible
+    // provider candidates are unavailable solely due to 429 credential
+    // cooldown. A 5xx, invalid body, transport error, open breaker, missing
+    // key, or capability-mismatched candidate must not masquerade as 429.
+    let mut all_candidates_rate_limited = true;
+    let mut rate_limit_retry: Option<Duration> = None;
     // Exactly ONE candidate loop for chat + embedding. Key failover is confined to this loop.
     for step in steps {
         let provider = &state.config.providers[step.provider_index];
         if provider.stream_only && !streaming && !matches!(endpoint, Endpoint::Chat) {
+            all_candidates_rate_limited = false;
             continue; // Only Chat has a validated SSE-to-JSON adapter.
         }
         // Ordinary Chat JSON can carry token log-probabilities, but this
@@ -159,6 +166,7 @@ pub(super) async fn dispatch(
                 || request.get("top_logprobs").is_some())
         {
             unsupported_aggregate_logprobs = true;
+            all_candidates_rate_limited = false;
             continue;
         }
         // Four permits bound at most 8 MiB of buffered JSON output globally.
@@ -176,6 +184,7 @@ pub(super) async fn dispatch(
                     Metrics::inc(&state.metrics.aggregation_busy);
                     crate::ops_log::warn("aggregate_capacity");
                     aggregation_busy = true;
+                    all_candidates_rate_limited = false;
                     continue;
                 }
             }
@@ -192,6 +201,7 @@ pub(super) async fn dispatch(
                 None => {
                     Metrics::inc(&state.metrics.circuit_bypasses);
                     bypassed_circuit = true;
+                    all_candidates_rate_limited = false;
                     continue; // No HTTP calls while open or a recovery probe runs.
                 }
             },
@@ -343,6 +353,31 @@ pub(super) async fn dispatch(
             }
             break; // 4xx or 5xx: next chain step; no uncontrolled retries
         }
+        if let Some(delay) = state.pools[step.provider_index].all_keys_rate_limited_for() {
+            rate_limit_retry = Some(rate_limit_retry.map_or(delay, |previous| previous.min(delay)));
+        } else {
+            all_candidates_rate_limited = false;
+        }
+    }
+    if all_candidates_rate_limited && let Some(delay) = rate_limit_retry {
+        // A *bounded* delta-seconds retry hint, rounded up so fast retries do
+        // not re-hit isolated keys. Never reflect an upstream header verbatim.
+        let seconds = delay
+            .as_secs()
+            .saturating_add(u64::from(delay.subsec_nanos() != 0));
+        let seconds = seconds.clamp(1, 24 * 3600);
+        let mut response = error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "providers_rate_limited",
+            "All eligible upstream credentials are temporarily rate limited",
+        );
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_str(&seconds.to_string()).expect("bounded retry seconds"),
+        );
+        Metrics::inc(&state.metrics.rate_limit_exhaustions);
+        ops_log::warn("rate_limit_exhausted");
+        return response;
     }
     if unsupported_aggregate_logprobs && !attempted_network {
         return error(

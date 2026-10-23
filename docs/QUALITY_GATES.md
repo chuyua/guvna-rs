@@ -124,6 +124,17 @@ manual-linux-build.yml is explicitly dispatched from main and uploads a
 real Linux executable with SHA256, ELF/glibc metadata and the same quality
 report. CI is necessary but not sufficient to prove real-provider behavior.
 
+## Provider rate-limit recovery on the actual Release binary
+
+An independent Linux Release gateway faces an upstream forced to return
+HTTP 429 and Retry-After 3600. After quarantining the only affected
+credential, 32 concurrent native Chat and Auto requests must all return
+bounded 429 hints without a second upstream call. A different healthy
+fallback still returns valid 200 results. Exact metrics, RSS, FDs, threads
+and privacy-safe sampled local logs are checked. The original multiwave
+throughput and SSE aggregation gates remain unchanged; this PR does not
+initiate the manual GitHub Release publishing workflow.
+
 ## Planned broader gates
 
 - Deterministic random fault matrix (429/5xx/invalid JSON/stalled response/

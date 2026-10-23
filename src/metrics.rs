@@ -13,6 +13,7 @@ pub struct Metrics {
     pub credential_quarantines: AtomicU64,
     pub candidate_fallbacks: AtomicU64,
     pub aggregation_busy: AtomicU64,
+    pub rate_limit_exhaustions: AtomicU64,
     pub aggregation_completed: AtomicU64,
     pub admission_rejections: AtomicU64,
     pub circuit_bypasses: AtomicU64,
@@ -58,6 +59,7 @@ impl Metrics {
         emit!("credential_quarantines_total", self.credential_quarantines);
         emit!("candidate_fallbacks_total", self.candidate_fallbacks);
         emit!("aggregation_busy_total", self.aggregation_busy);
+        emit!("rate_limit_exhaustions_total", self.rate_limit_exhaustions);
         emit!("aggregation_completed_total", self.aggregation_completed);
         emit!("admission_rejections_total", self.admission_rejections);
         emit!("circuit_bypasses_total", self.circuit_bypasses);
@@ -112,6 +114,6 @@ mod tests {
             rendered.len()
         );
         assert!(rendered.contains("guvna_circuit_open_providers 2\n"));
-        assert_eq!(rendered.matches("# TYPE guvna_").count(), 24);
+        assert_eq!(rendered.matches("# TYPE guvna_").count(), 25);
     }
 }

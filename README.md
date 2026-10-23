@@ -61,6 +61,19 @@ limit. Permits remain held through dispatch and streamed response delivery.
 
 ## Basic Auto routing and local diagnostics
 
+## Exhausted upstream rate-limit recovery
+
+If every eligible candidate has all its usable keys isolated by upstream
+HTTP 429, the gateway returns HTTP 429 with a bounded downstream
+Retry-After delta rather than a generic 502. It waits on no timer
+and initiates no more provider calls while the keys cool down;
+configured fallback providers with healthy keys still work immediately.
+Mixed upstream 5xx, connection, invalid-result, auth and circuit failures
+retain the conservative failover/error behavior. Fixed-cardinality
+guvna_rate_limit_exhaustions_total and the opt-in rate_limit_exhausted
+local stderr event expose this condition without prompts, credentials
+or provider identifiers. No remote management endpoint or telemetry DB.
+
 An opt-in Auto V1 selects model candidates using configured priority
 and a bounded encoded-input-length filter. POST /v1/auto or Chat model
 auto delegates to existing failover and circuit logic; Auto is off by default.

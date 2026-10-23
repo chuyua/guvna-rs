@@ -271,6 +271,144 @@ chains:
 }
 
 #[tokio::test]
+async fn all_rate_limited_credentials_return_bounded_retry_after_without_network_retry() {
+    let (url, calls) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: only
+    type: openai
+    base_url: {url}
+    key_env: BAD
+    quarantine:
+      rate_limit: 100ms
+chains:
+  - name: demo
+    steps:
+      - provider: only
+        model: one
+auto:
+  enabled: true
+  candidates:
+    - provider: only
+      model: one
+      priority: 1
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("BAD".into(), "bad".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    // Fresh 429 comes from the actual upstream. The longer 3600s
+    // Retry-After beats the configured 100ms minimum key cooldown.
+    let response = router
+        .clone()
+        .oneshot(request("demo", "", "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!((3599..=3600).contains(&retry), "{retry}");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "providers_rate_limited");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // 24 concurrent Chat and Auto calls must get a bounded retry hint with
+    // zero further upstream attempts and no credential re-quarantining.
+    let responses = futures_util::future::join_all((0..24).map(|index| {
+        let router = router.clone();
+        async move {
+            let request = if index % 2 == 0 {
+                request("demo", "", "client")
+            } else {
+                auto_request(
+                    "/v1/auto",
+                    "client",
+                    json!({"messages":[{"role":"user","content":"hello"}]}),
+                )
+            };
+            router.oneshot(request).await.unwrap()
+        }
+    }))
+    .await;
+    for response in responses {
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry = response.headers()["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!((3598..=3600).contains(&retry));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 1);
+    assert_eq!(metric_value(&metrics, "upstream_attempts_total"), 1);
+    assert_eq!(metric_value(&metrics, "rate_limit_exhaustions_total"), 25);
+}
+
+#[tokio::test]
+async fn mixed_rate_limit_and_provider_failure_do_not_misreport_global_429() {
+    let (rate_url, rate_calls) = start_upstream(StatusCode::OK).await;
+    let (down_url, down_calls) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: rate
+    type: openai
+    base_url: {rate_url}
+    key_env: BAD
+    quarantine:
+      rate_limit: 100ms
+  - name: unavailable
+    type: openai
+    base_url: {down_url}
+    key_env: DOWN
+chains:
+  - name: demo
+    steps:
+      - provider: rate
+        model: one
+      - provider: unavailable
+        model: two
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("BAD".into(), "bad".into()), ("DOWN".into(), "down".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for _ in 0..2 {
+        let response = router
+            .clone()
+            .oneshot(request("demo", "", "client"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(response.headers().get("retry-after").is_none());
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "upstream_unavailable");
+    }
+    assert_eq!(rate_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(down_calls.load(Ordering::SeqCst), 2);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "rate_limit_exhaustions_total"), 0);
+    assert_eq!(metric_value(&metrics, "candidate_fallbacks_total"), 2);
+}
+
+#[tokio::test]
 async fn unauthenticated_posts_never_poll_unbounded_request_bodies() {
     let (url, calls) = start_upstream(StatusCode::OK).await;
     let router = make_app(&url, &url);
@@ -1752,7 +1890,7 @@ async fn metrics_auth_privacy_retry_fallback_and_credential_quarantine() {
     assert_eq!(metric_value(&after, "upstream_invalid_responses_total"), 0);
     assert!(!after.contains("secret"));
     assert!(!after.contains("BAD"));
-    assert_eq!(after.matches("# TYPE guvna_").count(), 24);
+    assert_eq!(after.matches("# TYPE guvna_").count(), 25);
     assert_eq!(metric_value(&after, "circuit_open_providers"), 0);
     assert_eq!(metric_value(&after, "circuit_bypasses_total"), 0);
     assert_eq!(metric_value(&after, "circuit_openings_total"), 0);
