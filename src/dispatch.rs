@@ -219,6 +219,15 @@ pub(super) async fn dispatch(
             object.entry(name).or_insert_with(|| value.clone()); // caller always wins.
         }
 
+        // Chain defaults are applied per candidate. An injected n must drive
+        // the SSE parser and SSE-to-JSON aggregator just like a caller n;
+        // otherwise valid multi-choice streams are rejected as malformed.
+        let effective_n = payload.get("n").map_or(1, |v| v.as_u64().unwrap_or(0));
+        if upstream_stream && ChatSse::new(effective_n).is_err() {
+            all_candidates_rate_limited = false;
+            continue;
+        }
+
         // Serialize once per candidate, not once for every credential retry.
         let payload_json = Bytes::from(payload.to_string());
         let mut tried = HashSet::new();
@@ -279,8 +288,8 @@ pub(super) async fn dispatch(
                 if streaming {
                     match chat_stream::start(
                         upstream,
-                        ChatSse::new(expected)
-                            .expect("validated stream n")
+                        ChatSse::new(effective_n)
+                            .expect("validated candidate stream n")
                             .with_tool_choice(payload.get("tool_choice")),
                         state.clone(),
                         step.provider_index,
@@ -304,7 +313,7 @@ pub(super) async fn dispatch(
                         deadline,
                         chat_aggregate::aggregate(
                             upstream,
-                            expected,
+                            effective_n,
                             &step.model,
                             payload.get("tool_choice"),
                         ),
