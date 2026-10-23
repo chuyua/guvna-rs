@@ -441,10 +441,17 @@ async fn responses(
     let output_tokens = usage["completion_tokens"].as_u64();
     let total_tokens = usage["total_tokens"].as_u64();
     let translated_usage = match (input_tokens, output_tokens, total_tokens) {
-        (Some(input), Some(output), Some(total)) => {
+        (Some(input), Some(output), Some(total)) if input.checked_add(output) == Some(total) => {
             json!({"input_tokens":input,"output_tokens":output,"total_tokens":total})
         }
-        _ => Value::Null,
+        (None, None, None) => Value::Null,
+        _ => {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_upstream_usage",
+                "Inconsistent upstream token usage",
+            );
+        }
     };
     (StatusCode::OK, Json(json!({
         "id":chat["id"], "object":"response", "status":response_status, "incomplete_details":incomplete_details, "created_at":created_at, "model":logical_model,
