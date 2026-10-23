@@ -3,6 +3,20 @@ use bytes::Bytes;
 use serde_json::Value;
 
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
+// Track only tool calls, and cap the cumulative memory retained across frames.
+const MAX_STREAM_TOOL_CALLS: usize = 128;
+const MAX_STREAM_TOOL_ARGUMENTS: usize = 1024 * 1024;
+const MAX_TOOL_IDENTIFIER_BYTES: usize = 256;
+
+#[derive(Debug)]
+struct StreamToolCall {
+    choice: u64,
+    index: u64,
+    id: Option<String>,
+    name: Option<String>,
+    function_type: bool,
+    arguments: String,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct SseError;
@@ -13,6 +27,8 @@ pub struct ChatSse {
     data: Vec<u8>,
     finished_mask: u64,
     tool_calls_mask: u64,
+    tool_calls: Vec<StreamToolCall>,
+    tool_argument_bytes: usize,
     expected: u64,
     done: bool,
 }
@@ -120,7 +136,7 @@ impl ChatSse {
         Ok(())
     }
 
-    fn process_choice(&self, choice: &Value) -> Result<(u64, bool), SseError> {
+    fn process_choice(&mut self, choice: &Value) -> Result<(u64, bool), SseError> {
         let index = choice
             .get("index")
             .and_then(Value::as_u64)
@@ -148,28 +164,7 @@ impl ChatSse {
             has_tool_delta = true;
             for call in calls {
                 let call = call.as_object().ok_or(SseError)?;
-                if !call
-                    .get("index")
-                    .is_some_and(|index| index.as_u64().is_some())
-                    || call
-                        .get("id")
-                        .is_some_and(|id| id.as_str().is_none_or(str::is_empty))
-                    || call.get("type").is_some_and(|kind| kind != "function")
-                {
-                    return Err(SseError);
-                }
-                if let Some(function) = call.get("function") {
-                    let function = function.as_object().ok_or(SseError)?;
-                    if function
-                        .get("name")
-                        .is_some_and(|name| name.as_str().is_none_or(str::is_empty))
-                        || function
-                            .get("arguments")
-                            .is_some_and(|args| !args.is_string())
-                    {
-                        return Err(SseError);
-                    }
-                }
+                self.process_tool_call(index, call)?;
             }
         }
         if let Some(reason) = choice.get("finish_reason").filter(|v| !v.is_null()) {
@@ -189,8 +184,118 @@ impl ChatSse {
             if (reason == "tool_calls" && !has_tools) || (reason == "stop" && has_tools) {
                 return Err(SseError);
             }
+            if reason == "tool_calls"
+                && self
+                    .tool_calls
+                    .iter()
+                    .filter(|tool| tool.choice == index)
+                    .any(|tool| {
+                        tool.id.is_none()
+                            || tool.name.is_none()
+                            || !tool.function_type
+                            || !serde_json::from_str::<Value>(&tool.arguments)
+                                .is_ok_and(|value| value.is_object())
+                    })
+            {
+                return Err(SseError);
+            }
         }
         Ok((index, has_tool_delta))
+    }
+
+    fn process_tool_call(
+        &mut self,
+        choice: u64,
+        call: &serde_json::Map<String, Value>,
+    ) -> Result<(), SseError> {
+        let index = call.get("index").and_then(Value::as_u64).ok_or(SseError)?;
+        if index >= 32 || call.get("type").is_some_and(|kind| kind != "function") {
+            return Err(SseError);
+        }
+        let id = call
+            .get("id")
+            .map(|value| value.as_str().filter(|id| !id.is_empty()).ok_or(SseError))
+            .transpose()?;
+        let function = call
+            .get("function")
+            .map(|value| value.as_object().ok_or(SseError))
+            .transpose()?;
+        let name = function
+            .and_then(|obj| obj.get("name"))
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|name| !name.is_empty())
+                    .ok_or(SseError)
+            })
+            .transpose()?;
+        let fragment = function
+            .and_then(|obj| obj.get("arguments"))
+            .map(|value| value.as_str().ok_or(SseError))
+            .transpose()?;
+        if id.is_some_and(|id| id.len() > MAX_TOOL_IDENTIFIER_BYTES)
+            || name.is_some_and(|name| name.len() > MAX_TOOL_IDENTIFIER_BYTES)
+        {
+            return Err(SseError);
+        }
+        let position = self
+            .tool_calls
+            .iter()
+            .position(|tool| tool.choice == choice && tool.index == index);
+        let position = match position {
+            Some(position) => position,
+            None => {
+                if self.tool_calls.len() >= MAX_STREAM_TOOL_CALLS
+                    || self
+                        .tool_calls
+                        .iter()
+                        .filter(|tool| tool.choice == choice)
+                        .count()
+                        != index as usize
+                {
+                    return Err(SseError);
+                }
+                self.tool_calls.push(StreamToolCall {
+                    choice,
+                    index,
+                    id: None,
+                    name: None,
+                    function_type: false,
+                    arguments: String::new(),
+                });
+                self.tool_calls.len() - 1
+            }
+        };
+        let tool = &self.tool_calls[position];
+        if id.is_some_and(|id| {
+            tool.id.as_deref().is_some_and(|old| old != id)
+                || self
+                    .tool_calls
+                    .iter()
+                    .enumerate()
+                    .any(|(i, other)| i != position && other.id.as_deref() == Some(id))
+        }) || name.is_some_and(|name| tool.name.as_deref().is_some_and(|old| old != name))
+        {
+            return Err(SseError);
+        }
+        if fragment.is_some_and(|part| {
+            part.len() > MAX_STREAM_TOOL_ARGUMENTS.saturating_sub(self.tool_argument_bytes)
+        }) {
+            return Err(SseError);
+        }
+        let tool = &mut self.tool_calls[position];
+        if let Some(id) = id {
+            tool.id.get_or_insert_with(|| id.to_owned());
+        }
+        if let Some(name) = name {
+            tool.name.get_or_insert_with(|| name.to_owned());
+        }
+        tool.function_type |= call.get("type").and_then(Value::as_str) == Some("function");
+        if let Some(part) = fragment {
+            tool.arguments.push_str(part);
+            self.tool_argument_bytes += part.len();
+        }
+        Ok(())
     }
 
     fn process_field(&mut self, line: &[u8]) -> Result<(), SseError> {
@@ -320,6 +425,68 @@ mod tests {
         parser.push(tool_finish).unwrap();
         parser.push(b"data: [DONE]\n\n").unwrap();
         assert!(parser.finish().is_ok());
+    }
+
+    #[test]
+    fn tool_finish_rejects_incomplete_identity_and_invalid_json() {
+        for call in [
+            serde_json::json!({"index":0}),
+            serde_json::json!({"index":0,"id":"call_1","type":"function","function":{"name":"lookup"}}),
+            serde_json::json!({"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"[1]"}}),
+            serde_json::json!({"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{bad"}}),
+        ] {
+            let mut parser = ChatSse::new(1).unwrap();
+            let first = format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "choices":[{"index":0,"delta":{"tool_calls":[call]},"finish_reason":null}]
+                })
+            );
+            parser.push(first.as_bytes()).unwrap();
+            let finish =
+                br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+"#;
+            assert!(
+                parser.push(finish).is_err(),
+                "accepted incomplete tool call"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_stream_rejects_duplicate_ids_and_unbounded_arguments() {
+        let mut parser = ChatSse::new(1).unwrap();
+        let first = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"same","type":"function","function":{"name":"a","arguments":"{}"}},
+            {"index":1,"id":"same","type":"function","function":{"name":"b","arguments":"{}"}}
+        ]},"finish_reason":null}]});
+        assert!(
+            parser
+                .push(format!("data: {first}\n\n").as_bytes())
+                .is_err()
+        );
+
+        let mut parser = ChatSse::new(1).unwrap();
+        let first = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":""}}
+        ]},"finish_reason":null}]});
+        parser
+            .push(format!("data: {first}\n\n").as_bytes())
+            .unwrap();
+        let fragment = "x".repeat(64 * 1024);
+        let event = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":fragment}}
+        ]},"finish_reason":null}]});
+        let frame = format!("data: {event}\n\n");
+        let mut rejected = false;
+        for _ in 0..20 {
+            if parser.push(frame.as_bytes()).is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "unbounded tool arguments accepted");
     }
 
     #[test]
