@@ -1,0 +1,282 @@
+//! Offline, local-only runtime chain management.
+//! Mutations are serialized with an OS advisory file lock and committed using
+//! a synced temporary file followed by one atomic rename. No management HTTP
+//! surface, background reload, secret logging, or in-process mutable routing.
+use crate::config::{Chain, Config, RuntimeChains};
+use fs2::FileExt;
+use serde_json::json;
+use std::{
+    collections::HashSet,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+const MAX_CHAIN_FILE_BYTES: usize = 1024 * 1024;
+
+pub enum Command {
+    List,
+    Validate,
+    Set(PathBuf),
+    Delete(String),
+    Recover(Option<PathBuf>),
+}
+
+fn runtime_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("chains.yaml")
+}
+
+fn read_limited(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("stat {}: {err}", path.display())),
+    };
+    if !meta.file_type().is_file() || meta.len() > MAX_CHAIN_FILE_BYTES as u64 {
+        return Err(format!(
+            "{} must be a regular file of at most 1 MiB",
+            path.display()
+        ));
+    }
+    let bytes = fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    if bytes.len() > MAX_CHAIN_FILE_BYTES {
+        return Err(format!("{} exceeds 1 MiB", path.display()));
+    }
+    Ok(Some(bytes))
+}
+
+fn validate_data(bytes: Option<&[u8]>, config: &Config) -> Result<RuntimeChains, String> {
+    let mut state = match bytes {
+        Some(bytes) => serde_yaml::from_slice::<RuntimeChains>(bytes)
+            .map_err(|e| format!("malformed chains.yaml (preserved): {e}"))?,
+        None => RuntimeChains {
+            version: Some(1),
+            chains: vec![],
+        },
+    };
+    if state.version.unwrap_or(1) != 1 {
+        return Err("unsupported chains.yaml version (preserved)".into());
+    }
+    let mut names = HashSet::new();
+    for chain in &state.chains {
+        if chain.name.is_empty() || !names.insert(chain.name.as_str()) {
+            return Err(format!(
+                "empty or duplicate runtime chain {:?} (preserved)",
+                chain.name
+            ));
+        }
+        if config.chains.iter().any(|base| base.name == chain.name) {
+            return Err(format!(
+                "runtime chain {:?} shadows config.yaml (preserved)",
+                chain.name
+            ));
+        }
+        config.validate_chain(chain)?;
+    }
+    state.version = Some(1);
+    Ok(state)
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > MAX_CHAIN_FILE_BYTES {
+        return Err("serialized chains.yaml exceeds 1 MiB".into());
+    }
+    let parent = path.parent().ok_or("chains file has no parent directory")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("temporary file in {}: {e}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("restricting temporary file permissions: {e}"))?;
+    }
+    temporary
+        .write_all(bytes)
+        .map_err(|e| format!("writing temporary chains file: {e}"))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|e| format!("syncing temporary chains file: {e}"))?;
+    temporary
+        .persist(path)
+        .map_err(|e| format!("committing {}: {}", path.display(), e.error))?;
+    #[cfg(unix)]
+    File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| format!("syncing chains directory {}: {e}", parent.display()))?;
+    Ok(())
+}
+
+fn lock_directory(data_dir: &Path) -> Result<(PathBuf, File), String> {
+    fs::create_dir_all(data_dir)
+        .map_err(|e| format!("creating data directory {}: {e}", data_dir.display()))?;
+    let directory = fs::canonicalize(data_dir)
+        .map_err(|e| format!("resolving data directory {}: {e}", data_dir.display()))?;
+    let path = directory.join(".chains.yaml.lock");
+    if let Ok(meta) = fs::symlink_metadata(&path)
+        && !meta.file_type().is_file()
+    {
+        return Err(format!("refusing non-regular lock file {}", path.display()));
+    }
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false) // never erase the advisory lock file between processes
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("opening {}: {e}", path.display()))?;
+    lock.lock_exclusive()
+        .map_err(|e| format!("locking {}: {e}", path.display()))?;
+    Ok((directory, lock))
+}
+
+fn serialize(state: &RuntimeChains) -> Result<Vec<u8>, String> {
+    let serialized =
+        serde_yaml::to_string(state).map_err(|e| format!("serializing chains: {e}"))?;
+    let bytes = serialized.into_bytes();
+    if bytes.len() > MAX_CHAIN_FILE_BYTES {
+        return Err("updated chains.yaml would exceed 1 MiB (unchanged)".into());
+    }
+    Ok(bytes)
+}
+
+fn preserve_original(dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("system clock: {e}"))?
+        .as_nanos();
+    let path = dir.join(format!(
+        "chains.yaml.before-recovery-{}-{now}.bak",
+        std::process::id()
+    ));
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(&path)
+        .map_err(|e| format!("preserving {}: {e}", path.display()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("writing preserved original {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// All management operations are offline. A running daemon sees new routes
+/// only after a deliberate restart. Invalid files are not overwritten by
+/// Set/Delete; Recover requires an explicitly validated backup.
+pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<String, String> {
+    match command {
+        Command::List => {
+            let file = runtime_path(data_dir);
+            let current = read_limited(&file)?;
+            let state = validate_data(current.as_deref(), config)?;
+            let static_chains = config
+                .chains
+                .iter()
+                .map(|chain| json!({"source":"config","name":chain.name,"steps":chain.steps}));
+            let dynamic_chains = state
+                .chains
+                .iter()
+                .map(|chain| json!({"source":"runtime","name":chain.name,"steps":chain.steps}));
+            let listed = static_chains.chain(dynamic_chains).collect::<Vec<_>>();
+            serde_json::to_string_pretty(&listed)
+                .map_err(|e| format!("encoding chain listing: {e}"))
+        }
+        Command::Validate => {
+            let file = runtime_path(data_dir);
+            let current = read_limited(&file)?;
+            let runtime = validate_data(current.as_deref(), config)?;
+            Ok(format!(
+                "valid: {} static, {} runtime chains; file={}",
+                config.chains.len(),
+                runtime.chains.len(),
+                file.display()
+            ))
+        }
+        Command::Set(source) => {
+            let input = read_limited(&source)?
+                .ok_or_else(|| format!("missing chain input {}", source.display()))?;
+            let chain: Chain = serde_yaml::from_slice(&input)
+                .map_err(|e| format!("invalid chain definition {}: {e}", source.display()))?;
+            if chain.name.is_empty() || config.chains.iter().any(|c| c.name == chain.name) {
+                return Err("chain name is empty or owned by config.yaml".into());
+            }
+            config.validate_chain(&chain)?;
+            let (directory, _lock) = lock_directory(data_dir)?;
+            let target = runtime_path(&directory);
+            let original = read_limited(&target)?;
+            let mut state = validate_data(original.as_deref(), config)?;
+            let name = chain.name.clone();
+            let replacing = if let Some(old) = state.chains.iter_mut().find(|c| c.name == name) {
+                *old = chain;
+                true
+            } else {
+                state.chains.push(chain);
+                false
+            };
+            let next = serialize(&state)?;
+            if let Some(bytes) = &original {
+                atomic_write(&directory.join("chains.yaml.bak"), bytes)?;
+            }
+            atomic_write(&target, &next)?;
+            Ok(format!(
+                "{} runtime chain {name}; restart guvna to apply",
+                if replacing { "updated" } else { "created" }
+            ))
+        }
+        Command::Delete(name) => {
+            if name.is_empty() {
+                return Err("delete requires a nonempty chain name".into());
+            }
+            let (directory, _lock) = lock_directory(data_dir)?;
+            let target = runtime_path(&directory);
+            let original = read_limited(&target)?;
+            let mut state = validate_data(original.as_deref(), config)?;
+            let count = state.chains.len();
+            state.chains.retain(|chain| chain.name != name);
+            if state.chains.len() == count {
+                return Err(format!(
+                    "runtime chain {name:?} not found; config.yaml chains are read-only"
+                ));
+            }
+            let next = serialize(&state)?;
+            if let Some(bytes) = &original {
+                atomic_write(&directory.join("chains.yaml.bak"), bytes)?;
+            }
+            atomic_write(&target, &next)?;
+            Ok(format!(
+                "deleted runtime chain {name}; restart guvna to apply"
+            ))
+        }
+        Command::Recover(source) => {
+            let (directory, _lock) = lock_directory(data_dir)?;
+            let target = runtime_path(&directory);
+            let backup = source.unwrap_or_else(|| directory.join("chains.yaml.bak"));
+            let incoming = read_limited(&backup)?
+                .ok_or_else(|| format!("recovery source {} not found", backup.display()))?;
+            let validated = validate_data(Some(&incoming), config)?;
+            let next = serialize(&validated)?;
+            // Preserve even a corrupt original byte-for-byte and report its
+            // name. Never rewrite a failed recovery source or the live file.
+            let original = read_limited(&target)?;
+            let preserved = match original {
+                Some(ref original) => Some(preserve_original(&directory, original)?),
+                None => None,
+            };
+            atomic_write(&target, &next)?;
+            Ok(format!(
+                "recovered {} runtime chains from {}; prior content={}; restart guvna to apply",
+                validated.chains.len(),
+                backup.display(),
+                preserved.map_or_else(|| "none".into(), |p| p.display().to_string())
+            ))
+        }
+    }
+}

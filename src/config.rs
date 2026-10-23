@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -149,14 +149,14 @@ pub fn parse_duration(input: &str) -> Result<Duration, String> {
     Ok(total)
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Chain {
     pub name: String,
     pub steps: Vec<Step>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
     pub provider: String,
@@ -165,13 +165,13 @@ pub struct Step {
     pub params: BTreeMap<String, Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct RuntimeChains {
+pub(crate) struct RuntimeChains {
     #[serde(default)]
-    version: Option<u16>,
+    pub(crate) version: Option<u16>,
     #[serde(default)]
-    chains: Vec<Chain>,
+    pub(crate) chains: Vec<Chain>,
 }
 
 impl Provider {
@@ -274,7 +274,7 @@ impl Config {
         Ok(())
     }
 
-    fn validate_chain(&self, chain: &Chain) -> Result<(), String> {
+    pub(crate) fn validate_chain(&self, chain: &Chain) -> Result<(), String> {
         if chain.steps.is_empty() {
             return Err(format!("chain {} has no steps", chain.name));
         }

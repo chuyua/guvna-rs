@@ -1,4 +1,4 @@
-use guvna::{config::Config, gateway};
+use guvna::{chain_store, config::Config, gateway};
 use std::{collections::HashMap, env, path::PathBuf};
 
 #[tokio::main]
@@ -20,8 +20,18 @@ async fn run() -> Result<(), String> {
         })
         .unwrap_or_else(|| PathBuf::from(".guvna"));
     let mut healthcheck = false;
+    let mut chains_action: Option<String> = None;
+    let mut chains_file: Option<PathBuf> = None;
+    let mut chains_name: Option<String> = None;
+    let mut recover_from: Option<PathBuf> = None;
     let mut args = env::args().skip(1).peekable();
-    if args.peek().is_some_and(|s| s == "serve") {
+    if args.peek().is_some_and(|s| s == "chains") {
+        args.next();
+        chains_action = Some(
+            args.next()
+                .ok_or("chains requires list|validate|set|delete|recover")?,
+        );
+    } else if args.peek().is_some_and(|s| s == "serve") {
         args.next();
     }
     while let Some(arg) = args.next() {
@@ -33,6 +43,15 @@ async fn run() -> Result<(), String> {
                 data_dir = PathBuf::from(args.next().ok_or("missing -data value")?);
             }
             "-healthcheck" | "--healthcheck" => healthcheck = true,
+            "-file" | "--file" if chains_action.is_some() => {
+                chains_file = Some(PathBuf::from(args.next().ok_or("missing --file value")?));
+            }
+            "-name" | "--name" if chains_action.is_some() => {
+                chains_name = Some(args.next().ok_or("missing --name value")?);
+            }
+            "-from" | "--from" if chains_action.is_some() => {
+                recover_from = Some(PathBuf::from(args.next().ok_or("missing --from value")?));
+            }
             "--version" | "-version" => {
                 println!("guvna {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -49,6 +68,36 @@ async fn run() -> Result<(), String> {
 
     let real_path = std::fs::canonicalize(&config_path)
         .map_err(|e| format!("config path {}: {e}", config_path.display()))?;
+    if let Some(action) = chains_action {
+        if healthcheck {
+            return Err("--healthcheck is only for serve".into());
+        }
+        let command = match action.as_str() {
+            "list" if chains_file.is_none() && chains_name.is_none() && recover_from.is_none() => {
+                chain_store::Command::List
+            }
+            "validate"
+                if chains_file.is_none() && chains_name.is_none() && recover_from.is_none() =>
+            {
+                chain_store::Command::Validate
+            }
+            "set" if chains_name.is_none() && recover_from.is_none() => {
+                chain_store::Command::Set(chains_file.ok_or("chains set requires --file PATH")?)
+            }
+            "delete" if chains_file.is_none() && recover_from.is_none() => {
+                chain_store::Command::Delete(
+                    chains_name.ok_or("chains delete requires --name NAME")?,
+                )
+            }
+            "recover" if chains_file.is_none() && chains_name.is_none() => {
+                chain_store::Command::Recover(recover_from)
+            }
+            _ => return Err("invalid chains subcommand or incompatible flags".into()),
+        };
+        let config = Config::load(&real_path)?;
+        println!("{}", chain_store::execute(&config, &data_dir, command)?);
+        return Ok(());
+    }
     let config = Config::load(&real_path)?.with_runtime_chains(&data_dir)?;
     if healthcheck {
         let url = format!("http://127.0.0.1:{}/healthz", config.port);
