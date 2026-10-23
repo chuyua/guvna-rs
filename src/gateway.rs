@@ -217,23 +217,87 @@ async fn responses(
             "input is required",
         );
     };
+    // Translate the common Responses text message shape into Chat Completions.
+    // Reject non-text content rather than silently discarding image/tool data.
     let messages = match input {
         Value::String(text) => json!([{"role":"user","content":text}]),
-        Value::Array(messages)
-            if messages.iter().all(|m| {
-                matches!(
-                    m.get("role").and_then(Value::as_str),
-                    Some("user" | "assistant" | "system" | "developer")
-                ) && m.get("content").and_then(Value::as_str).is_some()
-            }) =>
-        {
+        Value::Array(items) if !items.is_empty() => {
+            let mut messages = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(role) = item.get("role").and_then(Value::as_str) else {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "unsupported_input",
+                        "Input messages require a role",
+                    );
+                };
+                if !matches!(role, "user" | "assistant" | "system" | "developer")
+                    || item.get("type").is_some_and(|kind| kind != "message")
+                    || item.as_object().is_none_or(|obj| {
+                        obj.keys()
+                            .any(|k| !["role", "content", "type"].contains(&k.as_str()))
+                    })
+                {
+                    return error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "responses_input_unsupported",
+                        "Only plain text messages are supported",
+                    );
+                }
+                let Some(content) = item.get("content") else {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "unsupported_input",
+                        "Input messages require content",
+                    );
+                };
+                let text = if let Some(text) = content.as_str() {
+                    text.to_owned()
+                } else if let Some(parts) = content.as_array() {
+                    if parts.is_empty() {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "unsupported_input",
+                            "Empty content parts",
+                        );
+                    }
+                    let mut text = String::new();
+                    for part in parts {
+                        if part.get("type").and_then(Value::as_str) != Some("input_text")
+                            || part.as_object().is_none_or(|obj| obj.len() != 2)
+                        {
+                            return error(
+                                StatusCode::NOT_IMPLEMENTED,
+                                "responses_input_unsupported",
+                                "Only input_text content parts are supported",
+                            );
+                        }
+                        let Some(fragment) = part.get("text").and_then(Value::as_str) else {
+                            return error(
+                                StatusCode::BAD_REQUEST,
+                                "unsupported_input",
+                                "input_text requires text",
+                            );
+                        };
+                        text.push_str(fragment);
+                    }
+                    text
+                } else {
+                    return error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "responses_input_unsupported",
+                        "Unsupported message content",
+                    );
+                };
+                messages.push(json!({"role":role,"content":text}));
+            }
             Value::Array(messages)
         }
         _ => {
             return error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_input",
-                "Only text or role/content messages are supported",
+                "Only text or text message arrays are supported",
             );
         }
     };
