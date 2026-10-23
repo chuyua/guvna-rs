@@ -676,6 +676,24 @@ async fn downstream_disconnect_drops_stalled_upstream_promptly() {
 }
 
 #[tokio::test]
+async fn malformed_tool_arguments_cannot_complete_chat_stream() {
+    let tool = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"[1]\"}}]},\"finish_reason\":null}]}\n\n";
+    let finish =
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+    let (upstream, hits) = start_sse(vec![tool, finish, SSE_DONE]).await;
+    let response = make_app(&upstream, &upstream)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn malformed_sse_after_first_event_does_not_fail_over_or_claim_success() {
     let (a, first_hits) = start_sse(vec![SSE_START, b"data: not-json\n\n"]).await;
     let (b, backup_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
