@@ -676,6 +676,25 @@ async fn downstream_disconnect_drops_stalled_upstream_promptly() {
 }
 
 #[tokio::test]
+async fn streamed_required_tool_choice_cannot_complete_plain_text() {
+    let (upstream, hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let response = make_app(&upstream, &upstream)
+        .oneshot(request(
+            "demo",
+            r#","stream":true,"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"tool_choice":"required""#,
+            "client",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn malformed_tool_arguments_cannot_complete_chat_stream() {
     let tool = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"[1]\"}}]},\"finish_reason\":null}]}\n\n";
     let finish =
@@ -2171,7 +2190,7 @@ async fn responses_json_schema_and_tools_are_combined_without_loss_or_duplicate_
         "text":{"format":schema},
         "tools":[{"type":"function","name":"lookup",
             "parameters":{"type":"object","properties":{"id":{"type":"integer"}}}}],
-        "tool_choice":{"type":"function","name":"lookup"},
+        "tool_choice":"auto",
         "max_output_tokens":256});
     let (status, output) = call(app, responses_stream_req(input)).await;
     assert_eq!(status, StatusCode::OK, "{output}");
@@ -2185,10 +2204,36 @@ async fn responses_json_schema_and_tools_are_combined_without_loss_or_duplicate_
         latest["tools"][0]["function"]["parameters"]["type"],
         "object"
     );
-    assert_eq!(latest["tool_choice"]["function"]["name"], "lookup");
+    assert_eq!(latest["tool_choice"], "auto");
     assert_eq!(latest["max_tokens"], 256);
     assert!(latest.get("max_output_tokens").is_none());
     assert!(latest.get("metadata").is_none());
+}
+
+#[tokio::test]
+async fn responses_forced_tool_choice_ignoring_upstream_fails_over() {
+    let (url, seen) = start_format_probe("ordinary text").await;
+    let app = make_app(&url, &url);
+    for choice in [
+        json!("required"),
+        json!({"type":"function","name":"lookup"}),
+    ] {
+        let (status, result) = call(
+            app.clone(),
+            responses_stream_req(json!({
+                "model":"demo","input":"hello",
+                "tools":[{"type":"function","name":"lookup"}],
+                "tool_choice":choice
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{result}");
+        assert_eq!(result["error"]["code"], "upstream_unavailable");
+    }
+    assert!(
+        !seen.lock().await.is_empty(),
+        "upstream was never exercised"
+    );
 }
 
 #[tokio::test]
