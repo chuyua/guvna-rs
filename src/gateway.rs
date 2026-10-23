@@ -784,6 +784,23 @@ async fn responses(
     }
     let created_at = chat["created"].as_i64();
     let calls = chat["choices"][0]["message"]["tool_calls"].as_array();
+    if chat["choices"][0]["finish_reason"] == "tool_calls" && calls.is_none_or(Vec::is_empty) {
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "missing_tool_calls",
+            "Tool finish reason requires nonempty tool_calls",
+        );
+    }
+    if chat["choices"][0]["message"]
+        .get("tool_calls")
+        .is_some_and(|value| !value.is_array())
+    {
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "invalid_tool_calls",
+            "tool_calls must be an array",
+        );
+    }
     if calls.is_some_and(|items| !items.is_empty()) {
         if chat["choices"][0]["finish_reason"] != "tool_calls" {
             return error(
