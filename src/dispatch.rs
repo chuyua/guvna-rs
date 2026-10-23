@@ -113,7 +113,7 @@ pub(super) async fn dispatch(
     // Bytes of encoded message content are a deterministic bounded proxy
     // for context size; no remote tokenizer or prompt logging is involved.
     let steps = match if auto_enabled {
-        let input_bytes = request.get("messages").map_or(0, |m| m.to_string().len());
+        let input_bytes = routing::auto_input_bytes(request.get("messages"));
         routing::resolve_auto(&state.config, input_bytes)
     } else {
         routing::resolve(&state.config, model)
