@@ -269,6 +269,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-util",
+ "http-body-util",
  "reqwest",
  "serde",
  "serde_json",

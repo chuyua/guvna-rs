@@ -285,3 +285,147 @@ async fn duplicate_choice_index_fails_over_before_first_event() {
     assert_eq!(bad_hits.load(Ordering::SeqCst), 1);
     assert_eq!(good_hits.load(Ordering::SeqCst), 1);
 }
+
+// A stalled upstream keeps its response body alive until the downstream reader
+// finishes or disconnects. Dropping that body must release the upstream stream.
+struct DropSignal(Arc<AtomicUsize>);
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+async fn start_stalled_sse() -> (String, Arc<AtomicUsize>) {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let signal = drops.clone();
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let signal = signal.clone();
+            async move {
+                let output = futures_util::stream::unfold(
+                    (false, DropSignal(signal)),
+                    |(sent, guard)| async move {
+                        if sent {
+                            std::future::pending::<
+                                Option<(Result<Bytes, std::io::Error>, (bool, DropSignal))>,
+                            >()
+                            .await
+                        } else {
+                            Some((Ok(Bytes::from_static(SSE_START)), (true, guard)))
+                        }
+                    },
+                );
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(output),
+                )
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(socket, router).await.unwrap();
+    });
+    (format!("http://{addr}"), drops)
+}
+
+#[tokio::test]
+async fn stalled_sse_emits_one_incomplete_error_without_failover() {
+    let (a, drops) = start_stalled_sse().await;
+    let (b, backup_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let response = make_app(&a, &b)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(19),
+        to_bytes(response.into_body(), 1 << 20),
+    )
+    .await
+    .expect("idle timeout should complete the response")
+    .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(
+        text.matches("upstream_stream_incomplete").count(),
+        1,
+        "{text}"
+    );
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while drops.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("upstream stream must be dropped");
+}
+
+#[tokio::test]
+async fn downstream_disconnect_drops_stalled_upstream_promptly() {
+    let (a, drops) = start_stalled_sse().await;
+    let response = make_app(&a, &a)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    use http_body_util::BodyExt;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+        .await
+        .expect("first frame timed out")
+        .expect("body ended")
+        .unwrap();
+    assert!(first.into_data().unwrap().starts_with(b"data: "));
+    drop(body);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while drops.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("downstream cancellation should release upstream");
+}
+
+#[tokio::test]
+async fn malformed_sse_after_first_event_does_not_fail_over_or_claim_success() {
+    let (a, first_hits) = start_sse(vec![SSE_START, b"data: not-json\n\n"]).await;
+    let (b, backup_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let response = make_app(&a, &b)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(
+        text.matches("upstream_stream_incomplete").count(),
+        1,
+        "{text}"
+    );
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn multi_event_chunk_preserves_order_and_one_terminal_marker() {
+    let mut combined = Vec::new();
+    combined.extend_from_slice(SSE_START);
+    combined.extend_from_slice(SSE_END);
+    combined.extend_from_slice(SSE_DONE);
+    let (upstream, hits) = start_sse(vec![Box::leak(combined.into_boxed_slice())]).await;
+    let response = make_app(&upstream, &upstream)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(text.matches("data: ").count(), 3, "{text}");
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
