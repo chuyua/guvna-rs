@@ -50,8 +50,8 @@ async fn upstream(State(state): State<UpstreamState>, request: Request<Body>) ->
         StatusCode::OK,
         axum::Json(json!({
             "id":"mock","object":"chat.completion","model":model,
-            "choices":[{"index":0,"message":if value["messages"][0]["content"] == "call" || value["messages"][0]["content"] == "callusage" { json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_123","type":"function","function":{"name":"lookup","arguments":json!({"city":"Paris"}).to_string()}}]}) } else { json!({"role":"assistant","content":"success"}) },
-            "finish_reason":if value["messages"][0]["content"] == "truncate" { "length" } else if value["messages"][0]["content"] == "call" || value["messages"][0]["content"] == "callusage" { "tool_calls" } else { "stop" }}],
+            "choices":[{"index":0,"message":if value["messages"][0]["content"] == "calldup" { json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_dup","type":"function","function":{"name":"lookup","arguments":"{}"}},{"id":"call_dup","type":"function","function":{"name":"lookup","arguments":"{}"}}]}) } else if value["messages"][0]["content"] == "callmixed" { json!({"role":"assistant","content":"I will look that up","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}},{"id":"call_2","type":"function","function":{"name":"lookup","arguments":"{}"}}]}) } else if value["messages"][0]["content"] == "call" || value["messages"][0]["content"] == "callusage" { json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_123","type":"function","function":{"name":"lookup","arguments":json!({"city":"Paris"}).to_string()}}]}) } else { json!({"role":"assistant","content":"success"}) },
+            "finish_reason":if value["messages"][0]["content"] == "truncate" { "length" } else if value["messages"][0]["content"] == "call" || value["messages"][0]["content"] == "callusage" || value["messages"][0]["content"] == "callmixed" || value["messages"][0]["content"] == "calldup" { "tool_calls" } else { "stop" }}],
             "usage": if value["messages"][0]["content"] == "usage" || value["messages"][0]["content"] == "callusage" { json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}) } else if value["messages"][0]["content"] == "badusage" { json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":7}) } else { Value::Null },
             "debug_seed": value["seed"]
         })),
@@ -663,13 +663,31 @@ async fn responses_text_bridge_and_unsupported_modes() {
     );
     assert!(call_usage["incomplete_details"].is_null());
     assert_eq!(hits.load(Ordering::SeqCst), 8);
+    let (status, mixed) = call(router.clone(), req(json!({"model":"demo","input":"callmixed","tools":[{"type":"function","name":"lookup"}],"parallel_tool_calls":true}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mixed["output_text"], "I will look that up");
+    assert_eq!(mixed["output"].as_array().unwrap().len(), 3);
+    assert_eq!(mixed["output"][0]["type"], "message");
+    assert_eq!(mixed["output"][1]["call_id"], "call_1");
+    assert_eq!(mixed["output"][2]["call_id"], "call_2");
+    assert_eq!(hits.load(Ordering::SeqCst), 9);
+    let (status, duplicate) = call(
+        router.clone(),
+        req(
+            json!({"model":"demo","input":"calldup","tools":[{"type":"function","name":"lookup"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(duplicate["error"]["code"], "invalid_tool_call");
+    assert_eq!(hits.load(Ordering::SeqCst), 10);
     let (status, continued) = call(router.clone(), req(json!({"model":"demo","input":[{"type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call_123","output":"Paris is in France"}]}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(continued["output_text"], "success");
-    assert_eq!(hits.load(Ordering::SeqCst), 9);
+    assert_eq!(hits.load(Ordering::SeqCst), 11);
     let (status, _) = call(router.clone(), req(json!({"model":"demo","input":[{"type":"function_call_output","call_id":"call_123","output":7}]}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(hits.load(Ordering::SeqCst), 9);
+    assert_eq!(hits.load(Ordering::SeqCst), 11);
     for invalid_input in [
         json!([{"type":"function_call_output","call_id":"orphan","output":"x"}]),
         json!([{"type":"function_call","call_id":"dup","name":"lookup","arguments":"{}"},{"type":"function_call","call_id":"dup","name":"lookup","arguments":"{}"}]),
@@ -683,7 +701,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
-    assert_eq!(hits.load(Ordering::SeqCst), 9);
+    assert_eq!(hits.load(Ordering::SeqCst), 11);
     for bad_request in [
         json!({"model":"demo","input":"hello","tools":[{"type":"function","name":"lookup"},{"type":"function","name":"lookup"}]}),
         json!({"model":"demo","input":"hello","tools":[{"type":"function","name":"lookup","parameters":7}]}),
@@ -695,7 +713,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
         let (status, _) = call(router.clone(), req(bad_request)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
-    assert_eq!(hits.load(Ordering::SeqCst), 9);
+    assert_eq!(hits.load(Ordering::SeqCst), 11);
     for payload in [
         json!({"model":"demo","input":"hello","stream":true}),
         json!({"model":"demo","input":"hello","tools":[{"type":"web_search"}]}),
@@ -718,5 +736,5 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = call(router, req(json!({"input":"hello"}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(hits.load(Ordering::SeqCst), 9);
+    assert_eq!(hits.load(Ordering::SeqCst), 11);
 }
