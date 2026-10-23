@@ -1488,6 +1488,7 @@ const RESP_START_A: &[u8] = b"data: {\"id\":\"chat1\",\"created\":123,\"choices\
 const RESP_START_B: &[u8] = b"\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
 const RESP_END: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\n";
 const RESP_LENGTH_END: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"length\"}]}\n\n";
+const RESP_FILTER_END: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n";
 const RESP_USAGE: &[u8] = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n";
 
 #[tokio::test]
@@ -1535,6 +1536,34 @@ async fn responses_sse_real_upstream_fragmentation_metadata_usage() {
     assert_eq!(completed["response"]["output_text"], "hi!");
     assert_eq!(completed["response"]["metadata"]["job"], "sse");
     assert_eq!(completed["response"]["usage"]["total_tokens"], 7);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn responses_sse_content_filter_preserves_incomplete_reason() {
+    let (url, hits) = start_sse(vec![RESP_START_A, RESP_START_B, RESP_FILTER_END, SSE_DONE]).await;
+    let response = make_app(&url, &url)
+        .oneshot(responses_stream_req(
+            json!({"model":"demo","input":"hello","stream":true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        text.matches("event: response.incomplete").count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("\"reason\":\"content_filter\""), "{text}");
+    assert!(!text.contains("event: response.failed"), "{text}");
+    assert!(!text.contains("event: response.completed"), "{text}");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 

@@ -166,7 +166,13 @@ impl ResponsesSse {
         }
         json!({"id":self.id,"object":"response","created_at":self.created_at,
             "model":self.model,"status":status,
-            "incomplete_details": if status == "incomplete" {json!({"reason":"max_output_tokens"})} else {Value::Null},
+            "incomplete_details": if status == "incomplete" {
+                json!({"reason": if self.finish_reason.as_deref() == Some("content_filter") {
+                    "content_filter"
+                } else {
+                    "max_output_tokens"
+                }})
+            } else {Value::Null},
             "output":output,
             "output_text":self.text,"usage":self.usage,"metadata":self.metadata})
     }
@@ -469,6 +475,7 @@ impl ResponsesSse {
                 }
                 "stop" if self.tools.is_empty() => {}
                 "length" if self.tools.is_empty() => {}
+                "content_filter" if self.tools.is_empty() => {}
                 _ => return Err(()),
             }
             self.finish_reason = Some(reason.to_owned());
@@ -476,7 +483,10 @@ impl ResponsesSse {
         Ok(())
     }
     fn complete(&mut self, pending: &mut VecDeque<Bytes>) {
-        let status = if self.finish_reason.as_deref() == Some("length") {
+        let status = if matches!(
+            self.finish_reason.as_deref(),
+            Some("length" | "content_filter")
+        ) {
             "incomplete"
         } else {
             "completed"
@@ -638,6 +648,22 @@ mod tests {
         t.feed(&frame(json!({"id":"x","choices":[{"index":0,"delta":{"content":"lost"},"finish_reason":null}]})), &mut q).unwrap();
         assert!(t.feed(b"data: [DONE]\n\n", &mut q).is_err());
         assert!(String::from_utf8_lossy(&t.failed()).contains("response.failed"));
+    }
+    #[test]
+    fn content_filter_is_an_incomplete_response_not_a_stream_failure() {
+        let mut t = ResponsesSse::new("logical".into(), Value::Null);
+        let mut q = VecDeque::new();
+        t.feed(
+            &frame(json!({"id":"filtered","choices":[{"index":0,
+                "delta":{"content":"partial"},"finish_reason":"content_filter"}]})),
+            &mut q,
+        )
+        .unwrap();
+        t.feed(b"data: [DONE]\n\n", &mut q).unwrap();
+        let last = String::from_utf8_lossy(q.back().unwrap());
+        assert!(last.contains("event: response.incomplete"), "{last}");
+        assert!(last.contains("\"reason\":\"content_filter\""), "{last}");
+        assert!(!last.contains("response.failed"), "{last}");
     }
     #[test]
     fn bounded_malformed_and_tools() {
