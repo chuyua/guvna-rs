@@ -713,6 +713,26 @@ async fn malformed_tool_arguments_cannot_complete_chat_stream() {
 }
 
 #[tokio::test]
+async fn truncated_tool_stream_cannot_claim_success_or_retry_after_partial_output() {
+    let tool = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"key\\\":\"}}]},\"finish_reason\":null}]}\n\n";
+    let finish =
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n";
+    let (primary, primary_hits) = start_sse(vec![tool, finish, SSE_DONE]).await;
+    let (backup, backup_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let response = make_app(&primary, &backup)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn malformed_sse_after_first_event_does_not_fail_over_or_claim_success() {
     let (a, first_hits) = start_sse(vec![SSE_START, b"data: not-json\n\n"]).await;
     let (b, backup_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;

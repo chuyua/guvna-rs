@@ -197,19 +197,14 @@ impl ChatSse {
         }
         if let Some(reason) = choice.get("finish_reason").filter(|v| !v.is_null()) {
             let reason = reason.as_str().ok_or(SseError)?;
-            if ![
-                "stop",
-                "length",
-                "tool_calls",
-                "function_call",
-                "content_filter",
-            ]
-            .contains(&reason)
-            {
+            if !["stop", "length", "tool_calls", "content_filter"].contains(&reason) {
                 return Err(SseError);
             }
             let has_tools = has_tool_delta || self.tool_calls_mask & (1u64 << index) != 0;
-            if (reason == "tool_calls" && !has_tools) || (reason == "stop" && has_tools) {
+            // A truncated/filtered tool stream must never look like a
+            // completed function invocation. Legacy function_call deltas
+            // are unsupported, so only tool_calls may terminate tool data.
+            if (reason == "tool_calls") != has_tools {
                 return Err(SseError);
             }
             match &self.tool_choice {
@@ -471,6 +466,46 @@ mod tests {
         parser.push(tool_finish).unwrap();
         parser.push(b"data: [DONE]\n\n").unwrap();
         assert!(parser.finish().is_ok());
+    }
+
+    #[test]
+    fn incomplete_tool_calls_and_unsupported_legacy_finish_cannot_complete() {
+        let tool_delta = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"key\":"}}
+        ]},"finish_reason":null}]});
+        for reason in ["length", "content_filter", "function_call"] {
+            let mut parser = ChatSse::new(1).unwrap();
+            parser
+                .push(format!("data: {tool_delta}\n\n").as_bytes())
+                .unwrap();
+            let finish =
+                serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}]});
+            assert!(
+                parser
+                    .push(format!("data: {finish}\n\n").as_bytes())
+                    .is_err(),
+                "accepted incomplete tool call with finish_reason={reason}"
+            );
+        }
+        let mut parser = ChatSse::new(1).unwrap();
+        let legacy =
+            serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"function_call"}]});
+        assert!(
+            parser
+                .push(format!("data: {legacy}\n\n").as_bytes())
+                .is_err(),
+            "legacy function_call without a function payload must not claim completion"
+        );
+        for reason in ["length", "content_filter"] {
+            let mut parser = ChatSse::new(1).unwrap();
+            let text = serde_json::json!({"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":reason}]});
+            parser.push(format!("data: {text}\n\n").as_bytes()).unwrap();
+            parser.push(b"data: [DONE]\n\n").unwrap();
+            assert!(
+                parser.finish().is_ok(),
+                "rejected valid text finish {reason}"
+            );
+        }
     }
 
     #[test]
