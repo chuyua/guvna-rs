@@ -298,6 +298,68 @@ async fn unauthenticated_posts_never_poll_unbounded_request_bodies() {
 }
 
 #[tokio::test]
+async fn stalled_authenticated_uploads_cannot_bypass_global_admission() {
+    let (url, calls) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&url, &url);
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mut tasks = Vec::new();
+    for _ in 0..128 {
+        let polls = polls.clone();
+        let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
+            polls.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::<Option<Result<Bytes, std::io::Error>>>::Pending
+        }));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer client")
+            .body(body)
+            .unwrap();
+        let router = router.clone();
+        tasks.push(tokio::spawn(async move { router.oneshot(request).await }));
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while polls.load(Ordering::SeqCst) < 128 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all stalled uploads must reach body polling");
+
+    // A 129th request must fail before touching its own never-ending body.
+    for path in ["/v1/chat/completions", "/v1/embeddings", "/v1/responses"] {
+        let body =
+            Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Bearer client")
+            .body(body)
+            .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            router.clone().oneshot(request),
+        )
+        .await
+        .expect("admission must reject before buffering another body")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(response.headers()["retry-after"], "1");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    let (status, _) = call(router, request("demo", "", "client")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "cancelled uploads must free admission slots"
+    );
+}
+
+#[tokio::test]
 async fn authorized_posts_still_enforce_the_32_mib_body_limit() {
     let (url, calls) = start_upstream(StatusCode::OK).await;
     let router = make_app(&url, &url);

@@ -162,6 +162,7 @@ fn retry_after_delay(headers: &reqwest::header::HeaderMap, now: SystemTime) -> O
 // extractor buffers the body before handler-level authorization can run.
 enum RequestBodyError {
     Unauthorized,
+    Overloaded,
     Invalid(StatusCode),
 }
 
@@ -169,6 +170,18 @@ impl RequestBodyError {
     fn into_response(self) -> Response {
         match self {
             Self::Unauthorized => unauthorized(),
+            Self::Overloaded => {
+                let mut response = error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "gateway_overloaded",
+                    "Too many concurrent upstream requests",
+                );
+                response.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static("1"),
+                );
+                response
+            }
             Self::Invalid(status) => error(
                 status,
                 "invalid_body",
@@ -181,13 +194,20 @@ impl RequestBodyError {
 async fn authenticated_body(
     state: &Arc<AppState>,
     request: Request<Body>,
-) -> Result<Bytes, RequestBodyError> {
+) -> Result<(Bytes, OwnedSemaphorePermit), RequestBodyError> {
     if !state.allowed(request.headers()) {
         return Err(RequestBodyError::Unauthorized);
     }
-    Bytes::from_request(request, state)
+    // Reserve a slot before reading a potentially slow 32 MiB upload. The
+    // permit follows the request through parsing, routing and SSE delivery.
+    let permit = state.inflight.clone().try_acquire_owned().map_err(|_| {
+        Metrics::inc(&state.metrics.admission_rejections);
+        RequestBodyError::Overloaded
+    })?;
+    let body = Bytes::from_request(request, state)
         .await
-        .map_err(|rejection| RequestBodyError::Invalid(rejection.status()))
+        .map_err(|rejection| RequestBodyError::Invalid(rejection.status()))?;
+    Ok((body, permit))
 }
 
 // Keep one classification path for all candidate and SSE circuit outcomes.
@@ -277,8 +297,8 @@ async fn model_detail(
 
 // Minimal non-streaming Responses compatibility adapter. Unsupported modes fail closed.
 async fn responses(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    let body = match authenticated_body(&state, request).await {
-        Ok(body) => body,
+    let (body, permit) = match authenticated_body(&state, request).await {
+        Ok(result) => result,
         Err(error) => return error.into_response(),
     };
     let mut value: Value = match serde_json::from_slice::<Value>(&body) {
@@ -827,7 +847,13 @@ async fn responses(State(state): State<Arc<AppState>>, request: Request<Body>) -
         object.insert("max_tokens".into(), tokens);
     }
     let response_metrics = state.metrics.clone();
-    let response = dispatch(state, Bytes::from(value.to_string()), Endpoint::Chat).await;
+    let response = dispatch(
+        state,
+        Bytes::from(value.to_string()),
+        Endpoint::Chat,
+        permit,
+    )
+    .await;
     if response.status() != StatusCode::OK {
         return response;
     }
@@ -1047,21 +1073,26 @@ impl Endpoint {
 }
 
 async fn chat(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    let body = match authenticated_body(&state, request).await {
-        Ok(body) => body,
+    let (body, permit) = match authenticated_body(&state, request).await {
+        Ok(result) => result,
         Err(error) => return error.into_response(),
     };
-    dispatch(state, body, Endpoint::Chat).await
+    dispatch(state, body, Endpoint::Chat, permit).await
 }
 async fn embeddings(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    let body = match authenticated_body(&state, request).await {
-        Ok(body) => body,
+    let (body, permit) = match authenticated_body(&state, request).await {
+        Ok(result) => result,
         Err(error) => return error.into_response(),
     };
-    dispatch(state, body, Endpoint::Embeddings).await
+    dispatch(state, body, Endpoint::Embeddings, permit).await
 }
 
-async fn dispatch(state: Arc<AppState>, body: Bytes, endpoint: Endpoint) -> Response {
+async fn dispatch(
+    state: Arc<AppState>,
+    body: Bytes,
+    endpoint: Endpoint,
+    admission: OwnedSemaphorePermit,
+) -> Response {
     let request: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
@@ -1135,23 +1166,7 @@ async fn dispatch(state: Arc<AppState>, body: Bytes, endpoint: Endpoint) -> Resp
         }
     };
 
-    // Reject overload immediately instead of building unbounded waiting tasks.
-    let mut permit = Some(match state.inflight.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            Metrics::inc(&state.metrics.admission_rejections);
-            let mut response = error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "gateway_overloaded",
-                "Too many concurrent upstream requests",
-            );
-            response.headers_mut().insert(
-                axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_static("1"),
-            );
-            return response;
-        }
-    });
+    let mut permit = Some(admission);
 
     // Count actual candidate transitions, not provider-key retries.
     let mut candidates_visited = 0usize;
@@ -1691,18 +1706,24 @@ mod tests {
             .try_acquire_many_owned(MAX_INFLIGHT_REQUESTS as u32)
             .unwrap();
         assert_eq!(state.inflight.available_permits(), 0);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer client")
+            .body(Body::from(
+                r#"{"model":"demo","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
         let response = tokio::time::timeout(
             Duration::from_millis(200),
-            dispatch(
-                state.clone(),
-                Bytes::from_static(
-                    br#"{"model":"demo","messages":[{"role":"user","content":"hi"}]}"#,
-                ),
-                Endpoint::Chat,
-            ),
+            authenticated_body(&state, request),
         )
         .await
         .expect("overload should fail fast");
+        let response = match response {
+            Err(error) => error.into_response(),
+            Ok(_) => panic!("overloaded request was admitted"),
+        };
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
         assert_eq!(
