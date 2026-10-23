@@ -49,7 +49,10 @@ pub fn resolve_auto(config: &Config, input_bytes: usize) -> Result<Vec<ResolvedS
         .iter()
         .enumerate()
         .filter(|(_, candidate)| {
-            input_bytes >= candidate.min_input_bytes
+            candidate
+                .max_context_tokens
+                .is_none_or(|max| input_bytes <= max)
+                && input_bytes >= candidate.min_input_bytes
                 && candidate
                     .max_input_bytes
                     .is_none_or(|max| input_bytes <= max)
@@ -166,18 +169,21 @@ auto:
       priority: 20
       min_input_bytes: 100
       max_input_bytes: 200
+      max_context_tokens: 180
     - provider: primary
       model: alpha
       priority: 10
       min_input_bytes: 100
       max_input_bytes: 200
+      max_context_tokens: 180
 "#,
         )
         .unwrap();
         cfg.validate().unwrap();
         assert!(resolve_auto(&cfg, 99).unwrap().is_empty());
         assert!(resolve_auto(&cfg, 201).unwrap().is_empty());
-        for size in [100, 150, 200] {
+        assert!(resolve_auto(&cfg, 181).unwrap().is_empty());
+        for size in [100, 150, 180] {
             let steps = resolve_auto(&cfg, size).unwrap();
             assert_eq!(steps.len(), 2);
             assert_eq!(steps[0].model, "alpha");

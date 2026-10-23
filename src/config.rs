@@ -75,6 +75,7 @@ pub struct AutoCandidate {
     #[serde(default)]
     pub min_input_bytes: usize,
     pub max_input_bytes: Option<usize>,
+    pub max_context_tokens: Option<usize>,
 }
 
 fn default_auto_priority() -> u16 {
@@ -342,6 +343,7 @@ impl Config {
                 .max_input_bytes
                 .is_some_and(|v| v < candidate.min_input_bytes)
                 || candidate.max_input_bytes == Some(0)
+                || candidate.max_context_tokens == Some(0)
             {
                 return Err("auto candidate invalid input length range".into());
             }
