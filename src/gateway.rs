@@ -85,6 +85,12 @@ impl AppState {
                 json!({"id":chain.name,"object":"model","owned_by":"guvna"}),
             );
         }
+        if config.auto.enabled {
+            model_details.insert(
+                "auto".to_owned(),
+                json!({"id":"auto","object":"model","owned_by":"guvna-auto"}),
+            );
+        }
         for provider in &config.providers {
             for prefix in provider.prefixes() {
                 for model in &provider.models {
@@ -251,6 +257,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/models/{model}", get(model_detail))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/auto", post(auto))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/responses", post(responses::handle))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -313,6 +320,50 @@ async fn chat(State(state): State<Arc<AppState>>, request: Request<Body>) -> Res
     };
     dispatch::dispatch(state, body, dispatch::Endpoint::Chat, permit).await
 }
+/// Optional Auto Chat alias. It rewrites only the logical model name and
+/// then invokes the exact same dispatch loop as ordinary Chat completions.
+async fn auto(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
+    let (body, permit) = match authenticated_body(&state, request).await {
+        Ok(result) => result,
+        Err(error) => return error.into_response(),
+    };
+    if !state.config.auto.enabled {
+        return error(
+            StatusCode::NOT_FOUND,
+            "auto_disabled",
+            "Auto routing is not configured",
+        );
+    }
+    let mut value: Value = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) if value.is_object() => value,
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "Expected one JSON object",
+            );
+        }
+    };
+    if value.get("model").is_some_and(|model| model != "auto") {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_auto_model",
+            "/v1/auto accepts only model auto or an omitted model",
+        );
+    }
+    value
+        .as_object_mut()
+        .expect("checked")
+        .insert("model".into(), Value::String("auto".into()));
+    dispatch::dispatch(
+        state,
+        Bytes::from(value.to_string()),
+        dispatch::Endpoint::Chat,
+        permit,
+    )
+    .await
+}
+
 async fn embeddings(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
     let (body, permit) = match authenticated_body(&state, request).await {
         Ok(result) => result,

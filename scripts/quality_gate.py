@@ -548,6 +548,104 @@ def verify_release_chain_management(binary: str, config: Path, directory: str) -
             "atomic_backup_matches_prior": True, "mode": "0600"}
 
 
+def verify_release_auto_and_local_logs(binary: str, cfg: Path, root: str,
+                                       env: dict, mock1: Stub, mock2: Stub) -> dict:
+    """64 real Linux release requests: Auto ranking, failure fallback,
+    diagnostic privacy, bounded resources. Separate process avoids changing
+    the fixed existing baseline metrics and fault accounting."""
+    auto_port = port()
+    auto_cfg = Path(root) / "auto-enabled.yaml"
+    original = cfg.read_text(encoding="utf-8")
+    original_port = original.splitlines()[0]
+    check(original_port.startswith("port: "), "unexpected quality YAML port")
+    changed = original.replace(original_port, f"port: {auto_port}", 1)
+    changed += ("""
+auto:
+  enabled: true
+  candidates:
+    - provider: down
+      model: down
+      priority: 1
+      max_input_bytes: 256
+    - provider: live
+      model: fast
+      priority: 2
+""")
+    auto_cfg.write_text(changed, encoding="utf-8")
+    autodata = Path(root) / "auto-data"
+    autodata.mkdir()
+    auto_env = dict(env, GUVNA_LOG_EVENTS="1")
+    proc = subprocess.Popen(
+        [str(Path(binary).resolve()), "serve", "-config", str(auto_cfg),
+         "-data", str(autodata)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=auto_env)
+    log_content = ""
+    try:
+        started = time.monotonic()
+        health = f"http://127.0.0.1:{auto_port}/healthz"
+        while time.monotonic() - started < 2:
+            check(proc.poll() is None, "Auto process exited at startup")
+            if get_status(health, timeout=0.15) == 200:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("Auto process startup timed out")
+        primary_before, healthy_before = mock1.calls, mock2.calls
+        wave = run_wave(
+            f"http://127.0.0.1:{auto_port}/v1/auto", "auto", 64, 8, proc.pid)
+        primary = mock1.calls - primary_before
+        healthy = mock2.calls - healthy_before
+        check(primary == 64 and healthy == 64,
+              f"Auto failed shared fallback: primary={primary}, healthy={healthy}")
+        metrics_req = Request(
+            f"http://127.0.0.1:{auto_port}/metrics",
+            headers={"Authorization": "Bearer only-for-local-test"})
+        with urlopen(metrics_req, timeout=3) as resp:
+            raw = resp.read(8192).decode("utf-8")
+        for key, expected in [
+            ("guvna_requests_dispatched", 64),
+            ("guvna_upstream_attempts", 128),
+            ("guvna_candidate_fallbacks", 64),
+            ("guvna_upstream_success", 64),
+        ]:
+            lines = [line for line in raw.splitlines()
+                     if line.startswith(key + "_total ")]
+            check(len(lines) == 1 and int(lines[0].split()[1]) == expected,
+                  f"Auto metrics {key} != {expected}: {lines}")
+        usage = proc_info(proc.pid)
+        check(usage["VmRSS"] <= 16 * 1024, "Auto process RSS exceeded 16 MiB")
+        check(usage["fd"] <= 20, "Auto process leaked file descriptors")
+        check(usage["Threads"] <= 12, "Auto process leaked threads")
+        return {
+            "passed": True, "wave": wave,
+            "primary_attempts": primary, "fallback_successes": healthy,
+            "rss_kib": usage["VmRSS"], "fds": usage["fd"],
+            "threads": usage["Threads"]
+        }
+    finally:
+        proc.terminate()
+        try:
+            _stdout, captured = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _stdout, captured = proc.communicate(timeout=5)
+        log_content = captured.decode("utf-8", "replace")
+        events = [line for line in log_content.splitlines() if line.startswith("{")]
+        check(1 <= len(events) <= 10,
+              f"opt-in local warning logs must be bounded: {len(events)}")
+        for raw_event in events:
+            event = json.loads(raw_event)
+            check(set(event) == {"ts_unix_ms", "level", "event", "sequence"},
+                  "local warning includes unapproved telemetry fields")
+            check(event["event"] in {"provider_http_failure", "transport_failure",
+                                    "upstream_invalid", "stream_preflight_failure",
+                                    "provider_circuit_open"},
+                  "local warning has unapproved event label")
+        check("fake-down-key" not in log_content
+              and "fake-live-key" not in log_content
+              and "only-for-local-test" not in log_content,
+              "local logs exposed test credential")
+
 def idle(pid: int, seconds: float):
     samples = []
     cpu_first = proc_info(pid)
@@ -759,6 +857,8 @@ chains:
                 check(all(count > 0 for count in mock1.faults.values()),
                       "fault injection did not cover every variant")
                 summary["opt_in_circuit_gate"] = exercise_opt_in_circuit_gate(
+                    a.binary, cfg, directory, env, mock1, mock2)
+                summary["auto_and_local_log_gate"] = verify_release_auto_and_local_logs(
                     a.binary, cfg, directory, env, mock1, mock2)
                 summary["structured_output_gate"] = verify_structured_output_on_release(
                     response_endpoint, mock2)

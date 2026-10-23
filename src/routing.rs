@@ -10,6 +10,45 @@ pub struct ResolvedStep {
     pub params: BTreeMap<String, Value>,
 }
 
+/// A small, transparent Auto V1: fixed configured priorities and a bounded
+/// length heuristic, not a black-box performance claim or remote-model ranking.
+/// The returned candidates use the SAME dispatch/failover loop as named chains.
+pub fn resolve_auto(config: &Config, input_bytes: usize) -> Result<Vec<ResolvedStep>, String> {
+    if !config.auto.enabled {
+        return Err("auto routing is disabled".into());
+    }
+    let mut ranked = config
+        .auto
+        .candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            input_bytes >= candidate.min_input_bytes
+                && candidate
+                    .max_input_bytes
+                    .is_none_or(|max| input_bytes <= max)
+        })
+        .collect::<Vec<_>>();
+    // Stable tie-break preserves configured order, avoiding non-deterministic
+    // model selection on restart or across concurrent requests.
+    ranked.sort_by_key(|(position, candidate)| (candidate.priority, *position));
+    ranked
+        .into_iter()
+        .map(|(_, candidate)| {
+            let provider_index = config
+                .providers
+                .iter()
+                .position(|p| p.name == candidate.provider)
+                .ok_or_else(|| "auto candidate references missing provider".to_string())?;
+            Ok(ResolvedStep {
+                provider_index,
+                model: candidate.model.clone(),
+                params: BTreeMap::new(),
+            })
+        })
+        .collect()
+}
+
 pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>, String> {
     if logical_model.is_empty() {
         return Err("missing model".into());

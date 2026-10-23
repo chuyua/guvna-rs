@@ -5,6 +5,7 @@ pub mod config;
 pub mod gateway;
 pub mod keypool;
 pub mod metrics;
+pub mod ops_log;
 pub mod outcome;
 pub mod routing;
 pub mod sse;

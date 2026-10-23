@@ -2397,3 +2397,285 @@ async fn invalid_json_stream_must_never_emit_a_completed_response_or_replay() {
         0
     );
 }
+
+fn make_auto_app(broken: &str, healthy: &str) -> Router {
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: broken
+    type: openai
+    base_url: {broken}
+    key_env: FIRST
+  - name: healthy
+    type: openai
+    base_url: {healthy}
+    key_env: GOOD
+auto:
+  enabled: true
+  candidates:
+    - provider: healthy
+      model: fallback-low
+      priority: 90
+    - provider: broken
+      model: fast-short
+      priority: 1
+      max_input_bytes: 130
+    - provider: healthy
+      model: long-context
+      priority: 2
+      min_input_bytes: 131
+"#,
+    ))
+    .unwrap();
+    app(AppState::new(
+        config,
+        HashMap::from([
+            ("FIRST".into(), "first".into()),
+            ("GOOD".into(), "good".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap())
+}
+
+fn auto_request(path: &str, bearer: &str, payload: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn auto_chat_and_alias_share_fallback_with_priority_and_context_filter() {
+    let (failed, failed_calls) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
+    let (good, good_calls) = start_upstream(StatusCode::OK).await;
+    let router = make_auto_app(&failed, &good);
+    let (status, response) = call(
+        router.clone(),
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({
+                "messages":[{"role":"user","content":"hi"}]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["model"], "fallback-low");
+    assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(good_calls.load(Ordering::SeqCst), 1);
+
+    let (status, response) = call(
+        router.clone(),
+        auto_request(
+            "/v1/chat/completions",
+            "client",
+            json!({
+                "model":"auto","messages":[{"role":"user","content":"x".repeat(400)}]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["model"], "long-context");
+    assert_eq!(
+        failed_calls.load(Ordering::SeqCst),
+        1,
+        "long context skips short-only provider"
+    );
+    assert_eq!(good_calls.load(Ordering::SeqCst), 2);
+
+    let (status, model_list) = call_model_list(router.clone(), "client").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        model_list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["id"] == "auto")
+    );
+
+    for payload in [
+        json!({"model":"different","messages":[{"role":"user","content":"hi"}]}),
+        json!({"model":123,"messages":[{"role":"user","content":"hi"}]}),
+    ] {
+        let (status, result) =
+            call(router.clone(), auto_request("/v1/auto", "client", payload)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(result["error"]["code"], "invalid_auto_model");
+    }
+    let (status, _) = call(
+        router.clone(),
+        auto_request("/v1/auto", "bad", json!({"messages":[]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(good_calls.load(Ordering::SeqCst), 2);
+}
+
+async fn call_model_list(router: Router, key: &str) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .header("authorization", format!("Bearer {key}"))
+        .body(Body::empty())
+        .unwrap();
+    call(router, request).await
+}
+
+#[tokio::test]
+async fn auto_config_invalid_ranges_and_candidate_references_rejected() {
+    let (good, _) = start_upstream(StatusCode::OK).await;
+    let yaml = format!(
+        r#"
+providers:
+  - name: healthy
+    type: openai
+    base_url: {good}
+    key_env: GOOD
+auto:
+  enabled: true
+  candidates:
+    - provider: healthy
+      model: x
+      priority: 1
+      min_input_bytes: 30
+      max_input_bytes: 2
+"#
+    );
+    let config: Config = serde_yaml::from_str(&yaml).unwrap();
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .contains("input length range")
+    );
+    let config: Config = serde_yaml::from_str(
+        &yaml
+            .replace("max_input_bytes: 2", "max_input_bytes: 33")
+            .replace(
+                "provider: healthy\n      model: x",
+                "provider: unknown\n      model: x",
+            ),
+    )
+    .unwrap();
+    assert!(config.validate().unwrap_err().contains("missing provider"));
+    let config: Config = serde_yaml::from_str(
+        &yaml
+            .replace("max_input_bytes: 2", "max_input_bytes: 33")
+            .replace("min_input_bytes: 30", "min_input_bytes: 0")
+            .replace("  enabled: true", "  enabled: false"),
+    )
+    .unwrap();
+    assert!(config.validate().unwrap_err().contains("enabled: true"));
+}
+
+#[tokio::test]
+async fn auto_without_eligible_candidate_returns_422_without_network_attempt() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {url}
+    key_env: FIRST
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: x
+      min_input_bytes: 8192
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("FIRST".into(), "first".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, body) = call(
+        router.clone(),
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({
+                "messages":[{"role":"user","content":"short"}]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "auto_no_eligible_candidate");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "upstream_attempts_total"), 0);
+}
+
+#[tokio::test]
+async fn auto_is_disabled_by_default_and_keeps_old_routing_unchanged() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&url, &url);
+    let (status, body) = call(
+        router.clone(),
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({"messages":[{"role":"user","content":"hi"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "auto_disabled");
+    let (status, body) = call(router, request("auto", "", "client")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "unknown_model");
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn auto_stream_reuses_existing_chat_sse_validation() {
+    let (good, hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: good
+    type: openai
+    base_url: {good}
+    key_env: GOOD
+auto:
+  enabled: true
+  candidates:
+    - provider: good
+      model: stream
+      priority: 1
+"#,
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("GOOD".into(), "good".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let response = router
+        .oneshot(auto_request(
+            "/v1/auto",
+            "client",
+            json!({
+                "stream":true,
+                "messages":[{"role":"user","content":"hi"}]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert!(bytes.ends_with(b"data: [DONE]\n\n"), "{bytes:?}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
