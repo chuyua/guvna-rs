@@ -662,6 +662,20 @@ async fn responses_text_bridge_and_unsupported_modes() {
     let (status, _) = call(router.clone(), req(json!({"model":"demo","input":[{"type":"function_call_output","call_id":"call_123","output":7}]}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(hits.load(Ordering::SeqCst), 8);
+    for invalid_input in [
+        json!([{"type":"function_call_output","call_id":"orphan","output":"x"}]),
+        json!([{"type":"function_call","call_id":"dup","name":"lookup","arguments":"{}"},{"type":"function_call","call_id":"dup","name":"lookup","arguments":"{}"}]),
+        json!([{"type":"function_call","call_id":"missing","name":"lookup","arguments":"{}"}]),
+        json!([{"type":"function_call","call_id":"id1","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"id2","output":"x"}]),
+    ] {
+        let (status, _) = call(
+            router.clone(),
+            req(json!({"model":"demo","input":invalid_input})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 8);
     for payload in [
         json!({"model":"demo","input":"hello","stream":true}),
         json!({"model":"demo","input":"hello","tools":[{"type":"web_search"}]}),

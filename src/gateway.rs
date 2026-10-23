@@ -223,6 +223,7 @@ async fn responses(
         Value::String(text) => json!([{"role":"user","content":text}]),
         Value::Array(items) if !items.is_empty() => {
             let mut messages = Vec::with_capacity(items.len());
+            let mut pending_calls = std::collections::HashSet::<String>::new();
             for item in items {
                 if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
                     let Some(call_id) = item
@@ -251,6 +252,13 @@ async fn responses(
                             StatusCode::NOT_IMPLEMENTED,
                             "function_output_unsupported",
                             "Unsupported function output fields",
+                        );
+                    }
+                    if !pending_calls.remove(call_id) {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "orphan_function_output",
+                            "Function output has no matching preceding call",
                         );
                     }
                     messages.push(json!({"role":"tool","tool_call_id":call_id,"content":output}));
@@ -298,6 +306,13 @@ async fn responses(
                             StatusCode::BAD_REQUEST,
                             "invalid_function_call",
                             "Invalid function call arguments or fields",
+                        );
+                    }
+                    if !pending_calls.insert(call_id.to_owned()) {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "duplicate_function_call",
+                            "Function call id is already pending",
                         );
                     }
                     messages.push(json!({"role":"assistant","content":Value::Null,"tool_calls":[{"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}}]}));
@@ -369,6 +384,13 @@ async fn responses(
                     );
                 };
                 messages.push(json!({"role":role,"content":text}));
+            }
+            if !pending_calls.is_empty() {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "pending_function_calls",
+                    "Function calls require matching output before continuing",
+                );
             }
             Value::Array(messages)
         }
