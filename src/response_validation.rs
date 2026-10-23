@@ -52,16 +52,7 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
         if !choice
             .get("finish_reason")
             .and_then(Value::as_str)
-            .is_some_and(|x| {
-                [
-                    "stop",
-                    "length",
-                    "tool_calls",
-                    "function_call",
-                    "content_filter",
-                ]
-                .contains(&x)
-            })
+            .is_some_and(|x| ["stop", "length", "tool_calls", "content_filter"].contains(&x))
         {
             return false;
         }
@@ -306,6 +297,15 @@ mod response_contract_tests {
                 "finish_reason":"tool_calls"
             }]})
         ));
+    }
+
+    #[test]
+    fn chat_rejects_unsupported_legacy_function_finish() {
+        let response = json!({"choices":[{
+            "index":0,"message":{"role":"assistant","content":"ok"},
+            "finish_reason":"function_call"
+        }]});
+        assert!(!validate_chat(&json!({}), &response));
     }
 
     #[test]
