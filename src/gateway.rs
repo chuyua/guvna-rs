@@ -2,8 +2,8 @@
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
-    extract::{DefaultBodyLimit, Path as AxumPath, State},
-    http::{HeaderMap, StatusCode},
+    extract::{DefaultBodyLimit, FromRequest, Path as AxumPath, State},
+    http::{HeaderMap, Request, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -138,6 +138,26 @@ fn unauthorized() -> Response {
     )
 }
 
+// Authenticate before invoking Bytes::from_request: the normal Bytes handler
+// extractor buffers the body before handler-level authorization can run.
+async fn authenticated_body(
+    state: &Arc<AppState>,
+    request: Request<Body>,
+) -> Result<Bytes, Response> {
+    if !state.allowed(request.headers()) {
+        return Err(unauthorized());
+    }
+    Bytes::from_request(request, state)
+        .await
+        .map_err(|rejection| {
+            error(
+                rejection.status(),
+                "invalid_body",
+                "Request body is invalid or exceeds the configured limit",
+            )
+        })
+}
+
 // Keep one classification path for all candidate and SSE circuit outcomes.
 fn record_circuit_failure(ticket: &mut Option<Ticket>, metrics: &Metrics) {
     if let Some(ticket) = ticket {
@@ -224,14 +244,11 @@ async fn model_detail(
 }
 
 // Minimal non-streaming Responses compatibility adapter. Unsupported modes fail closed.
-async fn responses(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if !state.allowed(&headers) {
-        return unauthorized();
-    }
+async fn responses(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
+    let body = match authenticated_body(&state, request).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let mut value: Value = match serde_json::from_slice::<Value>(&body) {
         Ok(value) if value.is_object() => value,
         _ => {
@@ -1003,26 +1020,22 @@ impl Endpoint {
     }
 }
 
-async fn chat(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    dispatch(state, headers, body, Endpoint::Chat).await
+async fn chat(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
+    let body = match authenticated_body(&state, request).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    dispatch(state, body, Endpoint::Chat).await
 }
-async fn embeddings(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    dispatch(state, headers, body, Endpoint::Embeddings).await
+async fn embeddings(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
+    let body = match authenticated_body(&state, request).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    dispatch(state, body, Endpoint::Embeddings).await
 }
 
-async fn dispatch(
-    state: Arc<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-    endpoint: Endpoint,
-) -> Response {
-    if !state.allowed(&headers) {
-        return unauthorized();
-    }
+async fn dispatch(state: Arc<AppState>, body: Bytes, endpoint: Endpoint) -> Response {
     let request: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {

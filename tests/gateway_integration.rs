@@ -224,6 +224,51 @@ async fn reject_bad_key_and_invalid_stream_n_without_calling_upstream() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn unauthenticated_posts_never_poll_unbounded_request_bodies() {
+    let (url, calls) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&url, &url);
+    for path in ["/v1/chat/completions", "/v1/embeddings", "/v1/responses"] {
+        // A never-ending body used to hold the handler open before authentication.
+        // The request must return 401 even if not a single byte arrives.
+        let body =
+            Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Bearer invalid")
+            .body(body)
+            .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            router.clone().oneshot(request),
+        )
+        .await
+        .expect("authorization must not wait for request body")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn authorized_posts_still_enforce_the_32_mib_body_limit() {
+    let (url, calls) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&url, &url);
+    let too_large = vec![b'x'; 32 * 1024 * 1024 + 1];
+    for path in ["/v1/chat/completions", "/v1/embeddings", "/v1/responses"] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Bearer client")
+            .body(Body::from(too_large.clone()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
 #[derive(Clone)]
 struct SseUpstream {
     hits: Arc<AtomicUsize>,
