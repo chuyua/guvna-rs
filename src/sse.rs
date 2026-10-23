@@ -34,7 +34,13 @@ impl ChatSse {
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Bytes>, SseError> {
         let mut emitted = Vec::new();
+        if self.done && !chunk.is_empty() {
+            return Err(SseError);
+        }
         for &byte in chunk {
+            if self.done {
+                return Err(SseError);
+            }
             if byte == b'\n' {
                 let line = std::mem::take(&mut self.line);
                 self.process_line(line.strip_suffix(b"\r").unwrap_or(&line), &mut emitted)?;
@@ -84,6 +90,7 @@ impl ChatSse {
         }
         // At most 64 choices are permitted, so a bitset avoids a hot-path allocation.
         let mut seen_indices = 0u64;
+        let mut newly_finished = 0u64;
         for choice in choices {
             let index = self.process_choice(choice)?;
             let bit = 1u64 << index;
@@ -91,6 +98,17 @@ impl ChatSse {
                 return Err(SseError);
             }
             seen_indices |= bit;
+            if choice
+                .get("finish_reason")
+                .is_some_and(|reason| !reason.is_null())
+            {
+                newly_finished |= bit;
+            }
+        }
+        for index in 0..self.expected {
+            if newly_finished & (1u64 << index) != 0 {
+                self.finished.insert(index);
+            }
         }
         let mut normalized = Vec::with_capacity(data.len() + 8);
         normalized.extend_from_slice(b"data: ");
@@ -100,7 +118,7 @@ impl ChatSse {
         Ok(())
     }
 
-    fn process_choice(&mut self, choice: &Value) -> Result<u64, SseError> {
+    fn process_choice(&self, choice: &Value) -> Result<u64, SseError> {
         let index = choice
             .get("index")
             .and_then(Value::as_u64)
@@ -124,7 +142,6 @@ impl ChatSse {
             {
                 return Err(SseError);
             }
-            self.finished.insert(index);
         }
         Ok(index)
     }
@@ -214,5 +231,26 @@ mod tests {
         parser.push(END).unwrap();
         parser.push(b"data: [DONE]\n\n").unwrap();
         assert!(parser.push(b"data: [DONE]\n\n").is_err());
+    }
+
+    #[test]
+    fn invalid_later_choice_cannot_commit_earlier_finish() {
+        let mut parser = ChatSse::new(2).unwrap();
+        let bad = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delta":null,"finish_reason":null}]}
+
+"#;
+        assert!(parser.push(bad).is_err());
+        assert!(parser.finished.is_empty());
+    }
+
+    #[test]
+    fn rejects_trailing_bytes_after_done_in_same_and_later_chunk() {
+        let mut parser = ChatSse::new(1).unwrap();
+        parser.push(END).unwrap();
+        assert!(parser.push(b"data: [DONE]\n\nextra").is_err());
+        let mut parser = ChatSse::new(1).unwrap();
+        parser.push(END).unwrap();
+        parser.push(b"data: [DONE]\n\n").unwrap();
+        assert!(parser.push(b"extra").is_err());
     }
 }
