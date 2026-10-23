@@ -3,6 +3,7 @@
 //! Responses SSE wrapping live here. Dispatch still uses one shared
 //! candidate/failover loop in dispatch.rs; this module never retries upstream.
 use super::dispatch::{Endpoint, dispatch};
+use super::responses_format;
 use super::{AppState, MAX_BODY_BYTES, authenticated_body, error};
 use axum::{
     Json,
@@ -145,7 +146,6 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
         "previous_response_id",
         "conversation",
         "reasoning",
-        "text",
         "modalities",
         "include",
         "service_tier",
@@ -170,6 +170,7 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             "model",
             "input",
             "stream",
+            "text",
             "max_output_tokens",
             "temperature",
             "top_p",
@@ -202,6 +203,20 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             "parallel_tool_calls must be boolean",
         );
     }
+    // Structured text output uses a different envelope in Responses and Chat.
+    // Translate only modes whose parameters can be forwarded without loss.
+    let mapped_text_format = match responses_format::translate(object.get("text")) {
+        Ok(format) => format,
+        Err(problem) => return error(problem.0, problem.1, problem.2),
+    };
+    let json_mode = mapped_text_format
+        .as_ref()
+        .and_then(|format| format.get("type").and_then(Value::as_str))
+        .and_then(|kind| match kind {
+            "json_object" => Some(true),
+            "json_schema" => Some(false),
+            _ => None,
+        });
     // Map the supported Responses function-tool declaration to Chat Completions.
     let mut declared_functions = std::collections::HashSet::<String>::new();
     if let Some(tools) = object.get_mut("tools") {
@@ -320,6 +335,10 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     for key in ["metadata", "store", "background", "truncation"] {
         object.remove(key);
     }
+    object.remove("text");
+    if let Some(format) = mapped_text_format {
+        object.insert("response_format".into(), format);
+    }
     let instructions = match object.remove("instructions") {
         Some(Value::String(text)) => Some(text),
         Some(_) => {
@@ -355,7 +374,13 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
         return response;
     }
     if streaming {
-        return crate::responses_sse::wrap(response, logical_model, metadata, response_metrics);
+        return crate::responses_sse::wrap(
+            response,
+            logical_model,
+            metadata,
+            response_metrics,
+            json_mode,
+        );
     }
     let bytes = match to_bytes(response.into_body(), MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,

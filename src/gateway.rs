@@ -34,6 +34,8 @@ mod dispatch;
 mod response_validation;
 #[path = "responses.rs"]
 mod responses;
+#[path = "responses_format.rs"]
+mod responses_format;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_INFLIGHT_REQUESTS: usize = 128;
