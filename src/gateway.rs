@@ -368,12 +368,13 @@ fn stream_response(state: ChatStreamState) -> Response {
             if state.parser.is_done() {
                 return None;
             }
-            match state.upstream.chunk().await {
-                Ok(Some(bytes)) => match state.parser.push(&bytes) {
+            // Bound upstream stalls after the first event without buffering the response.
+            match tokio::time::timeout(Duration::from_secs(15), state.upstream.chunk()).await {
+                Ok(Ok(Some(bytes))) => match state.parser.push(&bytes) {
                     Ok(events) => state.pending.extend(events),
                     Err(_) => state.terminated = true,
                 },
-                Ok(None) | Err(_) => state.terminated = true,
+                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => state.terminated = true,
             }
             if state.terminated {
                 return Some((Ok(stream_error()), state));
