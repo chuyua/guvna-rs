@@ -35,6 +35,11 @@ Interfaces:
 - Both endpoints require the same Bearer authentication and global admission.
 - The shared Chat candidate/credential/circuit/fallback and streaming
   lifecycle is reused, without introducing a second retry engine.
+- When every eligible Auto candidate is in upstream 429 credential
+  cooldown, return HTTP 429 with aggregated, bounded Retry-After and
+  no extra provider call. Native Chat uses the same state, counter and
+  failure classification. Healthy fallback still works, and mixed
+  non-429 faults cannot be misreported as global rate limiting.
 - /v1/auto rejects other model names with HTTP 400 invalid_auto_model.
 - Disabled Auto returns 404 auto_disabled; no eligible size-match candidate
   returns 422 auto_no_eligible_candidate before any network attempt.
@@ -53,7 +58,8 @@ successes vastly outnumber them.
 Logs are disabled by default.
 
 Warning kinds: transport_failure, provider_http_failure, upstream_invalid,
-stream_preflight_failure, provider_circuit_open, aggregate_capacity and
+stream_preflight_failure, provider_circuit_open, rate_limit_exhausted,
+aggregate_capacity and
 aggregation_failed. Informational event: aggregation_completed. All
 events are local-only and sampled; no per-user or per-provider data is logged.
 

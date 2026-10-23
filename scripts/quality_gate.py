@@ -64,6 +64,15 @@ class StubHandler(BaseHTTPRequestHandler):
         requested_format = query.get("response_format")
         json_mode = isinstance(requested_format, dict) and (
             requested_format.get("type") in ("json_object", "json_schema"))
+        if self.server.role == "rate_limited":
+            payload = b'{"error":"upstream_throttled"}'
+            self.send_response(429)
+            self.send_header("Retry-After", "3600")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.server.role == "stream_only":
             # This simulated provider has no JSON Chat response capability:
             # it rejects every request without stream:true. Invalid terminal
@@ -376,6 +385,7 @@ def verify_metrics(url: str, requests: int, sse_requests: int) -> dict:
         "guvna_chat_stream_cancelled_total": 0,
         "guvna_admission_rejections_total": 0,
         "guvna_active_requests": 0,
+        "guvna_rate_limit_exhaustions_total": 0,
         "guvna_circuit_bypasses_total": 0,
         "guvna_circuit_openings_total": 0,
         "guvna_circuit_probe_success_total": 0,
@@ -635,6 +645,157 @@ chains:
                   ("fake-stream-key", "fake-live-key", "only-for-local-test",
                    "stream-ok", "request declined", "private reasoning", "fake-audio")),
               "SSE-only logs exposed credentials or generated content")
+
+
+def verify_release_rate_limit_exhaustion(binary: str, root: str,
+                                         env: dict, healthy_stub: Stub) -> dict:
+    """Release-only recovery regression: 429-only exhaustion, local Auto,
+    healthy fallback, read-only counters and privacy-safe local diagnostics."""
+    limited = Stub("rate_limited")
+    thread = threading.Thread(target=limited.serve_forever, daemon=True)
+    thread.start()
+    gateway_port = port()
+    config = Path(root) / "rate-limit-recovery.yaml"
+    config.write_text(f"""port: {gateway_port}
+providers:
+  - name: exhausted
+    type: openai
+    base_url: http://127.0.0.1:{limited.server_address[1]}
+    key_env: RATE_TEST_KEY
+    quarantine:
+      rate_limit: 100ms
+  - name: backup
+    type: openai
+    base_url: http://127.0.0.1:{healthy_stub.server_address[1]}
+    key_env: LIVE_KEY
+chains:
+  - name: exhausted
+    steps:
+      - provider: exhausted
+        model: simulated
+  - name: with-fallback
+    steps:
+      - provider: exhausted
+        model: simulated
+      - provider: backup
+        model: fast
+auto:
+  enabled: true
+  candidates:
+    - provider: exhausted
+      model: simulated
+      priority: 1
+""", encoding="utf-8")
+    extra_env = dict(env)
+    extra_env["RATE_TEST_KEY"] = "local-only-synthetic-limited-key"
+    extra_env["GUVNA_LOG_EVENTS"] = "1"
+    proc = subprocess.Popen(
+        [str(Path(binary).resolve()), "serve", "-config", str(config), "-data", root],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=extra_env)
+    try:
+        health = f"http://127.0.0.1:{gateway_port}/healthz"
+        started = time.monotonic()
+        while time.monotonic() - started < 2:
+            check(proc.poll() is None, "rate-limit gateway exited at startup")
+            if get_status(health, timeout=0.1) == 200:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("rate-limit gateway startup timeout")
+        api = f"http://127.0.0.1:{gateway_port}/v1/chat/completions"
+        auto_api = f"http://127.0.0.1:{gateway_port}/v1/auto"
+
+        def call(model: str, use_auto: bool = False) -> tuple[int, int | None, str]:
+            body = json.dumps({"model": model, "messages": [
+                {"role": "user", "content": "diagnostic"}]}).encode("utf-8")
+            req = Request(auto_api if use_auto else api, data=body, method="POST",
+                          headers={"Authorization": "Bearer only-for-local-test",
+                                   "Content-Type": "application/json"})
+            try:
+                with urlopen(req, timeout=5) as response:
+                    code = response.status
+                    retry = response.headers.get("Retry-After")
+                    obj = json.load(response)
+            except HTTPError as error:
+                code = error.code
+                retry = error.headers.get("Retry-After")
+                obj = json.loads(error.read())
+            detail = obj.get("error", {}).get("code", "") if code != 200 else (
+                obj["choices"][0]["message"]["content"])
+            return (code, int(retry) if retry is not None else None, detail)
+
+        code, retry, detail = call("exhausted")
+        check(code == 429 and detail == "providers_rate_limited",
+              "initial 429 was not reported downstream")
+        check(retry is not None and 3598 <= retry <= 3600,
+              f"wrong bounded Retry-After: {retry}")
+        check(limited.calls == 1, "initial throttling failed to quarantine")
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            requests = list(executor.map(
+                lambda i: call("auto" if i % 2 else "exhausted", bool(i % 2)),
+                range(32)))
+        check(all(status == 429 and detail == "providers_rate_limited"
+                  and retry is not None and 3595 <= retry <= 3600
+                  for status, retry, detail in requests),
+              "Auto/Chat cooldown responses did not retain consistent retry hints")
+        check(limited.calls == 1, "repeated clients bypassed quarantine")
+        previous_healthy = healthy_stub.calls
+        code, retry, detail = call("with-fallback")
+        check(code == 200 and retry is None and detail == "ok",
+              "healthy fallback was suppressed by unrelated rate limit")
+        check(limited.calls == 1 and healthy_stub.calls == previous_healthy + 1,
+              "fallback still touched quarantined credential")
+
+        metrics_req = Request(f"http://127.0.0.1:{gateway_port}/metrics",
+                              headers={"Authorization":"Bearer only-for-local-test"})
+        with urlopen(metrics_req, timeout=3) as response:
+            raw = response.read(12 << 10).decode("utf-8")
+        metrics = {}
+        for line in raw.splitlines():
+            if line.startswith("guvna_"):
+                name, _, value = line.partition(" ")
+                metrics[name] = int(value)
+        expected = {
+            "guvna_requests_dispatched_total": 34,
+            "guvna_upstream_attempts_total": 2,
+            "guvna_upstream_success_total": 1,
+            "guvna_credential_quarantines_total": 1,
+            "guvna_upstream_http_failures_total": 1,
+            "guvna_rate_limit_exhaustions_total": 33,
+            "guvna_candidate_fallbacks_total": 1,
+            "guvna_active_requests": 0,
+        }
+        for name, want in expected.items():
+            check(metrics.get(name) == want,
+                  f"rate-limit telemetry {name}={metrics.get(name)}, expected {want}")
+        usage = proc_info(proc.pid)
+        check(usage["VmRSS"] <= 16 * 1024,
+              "rate-limit diagnostic subprocess idle RSS >16 MiB")
+        check(usage["fd"] <= 20, "rate-limit diagnosis leaked file descriptors")
+        check(usage["Threads"] <= 12, "rate-limit diagnosis leaked threads")
+        return {"passed": True, "avoided_http_calls": 33,
+                "downstream_429": 33, "fallback_200": 1,
+                "metrics": expected, "rss_kib": usage["VmRSS"]}
+    finally:
+        proc.terminate()
+        try:
+            _, logs = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, logs = proc.communicate(timeout=5)
+        limited.shutdown()
+        thread.join(timeout=3)
+        log = logs.decode("utf-8", "replace")
+        events = [json.loads(line) for line in log.splitlines()
+                  if line.startswith("{")]
+        check(any(e.get("event") == "rate_limit_exhausted" for e in events),
+              "rate-limit failure class missing from local diagnostics")
+        check(all(set(e) == {"ts_unix_ms", "level", "event", "sequence"}
+                  for e in events), "local diagnostics used uncontrolled fields")
+        check(all(secret not in log for secret in
+                  ("local-only-synthetic-limited-key", "only-for-local-test",
+                   "diagnostic", "simulated", "http://127.0.0.1:")),
+              "rate-limit diagnostic log leaked content or internal endpoints")
 
 
 def verify_release_chain_management(binary: str, config: Path, directory: str) -> dict:
@@ -1073,6 +1234,8 @@ chains:
                     a.binary, directory, env, mock2)
                 summary["opt_in_circuit_gate"] = exercise_opt_in_circuit_gate(
                     a.binary, cfg, directory, env, mock1, mock2)
+                summary["rate_limit_recovery_gate"] = verify_release_rate_limit_exhaustion(
+                    a.binary, directory, env, mock2)
                 summary["auto_and_local_log_gate"] = verify_release_auto_and_local_logs(
                     a.binary, cfg, directory, env, mock1, mock2)
                 summary["structured_output_gate"] = verify_structured_output_on_release(

@@ -11,6 +11,7 @@ struct Credential {
     secret: String,
     epoch: u64,
     blocked_until: Option<Instant>,
+    blocked_for: Option<Outcome>,
     uses: u64,
 }
 struct Inner {
@@ -49,6 +50,7 @@ impl KeyPool {
                     secret: value.clone(),
                     epoch: 0,
                     blocked_until: None,
+                    blocked_for: None,
                     uses: 0,
                 })
             })
@@ -135,6 +137,7 @@ impl KeyPool {
         }
         key.epoch = key.epoch.wrapping_add(1);
         key.blocked_until = Instant::now().checked_add(delay);
+        key.blocked_for = Some(outcome);
         true
     }
 
@@ -145,7 +148,32 @@ impl KeyPool {
             && key.epoch == lease.epoch
         {
             key.blocked_until = None;
+            key.blocked_for = None;
         }
+    }
+
+    /// An advisory only when every usable credential is still cooling down
+    /// due specifically to upstream 429, never because of 401/403 or no keys.
+    /// The caller may safely map *all* eligible candidates to HTTP 429 only
+    /// if this is true for each candidate, preserving conservative failures.
+    pub fn all_keys_rate_limited_for(&self) -> Option<Duration> {
+        let now = Instant::now();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.credentials.is_empty() {
+            return None;
+        }
+        let mut shortest = Duration::MAX;
+        for key in &inner.credentials {
+            if key.blocked_for != Some(Outcome::RateLimited) {
+                return None;
+            }
+            let remaining = key.blocked_until?.checked_duration_since(now)?;
+            if remaining.is_zero() {
+                return None;
+            }
+            shortest = shortest.min(remaining);
+        }
+        Some(shortest)
     }
 
     pub fn configured_cooldown(&self, outcome: Outcome) -> Option<Duration> {
@@ -200,6 +228,40 @@ quarantine:
         assert!(!pool.record(&a_late, Outcome::RateLimited));
         assert!(pool.acquire(&HashSet::new()).is_some()); // other credential works
         assert!(!pool.record(&a_late, Outcome::ProviderTransient));
+    }
+
+    #[test]
+    fn exhausted_429_cooldown_requires_every_key_and_excludes_auth_or_missing() {
+        let mut provider = provider();
+        provider.quarantine.rate_limit = Some("5s".into());
+        let keys = HashMap::from([
+            ("A".to_owned(), "a-local".to_owned()),
+            ("B".to_owned(), "b-local".to_owned()),
+        ]);
+        let pool = KeyPool::new(&provider, &keys).unwrap();
+        assert!(pool.all_keys_rate_limited_for().is_none());
+        let first = pool.acquire(&HashSet::new()).unwrap();
+        assert!(pool.record(&first, Outcome::RateLimited));
+        assert!(pool.all_keys_rate_limited_for().is_none());
+        let second = pool.acquire(&HashSet::new()).unwrap();
+        assert!(pool.record(&second, Outcome::RateLimited));
+        let remaining = pool.all_keys_rate_limited_for().unwrap();
+        assert!(remaining > Duration::from_secs(4));
+        assert!(remaining <= Duration::from_secs(5));
+        assert!(pool.acquire(&HashSet::new()).is_none());
+        // A stale success cannot clear an earlier quarantine.
+        pool.record_success(&first);
+        assert!(pool.all_keys_rate_limited_for().is_some());
+
+        let auth_pool = KeyPool::new(&provider, &keys).unwrap();
+        let first = auth_pool.acquire(&HashSet::new()).unwrap();
+        assert!(auth_pool.record(&first, Outcome::RateLimited));
+        let second = auth_pool.acquire(&HashSet::new()).unwrap();
+        assert!(auth_pool.record(&second, Outcome::CredentialAuth));
+        assert!(auth_pool.all_keys_rate_limited_for().is_none());
+
+        let empty = KeyPool::new(&provider, &HashMap::new()).unwrap();
+        assert!(empty.all_keys_rate_limited_for().is_none());
     }
 
     #[test]
