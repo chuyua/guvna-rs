@@ -3119,7 +3119,7 @@ async fn drive_aggregating_progress(
 
 #[tokio::test(flavor = "current_thread")]
 async fn sse_only_aggregation_survives_ninety_seconds_of_valid_progress() {
-    let (status, result, elapsed, primary, backup) = drive_aggregating_progress(true, "2m").await;
+    let (status, result, elapsed, primary, backup) = drive_aggregating_progress(true, "3m").await;
     assert!(elapsed > std::time::Duration::from_secs(90), "{elapsed:?}");
     assert!(elapsed < std::time::Duration::from_secs(10 * 60));
     assert_eq!(status, StatusCode::OK, "{result}");

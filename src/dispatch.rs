@@ -390,6 +390,7 @@ async fn dispatch_inner(
                     // retries or heartbeats across multiple candidates.
                     let lifetime =
                         tokio::time::Instant::now() + chat_aggregate::MAX_AGGREGATION_LIFETIME;
+                    let lifetime = walk_deadline.map_or(lifetime, |until| until.min(lifetime));
                     let aggregated = tokio::time::timeout_at(
                         lifetime,
                         chat_aggregate::aggregate(
