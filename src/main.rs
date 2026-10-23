@@ -22,6 +22,7 @@ async fn run() -> Result<(), String> {
     let mut healthcheck = false;
     let mut status = false;
     let mut logs = false;
+    let mut system_journal = false;
     let mut tail: usize = 100;
     let mut chains_action: Option<String> = None;
     let mut chains_file: Option<PathBuf> = None;
@@ -51,6 +52,7 @@ async fn run() -> Result<(), String> {
             "-data" | "--data" => {
                 data_dir = PathBuf::from(args.next().ok_or("missing -data value")?);
             }
+            "--system" if logs => system_journal = true,
             "--tail" if logs => {
                 tail = args
                     .next()
@@ -77,7 +79,7 @@ async fn run() -> Result<(), String> {
             }
             "--help" | "-h" | "help" => {
                 println!(
-                    "guvna serve [-config config.yaml] [-data DIR]\nguvna status [-config config.yaml]\nguvna logs [--tail 100]\n  --healthcheck probes /healthz\nguvna chains list|validate [-config FILE] [-data DIR]\nguvna chains set -file CHAIN.yaml [-config FILE] [-data DIR]\nguvna chains delete -name NAME [-config FILE] [-data DIR]\nguvna chains recover [-from BACKUP] [-config FILE] [-data DIR]\n  --version"
+                    "guvna serve [-config config.yaml] [-data DIR]\nguvna status [-config config.yaml]\nguvna logs [--tail 100] [--system]\n  --healthcheck probes /healthz\nguvna chains list|validate [-config FILE] [-data DIR]\nguvna chains set -file CHAIN.yaml [-config FILE] [-data DIR]\nguvna chains delete -name NAME [-config FILE] [-data DIR]\nguvna chains recover [-from BACKUP] [-config FILE] [-data DIR]\n  --version"
                 );
                 return Ok(());
             }
@@ -86,17 +88,16 @@ async fn run() -> Result<(), String> {
     }
 
     if logs {
+        #[cfg(not(target_os = "linux"))]
+        let _ = system_journal;
         #[cfg(target_os = "linux")]
         {
-            let result = std::process::Command::new("journalctl")
-                .args([
-                    "--user",
-                    "-u",
-                    "guvna.service",
-                    "--no-pager",
-                    "-n",
-                    &tail.to_string(),
-                ])
+            let mut command = std::process::Command::new("journalctl");
+            if !system_journal {
+                command.arg("--user");
+            }
+            let result = command
+                .args(["-u", "guvna.service", "--no-pager", "-n", &tail.to_string()])
                 .status()
                 .map_err(|e| format!("journalctl unavailable: {e}"))?;
             if !result.success() {
@@ -141,7 +142,16 @@ async fn run() -> Result<(), String> {
     }
     let config = Config::load(&real_path)?.with_runtime_chains(&data_dir)?;
     if healthcheck || status {
-        let url = format!("http://127.0.0.1:{}/healthz", config.port);
+        let bind = env::var("GUVNA_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+        let probe_host = match bind.as_str() {
+            "0.0.0.0" => "127.0.0.1",
+            "::" | "[::]" => "[::1]",
+            other if other.contains(':') && !other.starts_with('[') => {
+                return Err("invalid GUVNA_BIND_ADDR for local healthcheck".into());
+            }
+            other => other,
+        };
+        let url = format!("http://{probe_host}:{}/healthz", config.port);
         let response = reqwest::Client::new()
             .get(url)
             .timeout(std::time::Duration::from_secs(3))
