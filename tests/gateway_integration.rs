@@ -544,3 +544,43 @@ async fn model_catalog_and_detail_are_consistent_and_authorized() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(hits.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn catalog_exposes_configured_provider_models_without_upstream_discovery() {
+    let cfg: guvna::config::Config = serde_yaml::from_str(
+        "providers:\n  - name: fast\n    type: openai\n    base_url: https://example.org\n    key_env: FAST\n    prefixes: [fast, openai]\n    models: [gpt-a, gpt-b]\nchains:\n  - name: demo\n    steps:\n      - provider: fast\n        model: gpt-a\n",
+    ).unwrap();
+    let router = app(AppState::new(
+        cfg,
+        HashMap::from([("FAST".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let req = |uri: &str| {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", "Bearer client")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, list) = call(router.clone(), req("/v1/models")).await;
+    assert_eq!(status, StatusCode::OK);
+    let data = list["data"].as_array().unwrap();
+    let ids: Vec<_> = data
+        .iter()
+        .map(|model| model["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "demo",
+            "fast/gpt-a",
+            "fast/gpt-b",
+            "openai/gpt-a",
+            "openai/gpt-b"
+        ]
+    );
+    let (status, detail) = call(router, req("/v1/models/openai%2Fgpt-b")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["owned_by"], "fast");
+}

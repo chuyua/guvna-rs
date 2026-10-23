@@ -76,17 +76,23 @@ impl KeyPool {
         } else {
             inner.next % count
         };
-        let mut eligible: Vec<usize> = (0..count)
-            .map(|offset| (start + offset) % count)
-            .filter(|&i| {
-                let k = &inner.credentials[i];
-                !excluded.contains(&k.env) && k.blocked_until.is_none_or(|t| t <= now)
-            })
-            .collect();
-        if self.rotation == "least_used" {
-            eligible.sort_by_key(|&i| inner.credentials[i].uses);
+        // Scan in rotation order without allocating or sorting an index vector per request.
+        let mut selected: Option<usize> = None;
+        for offset in 0..count {
+            let index = (start + offset) % count;
+            let key = &inner.credentials[index];
+            if excluded.contains(&key.env) || key.blocked_until.is_some_and(|until| until > now) {
+                continue;
+            }
+            if self.rotation != "least_used" {
+                selected = Some(index);
+                break;
+            }
+            if selected.is_none_or(|old| key.uses < inner.credentials[old].uses) {
+                selected = Some(index);
+            }
         }
-        let index = *eligible.first()?;
+        let index = selected?;
         inner.next = (index + 1) % count;
         let key = &mut inner.credentials[index];
         key.uses += 1;
