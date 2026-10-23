@@ -39,8 +39,13 @@ Unsupported reasoning, image, audio, stateful continuation, and other
 advanced Responses modes remain explicitly unsupported. The gateway must not
 be treated as full OpenAI Responses parity or a production drop-in replacement.
 
-Not yet shipped: Auto, CLI management, persistent chain mutation, telemetry,
+Not yet shipped: Auto, CLI management, persistent chain mutation,
 complete Go protocol parity and full multi-modal streaming.
+
+POST /v1/chat/completions, /v1/embeddings and /v1/responses authenticate
+request headers **before** buffering the request body. The existing 32 MiB
+body limit is enforced for authorized requests, including chunked requests;
+invalid credentials are rejected without consuming a slow or unbounded body.
 
 ## Development
 

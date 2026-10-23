@@ -2,8 +2,8 @@
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
-    extract::{DefaultBodyLimit, Path as AxumPath, State},
-    http::{HeaderMap, StatusCode},
+    extract::{DefaultBodyLimit, FromRequest, Path as AxumPath, State},
+    http::{HeaderMap, Request, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -138,6 +138,38 @@ fn unauthorized() -> Response {
     )
 }
 
+// Authenticate before invoking Bytes::from_request: the normal Bytes handler
+// extractor buffers the body before handler-level authorization can run.
+enum RequestBodyError {
+    Unauthorized,
+    Invalid(StatusCode),
+}
+
+impl RequestBodyError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Unauthorized => unauthorized(),
+            Self::Invalid(status) => error(
+                status,
+                "invalid_body",
+                "Request body is invalid or exceeds the configured limit",
+            ),
+        }
+    }
+}
+
+async fn authenticated_body(
+    state: &Arc<AppState>,
+    request: Request<Body>,
+) -> Result<Bytes, RequestBodyError> {
+    if !state.allowed(request.headers()) {
+        return Err(RequestBodyError::Unauthorized);
+    }
+    Bytes::from_request(request, state)
+        .await
+        .map_err(|rejection| RequestBodyError::Invalid(rejection.status()))
+}
+
 // Keep one classification path for all candidate and SSE circuit outcomes.
 fn record_circuit_failure(ticket: &mut Option<Ticket>, metrics: &Metrics) {
     if let Some(ticket) = ticket {
@@ -224,14 +256,11 @@ async fn model_detail(
 }
 
 // Minimal non-streaming Responses compatibility adapter. Unsupported modes fail closed.
-async fn responses(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if !state.allowed(&headers) {
-        return unauthorized();
-    }
+async fn responses(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
+    let body = match authenticated_body(&state, request).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
     let mut value: Value = match serde_json::from_slice::<Value>(&body) {
         Ok(value) if value.is_object() => value,
         _ => {
@@ -778,13 +807,7 @@ async fn responses(
         object.insert("max_tokens".into(), tokens);
     }
     let response_metrics = state.metrics.clone();
-    let response = dispatch(
-        state,
-        headers,
-        Bytes::from(value.to_string()),
-        Endpoint::Chat,
-    )
-    .await;
+    let response = dispatch(state, Bytes::from(value.to_string()), Endpoint::Chat).await;
     if response.status() != StatusCode::OK {
         return response;
     }
@@ -1003,26 +1026,22 @@ impl Endpoint {
     }
 }
 
-async fn chat(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    dispatch(state, headers, body, Endpoint::Chat).await
+async fn chat(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
+    let body = match authenticated_body(&state, request).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    dispatch(state, body, Endpoint::Chat).await
 }
-async fn embeddings(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    dispatch(state, headers, body, Endpoint::Embeddings).await
+async fn embeddings(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
+    let body = match authenticated_body(&state, request).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    dispatch(state, body, Endpoint::Embeddings).await
 }
 
-async fn dispatch(
-    state: Arc<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-    endpoint: Endpoint,
-) -> Response {
-    if !state.allowed(&headers) {
-        return unauthorized();
-    }
+async fn dispatch(state: Arc<AppState>, body: Bytes, endpoint: Endpoint) -> Response {
     let request: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
@@ -1601,15 +1620,10 @@ mod tests {
             .try_acquire_many_owned(MAX_INFLIGHT_REQUESTS as u32)
             .unwrap();
         assert_eq!(state.inflight.available_permits(), 0);
-        let headers = HeaderMap::from_iter([(
-            axum::http::header::AUTHORIZATION,
-            axum::http::HeaderValue::from_static("Bearer client"),
-        )]);
         let response = tokio::time::timeout(
             Duration::from_millis(200),
             dispatch(
                 state.clone(),
-                headers,
                 Bytes::from_static(
                     br#"{"model":"demo","messages":[{"role":"user","content":"hi"}]}"#,
                 ),
