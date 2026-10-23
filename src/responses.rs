@@ -58,231 +58,9 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             "input is required",
         );
     };
-    // Translate the common Responses text message shape into Chat Completions.
-    // Reject non-text content rather than silently discarding image/tool data.
-    let messages = match input {
-        Value::String(text) => json!([{"role":"user","content":text}]),
-        Value::Array(items) if !items.is_empty() => {
-            let mut messages = Vec::with_capacity(items.len());
-            let mut pending_calls = std::collections::HashSet::<String>::new();
-            let mut seen_calls = std::collections::HashSet::<String>::new();
-            for item in items {
-                if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
-                    let Some(call_id) = item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
-                    else {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_function_output",
-                            "function_call_output requires call_id",
-                        );
-                    };
-                    let Some(output) = item.get("output").and_then(Value::as_str) else {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_function_output",
-                            "function_call_output requires string output",
-                        );
-                    };
-                    if item.as_object().is_none_or(|map| {
-                        map.keys()
-                            .any(|key| !["type", "call_id", "output"].contains(&key.as_str()))
-                    }) {
-                        return error(
-                            StatusCode::NOT_IMPLEMENTED,
-                            "function_output_unsupported",
-                            "Unsupported function output fields",
-                        );
-                    }
-                    if !pending_calls.remove(call_id) {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "orphan_function_output",
-                            "Function output has no matching preceding call",
-                        );
-                    }
-                    messages.push(json!({"role":"tool","tool_call_id":call_id,"content":output}));
-                    continue;
-                }
-                if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                    let Some(call_id) = item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
-                    else {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_function_call",
-                            "function_call requires call_id",
-                        );
-                    };
-                    let Some(name) = item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .filter(|name| !name.is_empty())
-                    else {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_function_call",
-                            "function_call requires name",
-                        );
-                    };
-                    let Some(arguments) = item.get("arguments").and_then(Value::as_str) else {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_function_call",
-                            "function_call requires arguments",
-                        );
-                    };
-                    if !serde_json::from_str::<Value>(arguments)
-                        .is_ok_and(|value| value.is_object())
-                        || item.as_object().is_none_or(|map| {
-                            map.keys().any(|key| {
-                                !["type", "call_id", "name", "arguments", "id", "status"]
-                                    .contains(&key.as_str())
-                            })
-                        })
-                    {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_function_call",
-                            "Invalid function call arguments or fields",
-                        );
-                    }
-                    if item
-                        .get("id")
-                        .is_some_and(|v| v.as_str().is_none_or(str::is_empty))
-                        || item.get("status").is_some_and(|v| v != "completed")
-                    {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_function_call",
-                            "Function call id and status must be valid",
-                        );
-                    }
-                    if !seen_calls.insert(call_id.to_owned())
-                        || !pending_calls.insert(call_id.to_owned())
-                    {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "duplicate_function_call",
-                            "Function call id is already pending",
-                        );
-                    }
-                    let tool_call = json!({"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}});
-                    if let Some(last) = messages.last_mut().filter(|message: &&mut Value| {
-                        message["role"] == "assistant" && message["tool_calls"].is_array()
-                    }) {
-                        last["tool_calls"]
-                            .as_array_mut()
-                            .expect("checked above")
-                            .push(tool_call);
-                    } else {
-                        messages.push(json!({"role":"assistant","content":Value::Null,"tool_calls":[tool_call]}));
-                    }
-                    continue;
-                }
-                if !pending_calls.is_empty() {
-                    return error(
-                        StatusCode::BAD_REQUEST,
-                        "pending_function_calls",
-                        "Function calls must be resolved before another message",
-                    );
-                }
-                let Some(role) = item.get("role").and_then(Value::as_str) else {
-                    return error(
-                        StatusCode::BAD_REQUEST,
-                        "unsupported_input",
-                        "Input messages require a role",
-                    );
-                };
-                if !matches!(role, "user" | "assistant" | "system" | "developer")
-                    || item.get("type").is_some_and(|kind| kind != "message")
-                    || item.as_object().is_none_or(|obj| {
-                        obj.keys()
-                            .any(|k| !["role", "content", "type"].contains(&k.as_str()))
-                    })
-                {
-                    return error(
-                        StatusCode::NOT_IMPLEMENTED,
-                        "responses_input_unsupported",
-                        "Only plain text messages are supported",
-                    );
-                }
-                let Some(content) = item.get("content") else {
-                    return error(
-                        StatusCode::BAD_REQUEST,
-                        "unsupported_input",
-                        "Input messages require content",
-                    );
-                };
-                let text = if let Some(text) = content.as_str() {
-                    text.to_owned()
-                } else if let Some(parts) = content.as_array() {
-                    if parts.is_empty() {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "unsupported_input",
-                            "Empty content parts",
-                        );
-                    }
-                    let mut text = String::new();
-                    for part in parts {
-                        if !matches!(
-                            part.get("type").and_then(Value::as_str),
-                            Some("input_text") | Some("output_text")
-                        ) || part.as_object().is_none_or(|obj| obj.len() != 2)
-                        {
-                            return error(
-                                StatusCode::NOT_IMPLEMENTED,
-                                "responses_input_unsupported",
-                                "Only input_text or output_text content parts are supported",
-                            );
-                        }
-                        if part["type"] == "output_text" && role != "assistant" {
-                            return error(
-                                StatusCode::BAD_REQUEST,
-                                "invalid_output_text_role",
-                                "output_text parts require assistant role",
-                            );
-                        }
-                        let Some(fragment) = part.get("text").and_then(Value::as_str) else {
-                            return error(
-                                StatusCode::BAD_REQUEST,
-                                "unsupported_input",
-                                "input_text requires text",
-                            );
-                        };
-                        text.push_str(fragment);
-                    }
-                    text
-                } else {
-                    return error(
-                        StatusCode::NOT_IMPLEMENTED,
-                        "responses_input_unsupported",
-                        "Unsupported message content",
-                    );
-                };
-                messages.push(json!({"role":role,"content":text}));
-            }
-            if !pending_calls.is_empty() {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "pending_function_calls",
-                    "Function calls require matching output before continuing",
-                );
-            }
-            Value::Array(messages)
-        }
-        _ => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "unsupported_input",
-                "Only text or text message arrays are supported",
-            );
-        }
+    let messages = match translate_input(input) {
+        Ok(messages) => messages,
+        Err(response) => return *response,
     };
     for (name, min, max) in [("temperature", 0.0, 2.0), ("top_p", 0.0, 1.0)] {
         if value.get(name).is_some_and(|parameter| {
@@ -599,6 +377,244 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             );
         }
     };
+    translate_chat_result(chat, logical_model, metadata)
+}
+
+// Map input text or complete message/function-call history into
+// Chat messages. Preserve all original rejection codes and requirements.
+fn translate_input(input: Value) -> Result<Value, Box<Response>> {
+    // Translate the common Responses text message shape into Chat Completions.
+    // Reject non-text content rather than silently discarding image/tool data.
+    let messages = match input {
+        Value::String(text) => json!([{"role":"user","content":text}]),
+        Value::Array(items) if !items.is_empty() => {
+            let mut messages = Vec::with_capacity(items.len());
+            let mut pending_calls = std::collections::HashSet::<String>::new();
+            let mut seen_calls = std::collections::HashSet::<String>::new();
+            for item in items {
+                if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+                    let Some(call_id) = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                    else {
+                        return Err(Box::new(error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_output",
+                            "function_call_output requires call_id",
+                        )));
+                    };
+                    let Some(output) = item.get("output").and_then(Value::as_str) else {
+                        return Err(Box::new(error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_output",
+                            "function_call_output requires string output",
+                        )));
+                    };
+                    if item.as_object().is_none_or(|map| {
+                        map.keys()
+                            .any(|key| !["type", "call_id", "output"].contains(&key.as_str()))
+                    }) {
+                        return Err(Box::new(error(
+                            StatusCode::NOT_IMPLEMENTED,
+                            "function_output_unsupported",
+                            "Unsupported function output fields",
+                        )));
+                    }
+                    if !pending_calls.remove(call_id) {
+                        return Err(Box::new(error(
+                            StatusCode::BAD_REQUEST,
+                            "orphan_function_output",
+                            "Function output has no matching preceding call",
+                        )));
+                    }
+                    messages.push(json!({"role":"tool","tool_call_id":call_id,"content":output}));
+                    continue;
+                }
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    let Some(call_id) = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                    else {
+                        return Err(Box::new(error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_call",
+                            "function_call requires call_id",
+                        )));
+                    };
+                    let Some(name) = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                    else {
+                        return Err(Box::new(error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_call",
+                            "function_call requires name",
+                        )));
+                    };
+                    let Some(arguments) = item.get("arguments").and_then(Value::as_str) else {
+                        return Err(Box::new(error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_call",
+                            "function_call requires arguments",
+                        )));
+                    };
+                    if !serde_json::from_str::<Value>(arguments)
+                        .is_ok_and(|value| value.is_object())
+                        || item.as_object().is_none_or(|map| {
+                            map.keys().any(|key| {
+                                !["type", "call_id", "name", "arguments", "id", "status"]
+                                    .contains(&key.as_str())
+                            })
+                        })
+                    {
+                        return Err(Box::new(error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_call",
+                            "Invalid function call arguments or fields",
+                        )));
+                    }
+                    if item
+                        .get("id")
+                        .is_some_and(|v| v.as_str().is_none_or(str::is_empty))
+                        || item.get("status").is_some_and(|v| v != "completed")
+                    {
+                        return Err(Box::new(error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_call",
+                            "Function call id and status must be valid",
+                        )));
+                    }
+                    if !seen_calls.insert(call_id.to_owned())
+                        || !pending_calls.insert(call_id.to_owned())
+                    {
+                        return Err(Box::new(error(
+                            StatusCode::BAD_REQUEST,
+                            "duplicate_function_call",
+                            "Function call id is already pending",
+                        )));
+                    }
+                    let tool_call = json!({"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}});
+                    if let Some(last) = messages.last_mut().filter(|message: &&mut Value| {
+                        message["role"] == "assistant" && message["tool_calls"].is_array()
+                    }) {
+                        last["tool_calls"]
+                            .as_array_mut()
+                            .expect("checked above")
+                            .push(tool_call);
+                    } else {
+                        messages.push(json!({"role":"assistant","content":Value::Null,"tool_calls":[tool_call]}));
+                    }
+                    continue;
+                }
+                if !pending_calls.is_empty() {
+                    return Err(Box::new(error(
+                        StatusCode::BAD_REQUEST,
+                        "pending_function_calls",
+                        "Function calls must be resolved before another message",
+                    )));
+                }
+                let Some(role) = item.get("role").and_then(Value::as_str) else {
+                    return Err(Box::new(error(
+                        StatusCode::BAD_REQUEST,
+                        "unsupported_input",
+                        "Input messages require a role",
+                    )));
+                };
+                if !matches!(role, "user" | "assistant" | "system" | "developer")
+                    || item.get("type").is_some_and(|kind| kind != "message")
+                    || item.as_object().is_none_or(|obj| {
+                        obj.keys()
+                            .any(|k| !["role", "content", "type"].contains(&k.as_str()))
+                    })
+                {
+                    return Err(Box::new(error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "responses_input_unsupported",
+                        "Only plain text messages are supported",
+                    )));
+                }
+                let Some(content) = item.get("content") else {
+                    return Err(Box::new(error(
+                        StatusCode::BAD_REQUEST,
+                        "unsupported_input",
+                        "Input messages require content",
+                    )));
+                };
+                let text = if let Some(text) = content.as_str() {
+                    text.to_owned()
+                } else if let Some(parts) = content.as_array() {
+                    if parts.is_empty() {
+                        return Err(Box::new(error(
+                            StatusCode::BAD_REQUEST,
+                            "unsupported_input",
+                            "Empty content parts",
+                        )));
+                    }
+                    let mut text = String::new();
+                    for part in parts {
+                        if !matches!(
+                            part.get("type").and_then(Value::as_str),
+                            Some("input_text") | Some("output_text")
+                        ) || part.as_object().is_none_or(|obj| obj.len() != 2)
+                        {
+                            return Err(Box::new(error(
+                                StatusCode::NOT_IMPLEMENTED,
+                                "responses_input_unsupported",
+                                "Only input_text or output_text content parts are supported",
+                            )));
+                        }
+                        if part["type"] == "output_text" && role != "assistant" {
+                            return Err(Box::new(error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_output_text_role",
+                                "output_text parts require assistant role",
+                            )));
+                        }
+                        let Some(fragment) = part.get("text").and_then(Value::as_str) else {
+                            return Err(Box::new(error(
+                                StatusCode::BAD_REQUEST,
+                                "unsupported_input",
+                                "input_text requires text",
+                            )));
+                        };
+                        text.push_str(fragment);
+                    }
+                    text
+                } else {
+                    return Err(Box::new(error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "responses_input_unsupported",
+                        "Unsupported message content",
+                    )));
+                };
+                messages.push(json!({"role":role,"content":text}));
+            }
+            if !pending_calls.is_empty() {
+                return Err(Box::new(error(
+                    StatusCode::BAD_REQUEST,
+                    "pending_function_calls",
+                    "Function calls require matching output before continuing",
+                )));
+            }
+            Value::Array(messages)
+        }
+        _ => {
+            return Err(Box::new(error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_input",
+                "Only text or text message arrays are supported",
+            )));
+        }
+    };
+    Ok(messages)
+}
+
+// Convert one fully buffered Chat Completion into a non-streaming Responses
+// document. This function performs no I/O, routing or retry decisions.
+fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) -> Response {
     // Validate and translate usage once for both text and function-call responses.
     let usage = &chat["usage"];
     let translated_usage = match (
