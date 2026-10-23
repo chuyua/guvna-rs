@@ -39,6 +39,9 @@ Long-running SSE streams retain their permits until completion/cancellation.
   applied; stale concurrent failures cannot increase this counter.
 - guvna_candidate_fallbacks_total: transitions to the next chain step, not
   each attempted credential or retry.
+- guvna_rate_limit_exhaustions_total: downstream requests returning HTTP 429
+  with bounded Retry-After because every eligible upstream candidate has
+  all usable keys in 429 cooldown. Never includes key/provider labels.
 - guvna_admission_rejections_total: requests rejected with 503 and
   Retry-After: 1 when concurrency admission is exhausted, including requests
   whose body has not yet been read.
