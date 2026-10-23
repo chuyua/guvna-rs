@@ -184,13 +184,8 @@ async fn responses(
             );
         }
     };
-    if value.get("stream") == Some(&Value::Bool(true)) {
-        return error(
-            StatusCode::NOT_IMPLEMENTED,
-            "responses_stream_unsupported",
-            "Responses streaming is not supported",
-        );
-    }
+    let streaming = value.get("stream") == Some(&Value::Bool(true));
+
     if value.get("stream").is_some_and(|v| !v.is_boolean()) {
         return error(
             StatusCode::BAD_REQUEST,
@@ -717,7 +712,9 @@ async fn responses(
         items.insert(0, json!({"role":"system","content":text}));
     }
     object.remove("input");
-    object.remove("stream");
+    if !streaming {
+        object.remove("stream");
+    }
     object.insert("messages".into(), messages);
     if let Some(tokens) = object.remove("max_output_tokens") {
         object.insert("max_tokens".into(), tokens);
@@ -731,6 +728,9 @@ async fn responses(
     .await;
     if response.status() != StatusCode::OK {
         return response;
+    }
+    if streaming {
+        return crate::responses_sse::wrap(response, logical_model, metadata);
     }
     let bytes = match to_bytes(response.into_body(), MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,

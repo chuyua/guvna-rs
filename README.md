@@ -24,9 +24,23 @@ gateway cannot replay a partially delivered response on another provider.
 Disconnecting the client drops the upstream stream. The first event must
 arrive within 15 seconds; a stream event is limited to 1 MiB.
 
-Not yet shipped: Responses translation, Auto, CLI management, persistent chain
-mutation, telemetry, complete streaming tool-call validation, Go protocol
-parity. Responses still return 501; this is not a production replacement.
+Responses now supports bounded non-streaming text and function-call translation,
+and incremental text/function-call SSE translation via POST /v1/responses
+with stream:true. The streaming bridge emits response lifecycle, text delta,
+function-call argument delta/done and terminal events. It preserves stateless
+metadata and honors stop versus length finish reasons. Invalid or truncated
+upstream streams fail closed with response.failed or an error event; there is
+no silent provider replay after streaming begins.
+
+Responses streaming limits: 512 KiB combined generated text and function
+arguments, 256 KiB per function's arguments, 32 parallel function calls,
+1 MiB maximum framed SSE chunk, and 15 seconds of upstream idle time.
+Unsupported reasoning, image, audio, stateful continuation, and other
+advanced Responses modes remain explicitly unsupported. The gateway must not
+be treated as full OpenAI Responses parity or a production drop-in replacement.
+
+Not yet shipped: Auto, CLI management, persistent chain mutation, telemetry,
+complete Go protocol parity and full multi-modal streaming.
 
 ## Development
 

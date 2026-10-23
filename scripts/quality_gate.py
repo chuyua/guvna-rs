@@ -59,6 +59,26 @@ class StubHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if self.server.role == "healthy" and query.get("stream") is True:
+            first = {"id": "quality-stream", "created": 1, "choices": [{
+                "index": 0, "delta": {"role": "assistant", "content": "ok"},
+                "finish_reason": None}]}
+            finish = {"id": "quality-stream", "choices": [{
+                "index": 0, "delta": {}, "finish_reason": "stop"}]}
+            payload = (
+                "data: " + json.dumps(first, separators=(",", ":")) + "\n\n"
+                + "data: " + json.dumps(finish, separators=(",", ":"))
+                + "\n\ndata: [DONE]\n\n"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            try:
+                self.wfile.write(payload)
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+            return
         if self.server.role == "primary":
             seed = int(query.get("seed", 0))
             if seed % 17 == 0:
@@ -185,6 +205,63 @@ def run_wave(url: str, model: str, requests: int, clients: int, pid: int):
             "peak_rss_kib": peak_rss, "statuses": results}
 
 
+
+def timed_responses_sse_query(url: str, number: int):
+    start = time.monotonic()
+    data = json.dumps({"model": "healthy", "input": "ping", "stream": True,
+                       "metadata": {"request": str(number)}}).encode()
+    request = Request(url, data=data, method="POST", headers={
+        "Authorization": "Bearer only-for-local-test",
+        "Content-Type": "application/json",
+    })
+    try:
+        with urlopen(request, timeout=15) as resp:
+            if resp.status != 200 or resp.headers.get_content_type() != "text/event-stream":
+                return resp.status, "wrong_stream_response", (time.monotonic() - start) * 1000
+            raw = resp.read(1 << 20).decode("utf-8")
+            events = [json.loads(line[6:]) for line in raw.splitlines()
+                      if line.startswith("data: ")]
+            completed = [event for event in events
+                         if event.get("type") == "response.completed"]
+            if (len(completed) != 1 or len(events) < 5
+                    or any(event.get("sequence_number") != index
+                           for index, event in enumerate(events))
+                    or any(event.get("type") in ("error", "response.failed")
+                           for event in events)):
+                return resp.status, "invalid_sse_events", (time.monotonic() - start) * 1000
+            response = completed[0]["response"]
+            if (response["output_text"] != "ok"
+                    or response["status"] != "completed"
+                    or response["metadata"]["request"] != str(number)):
+                return resp.status, "wrong_stream_payload", (time.monotonic() - start) * 1000
+            return resp.status, "ok", (time.monotonic() - start) * 1000
+    except HTTPError as err:
+        return err.code, "http_error", (time.monotonic() - start) * 1000
+    except (OSError, ValueError, KeyError, URLError, UnicodeError) as err:
+        return 0, type(err).__name__, (time.monotonic() - start) * 1000
+
+
+def run_responses_sse_wave(url: str, requests: int, clients: int, pid: int):
+    results = {}
+    latencies = []
+    peak_rss = 0
+    with ThreadPoolExecutor(max_workers=clients) as pool:
+        futures = [pool.submit(timed_responses_sse_query, url, i)
+                   for i in range(requests)]
+        for future in as_completed(futures):
+            status, reason, elapsed_ms = future.result()
+            key = f"{status}:{reason}"
+            results[key] = results.get(key, 0) + 1
+            latencies.append(elapsed_ms)
+            peak_rss = max(peak_rss, proc_info(pid)["VmHWM"])
+    check(results == {"200:ok": requests},
+          f"Responses SSE wave: expected {requests} valid complete streams, got {results}")
+    latencies.sort()
+    p95 = latencies[max(0, int((len(latencies) - 1) * .95))]
+    check(p95 <= 4000, f"Responses SSE latency P95 {p95:.1f}ms exceeded 4000ms")
+    return {"requests": requests, "clients": clients,
+            "peak_rss_kib": peak_rss, "p95_ms": round(p95, 2),
+            "statuses": results}
 def idle(pid: int, seconds: float):
     samples = []
     cpu_first = proc_info(pid)
@@ -299,9 +376,24 @@ chains:
                       "FD leak between waves")
                 check(summary["post_wave2"]["threads"] - summary["post_wave1"]["threads"] <= 8,
                       "thread leak between waves")
+                # Exercise streaming Responses on the real release binary, not only unit mocks.
+                stream_requests = min(200, max(30, a.requests // 10))
+                stream_clients = min(16, a.clients)
+                response_endpoint = f"http://127.0.0.1:{gateway_port}/v1/responses"
+                summary["responses_sse_wave"] = run_responses_sse_wave(
+                    response_endpoint, stream_requests, stream_clients, proc.pid)
+                summary["post_sse_idle"] = idle(proc.pid, a.idle_seconds)
+                check(summary["responses_sse_wave"]["peak_rss_kib"] <=
+                      a.max_peak_rss_mib * 1024, "Responses SSE peak RSS limit exceeded")
+                check(summary["post_sse_idle"]["rss_kib_max"] <=
+                      a.max_idle_rss_mib * 1024, "post Responses SSE idle RSS exceeded")
+                check(summary["post_sse_idle"]["fds"] - summary["post_wave2"]["fds"] <= 8,
+                      "Responses SSE leaked file descriptors")
+                check(summary["post_sse_idle"]["threads"] - summary["post_wave2"]["threads"] <= 8,
+                      "Responses SSE leaked threads")
                 check(mock1.calls == a.requests, f"chaos attempt count {mock1.calls} != {a.requests}")
-                check(mock2.calls == a.requests * 2,
-                      f"healthy provider call count {mock2.calls} != {a.requests * 2}")
+                check(mock2.calls == a.requests * 2 + stream_requests,
+                      f"healthy provider call count {mock2.calls} != {a.requests * 2 + stream_requests}")
                 summary["upstream_calls"] = {"primary": mock1.calls, "healthy": mock2.calls}
                 summary["faults"] = mock1.faults
                 check(all(count > 0 for count in mock1.faults.values()),

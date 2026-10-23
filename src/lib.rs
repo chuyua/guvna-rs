@@ -5,3 +5,5 @@ pub mod keypool;
 pub mod outcome;
 pub mod routing;
 pub mod sse;
+
+pub(crate) mod responses_sse;
