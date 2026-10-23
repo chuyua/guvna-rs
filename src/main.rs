@@ -23,6 +23,7 @@ async fn run() -> Result<(), String> {
     let mut status = false;
     let mut logs = false;
     let mut system_journal = false;
+    let mut tail_specified = false;
     let mut tail: usize = 100;
     let mut chains_action: Option<String> = None;
     let mut chains_file: Option<PathBuf> = None;
@@ -54,6 +55,7 @@ async fn run() -> Result<(), String> {
             }
             "--system" if logs => system_journal = true,
             "--tail" if logs => {
+                tail_specified = true;
                 tail = args
                     .next()
                     .ok_or("missing --tail value")?
@@ -108,11 +110,14 @@ async fn run() -> Result<(), String> {
         #[cfg(not(target_os = "linux"))]
         return Err("logs requires Linux systemd journal".into());
     }
+    if system_journal || tail_specified {
+        return Err("journal options require logs subcommand".into());
+    }
     let real_path = std::fs::canonicalize(&config_path)
         .map_err(|e| format!("config path {}: {e}", config_path.display()))?;
     if let Some(action) = chains_action {
         if healthcheck || status {
-            return Err("--healthcheck is only for serve".into());
+            return Err("healthcheck/status cannot be combined with chains".into());
         }
         let command = match action.as_str() {
             "list" if chains_file.is_none() && chains_name.is_none() && recover_from.is_none() => {
