@@ -1,7 +1,6 @@
 //! Incremental streaming parser.
 use bytes::Bytes;
 use serde_json::Value;
-use std::collections::HashSet;
 
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 
@@ -12,7 +11,7 @@ pub struct SseError;
 pub struct ChatSse {
     line: Vec<u8>,
     data: Vec<u8>,
-    finished: HashSet<u64>,
+    finished_mask: u64,
     expected: u64,
     done: bool,
 }
@@ -64,7 +63,7 @@ impl ChatSse {
                 return Err(SseError);
             }
             if data == b"[DONE]" {
-                if self.finished.len() as u64 != self.expected {
+                if self.finished_mask.count_ones() as u64 != self.expected {
                     return Err(SseError);
                 }
                 self.done = true;
@@ -83,7 +82,7 @@ impl ChatSse {
             .and_then(Value::as_array)
             .ok_or(SseError)?;
         if choices.is_empty()
-            && (self.finished.len() as u64 != self.expected
+            && (self.finished_mask.count_ones() as u64 != self.expected
                 || !event.get("usage").is_some_and(Value::is_object))
         {
             return Err(SseError);
@@ -105,11 +104,8 @@ impl ChatSse {
                 newly_finished |= bit;
             }
         }
-        for index in 0..self.expected {
-            if newly_finished & (1u64 << index) != 0 {
-                self.finished.insert(index);
-            }
-        }
+        self.finished_mask |= newly_finished;
+
         let mut normalized = Vec::with_capacity(data.len() + 8);
         normalized.extend_from_slice(b"data: ");
         normalized.extend_from_slice(&data);
@@ -123,7 +119,7 @@ impl ChatSse {
             .get("index")
             .and_then(Value::as_u64)
             .ok_or(SseError)?;
-        if index >= self.expected || self.finished.contains(&index) {
+        if index >= self.expected || (self.finished_mask & (1u64 << index) != 0) {
             return Err(SseError);
         }
         if !choice.get("delta").is_some_and(Value::is_object) {
@@ -240,7 +236,7 @@ mod tests {
 
 "#;
         assert!(parser.push(bad).is_err());
-        assert!(parser.finished.is_empty());
+        assert_eq!(parser.finished_mask, 0);
     }
 
     #[test]
@@ -252,5 +248,27 @@ mod tests {
         parser.push(END).unwrap();
         parser.push(b"data: [DONE]\n\n").unwrap();
         assert!(parser.push(b"extra").is_err());
+    }
+    #[test]
+    fn sixty_four_choices_finish_out_of_order_without_allocating_per_choice() {
+        let mut parser = ChatSse::new(64).unwrap();
+        let high: Vec<Value> = (32..64)
+            .rev()
+            .map(|index| serde_json::json!({"index":index,"delta":{},"finish_reason":"stop"}))
+            .collect();
+        let low: Vec<Value> = (0..32)
+            .rev()
+            .map(|index| serde_json::json!({"index":index,"delta":{},"finish_reason":"stop"}))
+            .collect();
+        assert_eq!(high.len(), 32);
+        let first = format!("data: {}\n\n", serde_json::json!({"choices":high}));
+        parser.push(first.as_bytes()).unwrap();
+        assert_eq!(parser.finished_mask.count_ones(), 32);
+        assert!(parser.push(b"data: [DONE]\n\n").is_err());
+        let second = format!("data: {}\n\n", serde_json::json!({"choices":low}));
+        parser.push(second.as_bytes()).unwrap();
+        assert_eq!(parser.finished_mask, u64::MAX);
+        parser.push(b"data: [DONE]\n\n").unwrap();
+        assert!(parser.finish().is_ok());
     }
 }

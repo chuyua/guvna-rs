@@ -48,6 +48,20 @@ concurrent clients, large-body fuzzing, prolonged soak, or live upstream
 compatibility. Those are separate extended/nightly gates and must report
 peak memory, P95/P99, error rate and throughput with the machine size.
 
+## Streaming fragmentation and worst-case parser gates
+
+The Rust unit suite checks a 128 KiB event delivered one byte at a time,
+two 600 KiB events coalesced in a single input chunk, single-frame oversize
+rejection, forbidden trailing bytes after [DONE], zero intermediate frame
+allocations on the ordinary single-frame path, and out-of-order completion
+across the full 64-choice Chat SSE range. This guards against quadratic
+rescanning, unnecessary heap churn, and false terminal success.
+
+The real Linux release-binary gate also fragments every 13th Responses SSE
+request across several network writes, including the terminal marker, and
+still requires every event sequence and response to complete correctly.
+These deterministic checks supplement the existing 200-request/16-client
+SSE wave, but do not replace dedicated prolonged soak or fuzzing.
 ## Planned broader gates
 
 - Deterministic random fault matrix (429/5xx/invalid JSON/stalled response/

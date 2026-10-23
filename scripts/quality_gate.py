@@ -75,7 +75,21 @@ class StubHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             try:
-                self.wfile.write(payload)
+                # Fragment deterministic subsets of live SSE traffic across
+                # JSON fields and even the terminal marker. No fake success
+                # from a buffered one-shot mock is accepted as the only proof.
+                request_num = int(query.get("metadata", {}).get("request", "0"))
+                if request_num % 13 == 0:
+                    cuts = (1, len(payload) // 3, len(payload) - 1)
+                    previous = 0
+                    for cut in cuts:
+                        self.wfile.write(payload[previous:cut])
+                        self.wfile.flush()
+                        time.sleep(0.001)
+                        previous = cut
+                    self.wfile.write(payload[previous:])
+                else:
+                    self.wfile.write(payload)
             except (ConnectionResetError, BrokenPipeError):
                 pass
             return

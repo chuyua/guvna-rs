@@ -27,6 +27,13 @@ arguments. SSE event data includes a monotonically increasing sequence number.
 ## Explicit resource and compatibility boundaries
 
 - Incoming normalized event: at most 1 MiB.
+- The parser scans incrementally across arbitrary TCP chunk boundaries; it
+  does not rescan the entire unfinished frame on each 1-byte fragment.
+- Multiple individually valid frames can be coalesced into one <=2 MiB chunk
+  without treating the sum of their sizes as an oversized single event.
+- A complete single-event chunk avoids the intermediate frame buffer copy.
+- Chat completion validation tracks up to 64 finished indices with one u64
+  bitset rather than a per-request heap-allocated set.
 - Total generated text and buffered function arguments: at most 512 KiB.
 - One function's arguments: at most 256 KiB.
 - Number of functions in a single response: at most 32.
