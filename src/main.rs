@@ -20,6 +20,7 @@ async fn run() -> Result<(), String> {
         })
         .unwrap_or_else(|| PathBuf::from(".guvna"));
     let mut healthcheck = false;
+    let mut status = false;
     let mut chains_action: Option<String> = None;
     let mut chains_file: Option<PathBuf> = None;
     let mut chains_name: Option<String> = None;
@@ -31,6 +32,9 @@ async fn run() -> Result<(), String> {
             args.next()
                 .ok_or("chains requires list|validate|set|delete|recover")?,
         );
+    } else if args.peek().is_some_and(|s| s == "status") {
+        args.next();
+        status = true;
     } else if args.peek().is_some_and(|s| s == "serve") {
         args.next();
     }
@@ -58,7 +62,7 @@ async fn run() -> Result<(), String> {
             }
             "--help" | "-h" | "help" => {
                 println!(
-                    "guvna serve [-config config.yaml] [-data DIR]\n  --healthcheck probes /healthz\nguvna chains list|validate [-config FILE] [-data DIR]\nguvna chains set -file CHAIN.yaml [-config FILE] [-data DIR]\nguvna chains delete -name NAME [-config FILE] [-data DIR]\nguvna chains recover [-from BACKUP] [-config FILE] [-data DIR]\n  --version"
+                    "guvna serve [-config config.yaml] [-data DIR]\nguvna status [-config config.yaml]\n  --healthcheck probes /healthz\nguvna chains list|validate [-config FILE] [-data DIR]\nguvna chains set -file CHAIN.yaml [-config FILE] [-data DIR]\nguvna chains delete -name NAME [-config FILE] [-data DIR]\nguvna chains recover [-from BACKUP] [-config FILE] [-data DIR]\n  --version"
                 );
                 return Ok(());
             }
@@ -69,7 +73,7 @@ async fn run() -> Result<(), String> {
     let real_path = std::fs::canonicalize(&config_path)
         .map_err(|e| format!("config path {}: {e}", config_path.display()))?;
     if let Some(action) = chains_action {
-        if healthcheck {
+        if healthcheck || status {
             return Err("--healthcheck is only for serve".into());
         }
         let command = match action.as_str() {
@@ -99,7 +103,7 @@ async fn run() -> Result<(), String> {
         return Ok(());
     }
     let config = Config::load(&real_path)?.with_runtime_chains(&data_dir)?;
-    if healthcheck {
+    if healthcheck || status {
         let url = format!("http://127.0.0.1:{}/healthz", config.port);
         let response = reqwest::Client::new()
             .get(url)
@@ -109,6 +113,9 @@ async fn run() -> Result<(), String> {
             .map_err(|e| format!("healthcheck: {e}"))?;
         if !response.status().is_success() {
             return Err(format!("healthcheck HTTP {}", response.status()));
+        }
+        if status {
+            println!("guvna running on 127.0.0.1:{}", config.port);
         }
         return Ok(());
     }
