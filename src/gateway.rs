@@ -56,7 +56,6 @@ impl AppState {
             .collect::<Result<Vec<_>, _>>()?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(90))
             .redirect(reqwest::redirect::Policy::none()) // Do not redirect provider credentials.
             .build()
             .map_err(|e| format!("building HTTP client: {e}"))?;
@@ -1102,14 +1101,24 @@ async fn dispatch(
             tried.insert(lease.env.clone());
             let url = provider.endpoint(endpoint.path());
             Metrics::inc(&state.metrics.upstream_attempts);
-            let response = state
+            // A request-wide reqwest timeout would terminate a healthy SSE
+            // generation after 90s despite regular progress. Time only the
+            // HTTP headers and non-streaming bounded JSON body instead.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+            let send = state
                 .client
                 .post(url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .bearer_auth(&lease.secret)
                 .body(payload_json.clone())
-                .send()
-                .await;
+                .send();
+            let response = match tokio::time::timeout_at(deadline, send).await {
+                Ok(result) => result,
+                Err(_) => {
+                    Metrics::inc(&state.metrics.upstream_transport_failures);
+                    break;
+                }
+            };
             let upstream = match response {
                 Ok(response) => response,
                 Err(_) => {
@@ -1145,8 +1154,8 @@ async fn dispatch(
                         } // preflight rejected
                     }
                 }
-                match bounded_json(upstream).await {
-                    Ok(value) if valid_result(endpoint, &payload, &value) => {
+                match tokio::time::timeout_at(deadline, bounded_json(upstream)).await {
+                    Ok(Ok(value)) if valid_result(endpoint, &payload, &value) => {
                         state.pools[step.provider_index].record_success(&lease);
                         Metrics::inc(&state.metrics.upstream_success);
                         return (StatusCode::OK, Json(value)).into_response();
