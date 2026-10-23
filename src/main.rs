@@ -148,14 +148,7 @@ async fn run() -> Result<(), String> {
     let config = Config::load(&real_path)?.with_runtime_chains(&data_dir)?;
     if healthcheck || status {
         let bind = env::var("GUVNA_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
-        let probe_host = match bind.as_str() {
-            "0.0.0.0" => "127.0.0.1",
-            "::" | "[::]" => "[::1]",
-            other if other.contains(':') && !other.starts_with('[') => {
-                return Err("invalid GUVNA_BIND_ADDR for local healthcheck".into());
-            }
-            other => other,
-        };
+        let probe_host = local_probe_host(&bind)?;
         let url = format!("http://{probe_host}:{}/healthz", config.port);
         let response = reqwest::Client::new()
             .get(url)
@@ -167,7 +160,7 @@ async fn run() -> Result<(), String> {
             return Err(format!("healthcheck HTTP {}", response.status()));
         }
         if status {
-            println!("guvna running on 127.0.0.1:{}", config.port);
+            println!("guvna running on {probe_host}:{}", config.port);
         }
         return Ok(());
     }
@@ -203,4 +196,42 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|e| format!("serving: {e}"))?;
     Ok(())
+}
+
+fn local_probe_host(bind: &str) -> Result<&str, String> {
+    match bind {
+        "0.0.0.0" => Ok("127.0.0.1"),
+        "::" | "[::]" => Ok("[::1]"),
+        "localhost" | "127.0.0.1" | "[::1]" | "::1" => {
+            if bind == "::1" {
+                Ok("[::1]")
+            } else {
+                Ok(bind)
+            }
+        }
+        _ => Err("status/healthcheck requires a loopback or wildcard GUVNA_BIND_ADDR".into()),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::local_probe_host;
+
+    #[test]
+    fn healthcheck_never_probes_an_untrusted_remote_host() {
+        assert_eq!(local_probe_host("0.0.0.0").unwrap(), "127.0.0.1");
+        assert_eq!(local_probe_host("::").unwrap(), "[::1]");
+        assert_eq!(local_probe_host("::1").unwrap(), "[::1]");
+        assert_eq!(local_probe_host("127.0.0.1").unwrap(), "127.0.0.1");
+        for unsafe_host in [
+            "example.com",
+            "8.8.8.8",
+            "192.168.1.1",
+            "[fe80::1]",
+            "",
+            "127.0.0.1@evil.test",
+        ] {
+            assert!(local_probe_host(unsafe_host).is_err(), "{unsafe_host}");
+        }
+    }
 }
