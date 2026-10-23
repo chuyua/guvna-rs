@@ -157,9 +157,21 @@ fn apply_event(
                 append_bounded(slot.get_or_insert_with(String::new), fragment, used)?;
             }
         }
-        // Audio chunks cannot be represented by an ordinary text Chat
-        // Completion. Fail over instead of returning an incomplete 200.
-        if delta.get("audio").is_some_and(|value| !value.is_null()) {
+        // Unknown non-null deltas (legacy function_call, images, audio, etc.)
+        // cannot be synthesized losslessly as a JSON Chat Completion. Fail
+        // over instead of silently discarding output and returning HTTP 200.
+        if delta.iter().any(|(field, value)| {
+            !value.is_null()
+                && !matches!(
+                    field.as_str(),
+                    "role"
+                        | "content"
+                        | "refusal"
+                        | "reasoning"
+                        | "reasoning_content"
+                        | "tool_calls"
+                )
+        }) {
             return Err(AggregateError::InvalidStream);
         }
         if let Some(tool_calls) = delta.get("tool_calls") {

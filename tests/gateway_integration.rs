@@ -3283,7 +3283,7 @@ async fn sse_only_aggregate_preserves_reasoning_and_refusal_without_replaying_to
         (
             vec![
                 aggregate_chat_frame(json!({"id":"reasoned","choices":[{"index":0,"delta":{
-                    "role":"assistant","reasoning":"chain ", "reasoning_content":"first ", "content":"answer "
+                    "role":"assistant","reasoning":"chain ", "reasoning_content":"first ", "content":"answer ", "audio":null
                 },"finish_reason":null}]})),
                 aggregate_chat_frame(json!({"id":"reasoned","choices":[{"index":0,"delta":{
                     "reasoning":"complete","reasoning_content":"second","content":"done"
@@ -3331,6 +3331,14 @@ async fn sse_only_aggregate_preserves_reasoning_and_refusal_without_replaying_to
 #[tokio::test]
 async fn sse_only_aggregate_fails_over_for_unrepresentable_and_invalid_deltas() {
     let failures = vec![
+        // Unsupported but syntactically valid extensions must never be
+        // silently dropped from a successful synthesized Chat response.
+        aggregate_chat_frame(json!({"choices":[{"index":0,"delta":{
+            "role":"assistant","function_call":{"name":"legacy","arguments":"{}"}
+        },"finish_reason":null}]})),
+        aggregate_chat_frame(json!({"choices":[{"index":0,"delta":{
+            "role":"assistant","image":{"url":"hidden-image-data"}
+        },"finish_reason":null}]})),
         aggregate_chat_frame(json!({"choices":[{"index":0,"delta":{
             "role":"assistant","audio":{"data":"abcd"}
         },"finish_reason":null}]})),
