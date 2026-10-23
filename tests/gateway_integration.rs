@@ -602,6 +602,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["object"], "response");
     assert_eq!(value["status"], "completed");
+    assert_eq!(value["output"][0]["status"], "completed");
     assert!(value["incomplete_details"].is_null());
     assert_eq!(value["output"][0]["content"][0]["text"], "success");
     assert_eq!(value["output_text"], "success");
@@ -627,6 +628,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(truncated["status"], "incomplete");
+    assert_eq!(truncated["output"][0]["status"], "incomplete");
     assert_eq!(
         truncated["incomplete_details"]["reason"],
         "max_output_tokens"
