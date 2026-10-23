@@ -47,6 +47,42 @@ pub(super) async fn dispatch(
     endpoint: Endpoint,
     admission: OwnedSemaphorePermit,
 ) -> Response {
+    let started = tokio::time::Instant::now();
+    let id = ops_log::next_request_id();
+    let response = dispatch_inner(state, body, endpoint, admission, started).await;
+    let sse_headers = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .is_some_and(|value| value.as_bytes().starts_with(b"text/event-stream"));
+    ops_log::request_finished(
+        id,
+        started.elapsed(),
+        response.status().as_u16(),
+        sse_headers,
+    );
+    response
+}
+
+fn walk_expired(deadline: Option<tokio::time::Instant>) -> bool {
+    deadline.is_some_and(|until| tokio::time::Instant::now() >= until)
+}
+
+fn walk_timeout() -> Response {
+    ops_log::warn("walk_deadline_exhausted");
+    error(
+        StatusCode::GATEWAY_TIMEOUT,
+        "upstream_walk_timeout",
+        "Non-streaming upstream failover exceeded its total time budget",
+    )
+}
+
+async fn dispatch_inner(
+    state: Arc<AppState>,
+    body: Bytes,
+    endpoint: Endpoint,
+    admission: OwnedSemaphorePermit,
+    started: tokio::time::Instant,
+) -> Response {
     let request: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
@@ -87,6 +123,17 @@ pub(super) async fn dispatch(
     }
     Metrics::inc(&state.metrics.requests_dispatched);
     let streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
+    // One monotonic deadline across ALL candidates, key attempts, 429
+    // retries, aggregation permit waits and response bodies. Client-facing
+    // SSE is intentionally exempt: only its header preflight is time-bounded.
+    let walk_deadline = (!streaming).then(|| {
+        started
+            + state
+                .config
+                .timeout
+                .walk_duration()
+                .expect("config validated")
+    });
     if streaming && !matches!(endpoint, Endpoint::Chat) {
         return error(
             StatusCode::NOT_IMPLEMENTED,
@@ -153,6 +200,9 @@ pub(super) async fn dispatch(
     let mut rate_limit_retry: Option<Duration> = None;
     // Exactly ONE candidate loop for chat + embedding. Key failover is confined to this loop.
     for step in steps {
+        if walk_expired(walk_deadline) {
+            return walk_timeout();
+        }
         let provider = &state.config.providers[step.provider_index];
         if provider.stream_only && !streaming && !matches!(endpoint, Endpoint::Chat) {
             all_candidates_rate_limited = false;
@@ -183,14 +233,20 @@ pub(super) async fn dispatch(
         // After two seconds, try the next candidate without consuming any
         // provider key or altering circuit state.
         let _aggregate_budget = if provider.stream_only && !streaming {
-            match tokio::time::timeout(
-                Duration::from_secs(2),
+            let slot_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let slot_deadline =
+                walk_deadline.map_or(slot_deadline, |until| until.min(slot_deadline));
+            match tokio::time::timeout_at(
+                slot_deadline,
                 state.aggregation_slots.clone().acquire_owned(),
             )
             .await
             {
                 Ok(Ok(permit)) => Some(permit),
                 _ => {
+                    if walk_expired(walk_deadline) {
+                        return walk_timeout();
+                    }
                     Metrics::inc(&state.metrics.aggregation_busy);
                     crate::ops_log::warn("aggregate_capacity");
                     aggregation_busy = true;
@@ -242,6 +298,9 @@ pub(super) async fn dispatch(
         let payload_json = Bytes::from(payload.to_string());
         let mut tried = HashSet::new();
         while let Some(lease) = state.pools[step.provider_index].acquire(&tried) {
+            if walk_expired(walk_deadline) {
+                return walk_timeout();
+            }
             tried.insert(lease.env.clone());
             let url = provider.endpoint(endpoint.path());
             attempted_network = true;
@@ -249,7 +308,9 @@ pub(super) async fn dispatch(
             // A request-wide reqwest timeout would terminate a healthy SSE
             // generation after 90s despite regular progress. Time only the
             // HTTP headers and non-streaming bounded JSON body instead.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+            let attempt_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+            let deadline =
+                walk_deadline.map_or(attempt_deadline, |until| until.min(attempt_deadline));
             let send = state
                 .client
                 .post(url)
@@ -260,6 +321,9 @@ pub(super) async fn dispatch(
             let response = match tokio::time::timeout_at(deadline, send).await {
                 Ok(result) => result,
                 Err(_) => {
+                    if walk_expired(walk_deadline) {
+                        return walk_timeout();
+                    }
                     Metrics::inc(&state.metrics.upstream_transport_failures);
                     ops_log::warn("transport_failure");
                     record_circuit_failure(&mut circuit_ticket, &state.metrics);
@@ -337,6 +401,9 @@ pub(super) async fn dispatch(
                 } else {
                     tokio::time::timeout_at(deadline, bounded_json(upstream)).await
                 };
+                if walk_expired(walk_deadline) {
+                    return walk_timeout();
+                }
                 match result {
                     Ok(Ok(value))
                         if response_validation::valid_result(endpoint, &payload, &value) =>
@@ -382,6 +449,9 @@ pub(super) async fn dispatch(
         } else {
             all_candidates_rate_limited = false;
         }
+    }
+    if walk_expired(walk_deadline) {
+        return walk_timeout();
     }
     if all_candidates_rate_limited && let Some(delay) = rate_limit_retry {
         // A *bounded* delta-seconds retry hint, rounded up so fast retries do

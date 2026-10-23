@@ -25,6 +25,35 @@ pub struct Config {
     pub default_chain: String,
     #[serde(default)]
     pub auto: AutoConfig,
+    #[serde(default)]
+    pub timeout: TimeoutConfig,
+}
+
+/// The walk budget applies only to client non-streaming requests. It is
+/// independent from the per-attempt timeout and cannot terminate an active
+/// client SSE stream.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TimeoutConfig {
+    pub walk: String,
+}
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            walk: "100s".into(),
+        }
+    }
+}
+
+impl TimeoutConfig {
+    pub fn walk_duration(&self) -> Result<Duration, String> {
+        let duration = parse_duration(&self.walk)?;
+        if duration < Duration::from_millis(100) || duration > Duration::from_secs(3600) {
+            return Err("timeout.walk must be between 100ms and 1h".into());
+        }
+        Ok(duration)
+    }
 }
 
 /// Deterministic, opt-in Auto routing. No remote control, external cache,
@@ -242,6 +271,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.timeout.walk_duration()?;
         let mut providers = HashSet::new();
         let mut prefixes = HashSet::new();
         for p in &self.providers {
@@ -365,6 +395,36 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walk_budget_defaults_and_bounds_are_fail_closed() {
+        assert_eq!(
+            TimeoutConfig::default().walk_duration().unwrap(),
+            Duration::from_secs(100)
+        );
+        for (value, allowed) in [
+            ("100ms", true),
+            ("1s", true),
+            ("100s", true),
+            ("1h", true),
+            ("0s", false),
+            ("99ms", false),
+            ("1h1s", false),
+            ("garbage", false),
+            ("18446744073709551615h", false),
+        ] {
+            let config: Config =
+                serde_yaml::from_str(&format!("providers: []\ntimeout:\n  walk: {value}\n"))
+                    .unwrap();
+            assert_eq!(config.validate().is_ok(), allowed, "{value}");
+        }
+        let invalid: Result<Config, _> =
+            serde_yaml::from_str("providers: []\ntimeout:\n  walk: 100s\n  extra: ignored\n");
+        assert!(
+            invalid.is_err(),
+            "unknown timeout keys cannot be silently accepted"
+        );
+    }
 
     #[test]
     fn parse_go_durations() {
