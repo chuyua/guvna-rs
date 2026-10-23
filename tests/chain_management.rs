@@ -302,3 +302,216 @@ fn file_persistence_preserves_large_integer_parameters_without_float_rounding() 
     let persisted = fs::read_to_string(data.join("chains.yaml")).unwrap();
     assert!(persisted.contains("12345678901234567890"), "{persisted}");
 }
+
+#[test]
+fn daemon_and_cli_reject_the_same_invalid_runtime_files() {
+    let (_tmp, config_file, data) = setup();
+    let base = Config::load(&config_file).unwrap();
+    fs::create_dir_all(&data).unwrap();
+    let live = data.join("chains.yaml");
+    let invalid = [
+        // Prior daemon silently dropped the shadowed runtime chain.
+        (
+            "version: 1\nchains:\n  - name: immutable\n    steps: [{provider: p, model: shadow}]\n",
+            "shadows config.yaml",
+        ),
+        // Prior daemon admitted duplicate runtime names instead of rejecting.
+        (
+            "version: 1\nchains:\n  - name: route\n    steps: [{provider: p, model: a}]\n  - name: route\n    steps: [{provider: p, model: b}]\n",
+            "duplicate runtime chain",
+        ),
+        (
+            "version: 1\nchains:\n  - name: route\n    steps: []\n",
+            "no steps",
+        ),
+        (
+            "version: 1\nchains:\n  - name: route\n    steps: [{provider: missing, model: x}]\n",
+            "missing provider",
+        ),
+        (
+            "version: 1\nchains:\n  - name: route\n    steps: [{provider: p, model: x, params: {messages: hi}}]\n",
+            "forbidden param key",
+        ),
+        (
+            "version: 999\nchains: []\n",
+            "unsupported chains.yaml version",
+        ),
+        (
+            "version: 1\nunknown: x\nchains: []\n",
+            "malformed chains.yaml",
+        ),
+    ];
+    for (yaml, expected) in invalid {
+        fs::write(&live, yaml).unwrap();
+        let startup = base.clone().with_runtime_chains(&data).unwrap_err();
+        assert!(
+            startup.contains(expected),
+            "daemon startup accepted or misclassified {yaml:?}: {startup}"
+        );
+        failure(&run(&config_file, &data, &["validate"]), expected);
+        // Public binary startup must reject before binding an HTTP port.
+        failure(&run_serve_healthcheck(&config_file, &data), expected);
+        assert_eq!(fs::read_to_string(&live).unwrap(), yaml);
+    }
+}
+
+fn run_serve_healthcheck(config: &Path, data: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_guvna"))
+        .args(["serve", "-config"])
+        .arg(config)
+        .arg("-data")
+        .arg(data)
+        .arg("--healthcheck")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn oversized_runtime_file_fails_consistently_without_being_parsed() {
+    let (_tmp, config_file, data) = setup();
+    fs::create_dir_all(&data).unwrap();
+    let live = data.join("chains.yaml");
+    // The former daemon path had no read bound and parsed arbitrary lengths.
+    let oversized = [
+        b"version: 1\nchains: []\n".as_slice(),
+        &vec![b'#'; 1024 * 1024],
+    ]
+    .concat();
+    fs::write(&live, &oversized).unwrap();
+    let err = Config::load(&config_file)
+        .unwrap()
+        .with_runtime_chains(&data)
+        .unwrap_err();
+    assert!(err.contains("at most 1 MiB"), "{err}");
+    failure(&run(&config_file, &data, &["validate"]), "at most 1 MiB");
+    failure(&run_serve_healthcheck(&config_file, &data), "at most 1 MiB");
+    assert_eq!(fs::metadata(&live).unwrap().len(), oversized.len() as u64);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_and_cli_refuse_symlinked_runtime_file_and_lock() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, config_file, data) = setup();
+    fs::create_dir_all(&data).unwrap();
+    let original = data.join("original.yaml");
+    fs::write(&original, "version: 1\nchains: []\n").unwrap();
+    let live = data.join("chains.yaml");
+    symlink(&original, &live).unwrap();
+    let startup_err = Config::load(&config_file)
+        .unwrap()
+        .with_runtime_chains(&data)
+        .unwrap_err();
+    assert!(startup_err.contains("regular file"), "{startup_err}");
+    failure(&run(&config_file, &data, &["list"]), "regular file");
+    failure(&run_serve_healthcheck(&config_file, &data), "regular file");
+
+    fs::remove_file(&live).unwrap();
+    let outside_lock = data.join("outside-lock-file");
+    fs::write(&outside_lock, "lock target not overwritten").unwrap();
+    symlink(&outside_lock, data.join(".chains.yaml.lock")).unwrap();
+    let input = data.join("input.yaml");
+    definition(&input, "new", "model");
+    failure(
+        &run(
+            &config_file,
+            &data,
+            &["set", "-file", input.to_str().unwrap()],
+        ),
+        "non-regular lock file",
+    );
+    assert_eq!(
+        fs::read_to_string(outside_lock).unwrap(),
+        "lock target not overwritten"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_atomic_writer_and_daemon_snapshot_readers_never_parse_partial_yaml() {
+    use guvna::chain_store::{self, Command as ChainCommand};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let (dir, config_file, data) = setup();
+    let base = Arc::new(Config::load(&config_file).unwrap());
+    let a = dir.path().join("a.yaml");
+    let b = dir.path().join("b.yaml");
+    definition(&a, "changing", "model-A");
+    definition(&b, "changing", "model-B");
+    let done = Arc::new(AtomicBool::new(false));
+    let successes = Arc::new(AtomicUsize::new(0));
+
+    thread::scope(|scope| {
+        let writer_base = base.clone();
+        let writer_data = data.clone();
+        let writer_done = done.clone();
+        scope.spawn(move || {
+            for i in 0..64 {
+                let chosen = if i % 2 == 0 { &a } else { &b };
+                let result = chain_store::execute(
+                    &writer_base,
+                    &writer_data,
+                    ChainCommand::Set(chosen.clone()),
+                )
+                .unwrap();
+                assert!(result.contains("runtime chain changing"), "{result}");
+            }
+            writer_done.store(true, Ordering::Release);
+        });
+        for _ in 0..6 {
+            let base = base.clone();
+            let data = data.clone();
+            let done = done.clone();
+            let successes = successes.clone();
+            scope.spawn(move || {
+                let mut rounds = 0;
+                loop {
+                    let loaded = base
+                        .as_ref()
+                        .clone()
+                        .with_runtime_chains(&data)
+                        .expect("reader observed partial or invalid YAML");
+                    assert!(loaded.chains.len() == 1 || loaded.chains.len() == 2);
+                    if loaded.chains.len() == 2 {
+                        assert_eq!(loaded.chains[1].name, "changing");
+                        assert!(matches!(
+                            loaded.chains[1].steps[0].model.as_str(),
+                            "model-A" | "model-B"
+                        ));
+                    }
+                    successes.fetch_add(1, Ordering::Relaxed);
+                    rounds += 1;
+                    if done.load(Ordering::Acquire) && rounds > 50 {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            });
+        }
+    });
+    assert!(successes.load(Ordering::Relaxed) > 300);
+    let final_state = base.as_ref().clone().with_runtime_chains(&data).unwrap();
+    assert_eq!(final_state.chains[1].steps[0].model, "model-B");
+}
+
+#[test]
+fn offline_chain_operations_appear_in_binary_help() {
+    let help = Command::new(env!("CARGO_BIN_EXE_guvna"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let output = success(&help);
+    for supported in [
+        "chains list|validate",
+        "chains set",
+        "chains delete",
+        "chains recover",
+        "-config",
+        "-data",
+    ] {
+        assert!(
+            output.contains(supported),
+            "help omits {supported}: {output}"
+        );
+    }
+}

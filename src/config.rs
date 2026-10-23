@@ -301,31 +301,8 @@ impl Config {
     }
 
     pub fn with_runtime_chains(mut self, data_dir: &Path) -> Result<Self, String> {
-        let path = data_dir.join("chains.yaml");
-        let data = match fs::read_to_string(&path) {
-            Ok(v) => v,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(self),
-            Err(err) => return Err(format!("reading {}: {err}", path.display())),
-        };
-        // Gate G11: malformed files are preserved, never overwritten or ignored.
-        let file: RuntimeChains = serde_yaml::from_str(&data)
-            .map_err(|e| format!("invalid {} (not modified): {e}", path.display()))?;
-        if file.version.unwrap_or(1) != 1 {
-            return Err(format!(
-                "unsupported chains.yaml version in {}",
-                path.display()
-            ));
-        }
-        for chain in file.chains {
-            self.validate_chain(&chain)?;
-            if !self
-                .chains
-                .iter()
-                .any(|existing| existing.name == chain.name)
-            {
-                self.chains.push(chain);
-            }
-        }
+        let runtime = crate::chain_store::load_runtime(&self, data_dir)?;
+        self.chains.extend(runtime.chains);
         Ok(self)
     }
 }

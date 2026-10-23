@@ -81,6 +81,15 @@ integration suite also races eight independent CLI writers and verifies that
 all named chains survive, with no abandoned temporary files. A running
 daemon intentionally requires a restart to load newly committed chains.
 
+## Runtime chain startup and CLI parity (G11 follow-up)
+
+The actual Linux release binary must reject bad chains.yaml at startup,
+using the same rejection rules as the CLI: shadowing static routes,
+duplicate runtime names, unsupported versions, >1 MiB files, and
+symlinked runtime files. Validation cannot rewrite the rejected input.
+Bounded O_NOFOLLOW reads prevent symlink following and excessive reads;
+atomic replace keeps runtime reader snapshots complete.
+
 ## Planned broader gates
 
 - Deterministic random fault matrix (429/5xx/invalid JSON/stalled response/

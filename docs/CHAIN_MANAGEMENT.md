@@ -52,6 +52,19 @@ from the runtime store fails. Set creates or updates a named runtime chain.
 - A missing or invalid backup never changes chains.yaml.
   Recovery preimages are kept for forensic review.
 
+## Startup and file safety parity
+
+The gateway's daemon startup and CLI use one bounded reader and validator
+for chains.yaml. Duplicate names, shadowing a base route, unsupported
+versions, empty steps or malformed YAML stop startup with a clear error.
+No route silently disappears, and unsafe content is not auto-overwritten.
+
+Linux uses O_NOFOLLOW on the runtime and lock files before accessing them.
+The already-open file descriptor is inspected, closing the symlink-swap
+gap between pathname inspection and read. Reads are limited to 1 MiB even
+when another process extends the file mid-read. File backup/recovery
+semantics remain unchanged, including explicit operator recovery.
+
 ## Deployment limits
 
 Management is offline: no live daemon reload, Unix socket or remote mutation

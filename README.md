@@ -66,6 +66,14 @@ reload routes: validate and restart manually. Management needs filesystem
 access but no remote management port or API key.
 See [the chain management contract](docs/CHAIN_MANAGEMENT.md).
 
+**Safety upgrade:** daemon startup now uses exactly the same validated,
+size-limited runtime-chain loader as the CLI. Duplicate names and attempted
+static-route shadowing fail closed rather than being silently ignored. On
+Linux, O_NOFOLLOW plus checks of the opened inode prevent a symlink swap
+between inspection and read. The release-binary CI verifies these cases,
+as well as concurrent atomic writers and daemon readers.
+
+
 ## Development
 
 ```sh
