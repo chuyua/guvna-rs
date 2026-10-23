@@ -64,6 +64,30 @@ async fn upstream(State(state): State<UpstreamState>, request: Request<Body>) ->
                 .into_response();
         }
     }
+    if let Some(marker) = value["messages"][0]["content"]
+        .as_str()
+        .filter(|s| s.starts_with("invalidchat:"))
+    {
+        let mode = marker.trim_start_matches("invalidchat:");
+        let mut completion = json!({"id":"mock","object":"chat.completion","model":value["model"],"choices":[{"index":0,"message":{"role":"assistant","content":"success"},"finish_reason":"stop"}],"usage":null});
+        match mode {
+            "nochoices" => {
+                completion.as_object_mut().unwrap().remove("choices");
+            }
+            "empty" => completion["choices"] = json!([]),
+            "multiple" => {
+                completion["choices"] = json!([{"index":0,"message":{"role":"assistant","content":"success"},"finish_reason":"stop"},{"index":1,"message":{"role":"assistant","content":"extra"},"finish_reason":"stop"}])
+            }
+            "wrongindex" => completion["choices"][0]["index"] = json!(1),
+            "wrongrole" => completion["choices"][0]["message"]["role"] = json!("user"),
+            "noid" => {
+                completion.as_object_mut().unwrap().remove("id");
+            }
+            "emptyid" => completion["id"] = json!(""),
+            _ => unreachable!(),
+        }
+        return (StatusCode::OK, axum::Json(completion)).into_response();
+    }
     let model = value["model"].as_str().unwrap_or_default();
     (
         StatusCode::OK,
@@ -629,10 +653,34 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(value["model"], "demo");
     assert!(value["usage"].is_null());
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+    for mode in [
+        "nochoices",
+        "empty",
+        "multiple",
+        "wrongindex",
+        "wrongrole",
+        "noid",
+        "emptyid",
+    ] {
+        let (status, rejected) = call(
+            router.clone(),
+            req(json!({"model":"demo","input":format!("invalidchat:{mode}")})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{mode}");
+        assert!(
+            matches!(
+                rejected["error"]["code"].as_str(),
+                Some("invalid_chat_choices" | "invalid_chat_id" | "upstream_unavailable")
+            ),
+            "{mode}: {rejected}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 12);
     let (status, converted) = call(router.clone(), req(json!({"model":"demo","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hel"},{"type":"input_text","text":"lo"}]}]}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(converted["output_text"], "success");
-    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(hits.load(Ordering::SeqCst), 13);
     let (status, instructed) = call(
         router.clone(),
         req(json!({"model":"demo","instructions":"Answer briefly","input":"hello"})),
@@ -640,7 +688,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(instructed["output_text"], "success");
-    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    assert_eq!(hits.load(Ordering::SeqCst), 14);
     let (status, truncated) = call(
         router.clone(),
         req(json!({"model":"demo","input":"truncate"})),
@@ -653,7 +701,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
         truncated["incomplete_details"]["reason"],
         "max_output_tokens"
     );
-    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    assert_eq!(hits.load(Ordering::SeqCst), 15);
     let (status, usage) = call(router.clone(), req(json!({"model":"demo","input":"usage"}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -667,13 +715,13 @@ async fn responses_text_bridge_and_unsupported_modes() {
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(invalid["error"]["code"], "invalid_upstream_usage");
-    assert_eq!(hits.load(Ordering::SeqCst), 6);
+    assert_eq!(hits.load(Ordering::SeqCst), 17);
     let (status, tool_result) = call(router.clone(), req(json!({"model":"demo","input":"call","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"auto"}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(tool_result["output"][0]["type"], "function_call");
     assert_eq!(tool_result["output"][0]["name"], "lookup");
     assert_eq!(tool_result["output"][0]["call_id"], "call_123");
-    assert_eq!(hits.load(Ordering::SeqCst), 7);
+    assert_eq!(hits.load(Ordering::SeqCst), 18);
     let (status, call_usage) = call(router.clone(), req(json!({"model":"demo","input":"callusage","tools":[{"type":"function","name":"lookup"}]}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -681,7 +729,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
         json!({"input_tokens":5,"output_tokens":3,"total_tokens":8})
     );
     assert!(call_usage["incomplete_details"].is_null());
-    assert_eq!(hits.load(Ordering::SeqCst), 8);
+    assert_eq!(hits.load(Ordering::SeqCst), 19);
     let (status, mixed) = call(router.clone(), req(json!({"model":"demo","input":"callmixed","tools":[{"type":"function","name":"lookup"}],"parallel_tool_calls":true}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(mixed["output_text"], "I will look that up");
@@ -689,7 +737,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(mixed["output"][0]["type"], "message");
     assert_eq!(mixed["output"][1]["call_id"], "call_1");
     assert_eq!(mixed["output"][2]["call_id"], "call_2");
-    assert_eq!(hits.load(Ordering::SeqCst), 9);
+    assert_eq!(hits.load(Ordering::SeqCst), 20);
     let (status, duplicate) = call(
         router.clone(),
         req(
@@ -699,14 +747,14 @@ async fn responses_text_bridge_and_unsupported_modes() {
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(duplicate["error"]["code"], "invalid_tool_call");
-    assert_eq!(hits.load(Ordering::SeqCst), 10);
+    assert_eq!(hits.load(Ordering::SeqCst), 21);
     let (status, continued) = call(router.clone(), req(json!({"model":"demo","input":[{"type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call_123","output":"Paris is in France"}]}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(continued["output_text"], "success");
-    assert_eq!(hits.load(Ordering::SeqCst), 11);
+    assert_eq!(hits.load(Ordering::SeqCst), 22);
     let (status, _) = call(router.clone(), req(json!({"model":"demo","input":[{"type":"function_call_output","call_id":"call_123","output":7}]}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(hits.load(Ordering::SeqCst), 11);
+    assert_eq!(hits.load(Ordering::SeqCst), 22);
     let (status, parallel_history) = call(
         router.clone(),
         req(json!({"model":"demo","input":[
@@ -720,11 +768,11 @@ async fn responses_text_bridge_and_unsupported_modes() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(parallel_history["output_text"], "success");
-    assert_eq!(hits.load(Ordering::SeqCst), 12);
+    assert_eq!(hits.load(Ordering::SeqCst), 23);
     let (status, assistant_text) = call(router.clone(), req(json!({"model":"demo","input":[{"role":"assistant","content":[{"type":"output_text","text":"previous response"}]},{"role":"user","content":"follow up"}]}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(assistant_text["output_text"], "success");
-    assert_eq!(hits.load(Ordering::SeqCst), 13);
+    assert_eq!(hits.load(Ordering::SeqCst), 24);
     for invalid_input in [
         json!([{"type":"function_call","call_id":"x","name":"lookup","arguments":"{}","status":"in_progress"},{"type":"function_call_output","call_id":"x","output":"ok"}]),
         json!([{"type":"function_call","call_id":"x","name":"lookup","arguments":"{}","status":false},{"type":"function_call_output","call_id":"x","output":"ok"}]),
@@ -743,7 +791,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
-    assert_eq!(hits.load(Ordering::SeqCst), 13);
+    assert_eq!(hits.load(Ordering::SeqCst), 24);
     for bad_request in [
         json!({"model":"demo","input":"hello","tool_choice":"required"}),
         json!({"model":"demo","input":"hello","tool_choice":{"type":"function","name":"lookup"}}),
@@ -767,7 +815,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
         let (status, _) = call(router.clone(), req(bad_request)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
-    assert_eq!(hits.load(Ordering::SeqCst), 13);
+    assert_eq!(hits.load(Ordering::SeqCst), 24);
     for payload in [
         json!({"model":"demo","input":"hello","stream":true}),
         json!({"model":"demo","input":"hello","tools":[{"type":"web_search"}]}),
@@ -790,5 +838,5 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = call(router, req(json!({"input":"hello"}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(hits.load(Ordering::SeqCst), 13);
+    assert_eq!(hits.load(Ordering::SeqCst), 24);
 }

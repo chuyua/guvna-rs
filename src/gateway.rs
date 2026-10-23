@@ -732,6 +732,35 @@ async fn responses(
             );
         }
     };
+    // Do not translate a multi-choice Chat Completion as one Responses output.
+    let Some(choices) = chat.get("choices").and_then(Value::as_array) else {
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "invalid_chat_choices",
+            "Upstream chat choices must be an array",
+        );
+    };
+    if choices.len() != 1
+        || choices[0]["index"].as_u64() != Some(0)
+        || choices[0]["message"]["role"] != "assistant"
+    {
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "invalid_chat_choices",
+            "Responses requires one assistant choice with index zero",
+        );
+    }
+    let Some(response_id) = chat
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "invalid_chat_id",
+            "Upstream chat response id is missing",
+        );
+    };
     let created_at = chat["created"].as_i64();
     let calls = chat["choices"][0]["message"]["tool_calls"].as_array();
     if calls.is_some_and(|items| !items.is_empty()) {
@@ -745,7 +774,7 @@ async fn responses(
         let mut output = Vec::with_capacity(calls.map_or(0, Vec::len) + 1);
         let content = &chat["choices"][0]["message"]["content"];
         if let Some(text) = content.as_str().filter(|text| !text.is_empty()) {
-            output.push(json!({"id":format!("msg_{}",chat["id"].as_str().unwrap_or("generated")),"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":text,"annotations":[]}]}));
+            output.push(json!({"id":format!("msg_{}",response_id),"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":text,"annotations":[]}]}));
         } else if !content.is_null() && content.as_str() != Some("") {
             return error(
                 StatusCode::BAD_GATEWAY,
@@ -820,7 +849,7 @@ async fn responses(
     let output_status = response_status;
     (StatusCode::OK, Json(json!({
         "id":chat["id"], "object":"response", "status":response_status, "incomplete_details":incomplete_details, "created_at":created_at, "model":logical_model,
-        "output":[{"id":format!("msg_{}",chat["id"].as_str().unwrap_or("generated")), "type":"message", "status":output_status, "role":"assistant", "content":[{"type":"output_text","text":content,"annotations":[]}]}],
+        "output":[{"id":format!("msg_{}",response_id), "type":"message", "status":output_status, "role":"assistant", "content":[{"type":"output_text","text":content,"annotations":[]}]}],
         "output_text":content,
         "usage": translated_usage
     }))).into_response()
