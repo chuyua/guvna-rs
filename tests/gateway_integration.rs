@@ -607,12 +607,18 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(value["model"], "demo");
     assert!(value["usage"].is_null());
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let (status, converted) = call(router.clone(), req(json!({"model":"demo","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hel"},{"type":"input_text","text":"lo"}]}]}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(converted["output_text"], "success");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
     for payload in [
         json!({"model":"demo","input":"hello","stream":true}),
         json!({"model":"demo","input":"hello","tools":[]}),
         json!({"model":"demo","input":"hello","n":2}),
         json!({"model":"demo","input":"hello","unknown_option":42}),
         json!({"model":"demo","input":"hello","messages":[]}),
+        json!({"model":"demo","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.org/img.png"}]}]}),
+        json!({"model":"demo","input":[{"role":"user","content":"hi","unknown":1}]}),
     ] {
         let (status, _) = call(router.clone(), req(payload)).await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
@@ -621,5 +627,5 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = call(router, req(json!({"input":"hello"}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
