@@ -17,6 +17,31 @@ const MAX_AGGREGATED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EVENTS: usize = 16_384;
 const STREAM_IDLE: Duration = Duration::from_secs(15);
 
+// Error classes are fixed, local-only log keys. Never attach prompt/model,
+// provider URL, API key, response data or client identity to these events.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum AggregateError {
+    InvalidStream,
+    IdleTimeout,
+    UpstreamTransport,
+    ResourceLimit,
+}
+impl From<()> for AggregateError {
+    fn from(_: ()) -> Self {
+        Self::InvalidStream
+    }
+}
+impl AggregateError {
+    pub(super) const fn log_event(self) -> &'static str {
+        match self {
+            Self::InvalidStream => "aggregation_invalid_sse",
+            Self::IdleTimeout => "aggregation_idle_timeout",
+            Self::UpstreamTransport => "aggregation_transport_failure",
+            Self::ResourceLimit => "aggregation_resource_limit",
+        }
+    }
+}
+
 #[derive(Default)]
 struct Tool {
     id: Option<String>,
@@ -37,10 +62,16 @@ struct Choice {
     finish_reason: Option<String>,
 }
 
-fn append_bounded(into: &mut String, fragment: &str, used: &mut usize) -> Result<(), ()> {
-    *used = used.checked_add(fragment.len()).ok_or(())?;
+fn append_bounded(
+    into: &mut String,
+    fragment: &str,
+    used: &mut usize,
+) -> Result<(), AggregateError> {
+    *used = used
+        .checked_add(fragment.len())
+        .ok_or(AggregateError::ResourceLimit)?;
     if *used > MAX_AGGREGATED_OUTPUT_BYTES {
-        return Err(());
+        return Err(AggregateError::ResourceLimit);
     }
     into.push_str(fragment);
     Ok(())
@@ -54,11 +85,11 @@ fn apply_event(
     id: &mut Option<String>,
     created: &mut Option<u64>,
     model: &mut Option<String>,
-) -> Result<(), ()> {
+) -> Result<(), AggregateError> {
     if let Some(raw) = value.get("id") {
         let current = raw.as_str().filter(|id| !id.is_empty()).ok_or(())?;
         if id.as_deref().is_some_and(|old| old != current) {
-            return Err(());
+            return Err(AggregateError::InvalidStream);
         }
         if id.is_none() {
             *id = Some(current.to_owned());
@@ -67,14 +98,14 @@ fn apply_event(
     if let Some(raw) = value.get("created") {
         let current = raw.as_u64().ok_or(())?;
         if created.is_some_and(|old| old != current) {
-            return Err(());
+            return Err(AggregateError::InvalidStream);
         }
         *created = Some(current);
     }
     if let Some(raw) = value.get("model") {
         let current = raw.as_str().filter(|value| !value.is_empty()).ok_or(())?;
         if model.as_deref().is_some_and(|old| old != current) {
-            return Err(());
+            return Err(AggregateError::InvalidStream);
         }
         if model.is_none() {
             *model = Some(current.to_owned());
@@ -82,7 +113,7 @@ fn apply_event(
     }
     if let Some(value_usage) = value.get("usage").filter(|usage| !usage.is_null()) {
         if !value_usage.is_object() || !usage.is_null() {
-            return Err(());
+            return Err(AggregateError::InvalidStream);
         }
         let prompt = value_usage
             .get("prompt_tokens")
@@ -97,7 +128,7 @@ fn apply_event(
             .and_then(Value::as_u64)
             .ok_or(())?;
         if prompt.checked_add(completion) != Some(total) {
-            return Err(());
+            return Err(AggregateError::InvalidStream);
         }
         *usage = value_usage.clone();
     }
@@ -129,19 +160,19 @@ fn apply_event(
         // Audio chunks cannot be represented by an ordinary text Chat
         // Completion. Fail over instead of returning an incomplete 200.
         if delta.get("audio").is_some_and(|value| !value.is_null()) {
-            return Err(());
+            return Err(AggregateError::InvalidStream);
         }
         if let Some(tool_calls) = delta.get("tool_calls") {
             for tool_call in tool_calls.as_array().ok_or(())? {
                 let index = tool_call.get("index").and_then(Value::as_u64).ok_or(())?;
                 if index >= 32 {
-                    return Err(());
+                    return Err(AggregateError::InvalidStream);
                 }
                 let slot = choice.tools.entry(index).or_default();
                 if let Some(call_id) = tool_call.get("id") {
                     let call_id = call_id.as_str().filter(|id| !id.is_empty()).ok_or(())?;
                     if slot.id.as_deref().is_some_and(|old| old != call_id) {
-                        return Err(());
+                        return Err(AggregateError::InvalidStream);
                     }
                     slot.id = Some(call_id.to_owned());
                 }
@@ -149,7 +180,7 @@ fn apply_event(
                     if let Some(name) = function.get("name") {
                         let name = name.as_str().filter(|name| !name.is_empty()).ok_or(())?;
                         if slot.name.as_deref().is_some_and(|old| old != name) {
-                            return Err(());
+                            return Err(AggregateError::InvalidStream);
                         }
                         slot.name = Some(name.to_owned());
                     }
@@ -165,7 +196,7 @@ fn apply_event(
         {
             let reason = reason.as_str().ok_or(())?;
             if choice.finish_reason.is_some() {
-                return Err(());
+                return Err(AggregateError::InvalidStream);
             }
             choice.finish_reason = Some(reason.to_owned());
         }
@@ -173,7 +204,7 @@ fn apply_event(
     Ok(())
 }
 
-fn event_payload(frame: &[u8]) -> Result<Option<Value>, ()> {
+fn event_payload(frame: &[u8]) -> Result<Option<Value>, AggregateError> {
     if frame == b"data: [DONE]\n\n" {
         return Ok(None);
     }
@@ -193,7 +224,7 @@ pub(super) async fn aggregate(
     expected: u64,
     requested_model: &str,
     tool_choice: Option<&Value>,
-) -> Result<Value, ()> {
+) -> Result<Value, AggregateError> {
     let mime = upstream
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -204,7 +235,7 @@ pub(super) async fn aggregate(
         .next()
         .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
     {
-        return Err(());
+        return Err(AggregateError::InvalidStream);
     }
     // Apply the same named/required/none tool contract as direct Chat SSE.
     // Reject an incompatible first tool delta immediately rather than
@@ -221,22 +252,25 @@ pub(super) async fn aggregate(
     let mut created = None;
     let mut model = None;
     loop {
-        let bytes = tokio::time::timeout(STREAM_IDLE, upstream.chunk())
-            .await
-            .map_err(|_| ())?
-            .map_err(|_| ())?
-            .ok_or(())?;
+        let bytes = match tokio::time::timeout(STREAM_IDLE, upstream.chunk()).await {
+            Err(_) => return Err(AggregateError::IdleTimeout),
+            Ok(Err(_)) => return Err(AggregateError::UpstreamTransport),
+            Ok(Ok(None)) => return Err(AggregateError::InvalidStream),
+            Ok(Ok(Some(bytes))) => bytes,
+        };
         if bytes.len() > MAX_CHUNK_BYTES {
-            return Err(());
+            return Err(AggregateError::ResourceLimit);
         }
-        total_received = total_received.checked_add(bytes.len()).ok_or(())?;
+        total_received = total_received
+            .checked_add(bytes.len())
+            .ok_or(AggregateError::ResourceLimit)?;
         if total_received > MAX_TOTAL_STREAM_BYTES {
-            return Err(());
+            return Err(AggregateError::ResourceLimit);
         }
         for frame in parser.push(&bytes).map_err(|_| ())? {
             event_count += 1;
             if event_count > MAX_EVENTS {
-                return Err(());
+                return Err(AggregateError::ResourceLimit);
             }
             if let Some(event) = event_payload(&frame)? {
                 apply_event(
@@ -297,4 +331,29 @@ pub(super) async fn aggregate(
         "choices":choices,
         "usage":usage,
     }))
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::AggregateError;
+
+    #[test]
+    fn categories_are_fixed_redaction_safe_local_events() {
+        for (error, expected) in [
+            (AggregateError::InvalidStream, "aggregation_invalid_sse"),
+            (AggregateError::IdleTimeout, "aggregation_idle_timeout"),
+            (
+                AggregateError::UpstreamTransport,
+                "aggregation_transport_failure",
+            ),
+            (AggregateError::ResourceLimit, "aggregation_resource_limit"),
+        ] {
+            assert_eq!(error.log_event(), expected);
+            assert!(
+                expected
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c == b'_')
+            );
+        }
+    }
 }

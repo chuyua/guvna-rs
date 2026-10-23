@@ -105,9 +105,22 @@ output limit. Unsupported audio chunks and invalid field types fail
 closed and use the existing candidate fallback path; a mismatched named
 tool call is rejected at the first invalid SSE delta. The adapter does
 not currently synthesize token logprobs, so a non-streaming request for
+A non-streaming client requesting more than 64 choices (or an invalid n)
+never consumes SSE-only provider calls: the gateway skips that candidate and
+continues to a native-JSON provider in the same chain or Auto selection.
+With no eligible JSON provider, the gateway returns HTTP 422
+aggregate_n_unsupported instead of treating the unsupported request as a
+provider outage. The boundary n=64 still aggregates normally.
+
 logprobs bypasses SSE-only providers in favor of a compatible native-JSON
 candidate, whose returned logprobs must also be validated. This is a
 documented capability boundary, not silent data loss.
+
+Aggregation warnings now distinguish invalid SSE framing/content,
+15-second SSE idle timeout, transport interruption and resource ceilings.
+Log keys have constant cardinality, independent sampling and contain no
+prompt, API keys, model names or provider addresses. These diagnostics are
+local stderr lines only; no new management or logging HTTP endpoint is added.
 
 Set GUVNA_LOG_EVENTS=1 for sampled local stderr JSON-lines containing
 aggregation_completed or aggregation_failed with no user content, secret,
