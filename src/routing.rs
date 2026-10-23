@@ -144,6 +144,47 @@ mod tests {
     }
 
     #[test]
+    fn auto_boundary_and_priority_are_deterministic() {
+        let cfg: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: primary
+    type: openai
+    base_url: https://primary.example
+    key_env: P
+    models: [alpha]
+  - name: backup
+    type: openai
+    base_url: https://backup.example
+    key_env: B
+    models: [beta]
+auto:
+  enabled: true
+  candidates:
+    - provider: backup
+      model: beta
+      priority: 20
+      min_input_bytes: 100
+      max_input_bytes: 200
+    - provider: primary
+      model: alpha
+      priority: 10
+      min_input_bytes: 100
+      max_input_bytes: 200
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert!(resolve_auto(&cfg, 99).unwrap().is_empty());
+        assert!(resolve_auto(&cfg, 201).unwrap().is_empty());
+        for size in [100, 150, 200] {
+            let steps = resolve_auto(&cfg, size).unwrap();
+            assert_eq!(steps.len(), 2);
+            assert_eq!(steps[0].model, "alpha");
+            assert_eq!(steps[1].model, "beta");
+        }
+    }
+    #[test]
     fn chain_and_namespaced_passthrough() {
         let cfg: Config = serde_yaml::from_str(
             r#"
