@@ -105,6 +105,44 @@ class StubHandler(BaseHTTPRequestHandler):
             except (ConnectionResetError, BrokenPipeError):
                 pass
             return
+        if self.server.role == "stream_only":
+            if query.get("stream") is not True:
+                self.send_error(400, "SSE-only provider requires stream:true")
+                return
+            seed = int(query.get("seed", 0))
+            first = {"id": "aggregate-quality", "created": 123, "model": "upstream",
+                     "choices": [{"index": 0, "delta": {
+                         "role": "assistant", "content": "ok"},
+                         "finish_reason": None}]}
+            last = {"choices": [{"index": 0, "delta": {},
+                                 "finish_reason": "stop"}]}
+            payload = (
+                "data: " + json.dumps(first, separators=(",", ":")) + "\n\n"
+                + "data: " + json.dumps(last, separators=(",", ":")) + "\n\n"
+                + ("" if seed % 13 == 0 else
+                   "data: " + json.dumps({"choices": [],
+                           "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                                     "total_tokens": 2}}, separators=(",", ":"))
+                   + "\n\ndata: [DONE]\n\n")
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            try:
+                # Every 9th message is fragmented across both JSON and [DONE].
+                if seed % 9 == 0:
+                    for start, end in zip((0, 1, len(payload)//2),
+                                          (1, len(payload)//2, len(payload))):
+                        if end > start:
+                            self.wfile.write(payload[start:end])
+                            self.wfile.flush()
+                            time.sleep(0.001)
+                else:
+                    self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         if self.server.role == "primary":
             seed = int(query.get("seed", 0))
             if seed % 17 == 0:
@@ -548,6 +586,140 @@ def verify_release_chain_management(binary: str, config: Path, directory: str) -
             "atomic_backup_matches_prior": True, "mode": "0600"}
 
 
+def verify_release_sse_only_aggregation(binary: str, cfg: Path, root: str,
+                                        env: dict, backup: Stub) -> dict:
+    """64 actual Linux release requests with only-streaming primary upstream.
+    Prove client asked for JSON while upstream only accepts SSE; fragmented
+    and truncated streams must synthesize/validate or use a healthy fallback.
+    """
+    provider = Stub("stream_only")
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    test_port = port()
+    config = Path(root) / "stream-only-enabled.yaml"
+    original = cfg.read_text(encoding="utf-8")
+    first = original.splitlines()[0]
+    check(first.startswith("port: "), "missing port in base config")
+    modified = original.replace(first, f"port: {test_port}", 1)
+    anchor = "\nchains:\n"
+    check(modified.count(anchor) == 1, "missing chains insertion point")
+    modified = modified.replace(
+        anchor,
+        f"\n  - name: stream_primary\n    type: openai\n"
+        f"    base_url: http://127.0.0.1:{provider.server_address[1]}\n"
+        f"    key_env: STREAMONLY_KEY\n    stream_only: true\n" + anchor,
+        1)
+    modified += (
+        "\n  - name: synth-json\n    steps:\n"
+        "      - provider: stream_primary\n        model: synthetic\n"
+        "      - provider: live\n        model: fast\n")
+    config.write_text(modified, encoding="utf-8")
+    data = Path(root) / "sse-only-data"
+    data.mkdir()
+    start_env = dict(env, STREAMONLY_KEY="fake-sse-key",
+                     GUVNA_LOG_EVENTS="1")
+    proc = subprocess.Popen(
+        [str(Path(binary).resolve()), "serve", "-config", str(config),
+         "-data", str(data)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=start_env)
+    log_content = ""
+    try:
+        health = f"http://127.0.0.1:{test_port}/healthz"
+        start = time.monotonic()
+        while time.monotonic()-start < 2:
+            check(proc.poll() is None, "aggregation process exited at startup")
+            if get_status(health, timeout=.15) == 200:
+                break
+            time.sleep(.02)
+        else:
+            raise AssertionError("aggregation gateway startup timed out")
+        backup_before = backup.calls
+        endpoint = f"http://127.0.0.1:{test_port}/v1/chat/completions"
+
+        def submit(seed: int) -> tuple[int, str]:
+            payload = json.dumps({"model": "synth-json", "stream": False,
+                                  "messages": [{"role": "user", "content": "ping"}],
+                                  "seed": seed}).encode()
+            req = Request(endpoint, method="POST", data=payload, headers={
+                "Authorization": "Bearer only-for-local-test",
+                "Content-Type": "application/json"})
+            try:
+                with urlopen(req, timeout=6) as response:
+                    doc = json.load(response)
+                    check(doc["choices"][0]["message"]["content"] == "ok",
+                          "synthesized JSON had incorrect content")
+                    check(doc["choices"][0]["finish_reason"] == "stop",
+                          "synthesized completion missing terminal stop")
+                    check(doc["object"] == "chat.completion",
+                          "synthesized completion has wrong object")
+                    if seed % 13:
+                        check(doc["id"] == "aggregate-quality",
+                              "valid SSE unexpectedly fell back")
+                        check(doc["usage"]["total_tokens"] == 2,
+                              "SSE usage lost during aggregation")
+                    return response.status, "ok"
+            except (HTTPError, URLError, KeyError, ValueError) as exc:
+                return 0, type(exc).__name__
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(submit, range(64)))
+        check(all(result == (200, "ok") for result in results),
+              f"SSE-only JSON synthesis failures: {results}")
+        broken = sum(i % 13 == 0 for i in range(64))
+        check(provider.calls == 64,
+              f"stream-only upstream was not used for each request: {provider.calls}")
+        check(backup.calls - backup_before == broken,
+              f"invalid SSE did not fall back exactly {broken} times")
+        req = Request(f"http://127.0.0.1:{test_port}/metrics",
+                      headers={"Authorization": "Bearer only-for-local-test"})
+        with urlopen(req, timeout=3) as response:
+            text = response.read(8192).decode()
+        def metric(name: str) -> int:
+            matches = [line for line in text.splitlines()
+                       if line.startswith("guvna_" + name + " ")]
+            check(len(matches) == 1, f"missing metric {name}")
+            return int(matches[0].split()[1])
+        check(metric("aggregation_completed_total") == 64-broken,
+              "successful aggregation counter drifted")
+        check(metric("upstream_invalid_responses_total") == broken,
+              "bad upstream aggregation not classified")
+        check(metric("upstream_success_total") == 64,
+              "synthesized+fallback success counter drifted")
+        check(metric("active_requests") == 0,
+              "aggregated requests left permits acquired")
+        usage = proc_info(proc.pid)
+        check(usage["VmRSS"] <= 16 * 1024,
+              "aggregation process RSS exceeded 16 MiB")
+        check(usage["fd"] <= 20, "aggregation leaked FDs")
+        check(usage["Threads"] <= 12, "aggregation leaked threads")
+        return {"passed": True, "requests": 64, "sse_synthesized": 64-broken,
+                "bad_sse_fallback": broken, "peak_live_rss_kib": usage["VmRSS"],
+                "fds": usage["fd"], "threads": usage["Threads"]}
+    finally:
+        proc.terminate()
+        try:
+            _, captured = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, captured = proc.communicate(timeout=5)
+        provider.shutdown()
+        log_content = captured.decode("utf-8", "replace")
+        events = [json.loads(line) for line in log_content.splitlines()
+                  if line.startswith("{")]
+        check(any(event.get("event") == "aggregate_completed" and
+                  event.get("level") == "info" for event in events),
+              "missing local SSE aggregation success diagnostics")
+        check(any(event.get("event") == "aggregate_failed" and
+                  event.get("level") == "warn" for event in events),
+              "missing local SSE aggregation failure diagnostics")
+        check(len(events) <= 16, "unbounded local aggregation log volume")
+        for event in events:
+            check(set(event) == {"ts_unix_ms", "level", "event", "sequence"},
+                  "log contained unexpected potentially sensitive fields")
+        for secret in ("fake-sse-key", "fake-live-key", "only-for-local-test"):
+            check(secret not in log_content, "aggregation log exposed credential")
+
+
 def verify_release_auto_and_local_logs(binary: str, cfg: Path, root: str,
                                        env: dict, mock1: Stub, mock2: Stub) -> dict:
     """64 real Linux release requests: Auto ranking, failure fallback,
@@ -860,6 +1032,8 @@ chains:
                     a.binary, cfg, directory, env, mock1, mock2)
                 summary["auto_and_local_log_gate"] = verify_release_auto_and_local_logs(
                     a.binary, cfg, directory, env, mock1, mock2)
+                summary["stream_only_json_gate"] = verify_release_sse_only_aggregation(
+                    a.binary, cfg, directory, env, mock2)
                 summary["structured_output_gate"] = verify_structured_output_on_release(
                     response_endpoint, mock2)
                 summary["post_structured_idle"] = idle(proc.pid, a.idle_seconds)

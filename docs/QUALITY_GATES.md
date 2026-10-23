@@ -100,6 +100,19 @@ completions, reconciles metrics, and checks bounded RSS/FD/thread counts.
 Local warning JSON-line stderr events are restricted to fixed metadata
 fields, contain no API key values and are rate limited to ten lines.
 
+## Linux release SSE-only aggregation test
+
+A separate real Linux Release instance sends 64 non-stream JSON Chat
+requests to a provider that ONLY accepts upstream stream:true. The
+provider deliberately fragments frames and truncates every 13th stream
+without a final DONE marker. Every request must produce complete JSON,
+with five failed aggregates recovered by the healthy fallback. Counters,
+RSS <=16 MiB, file descriptors <=20, threads <=12 and sampled local
+log privacy are mandatory. The original 4,000 + 200 gates remain intact.
+
+The Manual Linux x86_64 binary workflow can be dispatched after merging;
+it builds a verified ELF and SHA256 manifest instead of a source archive.
+
 ## Planned broader gates
 
 - Deterministic random fault matrix (429/5xx/invalid JSON/stalled response/

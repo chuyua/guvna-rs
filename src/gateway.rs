@@ -26,6 +26,8 @@ use crate::{
 
 // Keep these children private to the gateway: only the route handlers and
 // narrow pub(super) bridge methods are shared, not a second public API.
+#[path = "chat_aggregate.rs"]
+mod chat_aggregate;
 #[path = "chat_stream.rs"]
 mod chat_stream;
 #[path = "dispatch.rs"]
@@ -39,6 +41,7 @@ mod responses_format;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_INFLIGHT_REQUESTS: usize = 128;
+const MAX_CONCURRENT_AGGREGATIONS: usize = 4;
 
 pub struct AppState {
     pub config: Config,
@@ -47,6 +50,7 @@ pub struct AppState {
     circuits: Vec<Option<Arc<Circuit>>>,
     client_keys: Vec<String>,
     inflight: Arc<Semaphore>,
+    aggregation_slots: Arc<Semaphore>,
     metrics: Arc<Metrics>,
     model_catalog: Value,
     model_details: HashMap<String, Value>,
@@ -113,6 +117,7 @@ impl AppState {
             circuits,
             client_keys,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
+            aggregation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_AGGREGATIONS)),
             metrics: Arc::new(Metrics::default()),
         })
     }

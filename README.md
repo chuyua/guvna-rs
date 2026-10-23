@@ -59,6 +59,17 @@ Authorized requests acquire a shared admission permit before reading the
 request body, preventing slow uploads from evading the global 128-request
 limit. Permits remain held through dispatch and streamed response delivery.
 
+## SSE-only providers and local operation
+
+A provider configured with stream_only: true can fulfill an ordinary
+non-streaming Chat request: a bounded upstream SSE stream is validated
+then converted into complete Chat JSON. Broken SSE uses shared fallback
+without exposing partial success. A local structured stderr event logger
+is available via GUVNA_LOG_EVENTS=1. No remote administration or control
+Socket is added. A manually triggered GitHub Actions workflow produces
+a real Linux x86_64 executable and SHA256 checksum.
+See docs/SSE_ONLY_RELEASE_AND_LOGS.md.
+
 ## Basic Auto routing and local diagnostics
 
 An opt-in Auto V1 selects model candidates using configured priority

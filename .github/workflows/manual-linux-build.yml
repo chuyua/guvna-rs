@@ -1,0 +1,49 @@
+name: Manual Linux x86_64 binary
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-linux-x86_64:
+    name: Compile and verify real Linux ELF
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate locked Rust source and tests
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+      - name: Compile Linux Release ELF
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          install -D -m 0755 target/release/guvna dist/guvna-linux-x86_64
+          file dist/guvna-linux-x86_64
+          file dist/guvna-linux-x86_64 | grep -F 'ELF 64-bit'
+          test "$(uname -m)" = "x86_64"
+          dist/guvna-linux-x86_64 --version
+          (
+            cd dist
+            sha256sum guvna-linux-x86_64 > guvna-linux-x86_64.sha256
+            sha256sum --check guvna-linux-x86_64.sha256
+          )
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "platform=$(uname -s)-$(uname -m)"
+            echo "glibc=$(getconf GNU_LIBC_VERSION)"
+            rustc --version
+          } > dist/build-info.txt
+      - name: Upload verified executable, not a source archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: guvna-linux-x86_64
+          path: |
+            dist/guvna-linux-x86_64
+            dist/guvna-linux-x86_64.sha256
+            dist/build-info.txt
+          if-no-files-found: error
+          retention-days: 30
