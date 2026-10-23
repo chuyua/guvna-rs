@@ -28,6 +28,7 @@ pub struct ChatSse {
     finished_mask: u64,
     tool_calls_mask: u64,
     tool_calls: Vec<StreamToolCall>,
+    tool_argument_bytes: usize,
     expected: u64,
     done: bool,
 }
@@ -278,12 +279,7 @@ impl ChatSse {
             return Err(SseError);
         }
         if fragment.is_some_and(|part| {
-            let used = self
-                .tool_calls
-                .iter()
-                .map(|tool| tool.arguments.len())
-                .sum::<usize>();
-            part.len() > MAX_STREAM_TOOL_ARGUMENTS.saturating_sub(used)
+            part.len() > MAX_STREAM_TOOL_ARGUMENTS.saturating_sub(self.tool_argument_bytes)
         }) {
             return Err(SseError);
         }
@@ -297,6 +293,7 @@ impl ChatSse {
         tool.function_type |= call.get("type").and_then(Value::as_str) == Some("function");
         if let Some(part) = fragment {
             tool.arguments.push_str(part);
+            self.tool_argument_bytes += part.len();
         }
         Ok(())
     }
