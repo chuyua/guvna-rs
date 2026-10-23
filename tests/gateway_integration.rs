@@ -692,6 +692,78 @@ async fn oversized_later_sse_chunk_returns_incomplete_without_failover() {
 }
 
 #[tokio::test]
+async fn authorized_slow_uploads_are_bounded_and_cancelled_uploads_release_permits() {
+    let (url, calls) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&url, &url);
+    let mut upload_tasks = Vec::with_capacity(128);
+    for index in 0..128 {
+        let path = match index % 3 {
+            0 => "/v1/chat/completions",
+            1 => "/v1/embeddings",
+            _ => "/v1/responses",
+        };
+        let req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Bearer client")
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<Bytes, std::io::Error>,
+            >()))
+            .unwrap();
+        let app = router.clone();
+        upload_tasks.push(tokio::spawn(async move { app.oneshot(req).await }));
+    }
+    // All three endpoints share the same global limiter even before the first
+    // request-body byte is read; no slow upload can reach the upstream.
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        loop {
+            let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
+            if metric_value(&metrics, "active_requests") == 128 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all slow uploads must reserve admission permits");
+    for path in ["/v1/chat/completions", "/v1/embeddings", "/v1/responses"] {
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            router.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("authorization", "Bearer client")
+                    .body(Body::from_stream(futures_util::stream::pending::<
+                        Result<Bytes, std::io::Error>,
+                    >()))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("overloaded requests must not wait for upload bodies")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(response.headers()["retry-after"], "1");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(metric_value(&metrics, "admission_rejections_total"), 3);
+    for task in upload_tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(metric_value(&metrics, "active_requests"), 0);
+    assert_eq!(
+        call(router, request("demo", "", "client")).await.0,
+        StatusCode::OK,
+        "admission must recover after cancellation"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn admission_control_bounds_concurrent_streams_and_recovers_after_disconnect() {
     let (upstream, dropped) = start_stalled_sse().await;
     let router = make_app(&upstream, &upstream);

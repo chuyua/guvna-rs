@@ -18,8 +18,11 @@ They reset on process restart. The endpoint intentionally does not expose
 the credential pool's internal key-level state.
 
 All counters ending in _total are cumulative. The active_requests gauge is
-the number of acquired upstream admission permits, not the number of currently
-connected clients. Long-running streams retain their permits.
+the number of acquired request admission permits, not the number of currently
+connected clients. The 128-permit admission gate is now enforced after
+authorization and **before** buffering JSON request bodies, so slow/partial
+uploads count against it. Long-running SSE streams retain their permits until
+completion or cancellation.
 
 ## Metric families
 
@@ -38,7 +41,8 @@ connected clients. Long-running streams retain their permits.
 - guvna_candidate_fallbacks_total: transitions to the next chain step, not
   each attempted credential or retry.
 - guvna_admission_rejections_total: requests rejected with 503 and
-  Retry-After: 1 when concurrency admission is exhausted.
+  Retry-After: 1 when concurrency admission is exhausted, including requests
+  whose body has not yet been read.
 - guvna_chat_stream_completed_total, chat_stream_failed_total,
   chat_stream_cancelled_total: validated upstream Chat SSE lifecycle.
 - guvna_responses_stream_completed_total, responses_stream_incomplete_total,

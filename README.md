@@ -46,6 +46,9 @@ POST /v1/chat/completions, /v1/embeddings and /v1/responses authenticate
 request headers **before** buffering the request body. The existing 32 MiB
 body limit is enforced for authorized requests, including chunked requests;
 invalid credentials are rejected without consuming a slow or unbounded body.
+Authorized requests also acquire a shared admission permit before reading
+their body, preventing slow uploads from evading the global 128-request limit.
+The permit remains held during dispatch and streamed response delivery.
 
 ## Development
 
