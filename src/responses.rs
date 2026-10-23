@@ -1,8 +1,9 @@
 //! OpenAI Responses compatibility adapter.
 //! Request validation, request translation, chat-result translation and
 //! Responses SSE wrapping live here. Dispatch still uses one shared
-//! candidate/failover loop in gateway; this module never retries upstream.
-use super::{AppState, Endpoint, MAX_BODY_BYTES, authenticated_body, dispatch, error};
+//! candidate/failover loop in dispatch.rs; this module never retries upstream.
+use super::dispatch::{Endpoint, dispatch};
+use super::{AppState, MAX_BODY_BYTES, authenticated_body, error};
 use axum::{
     Json,
     body::{Body, Bytes, to_bytes},
@@ -13,7 +14,7 @@ use axum::{
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-// Minimal non-streaming Responses compatibility adapter. Unsupported modes fail closed.
+// Strict stateless Responses compatibility adapter; unsupported modes fail closed.
 pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
     let (body, permit) = match authenticated_body(&state, request).await {
         Ok(result) => result,

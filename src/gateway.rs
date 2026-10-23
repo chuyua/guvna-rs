@@ -1,4 +1,6 @@
-//! Public API; Chat and Embeddings share the same candidate walk.
+//! Public API entry: routes, shared AppState, authentication and admission.
+//! Endpoint adapters, stream lifecycle, response checks and dispatch stay
+//! in private child modules; there is exactly one upstream candidate walk.
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -7,10 +9,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -21,10 +22,18 @@ use crate::{
     config::Config,
     keypool::KeyPool,
     metrics::Metrics,
-    outcome::{Outcome, classify},
-    routing,
-    sse::ChatSse,
 };
+
+// Keep these children private to the gateway: only the route handlers and
+// narrow pub(super) bridge methods are shared, not a second public API.
+#[path = "chat_stream.rs"]
+mod chat_stream;
+#[path = "dispatch.rs"]
+mod dispatch;
+#[path = "response_validation.rs"]
+mod response_validation;
+#[path = "responses.rs"]
+mod responses;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_INFLIGHT_REQUESTS: usize = 128;
@@ -295,295 +304,20 @@ async fn model_detail(
     }
 }
 
-// The Responses contract and all Chat<->Responses translation live in their
-// own module. Keep gateway responsible for auth, routing, and shared dispatch.
-#[path = "responses.rs"]
-mod responses;
-
-#[derive(Clone, Copy)]
-enum Endpoint {
-    Chat,
-    Embeddings,
-}
-impl Endpoint {
-    fn path(self) -> &'static str {
-        match self {
-            Self::Chat => "/chat/completions",
-            Self::Embeddings => "/embeddings",
-        }
-    }
-}
-
 async fn chat(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
     let (body, permit) = match authenticated_body(&state, request).await {
         Ok(result) => result,
         Err(error) => return error.into_response(),
     };
-    dispatch(state, body, Endpoint::Chat, permit).await
+    dispatch::dispatch(state, body, dispatch::Endpoint::Chat, permit).await
 }
 async fn embeddings(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
     let (body, permit) = match authenticated_body(&state, request).await {
         Ok(result) => result,
         Err(error) => return error.into_response(),
     };
-    dispatch(state, body, Endpoint::Embeddings, permit).await
+    dispatch::dispatch(state, body, dispatch::Endpoint::Embeddings, permit).await
 }
-
-async fn dispatch(
-    state: Arc<AppState>,
-    body: Bytes,
-    endpoint: Endpoint,
-    admission: OwnedSemaphorePermit,
-) -> Response {
-    let request: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(_) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "invalid_json",
-                "Expected one JSON object",
-            );
-        }
-    };
-    if !request.is_object() {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "Expected JSON object",
-        );
-    }
-    if request
-        .get("model")
-        .and_then(Value::as_str)
-        .is_some_and(str::is_empty)
-    {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "invalid_model",
-            "model must not be empty",
-        );
-    }
-    if request
-        .get("stream")
-        .is_some_and(|value| !value.is_boolean())
-    {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "invalid_stream",
-            "stream must be a boolean",
-        );
-    }
-    Metrics::inc(&state.metrics.requests_dispatched);
-    let streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
-    if streaming && !matches!(endpoint, Endpoint::Chat) {
-        return error(
-            StatusCode::NOT_IMPLEMENTED,
-            "migration_pending",
-            "Only Chat Completions streaming is supported",
-        );
-    }
-    let Some(model) = request.get("model").and_then(Value::as_str) else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "missing_model",
-            "model must be a string",
-        );
-    };
-    let expected = request.get("n").map_or(1, |v| v.as_u64().unwrap_or(0));
-    if streaming && ChatSse::new(expected).is_err() {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "invalid_n",
-            "stream n must be 1..64",
-        );
-    }
-    let steps = match routing::resolve(&state.config, model) {
-        Ok(steps) => steps,
-        Err(_) => {
-            return error(
-                StatusCode::NOT_FOUND,
-                "unknown_model",
-                "Unknown chain/model; configure a chain first",
-            );
-        }
-    };
-
-    let mut permit = Some(admission);
-
-    // Count actual candidate transitions, not provider-key retries.
-    let mut candidates_visited = 0usize;
-    let mut attempted_network = false;
-    let mut bypassed_circuit = false;
-    // Exactly ONE candidate loop for chat + embedding. Key failover is confined to this loop.
-    for step in steps {
-        let provider = &state.config.providers[step.provider_index];
-        if provider.stream_only && !streaming {
-            continue; // A stream-only upstream cannot serve non-streaming requests.
-        }
-        if candidates_visited != 0 {
-            Metrics::inc(&state.metrics.candidate_fallbacks);
-        }
-        candidates_visited += 1;
-        let mut circuit_ticket = match &state.circuits[step.provider_index] {
-            Some(circuit) => match circuit.admit() {
-                Some(ticket) => Some(ticket),
-                None => {
-                    Metrics::inc(&state.metrics.circuit_bypasses);
-                    bypassed_circuit = true;
-                    continue; // No HTTP calls while open or a recovery probe runs.
-                }
-            },
-            None => None, // Preserve existing routing behavior by default.
-        };
-        let mut payload = request.clone();
-        let object = payload.as_object_mut().expect("checked above");
-        object.insert("model".into(), Value::String(step.model.clone()));
-        for (name, value) in &step.params {
-            object.entry(name).or_insert_with(|| value.clone()); // caller always wins.
-        }
-
-        // Serialize once per candidate, not once for every credential retry.
-        let payload_json = Bytes::from(payload.to_string());
-        let mut tried = HashSet::new();
-        while let Some(lease) = state.pools[step.provider_index].acquire(&tried) {
-            tried.insert(lease.env.clone());
-            let url = provider.endpoint(endpoint.path());
-            attempted_network = true;
-            Metrics::inc(&state.metrics.upstream_attempts);
-            // A request-wide reqwest timeout would terminate a healthy SSE
-            // generation after 90s despite regular progress. Time only the
-            // HTTP headers and non-streaming bounded JSON body instead.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-            let send = state
-                .client
-                .post(url)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .bearer_auth(&lease.secret)
-                .body(payload_json.clone())
-                .send();
-            let response = match tokio::time::timeout_at(deadline, send).await {
-                Ok(result) => result,
-                Err(_) => {
-                    Metrics::inc(&state.metrics.upstream_transport_failures);
-                    record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                    break;
-                }
-            };
-            let upstream = match response {
-                Ok(response) => response,
-                Err(_) => {
-                    Metrics::inc(&state.metrics.upstream_transport_failures);
-                    record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                    break;
-                } // key-neutral
-            };
-            let status = upstream.status().as_u16();
-            let outcome = classify(Some(status));
-            if outcome.quarantine_credential() {
-                Metrics::inc(&state.metrics.upstream_http_failures);
-                let retry_after = if outcome == Outcome::RateLimited {
-                    retry_after_delay(upstream.headers(), SystemTime::now())
-                } else {
-                    None
-                };
-                if state.pools[step.provider_index].record_with_retry_after(
-                    &lease,
-                    outcome,
-                    retry_after,
-                ) {
-                    Metrics::inc(&state.metrics.credential_quarantines);
-                }
-                continue; // try a different key; each key is attempted once
-            }
-            if outcome == Outcome::Success {
-                if streaming {
-                    match chat_stream::start(
-                        upstream,
-                        expected,
-                        state.clone(),
-                        step.provider_index,
-                        lease.clone(),
-                        &mut permit,
-                        &mut circuit_ticket,
-                    )
-                    .await
-                    {
-                        Ok(stream_response) => return stream_response,
-                        Err(_) => {
-                            Metrics::inc(&state.metrics.upstream_invalid_responses);
-                            record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                            break;
-                        } // preflight rejected
-                    }
-                }
-                match tokio::time::timeout_at(deadline, bounded_json(upstream)).await {
-                    Ok(Ok(value))
-                        if response_validation::valid_result(endpoint, &payload, &value) =>
-                    {
-                        state.pools[step.provider_index].record_success(&lease);
-                        record_circuit_success(&mut circuit_ticket, &state.metrics);
-                        Metrics::inc(&state.metrics.upstream_success);
-                        return (StatusCode::OK, Json(value)).into_response();
-                    }
-                    _ => {
-                        Metrics::inc(&state.metrics.upstream_invalid_responses);
-                        record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                        break;
-                    } // next step
-                }
-            }
-            Metrics::inc(&state.metrics.upstream_http_failures);
-            if outcome == Outcome::ProviderTransient
-                && let Some(ticket) = &mut circuit_ticket
-            {
-                let probe = ticket.is_probe();
-                if ticket.failure() {
-                    Metrics::inc(&state.metrics.circuit_openings);
-                }
-                if probe {
-                    Metrics::inc(&state.metrics.circuit_probe_failures);
-                }
-            }
-            break; // 4xx or 5xx: next chain step; no uncontrolled retries
-        }
-    }
-    if bypassed_circuit && !attempted_network {
-        let mut response = error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "provider_circuit_open",
-            "All eligible providers are temporarily unavailable",
-        );
-        response.headers_mut().insert(
-            axum::http::header::RETRY_AFTER,
-            axum::http::HeaderValue::from_static("1"),
-        );
-        return response;
-    }
-    error(
-        StatusCode::BAD_GATEWAY,
-        "upstream_unavailable",
-        "No upstream returned a valid response",
-    )
-}
-
-#[path = "chat_stream.rs"]
-mod chat_stream;
-
-async fn bounded_json(response: reqwest::Response) -> Result<Value, ()> {
-    let mut stream = response.bytes_stream();
-    let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| ())?;
-        if chunk.len() > MAX_BODY_BYTES.saturating_sub(bytes.len()) {
-            return Err(());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    serde_json::from_slice(&bytes).map_err(|_| ())
-}
-
-#[path = "response_validation.rs"]
-mod response_validation;
 
 #[cfg(test)]
 mod tests {
@@ -684,24 +418,9 @@ mod tests {
         assert_eq!(state.inflight.available_permits(), MAX_INFLIGHT_REQUESTS);
     }
     #[test]
-    fn protects_credentials_and_big_numbers() {
+    fn protects_credentials() {
         assert!(constant_time_equal(b"a", b"a"));
         assert!(!constant_time_equal(b"a", b"b"));
         assert!(!constant_time_equal(b"a", b"aa"));
-        let request: Value = serde_json::from_str(r#"{"input":"hello"}"#).unwrap();
-        assert!(response_validation::valid_result(
-            Endpoint::Embeddings,
-            &request,
-            &json!({
-                "data":[{"embedding":[0.1,0.2],"index":0}]
-            })
-        ));
-        assert!(!response_validation::valid_result(
-            Endpoint::Embeddings,
-            &request,
-            &json!({
-                "data":[{"embedding":[]}]
-            })
-        ));
     }
 }

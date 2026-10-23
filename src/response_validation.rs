@@ -1,6 +1,6 @@
 //! Strict, endpoint-specific 2xx upstream payload checks.
 //! No routing, retry, quarantine, metrics or HTTP actions happen here.
-use super::Endpoint;
+use super::dispatch::Endpoint;
 use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
@@ -192,6 +192,21 @@ fn validate_embeddings(request: &Value, response: &Value) -> bool {
 #[cfg(test)]
 mod response_contract_tests {
     use super::*;
+
+    #[test]
+    fn embedding_smoke_contract_stays_with_validator() {
+        let request: Value = serde_json::from_str(r#"{"input":"hello"}"#).unwrap();
+        assert!(valid_result(
+            Endpoint::Embeddings,
+            &request,
+            &json!({"data":[{"embedding":[0.1,0.2],"index":0}]})
+        ));
+        assert!(!valid_result(
+            Endpoint::Embeddings,
+            &request,
+            &json!({"data":[{"embedding":[]}]})
+        ));
+    }
 
     fn assistant(index: u64) -> Value {
         json!({"index":index,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"})
