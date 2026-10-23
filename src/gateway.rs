@@ -1469,7 +1469,7 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
         return false;
     }
     let expected = request.get("n").and_then(Value::as_u64).unwrap_or(1);
-    if expected > 1 && choices.len() as u64 != expected {
+    if choices.len() as u64 != expected {
         return false;
     }
     let mut indices = HashSet::new();
@@ -1508,10 +1508,19 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
         {
             return false;
         }
-        if let Some(tool_calls) = message.get("tool_calls") {
-            let Some(calls) = tool_calls.as_array() else {
-                return false;
-            };
+        let calls = match message.get("tool_calls") {
+            None => None,
+            Some(value) => match value.as_array() {
+                Some(calls) => Some(calls),
+                None => return false,
+            },
+        };
+        let finished_with_tools =
+            choice.get("finish_reason").and_then(Value::as_str) == Some("tool_calls");
+        if finished_with_tools != calls.is_some_and(|calls| !calls.is_empty()) {
+            return false;
+        }
+        if let Some(calls) = calls {
             for call in calls {
                 let Some(id) = call
                     .get("id")
@@ -1767,6 +1776,47 @@ mod response_contract_tests {
         assert!(!validate_chat(
             &request,
             &json!({"choices":[{"index":0,"message":{},"finish_reason":null},assistant(1)]})
+        ));
+    }
+
+    #[test]
+    fn chat_requires_exactly_one_choice_by_default() {
+        let two = json!({"choices":[assistant(0),assistant(1)]});
+        assert!(!validate_chat(&json!({}), &two));
+        assert!(!validate_chat(&json!({"n":1}), &two));
+        assert!(validate_chat(&json!({"n":2}), &two));
+    }
+
+    #[test]
+    fn chat_tool_finish_must_match_actual_calls() {
+        let tool = json!({
+            "id":"call_1", "type":"function",
+            "function":{"name":"lookup","arguments":"{}"}
+        });
+        let with_calls = |reason: &str| {
+            json!({"choices":[{
+                "index":0,
+                "message":{"role":"assistant","content":null,"tool_calls":[tool]},
+                "finish_reason":reason
+            }]})
+        };
+        let without_calls = |reason: &str| {
+            json!({"choices":[{
+                "index":0,
+                "message":{"role":"assistant","content":"ok"},
+                "finish_reason":reason
+            }]})
+        };
+        assert!(validate_chat(&json!({}), &with_calls("tool_calls")));
+        assert!(!validate_chat(&json!({}), &with_calls("stop")));
+        assert!(!validate_chat(&json!({}), &without_calls("tool_calls")));
+        assert!(!validate_chat(
+            &json!({}),
+            &json!({"choices":[{
+                "index":0,
+                "message":{"role":"assistant","tool_calls":[]},
+                "finish_reason":"tool_calls"
+            }]})
         ));
     }
 
