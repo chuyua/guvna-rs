@@ -84,6 +84,18 @@ client IP or API key. Logs can be collected by the host journal for soak
 testing. No remote management endpoint, control socket, telemetry database
 or additional externally exposed interface is created. See docs/AUTO_V1.md.
 
+## Non-streaming whole-chain timeout
+
+The gateway now has one timeout budget for a non-streaming request,
+including all upstream keys, candidate failover and SSE-to-JSON aggregation.
+Configure timeout.walk: 100s (default; supported 100ms to 1h).
+Exhaustion returns HTTP 504 upstream_walk_timeout; no retry resets it.
+Live client SSE with stream:true is exempt from this total deadline.
+
+Set GUVNA_LOG_REQUESTS=1 for local stderr JSON lines containing an anonymous
+request ID, elapsed time, HTTP status and completion phase.
+See docs/WALK_DEADLINE.md for privacy and operational details.
+
 ## SSE-only providers: non-streaming client compatibility
 
 A provider can be configured with stream_only: true (disabled by default).
