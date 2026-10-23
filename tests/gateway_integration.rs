@@ -429,3 +429,41 @@ async fn multi_event_chunk_preserves_order_and_one_terminal_marker() {
     assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn oversized_first_sse_chunk_fails_over_before_response_starts() {
+    let oversized: &'static [u8] = Box::leak(vec![b'x'; 2 * 1024 * 1024 + 1].into_boxed_slice());
+    let (a, bad_hits) = start_sse(vec![oversized]).await;
+    let (b, good_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let response = make_app(&a, &b)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert!(bytes.ends_with(SSE_DONE));
+    assert_eq!(bad_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(good_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn oversized_later_sse_chunk_returns_incomplete_without_failover() {
+    let oversized: &'static [u8] = Box::leak(vec![b'x'; 2 * 1024 * 1024 + 1].into_boxed_slice());
+    let (a, first_hits) = start_sse(vec![SSE_START, oversized]).await;
+    let (b, backup_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let response = make_app(&a, &b)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(
+        text.matches("upstream_stream_incomplete").count(),
+        1,
+        "{text}"
+    );
+    assert!(!text.contains("[DONE]"));
+    assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+}
