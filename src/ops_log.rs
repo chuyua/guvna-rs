@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static AGGREGATION_SUCCESS_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static AGGREGATION_FAILED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn enabled() -> bool {
     *ENABLED.get_or_init(|| {
@@ -20,24 +22,53 @@ fn enabled() -> bool {
 
 /// One of a bounded list of fixed event names, supplied by source constants.
 pub fn warn(event: &'static str) {
+    emit("warn", event);
+}
+
+/// Sampled successful conversion events make it possible to verify that
+/// SSE-only providers actually aggregate during a multi-day soak.
+pub fn info(event: &'static str) {
+    emit("info", event);
+}
+
+fn should_emit(sequence: u64) -> bool {
+    sequence <= 8 || sequence.is_multiple_of(128)
+}
+
+fn emit(level: &'static str, event: &'static str) {
     if !enabled() {
         return;
     }
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
-    // Do not overwhelm stderr if thousands of providers fail during load.
-    if sequence > 8 && !sequence.is_multiple_of(128) {
+    // Keep aggregate successes/failures independently sampled, otherwise
+    // rare failures can disappear behind a busy healthy stream provider.
+    // The category set is fixed: no provider/model/client cardinality.
+    let counter = match event {
+        "aggregation_completed" => &AGGREGATION_SUCCESS_SEQUENCE,
+        "aggregation_failed" => &AGGREGATION_FAILED_SEQUENCE,
+        _ => &SEQUENCE,
+    };
+    let sequence = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if !should_emit(sequence) {
         return;
     }
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis());
     eprintln!(
-        "{{\"ts_unix_ms\":{timestamp_ms},\"level\":\"warn\",\"event\":\"{event}\",\"sequence\":{sequence}}}"
+        "{{\"ts_unix_ms\":{timestamp_ms},\"level\":\"{level}\",\"event\":\"{event}\",\"sequence\":{sequence}}}"
     );
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn log_sampling_is_fixed_cardinality_and_does_not_hide_rare_failures() {
+        assert!((1..=8).all(super::should_emit));
+        assert!((9..128).all(|i| !super::should_emit(i)));
+        assert!(super::should_emit(128));
+        assert!(!super::should_emit(129));
+        assert!(super::should_emit(256));
+    }
     #[test]
     fn explicitly_opt_in_without_exposing_request_or_credential_details() {
         assert!(!super::enabled() || std::env::var("GUVNA_LOG_EVENTS").is_ok());
