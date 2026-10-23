@@ -74,6 +74,15 @@ between inspection and read. The release-binary CI verifies these cases,
 as well as concurrent atomic writers and daemon readers.
 
 
+## Gateway architecture
+
+The public router and shared state live in src/gateway.rs. Protocol
+translation, the one shared upstream candidate walk, Chat SSE lifecycle
+and result validation have separate private modules. This is a mechanical
+file extraction; HTTP behavior, retry/fallback and existing streaming
+adapters remain unchanged. See docs/GATEWAY_MODULES.md for the exact
+boundaries and invariants.
+
 ## Development
 
 ```sh
