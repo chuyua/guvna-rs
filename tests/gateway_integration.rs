@@ -2959,6 +2959,15 @@ async fn start_strict_stream_only(
 }
 
 fn app_with_stream_only_and_auto(streaming_url: &str, healthy_url: &str, auto: bool) -> Router {
+    app_with_stream_only_and_auto_walk(streaming_url, healthy_url, auto, "100s")
+}
+
+fn app_with_stream_only_and_auto_walk(
+    streaming_url: &str,
+    healthy_url: &str,
+    auto: bool,
+    walk: &str,
+) -> Router {
     let auto_yaml = if auto {
         r#"
 auto:
@@ -2994,6 +3003,8 @@ chains:
       - provider: backup
         model: backup-model
 {auto_yaml}
+timeout:
+  walk: {walk}
 "#
     );
     let config: Config = serde_yaml::from_str(&yaml).unwrap();
@@ -3059,10 +3070,11 @@ async fn start_progressing_aggregation(terminal: bool) -> (String, Arc<AtomicUsi
 
 async fn drive_aggregating_progress(
     terminal: bool,
+    walk: &str,
 ) -> (StatusCode, Value, std::time::Duration, usize, usize) {
     let (primary, primary_hits) = start_progressing_aggregation(terminal).await;
     let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
-    let app = app_with_stream_only_and_auto(&primary, &backup, false);
+    let app = app_with_stream_only_and_auto_walk(&primary, &backup, false, walk);
     let task = tokio::spawn(async move { call(app, request("ordered", "", "client")).await });
     // Keep real time running through the TCP connect and HTTP headers.
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -3107,7 +3119,7 @@ async fn drive_aggregating_progress(
 
 #[tokio::test(flavor = "current_thread")]
 async fn sse_only_aggregation_survives_ninety_seconds_of_valid_progress() {
-    let (status, result, elapsed, primary, backup) = drive_aggregating_progress(true).await;
+    let (status, result, elapsed, primary, backup) = drive_aggregating_progress(true, "2m").await;
     assert!(elapsed > std::time::Duration::from_secs(90), "{elapsed:?}");
     assert!(elapsed < std::time::Duration::from_secs(10 * 60));
     assert_eq!(status, StatusCode::OK, "{result}");
@@ -3119,7 +3131,7 @@ async fn sse_only_aggregation_survives_ninety_seconds_of_valid_progress() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn sse_only_infinite_heartbeat_expires_and_uses_healthy_json_backup() {
-    let (status, result, elapsed, primary, backup) = drive_aggregating_progress(false).await;
+    let (status, result, elapsed, primary, backup) = drive_aggregating_progress(false, "12m").await;
     assert!(
         elapsed >= std::time::Duration::from_secs(9 * 60),
         "{elapsed:?}"
@@ -3132,6 +3144,21 @@ async fn sse_only_infinite_heartbeat_expires_and_uses_healthy_json_backup() {
     assert_eq!(result["choices"][0]["message"]["content"], "success");
     assert_eq!(primary, 1, "no repeated attempts on a drip-fed primary");
     assert_eq!(backup, 1, "hard deadline must allow exactly one fallback");
+}
+
+// Issue #65's shared walk budget is authoritative even if an SSE-only
+// upstream keeps sending heartbeats: it cannot silently monopolize a
+// non-streaming slot for the entire 10min per-stream cap.
+#[tokio::test(flavor = "current_thread")]
+async fn sse_only_progressing_heartbeat_cannot_bypass_shared_walk_budget() {
+    let (status, result, elapsed, primary, backup) =
+        drive_aggregating_progress(false, "100s").await;
+    assert!(elapsed >= std::time::Duration::from_secs(90), "{elapsed:?}");
+    assert!(elapsed < std::time::Duration::from_secs(150), "{elapsed:?}");
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{result}");
+    assert_eq!(result["error"]["code"], "upstream_walk_timeout");
+    assert_eq!(primary, 1, "do not replay a drip-fed candidate");
+    assert_eq!(backup, 0, "no fallback after exhausting the shared budget");
 }
 
 #[tokio::test]

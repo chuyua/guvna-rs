@@ -383,10 +383,11 @@ async fn dispatch_inner(
                     }
                 }
                 let result = if upstream_stream && !streaming {
-                    // JSON-capable providers keep the 90s absolute timeout.
-                    // SSE-only generations may continue making valid progress
-                    // beyond 90s; guard them independently with a 15s idle
-                    // timeout (in aggregate()) and an explicit 10min cap.
+                    // JSON-capable providers retain a bounded body read.
+                    // SSE-only generations have both a 15s idle limit and a
+                    // 10min absolute cap. The shared non-streaming walk
+                    // budget still wins if shorter, preventing indefinite
+                    // retries or heartbeats across multiple candidates.
                     let lifetime =
                         tokio::time::Instant::now() + chat_aggregate::MAX_AGGREGATION_LIFETIME;
                     let aggregated = tokio::time::timeout_at(
