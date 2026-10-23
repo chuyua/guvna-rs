@@ -106,7 +106,13 @@ mod tests {
         assert!(rendered.contains("guvna_upstream_attempts_total 100\n"));
         assert!(rendered.contains("guvna_active_requests 7\n"));
         assert!(!rendered.contains('{'));
-        assert!(rendered.len() < 2000);
+        assert!(
+            rendered.len() < 2600,
+            "24 fixed-name counters and gauges must remain bounded: {} bytes",
+            rendered.len()
+        );
+        assert!(rendered.contains("guvna_aggregation_busy_total 0\n"));
+        assert!(rendered.contains("guvna_aggregation_completed_total 0\n"));
         assert!(rendered.contains("guvna_circuit_open_providers 2\n"));
         assert_eq!(rendered.matches("# TYPE guvna_").count(), 24);
     }
