@@ -296,6 +296,9 @@ async fn dispatch(
     )
 }
 
+// Bound a single upstream read: even valid tiny events must not create an unbounded queue.
+const MAX_STREAM_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
 struct ChatStreamState {
     owner: Arc<AppState>,
     provider_index: usize,
@@ -342,6 +345,9 @@ async fn preflight_stream(state: &mut ChatStreamState) -> Result<(), ()> {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let chunk = state.upstream.chunk().await.map_err(|_| ())?.ok_or(())?;
+            if chunk.len() > MAX_STREAM_CHUNK_BYTES {
+                return Err(());
+            }
             let events = state.parser.push(&chunk).map_err(|_| ())?;
             state.pending.extend(events);
             if !state.pending.is_empty() {
@@ -370,10 +376,16 @@ fn stream_response(state: ChatStreamState) -> Response {
             }
             // Bound upstream stalls after the first event without buffering the response.
             match tokio::time::timeout(Duration::from_secs(15), state.upstream.chunk()).await {
-                Ok(Ok(Some(bytes))) => match state.parser.push(&bytes) {
-                    Ok(events) => state.pending.extend(events),
-                    Err(_) => state.terminated = true,
-                },
+                Ok(Ok(Some(bytes))) => {
+                    if bytes.len() > MAX_STREAM_CHUNK_BYTES {
+                        state.terminated = true;
+                    } else {
+                        match state.parser.push(&bytes) {
+                            Ok(events) => state.pending.extend(events),
+                            Err(_) => state.terminated = true,
+                        }
+                    }
+                }
                 Ok(Ok(None)) | Ok(Err(_)) | Err(_) => state.terminated = true,
             }
             if state.terminated {
