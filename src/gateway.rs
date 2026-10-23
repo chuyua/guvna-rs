@@ -224,6 +224,7 @@ async fn responses(
         Value::Array(items) if !items.is_empty() => {
             let mut messages = Vec::with_capacity(items.len());
             let mut pending_calls = std::collections::HashSet::<String>::new();
+            let mut seen_calls = std::collections::HashSet::<String>::new();
             for item in items {
                 if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
                     let Some(call_id) = item
@@ -308,7 +309,9 @@ async fn responses(
                             "Invalid function call arguments or fields",
                         );
                     }
-                    if !pending_calls.insert(call_id.to_owned()) {
+                    if !seen_calls.insert(call_id.to_owned())
+                        || !pending_calls.insert(call_id.to_owned())
+                    {
                         return error(
                             StatusCode::BAD_REQUEST,
                             "duplicate_function_call",
@@ -317,6 +320,13 @@ async fn responses(
                     }
                     messages.push(json!({"role":"assistant","content":Value::Null,"tool_calls":[{"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}}]}));
                     continue;
+                }
+                if !pending_calls.is_empty() {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "pending_function_calls",
+                        "Function calls must be resolved before another message",
+                    );
                 }
                 let Some(role) = item.get("role").and_then(Value::as_str) else {
                     return error(
@@ -419,7 +429,6 @@ async fn responses(
         "include",
         "metadata",
         "store",
-        "parallel_tool_calls",
         "background",
         "truncation",
         "service_tier",
@@ -451,6 +460,7 @@ async fn responses(
             "instructions",
             "tools",
             "tool_choice",
+            "parallel_tool_calls",
         ]
         .contains(&key.as_str())
         {
@@ -461,7 +471,17 @@ async fn responses(
             );
         }
     }
-    // Map the supported Responses function-tool declaration to Chat Completions.
+    if object
+        .get("parallel_tool_calls")
+        .is_some_and(|v| !v.is_boolean())
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_parallel_tool_calls",
+            "parallel_tool_calls must be boolean",
+        );
+    } // Map the supported Responses function-tool declaration to Chat Completions.
+    let mut declared_functions = std::collections::HashSet::<String>::new();
     if let Some(tools) = object.get_mut("tools") {
         let Some(items) = tools.as_array_mut() else {
             return error(
@@ -500,6 +520,24 @@ async fn responses(
                     "Only named function tools are supported",
                 );
             }
+            let name = map["name"].as_str().expect("validated above");
+            if !declared_functions.insert(name.to_owned()) {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "duplicate_function",
+                    "Function names must be unique",
+                );
+            }
+            if map.get("description").is_some_and(|v| !v.is_string())
+                || map.get("parameters").is_some_and(|v| !v.is_object())
+                || map.get("strict").is_some_and(|v| !v.is_boolean())
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_function",
+                    "Invalid function declaration fields",
+                );
+            }
             let mut function = map.clone();
             function.remove("type");
             *tool = json!({"type":"function","function":function});
@@ -526,6 +564,13 @@ async fn responses(
                     StatusCode::NOT_IMPLEMENTED,
                     "responses_tool_choice_unsupported",
                     "Unsupported tool choice",
+                );
+            }
+            if !declared_functions.contains(map["name"].as_str().expect("validated above")) {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "unknown_function",
+                    "Selected function was not declared",
                 );
             }
             *choice = json!({"type":"function","function":{"name":map["name"]}});

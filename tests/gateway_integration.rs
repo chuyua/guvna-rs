@@ -684,6 +684,18 @@ async fn responses_text_bridge_and_unsupported_modes() {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
     assert_eq!(hits.load(Ordering::SeqCst), 9);
+    for bad_request in [
+        json!({"model":"demo","input":"hello","tools":[{"type":"function","name":"lookup"},{"type":"function","name":"lookup"}]}),
+        json!({"model":"demo","input":"hello","tools":[{"type":"function","name":"lookup","parameters":7}]}),
+        json!({"model":"demo","input":"hello","parallel_tool_calls":1}),
+        json!({"model":"demo","input":"hello","tools":[{"type":"function","name":"lookup"}],"tool_choice":{"type":"function","name":"missing"}}),
+        json!({"model":"demo","input":[{"type":"function_call","call_id":"dup","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"dup","output":"x"},{"type":"function_call","call_id":"dup","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"dup","output":"y"}]}),
+        json!({"model":"demo","input":[{"type":"function_call","call_id":"id1","name":"lookup","arguments":"{}"},{"role":"user","content":"premature"},{"type":"function_call_output","call_id":"id1","output":"x"}]}),
+    ] {
+        let (status, _) = call(router.clone(), req(bad_request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 9);
     for payload in [
         json!({"model":"demo","input":"hello","stream":true}),
         json!({"model":"demo","input":"hello","tools":[{"type":"web_search"}]}),
