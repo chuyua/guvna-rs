@@ -2,7 +2,7 @@
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -33,6 +33,7 @@ pub struct AppState {
     pools: Vec<KeyPool>,
     client_keys: Vec<String>,
     inflight: Arc<Semaphore>,
+    model_catalog: Value,
 }
 
 impl AppState {
@@ -56,7 +57,9 @@ impl AppState {
             .redirect(reqwest::redirect::Policy::none()) // Do not redirect provider credentials.
             .build()
             .map_err(|e| format!("building HTTP client: {e}"))?;
+        let model_catalog = json!({"object":"list","data": config.chains.iter().map(|ch| json!({"id":ch.name,"object":"model","owned_by":"guvna"})).collect::<Vec<_>>()});
         Ok(Self {
+            model_catalog,
             config,
             client,
             pools,
@@ -107,6 +110,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/models", get(models))
+        .route("/v1/models/{model}", get(model_detail))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/responses", post(not_implemented))
@@ -122,21 +126,25 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     if !state.allowed(&headers) {
         return unauthorized();
     }
-    let models: Vec<_> = state
-        .config
-        .chains
-        .iter()
-        .map(|ch| {
-            json!({
-                "id": ch.name, "object": "model", "owned_by": "guvna"
-            })
-        })
-        .collect();
-    (
-        StatusCode::OK,
-        Json(json!({"object":"list", "data":models})),
-    )
-        .into_response()
+    (StatusCode::OK, Json(state.model_catalog.clone())).into_response()
+}
+
+async fn model_detail(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(model): AxumPath<String>,
+) -> Response {
+    if !state.allowed(&headers) {
+        return unauthorized();
+    }
+    match state.config.chains.iter().find(|chain| chain.name == model) {
+        Some(chain) => (
+            StatusCode::OK,
+            Json(json!({"id":chain.name,"object":"model","owned_by":"guvna"})),
+        )
+            .into_response(),
+        None => error(StatusCode::NOT_FOUND, "model_not_found", "Unknown model"),
+    }
 }
 
 async fn not_implemented() -> Response {
@@ -196,6 +204,27 @@ async fn dispatch(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "Expected JSON object",
+        );
+    }
+    if request
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(str::is_empty)
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_model",
+            "model must not be empty",
+        );
+    }
+    if request
+        .get("stream")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_stream",
+            "stream must be a boolean",
         );
     }
     let streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
@@ -263,7 +292,7 @@ async fn dispatch(
         }
 
         // Serialize once per candidate, not once for every credential retry.
-        let payload_json = payload.to_string();
+        let payload_json = Bytes::from(payload.to_string());
         let mut tried = HashSet::new();
         while let Some(lease) = state.pools[step.provider_index].acquire(&tried) {
             tried.insert(lease.env.clone());
@@ -351,7 +380,11 @@ async fn start_chat_stream(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
-    if !content_type.starts_with("text/event-stream") {
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+    {
         return Err(());
     }
     let mut state = ChatStreamState {

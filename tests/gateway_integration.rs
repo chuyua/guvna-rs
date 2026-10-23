@@ -503,3 +503,44 @@ async fn admission_control_bounds_concurrent_streams_and_recovers_after_disconne
     drop(recovered);
     assert!(dropped.load(Ordering::SeqCst) > 0);
 }
+
+#[tokio::test]
+async fn invalid_stream_and_empty_model_rejected_without_upstream_calls() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&url, &url);
+    for (model, extra, code) in [
+        ("demo", r#","stream":"true""#, "invalid_stream"),
+        ("demo", r#","stream":null"#, "invalid_stream"),
+        ("", "", "invalid_model"),
+    ] {
+        let (status, value) = call(router.clone(), request(model, extra, "client")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(value["error"]["code"], code);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn model_catalog_and_detail_are_consistent_and_authorized() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&url, &url);
+    let req = |uri: &str, key: &str| {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, catalog) = call(router.clone(), req("/v1/models", "client")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(catalog["data"][0]["id"], "demo");
+    let (status, detail) = call(router.clone(), req("/v1/models/demo", "client")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail, catalog["data"][0]);
+    let (status, missing) = call(router.clone(), req("/v1/models/missing", "client")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing["error"]["code"], "model_not_found");
+    let (status, _) = call(router, req("/v1/models/demo", "wrong")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
