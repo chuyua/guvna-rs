@@ -795,13 +795,7 @@ async fn responses(State(state): State<Arc<AppState>>, request: Request<Body>) -
         object.insert("max_tokens".into(), tokens);
     }
     let response_metrics = state.metrics.clone();
-    let response = dispatch(
-        state,
-        headers,
-        Bytes::from(value.to_string()),
-        Endpoint::Chat,
-    )
-    .await;
+    let response = dispatch(state, Bytes::from(value.to_string()), Endpoint::Chat).await;
     if response.status() != StatusCode::OK {
         return response;
     }
@@ -1614,15 +1608,10 @@ mod tests {
             .try_acquire_many_owned(MAX_INFLIGHT_REQUESTS as u32)
             .unwrap();
         assert_eq!(state.inflight.available_permits(), 0);
-        let headers = HeaderMap::from_iter([(
-            axum::http::header::AUTHORIZATION,
-            axum::http::HeaderValue::from_static("Bearer client"),
-        )]);
         let response = tokio::time::timeout(
             Duration::from_millis(200),
             dispatch(
                 state.clone(),
-                headers,
                 Bytes::from_static(
                     br#"{"model":"demo","messages":[{"role":"user","content":"hi"}]}"#,
                 ),
