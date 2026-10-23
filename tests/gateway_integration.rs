@@ -655,6 +655,13 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(tool_result["output"][0]["name"], "lookup");
     assert_eq!(tool_result["output"][0]["call_id"], "call_123");
     assert_eq!(hits.load(Ordering::SeqCst), 7);
+    let (status, continued) = call(router.clone(), req(json!({"model":"demo","input":[{"type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call_123","output":"Paris is in France"}]}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(continued["output_text"], "success");
+    assert_eq!(hits.load(Ordering::SeqCst), 8);
+    let (status, _) = call(router.clone(), req(json!({"model":"demo","input":[{"type":"function_call_output","call_id":"call_123","output":7}]}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(hits.load(Ordering::SeqCst), 8);
     for payload in [
         json!({"model":"demo","input":"hello","stream":true}),
         json!({"model":"demo","input":"hello","tools":[{"type":"web_search"}]}),
@@ -677,5 +684,5 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = call(router, req(json!({"input":"hello"}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(hits.load(Ordering::SeqCst), 7);
+    assert_eq!(hits.load(Ordering::SeqCst), 8);
 }
