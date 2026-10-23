@@ -663,16 +663,30 @@ async fn responses(
                 "Tool calls require tool_calls finish reason",
             );
         }
-        let mut output = Vec::with_capacity(calls.map_or(0, Vec::len));
+        let mut output = Vec::with_capacity(calls.map_or(0, Vec::len) + 1);
+        let content = &chat["choices"][0]["message"]["content"];
+        if let Some(text) = content.as_str().filter(|text| !text.is_empty()) {
+            output.push(json!({"id":format!("msg_{}",chat["id"].as_str().unwrap_or("generated")),"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":text,"annotations":[]}]}));
+        } else if !content.is_null() && content.as_str() != Some("") {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_tool_content",
+                "Tool call content must be text or null",
+            );
+        }
+        let mut seen_ids = std::collections::HashSet::with_capacity(calls.map_or(0, Vec::len));
         for call in calls.expect("checked above") {
-            let Some(id) = call["id"].as_str() else {
+            let Some(id) = call["id"].as_str().filter(|id| !id.is_empty()) else {
                 return error(
                     StatusCode::BAD_GATEWAY,
                     "invalid_tool_call",
                     "Missing tool call id",
                 );
             };
-            let Some(name) = call["function"]["name"].as_str() else {
+            let Some(name) = call["function"]["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+            else {
                 return error(
                     StatusCode::BAD_GATEWAY,
                     "invalid_tool_call",
@@ -686,23 +700,22 @@ async fn responses(
                     "Missing function arguments",
                 );
             };
-            if call["type"] != "function" || serde_json::from_str::<Value>(arguments).is_err() {
+            if call["type"] != "function"
+                || serde_json::from_str::<Value>(arguments).is_err()
+                || !seen_ids.insert(id)
+            {
                 return error(
                     StatusCode::BAD_GATEWAY,
                     "invalid_tool_call",
-                    "Invalid function call arguments",
+                    "Invalid or duplicate function call",
                 );
             }
             output.push(json!({"type":"function_call","id":id,"call_id":id,"name":name,"arguments":arguments,"status":"completed"}));
         }
-        return (
-            StatusCode::OK,
-            Json(json!({
-                "id":chat["id"], "object":"response", "status":"completed", "model":logical_model,
-                "output":output, "output_text":"", "usage":translated_usage, "created_at":created_at, "incomplete_details":Value::Null,
-            })),
-        )
-            .into_response();
+        return (StatusCode::OK, Json(json!({
+            "id":chat["id"], "object":"response", "status":"completed", "model":logical_model,
+            "output":output, "output_text":content.as_str().unwrap_or(""), "usage":translated_usage, "created_at":created_at, "incomplete_details":Value::Null,
+        }))).into_response();
     }
     let content = chat["choices"][0]["message"]["content"].as_str();
     let Some(content) = content else {
