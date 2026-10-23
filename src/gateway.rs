@@ -1,7 +1,7 @@
 //! Public API; Chat and Embeddings share the same candidate walk.
 use axum::{
     Json, Router,
-    body::{Body, Bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -135,7 +135,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/models/{model}", get(model_detail))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/embeddings", post(embeddings))
-        .route("/v1/responses", post(not_implemented))
+        .route("/v1/responses", post(responses))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(Arc::new(state))
 }
@@ -165,14 +165,153 @@ async fn model_detail(
     }
 }
 
-async fn not_implemented() -> Response {
-    error(
-        StatusCode::NOT_IMPLEMENTED,
-        "migration_pending",
-        "Responses translation is not implemented in this milestone",
+// Minimal non-streaming Responses compatibility adapter. Unsupported modes fail closed.
+async fn responses(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !state.allowed(&headers) {
+        return unauthorized();
+    }
+    let mut value: Value = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) if value.is_object() => value,
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                "Expected one JSON object",
+            );
+        }
+    };
+    if value.get("stream") == Some(&Value::Bool(true)) {
+        return error(
+            StatusCode::NOT_IMPLEMENTED,
+            "responses_stream_unsupported",
+            "Responses streaming is not supported",
+        );
+    }
+    if value.get("stream").is_some_and(|v| !v.is_boolean()) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_stream",
+            "stream must be a boolean",
+        );
+    }
+    let Some(input) = value.get("input").cloned() else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "missing_input",
+            "input is required",
+        );
+    };
+    let messages = match input {
+        Value::String(text) => json!([{"role":"user","content":text}]),
+        Value::Array(messages)
+            if messages.iter().all(|m| {
+                matches!(
+                    m.get("role").and_then(Value::as_str),
+                    Some("user" | "assistant" | "system" | "developer")
+                ) && m.get("content").and_then(Value::as_str).is_some()
+            }) =>
+        {
+            Value::Array(messages)
+        }
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "unsupported_input",
+                "Only text or role/content messages are supported",
+            );
+        }
+    };
+    if value.get("n").is_some_and(|n| n.as_u64() != Some(1)) {
+        return error(
+            StatusCode::NOT_IMPLEMENTED,
+            "responses_multi_choice_unsupported",
+            "Responses requires one output choice",
+        );
+    }
+    let object = value.as_object_mut().expect("checked above");
+    for key in [
+        "tools",
+        "tool_choice",
+        "previous_response_id",
+        "conversation",
+        "reasoning",
+        "text",
+        "modalities",
+        "include",
+        "instructions",
+        "metadata",
+        "store",
+        "parallel_tool_calls",
+        "background",
+        "truncation",
+        "service_tier",
+        "safety_identifier",
+        "prompt",
+        "prompt_cache_key",
+    ] {
+        if object.contains_key(key) {
+            return error(
+                StatusCode::NOT_IMPLEMENTED,
+                "responses_feature_unsupported",
+                "This Responses feature is not yet supported",
+            );
+        }
+    }
+    object.remove("input");
+    object.remove("stream");
+    object.insert("messages".into(), messages);
+    if let Some(tokens) = object.remove("max_output_tokens") {
+        object.insert("max_tokens".into(), tokens);
+    }
+    let response = dispatch(
+        state,
+        headers,
+        Bytes::from(value.to_string()),
+        Endpoint::Chat,
     )
+    .await;
+    if response.status() != StatusCode::OK {
+        return response;
+    }
+    let bytes = match to_bytes(response.into_body(), MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_upstream",
+                "Chat response exceeds size limit",
+            );
+        }
+    };
+    let chat: Value = match serde_json::from_slice(&bytes) {
+        Ok(chat) => chat,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_upstream",
+                "Invalid upstream chat response",
+            );
+        }
+    };
+    let content = chat["choices"][0]["message"]["content"].as_str();
+    let Some(content) = content else {
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "unsupported_chat_output",
+            "Only text chat responses can be translated",
+        );
+    };
+    (StatusCode::OK, Json(json!({
+        "id":chat["id"], "object":"response", "status":"completed", "model":chat["model"],
+        "output":[{"id":format!("msg_{}",chat["id"].as_str().unwrap_or("generated")), "type":"message", "status":"completed", "role":"assistant", "content":[{"type":"output_text","text":content,"annotations":[]}]}],
+        "output_text":content,
+        "usage": {"input_tokens":chat["usage"]["prompt_tokens"], "output_tokens":chat["usage"]["completion_tokens"], "total_tokens":chat["usage"]["total_tokens"]}
+    }))).into_response()
 }
-
 #[derive(Clone, Copy)]
 enum Endpoint {
     Chat,

@@ -584,3 +584,36 @@ async fn catalog_exposes_configured_provider_models_without_upstream_discovery()
     assert_eq!(status, StatusCode::OK);
     assert_eq!(detail["owned_by"], "fast");
 }
+
+#[tokio::test]
+async fn responses_text_bridge_and_unsupported_modes() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&url, &url);
+    let req = |payload: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    };
+    let (status, value) = call(router.clone(), req(json!({"model":"demo","input":"hello"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["object"], "response");
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["output"][0]["content"][0]["text"], "success");
+    assert_eq!(value["output_text"], "success");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    for payload in [
+        json!({"model":"demo","input":"hello","stream":true}),
+        json!({"model":"demo","input":"hello","tools":[]}),
+        json!({"model":"demo","input":"hello","n":2}),
+    ] {
+        let (status, _) = call(router.clone(), req(payload)).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+    let (status, _) = call(router, req(json!({"model":"demo"}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
