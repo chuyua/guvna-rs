@@ -318,7 +318,6 @@ async fn responses(
         "text",
         "modalities",
         "include",
-        "instructions",
         "metadata",
         "store",
         "parallel_tool_calls",
@@ -350,6 +349,7 @@ async fn responses(
             "temperature",
             "top_p",
             "user",
+            "instructions",
         ]
         .contains(&key.as_str())
         {
@@ -359,6 +359,23 @@ async fn responses(
                 "Unsupported Responses parameter",
             );
         }
+    }
+    // Instructions become a leading system message, not a provider-specific field.
+    // Validate before moving any data into the shared chat dispatcher.
+    let instructions = match object.remove("instructions") {
+        Some(Value::String(text)) => Some(text),
+        Some(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_instructions",
+                "instructions must be a string",
+            );
+        }
+        None => None,
+    };
+    let mut messages = messages;
+    if let (Some(text), Some(items)) = (instructions, messages.as_array_mut()) {
+        items.insert(0, json!({"role":"system","content":text}));
     }
     object.remove("input");
     object.remove("stream");

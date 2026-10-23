@@ -611,6 +611,14 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(converted["output_text"], "success");
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+    let (status, instructed) = call(
+        router.clone(),
+        req(json!({"model":"demo","instructions":"Answer briefly","input":"hello"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(instructed["output_text"], "success");
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
     for payload in [
         json!({"model":"demo","input":"hello","stream":true}),
         json!({"model":"demo","input":"hello","tools":[]}),
@@ -623,9 +631,15 @@ async fn responses_text_bridge_and_unsupported_modes() {
         let (status, _) = call(router.clone(), req(payload)).await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     }
+    let (status, _) = call(
+        router.clone(),
+        req(json!({"model":"demo","input":"hello","instructions":[]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = call(router.clone(), req(json!({"model":"demo"}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = call(router, req(json!({"input":"hello"}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
 }
