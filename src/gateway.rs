@@ -487,6 +487,40 @@ async fn responses(
             "Responses requires one output choice",
         );
     }
+    // Stateless proxy: only explicit non-persistent modes are safe to accept.
+    for (key, expected) in [
+        ("store", Value::Bool(false)),
+        ("background", Value::Bool(false)),
+        ("truncation", Value::String("disabled".into())),
+    ] {
+        if value.get(key).is_some_and(|actual| actual != &expected) {
+            return error(
+                StatusCode::NOT_IMPLEMENTED,
+                "responses_feature_unsupported",
+                "This stateful Responses mode is not supported",
+            );
+        }
+    }
+    let metadata = match value.get("metadata") {
+        None | Some(Value::Null) => Value::Null,
+        Some(Value::Object(map))
+            if map.len() <= 16
+                && map.iter().all(|(key, value)| {
+                    !key.is_empty()
+                        && key.len() <= 64
+                        && value.as_str().is_some_and(|text| text.len() <= 512)
+                }) =>
+        {
+            Value::Object(map.clone())
+        }
+        Some(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_metadata",
+                "metadata must contain at most 16 short string entries",
+            );
+        }
+    };
     let object = value.as_object_mut().expect("checked above");
     for key in [
         "previous_response_id",
@@ -495,10 +529,6 @@ async fn responses(
         "text",
         "modalities",
         "include",
-        "metadata",
-        "store",
-        "background",
-        "truncation",
         "service_tier",
         "safety_identifier",
         "prompt",
@@ -529,6 +559,10 @@ async fn responses(
             "tools",
             "tool_choice",
             "parallel_tool_calls",
+            "metadata",
+            "store",
+            "background",
+            "truncation",
         ]
         .contains(&key.as_str())
         {
@@ -661,8 +695,12 @@ async fn responses(
             "missing_tools",
             "A required tool choice needs declared tools",
         );
-    } // Instructions become a leading system message, not a provider-specific field.
+    }
+    // Instructions become a leading system message, not a provider-specific field.
     // Validate before moving any data into the shared chat dispatcher.
+    for key in ["metadata", "store", "background", "truncation"] {
+        object.remove(key);
+    }
     let instructions = match object.remove("instructions") {
         Some(Value::String(text)) => Some(text),
         Some(_) => {
@@ -860,7 +898,7 @@ async fn responses(
         }
         return (StatusCode::OK, Json(json!({
             "id":chat["id"], "object":"response", "status":"completed", "model":logical_model,
-            "output":output, "output_text":content.as_str().unwrap_or(""), "usage":translated_usage, "created_at":created_at, "incomplete_details":Value::Null,
+            "output":output, "output_text":content.as_str().unwrap_or(""), "usage":translated_usage, "created_at":created_at, "incomplete_details":Value::Null, "metadata":metadata,
         }))).into_response();
     }
     let content = chat["choices"][0]["message"]["content"].as_str();
@@ -889,7 +927,7 @@ async fn responses(
         "id":chat["id"], "object":"response", "status":response_status, "incomplete_details":incomplete_details, "created_at":created_at, "model":logical_model,
         "output":[{"id":format!("msg_{}",response_id), "type":"message", "status":output_status, "role":"assistant", "content":[{"type":"output_text","text":content,"annotations":[]}]}],
         "output_text":content,
-        "usage": translated_usage
+        "usage": translated_usage, "metadata":metadata
     }))).into_response()
 }
 #[derive(Clone, Copy)]
