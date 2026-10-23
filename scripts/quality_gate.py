@@ -605,6 +605,30 @@ chains:
         for metric, want in expected.items():
             check(metrics.get(metric) == want,
                   f"SSE-only metric {metric}={metrics.get(metric)}, wanted {want}")
+
+        # A request for more than 64 choices cannot be represented by
+        # the bounded SSE synthesizer. A direct route has no JSON fallback:
+        # the *actual Linux binary* must reject it without touching the
+        # upstream at all or misclassifying it as an upstream failure.
+        bad_choice_req = Request(
+            api,
+            data=json.dumps({"model":"streaming/only-stream",
+                             "messages":[{"role":"user","content":"ping"}],
+                             "n":65}).encode(),
+            method="POST",
+            headers={"Authorization":"Bearer only-for-local-test",
+                     "Content-Type":"application/json"})
+        try:
+            with urlopen(bad_choice_req, timeout=3) as response:
+                response.read()
+                raise AssertionError("unsupported SSE-only n=65 returned 200")
+        except HTTPError as error:
+            payload = json.load(error)
+            check(error.code == 422
+                  and payload.get("error", {}).get("code") == "aggregate_n_unsupported",
+                  f"SSE-only unsupported n returned wrong error: {error.code} {payload}")
+        check(upstream.calls == upstream_attempts,
+              "unsupported SSE aggregation consumed an unnecessary upstream HTTP attempt")
         usage = proc_info(proc.pid)
         check(usage["VmRSS"] <= 16 * 1024,
               "SSE-to-JSON adapter exceeds 16 MiB RSS in own release process")
@@ -629,18 +653,34 @@ chains:
         thread.join(timeout=3)
         text = captured.decode("utf-8", "replace")
         events = [line for line in text.splitlines() if line.startswith("{")]
-        check(2 <= len(events) <= 16,
-              f"SSE-only local per-category log sampling failed: {len(events)}")
-        kinds = set()
+        # A failed stream now emits both the overall failure event and one
+        # fixed cause event. Each category has its own first-eight sampling
+        # budget, so a large success wave cannot suppress rare faults.
+        # Keep the gate strict: exactly 8 from every deterministic category,
+        # no provider identifiers or unapproved fields, never just increase
+        # the old event count ceiling to hide unexpected new logging.
+        categories = {
+            "aggregation_failed": [],
+            "aggregation_completed": [],
+            "aggregation_invalid_sse": [],
+        }
         for line in events:
             record = json.loads(line)
             check(set(record) == {"ts_unix_ms", "level", "event", "sequence"},
                   "SSE-only local log contains unapproved metadata")
-            check(record["event"] in {"aggregation_failed", "aggregation_completed"},
+            check(record["event"] in categories,
                   f"unexpected aggregate diagnostic event: {record}")
-            kinds.add(record["event"])
-        check(kinds == {"aggregation_failed", "aggregation_completed"},
-              "SSE-only logs cannot distinguish success from failure")
+            check(record["level"] in ("warn", "info"),
+                  "unexpected local event severity")
+            check(isinstance(record["ts_unix_ms"], int)
+                  and record["ts_unix_ms"] > 0,
+                  "invalid local diagnostic timestamp")
+            categories[record["event"]].append(record["sequence"])
+        for kind, sequences in categories.items():
+            check(sorted(sequences) == list(range(1, 9)),
+                  f"SSE-only log {kind} independently sampled unexpected sequences: {sequences}")
+        check(len(events) == 24,
+              f"SSE-only local log event cardinality changed: {len(events)}")
         check(all(token not in text for token in
                   ("fake-stream-key", "fake-live-key", "only-for-local-test",
                    "stream-ok", "request declined", "private reasoning", "fake-audio")),

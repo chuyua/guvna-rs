@@ -117,6 +117,15 @@ fixed event name uses independent sampling so rare classes are not lost in
 a high-volume success stream. No user information or provider identifiers are
 logged, and no new remote management interface is introduced.
 
+In addition to the Rust integration cases, the real Linux Release quality
+gate now sends a direct SSE-only n=65 request and requires HTTP 422 with
+zero upstream HTTP calls. The sampled local event gate is deliberately
+strict: deterministic failure injection must produce exactly eight samples
+in each of aggregation_invalid_sse, aggregation_failed, and
+aggregation_completed, with independent sequence numbers starting at
+one. The gate checks approved log fields and secret redaction; it does not
+merely increase the old generic log count ceiling.
+
 ## SSE-only provider: bounded JSON synthesis and local logging
 
 The Linux --release gate runs 64 JSON Chat requests against a fixture that
