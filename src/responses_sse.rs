@@ -9,7 +9,8 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{collections::VecDeque, sync::Arc};
 
-const MAX_FRAME: usize = 1024 * 1024;
+const MAX_FRAME: usize = 1024 * 1024 + 8;
+const MAX_INPUT_CHUNK: usize = 2 * 1024 * 1024;
 const MAX_TEXT: usize = 512 * 1024;
 const MAX_TOOLS: usize = 32;
 const MAX_TOOL_ARGUMENTS: usize = 256 * 1024;
@@ -104,6 +105,7 @@ struct ResponsesSse {
     model: String,
     metadata: Value,
     buffer: Vec<u8>,
+    scan_from: usize,
     id: Option<String>,
     created_at: Option<i64>,
     text: String,
@@ -122,6 +124,7 @@ impl ResponsesSse {
             model,
             metadata,
             buffer: Vec::new(),
+            scan_from: 0,
             id: None,
             created_at: None,
             text: String::new(),
@@ -300,20 +303,54 @@ impl ResponsesSse {
         Ok(())
     }
     fn feed(&mut self, chunk: &[u8], pending: &mut VecDeque<Bytes>) -> Result<(), ()> {
-        if self.done
-            || chunk.len() > MAX_FRAME
-            || self.buffer.len().saturating_add(chunk.len()) > MAX_FRAME
-        {
+        // The Chat parser has already bounded upstream chunks to 2 MiB.
+        // Several independent <=1 MiB events may legitimately share one chunk.
+        if self.done || chunk.len() > MAX_INPUT_CHUNK {
             return Err(());
         }
+        // Normal gateway operation produces exactly one normalized event per
+        // chunk. Process it directly, avoiding any frame clone/buffer allocation.
+        if self.buffer.is_empty()
+            && chunk.len() <= MAX_FRAME
+            && chunk.ends_with(b"\n\n")
+            && chunk.windows(2).position(|pair| pair == b"\n\n") == Some(chunk.len() - 2)
+        {
+            return self.frame(chunk, pending);
+        }
         self.buffer.extend_from_slice(chunk);
-        while let Some(end) = self.buffer.windows(2).position(|w| w == b"\n\n") {
-            let frame = self.buffer.drain(..end + 2).collect::<Vec<_>>();
+        let mut consumed = 0;
+        let mut scan = self.scan_from;
+        while let Some(offset) = self.buffer[scan..]
+            .windows(2)
+            .position(|pair| pair == b"\n\n")
+        {
+            let end = scan + offset + 2;
+            if end - consumed > MAX_FRAME {
+                return Err(());
+            }
+            // Never emit success if the same chunk has forbidden trailing data.
+            // Check before frame() mutates the terminal state.
+            if self.buffer[consumed..end] == *b"data: [DONE]\n\n" && end != self.buffer.len() {
+                return Err(());
+            }
+            let frame = self.buffer[consumed..end].to_vec();
             self.frame(&frame, pending)?;
-            if self.done && !self.buffer.is_empty() {
+            consumed = end;
+            scan = end;
+            if self.done && end != self.buffer.len() {
                 return Err(());
             }
         }
+        // Drain once, not per event. Retain only the unfinished suffix.
+        if consumed != 0 {
+            self.buffer.drain(..consumed);
+        }
+        if self.buffer.len() > MAX_FRAME {
+            return Err(());
+        }
+        // Previously checked all pairs before this index. A future chunk only
+        // needs to inspect the last previous byte and its newly appended bytes.
+        self.scan_from = self.buffer.len().saturating_sub(1);
         Ok(())
     }
     fn frame(&mut self, frame: &[u8], pending: &mut VecDeque<Bytes>) -> Result<(), ()> {
@@ -323,9 +360,6 @@ impl ResponsesSse {
             .ok_or(())?;
         if data == b"[DONE]" {
             if self.finish_reason.is_none() || self.id.is_none() {
-                return Err(());
-            }
-            if !self.buffer.is_empty() {
                 return Err(());
             }
             self.complete(pending);
@@ -644,6 +678,111 @@ mod tests {
                 &mut q
             )
             .is_err()
+        );
+    }
+    #[test]
+    fn single_complete_frames_do_not_allocate_an_intermediate_frame_buffer() {
+        let mut translator = ResponsesSse::new("demo".into(), Value::Null);
+        let mut output = VecDeque::new();
+        let first = frame(json!({
+            "id":"chat","choices":[{"index":0,
+                "delta":{"content":"hello"},"finish_reason":"stop"}]
+        }));
+        translator.feed(&first, &mut output).unwrap();
+        assert_eq!(translator.buffer.capacity(), 0);
+        translator.feed(b"data: [DONE]\n\n", &mut output).unwrap();
+        assert_eq!(translator.buffer.capacity(), 0);
+        assert!(translator.done);
+    }
+    #[test]
+    fn one_byte_chunks_have_linear_scanning_and_complete_once() {
+        let mut translator = ResponsesSse::new("demo".into(), Value::Null);
+        let mut output = VecDeque::new();
+        let large = frame(json!({
+            "id":"chat","padding":"a".repeat(128 * 1024),
+            "choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},
+                "finish_reason":"stop"}]
+        }));
+        for byte in large {
+            translator.feed(&[byte], &mut output).unwrap();
+        }
+        assert_eq!(translator.text, "hello");
+        translator.feed(b"data: [DONE]\n\n", &mut output).unwrap();
+        assert_eq!(
+            output
+                .iter()
+                .filter(|event| event.starts_with(b"event: response.completed"))
+                .count(),
+            1
+        );
+        assert_eq!(translator.scan_from, 0);
+        assert!(translator.buffer.is_empty());
+    }
+
+    #[test]
+    fn coalesced_valid_frames_can_exceed_one_frame_limit() {
+        let mut translator = ResponsesSse::new("demo".into(), Value::Null);
+        let mut output = VecDeque::new();
+        let first = frame(json!({
+            "id":"chat","padding":"x".repeat(600 * 1024),
+            "choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]
+        }));
+        let last = frame(json!({
+            "id":"chat","padding":"y".repeat(600 * 1024),
+            "choices":[{"index":0,"delta":{"content":"!"},"finish_reason":"stop"}]
+        }));
+        assert!(first.len() < MAX_FRAME);
+        assert!(last.len() < MAX_FRAME);
+        let mut together = first.to_vec();
+        together.extend_from_slice(&last);
+        assert!(together.len() > MAX_FRAME);
+        assert!(together.len() < MAX_INPUT_CHUNK);
+        translator.feed(&together, &mut output).unwrap();
+        translator.feed(b"data: [DONE]\n\n", &mut output).unwrap();
+        assert_eq!(translator.text, "hi!");
+        assert!(translator.done);
+        assert_eq!(
+            output
+                .iter()
+                .filter(|event| event.starts_with(b"event: response.completed"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn oversized_frame_and_trailing_after_terminal_fail_closed() {
+        let mut translator = ResponsesSse::new("demo".into(), Value::Null);
+        let mut output = VecDeque::new();
+        let oversized = frame(json!({
+            "id":"chat","padding":"b".repeat(MAX_FRAME),
+            "choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]
+        }));
+        assert!(oversized.len() > MAX_FRAME);
+        assert!(oversized.len() < MAX_INPUT_CHUNK);
+        assert!(translator.feed(&oversized, &mut output).is_err());
+        assert!(output.is_empty());
+
+        let mut translator = ResponsesSse::new("demo".into(), Value::Null);
+        let mut output = VecDeque::new();
+        translator
+            .feed(
+                &frame(json!({
+                    "id":"chat","choices":[{"index":0,"delta":{"content":"hi"},
+                        "finish_reason":"stop"}]
+                })),
+                &mut output,
+            )
+            .unwrap();
+        assert!(
+            translator
+                .feed(b"data: [DONE]\n\ndata: extra\n\n", &mut output)
+                .is_err()
+        );
+        assert!(
+            !output
+                .iter()
+                .any(|event| event.starts_with(b"event: response.completed"))
         );
     }
 }
