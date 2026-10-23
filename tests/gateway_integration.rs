@@ -233,3 +233,38 @@ async fn incomplete_stream_never_fails_over_after_first_event() {
     assert_eq!(first_hits.load(Ordering::SeqCst), 1);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn sse_duplicate_terminal_marker_is_never_relayed_twice() {
+    let (upstream, hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE, SSE_DONE]).await;
+    let router = make_app(&upstream, &upstream);
+    let response = router
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(text.matches("data: [DONE]").count(), 1, "{text}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn sse_truncated_finish_event_never_claims_success() {
+    let (upstream, hits) = start_sse(vec![
+        SSE_START,
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]",
+    ])
+    .await;
+    let router = make_app(&upstream, &upstream);
+    let response = router
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
