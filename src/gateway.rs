@@ -19,6 +19,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::{
     config::Config,
     keypool::{KeyPool, Lease},
+    metrics::Metrics,
     outcome::{Outcome, classify},
     routing,
     sse::ChatSse,
@@ -33,6 +34,7 @@ pub struct AppState {
     pools: Vec<KeyPool>,
     client_keys: Vec<String>,
     inflight: Arc<Semaphore>,
+    metrics: Arc<Metrics>,
     model_catalog: Value,
     model_details: HashMap<String, Value>,
 }
@@ -87,6 +89,7 @@ impl AppState {
             pools,
             client_keys,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
+            metrics: Arc::new(Metrics::default()),
         })
     }
 
@@ -131,6 +134,7 @@ fn unauthorized() -> Response {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics_endpoint))
         .route("/v1/models", get(models))
         .route("/v1/models/{model}", get(model_detail))
         .route("/v1/chat/completions", post(chat))
@@ -144,6 +148,22 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+async fn metrics_endpoint(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !state.allowed(&headers) {
+        return unauthorized();
+    }
+    // Metrics contain no user/provider labels or secrets. The endpoint is authenticated
+    // because even aggregate traffic counts are operationally sensitive.
+    let active = MAX_INFLIGHT_REQUESTS - state.inflight.available_permits();
+    (
+        [
+            ("content-type", "text/plain; version=0.0.4; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
+        state.metrics.prometheus(active),
+    )
+        .into_response()
+}
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !state.allowed(&headers) {
         return unauthorized();
@@ -719,6 +739,7 @@ async fn responses(
     if let Some(tokens) = object.remove("max_output_tokens") {
         object.insert("max_tokens".into(), tokens);
     }
+    let response_metrics = state.metrics.clone();
     let response = dispatch(
         state,
         headers,
@@ -730,7 +751,7 @@ async fn responses(
         return response;
     }
     if streaming {
-        return crate::responses_sse::wrap(response, logical_model, metadata);
+        return crate::responses_sse::wrap(response, logical_model, metadata, response_metrics);
     }
     let bytes = match to_bytes(response.into_body(), MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,
@@ -1002,6 +1023,7 @@ async fn dispatch(
             "stream must be a boolean",
         );
     }
+    Metrics::inc(&state.metrics.requests_dispatched);
     let streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
     if streaming && !matches!(endpoint, Endpoint::Chat) {
         return error(
@@ -1040,6 +1062,7 @@ async fn dispatch(
     let mut permit = Some(match state.inflight.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
+            Metrics::inc(&state.metrics.admission_rejections);
             let mut response = error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "gateway_overloaded",
@@ -1053,12 +1076,18 @@ async fn dispatch(
         }
     });
 
+    // Count actual candidate transitions, not provider-key retries.
+    let mut candidates_visited = 0usize;
     // Exactly ONE candidate loop for chat + embedding. Key failover is confined to this loop.
     for step in steps {
         let provider = &state.config.providers[step.provider_index];
         if provider.stream_only && !streaming {
             continue; // A stream-only upstream cannot serve non-streaming requests.
         }
+        if candidates_visited != 0 {
+            Metrics::inc(&state.metrics.candidate_fallbacks);
+        }
+        candidates_visited += 1;
         let mut payload = request.clone();
         let object = payload.as_object_mut().expect("checked above");
         object.insert("model".into(), Value::String(step.model.clone()));
@@ -1072,6 +1101,7 @@ async fn dispatch(
         while let Some(lease) = state.pools[step.provider_index].acquire(&tried) {
             tried.insert(lease.env.clone());
             let url = provider.endpoint(endpoint.path());
+            Metrics::inc(&state.metrics.upstream_attempts);
             let response = state
                 .client
                 .post(url)
@@ -1082,12 +1112,18 @@ async fn dispatch(
                 .await;
             let upstream = match response {
                 Ok(response) => response,
-                Err(_) => break, // transport faults are key-neutral
+                Err(_) => {
+                    Metrics::inc(&state.metrics.upstream_transport_failures);
+                    break;
+                } // key-neutral
             };
             let status = upstream.status().as_u16();
             let outcome = classify(Some(status));
             if outcome.quarantine_credential() {
-                state.pools[step.provider_index].record(&lease, outcome);
+                Metrics::inc(&state.metrics.upstream_http_failures);
+                if state.pools[step.provider_index].record(&lease, outcome) {
+                    Metrics::inc(&state.metrics.credential_quarantines);
+                }
                 continue; // try a different key; each key is attempted once
             }
             if outcome == Outcome::Success {
@@ -1103,17 +1139,25 @@ async fn dispatch(
                     .await
                     {
                         Ok(stream_response) => return stream_response,
-                        Err(_) => break, // Fail over only BEFORE any bytes reach the client.
+                        Err(_) => {
+                            Metrics::inc(&state.metrics.upstream_invalid_responses);
+                            break;
+                        } // preflight rejected
                     }
                 }
                 match bounded_json(upstream).await {
                     Ok(value) if valid_result(endpoint, &payload, &value) => {
                         state.pools[step.provider_index].record_success(&lease);
+                        Metrics::inc(&state.metrics.upstream_success);
                         return (StatusCode::OK, Json(value)).into_response();
                     }
-                    _ => break, // malformed 2xx is not a usable success; next chain step
+                    _ => {
+                        Metrics::inc(&state.metrics.upstream_invalid_responses);
+                        break;
+                    } // next step
                 }
             }
+            Metrics::inc(&state.metrics.upstream_http_failures);
             break; // 4xx or 5xx: next chain step; no uncontrolled retries
         }
     }
@@ -1135,9 +1179,18 @@ struct ChatStreamState {
     parser: ChatSse,
     pending: VecDeque<Bytes>,
     terminated: bool,
+    terminal_reported: bool,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
+impl Drop for ChatStreamState {
+    fn drop(&mut self) {
+        // Dropping a partially consumed body must free the upstream request permit.
+        if self._permit.is_some() && !self.terminal_reported {
+            Metrics::inc(&self.owner.metrics.chat_stream_cancelled);
+        }
+    }
+}
 fn stream_error() -> Bytes {
     Bytes::from_static(b"data: {\"error\":{\"type\":\"gateway_error\",\"code\":\"upstream_stream_incomplete\"}}\n\n")
 }
@@ -1170,6 +1223,7 @@ async fn start_chat_stream(
         parser: ChatSse::new(expected).map_err(|_| ())?,
         pending: VecDeque::new(),
         terminated: false,
+        terminal_reported: false,
         _permit: None,
     };
     preflight_stream(&mut state).await?;
@@ -1201,6 +1255,9 @@ fn stream_response(state: ChatStreamState) -> Response {
             if let Some(event) = state.pending.pop_front() {
                 if event == Bytes::from_static(b"data: [DONE]\n\n") {
                     state.owner.pools[state.provider_index].record_success(&state.lease);
+                    Metrics::inc(&state.owner.metrics.upstream_success);
+                    Metrics::inc(&state.owner.metrics.chat_stream_completed);
+                    state.terminal_reported = true;
                 }
                 return Some((Ok::<Bytes, std::io::Error>(event), state));
             }
@@ -1225,6 +1282,8 @@ fn stream_response(state: ChatStreamState) -> Response {
                 Ok(Ok(None)) | Ok(Err(_)) | Err(_) => state.terminated = true,
             }
             if state.terminated {
+                Metrics::inc(&state.owner.metrics.chat_stream_failed);
+                state.terminal_reported = true;
                 return Some((Ok(stream_error()), state));
             }
         }
@@ -1414,6 +1473,67 @@ fn validate_embeddings(request: &Value, response: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn admission_limit_rejects_immediately_without_contacting_provider() {
+        let config: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: http://127.0.0.1:1\n    key_env: KEY\nchains:\n  - name: demo\n    steps:\n      - provider: p\n        model: test\n"
+        ).unwrap();
+        let state = Arc::new(
+            AppState::new(
+                config,
+                HashMap::from([("KEY".to_owned(), "test-only".to_owned())]),
+                vec!["client".to_owned()],
+            )
+            .unwrap(),
+        );
+        let all_permits = state
+            .inflight
+            .clone()
+            .try_acquire_many_owned(MAX_INFLIGHT_REQUESTS as u32)
+            .unwrap();
+        assert_eq!(state.inflight.available_permits(), 0);
+        let headers = HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer client"),
+        )]);
+        let response = tokio::time::timeout(
+            Duration::from_millis(200),
+            dispatch(
+                state.clone(),
+                headers,
+                Bytes::from_static(
+                    br#"{"model":"demo","messages":[{"role":"user","content":"hi"}]}"#,
+                ),
+                Endpoint::Chat,
+            ),
+        )
+        .await
+        .expect("overload should fail fast");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+        assert_eq!(
+            state
+                .metrics
+                .admission_rejections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            state
+                .metrics
+                .upstream_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert!(
+            state
+                .metrics
+                .prometheus(MAX_INFLIGHT_REQUESTS)
+                .contains("guvna_active_requests 128\n")
+        );
+        drop(all_permits);
+        assert_eq!(state.inflight.available_permits(), MAX_INFLIGHT_REQUESTS);
+    }
     #[test]
     fn protects_credentials_and_big_numbers() {
         assert!(constant_time_equal(b"a", b"a"));

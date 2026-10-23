@@ -1269,3 +1269,248 @@ async fn responses_sse_stalled_provider_reports_one_failure_not_success() {
     .await
     .expect("timed-out provider body was not dropped");
 }
+
+async fn get_metrics(router: Router, bearer: Option<&str>) -> (StatusCode, String) {
+    let mut request = Request::builder().method("GET").uri("/metrics");
+    if let Some(value) = bearer {
+        request = request.header("authorization", format!("Bearer {value}"));
+    }
+    let response = router
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    if status == StatusCode::OK {
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/plain")
+        );
+    }
+    let bytes = to_bytes(response.into_body(), 16 << 10).await.unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+fn metric_value(text: &str, name: &str) -> u64 {
+    let prefix = format!("guvna_{name} ");
+    let found: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .collect();
+    assert_eq!(found.len(), 1, "missing or duplicate {name} metric");
+    found[0].parse::<u64>().expect("numeric metric")
+}
+
+#[tokio::test]
+async fn metrics_auth_privacy_retry_fallback_and_credential_quarantine() {
+    let (primary, primary_calls) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
+    let (secondary, secondary_calls) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&primary, &secondary);
+    let (status, _) = get_metrics(router.clone(), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = get_metrics(router.clone(), Some("invalid")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, before) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(metric_value(&before, "upstream_attempts_total"), 0);
+    assert_eq!(metric_value(&before, "active_requests"), 0);
+    assert!(!before.contains("first"));
+    assert!(!before.contains("good"));
+    assert!(!before.contains("model"));
+    assert!(!before.contains("env"));
+
+    let (status, response) = call(router.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["choices"][0]["message"]["content"], "success");
+    assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(secondary_calls.load(Ordering::SeqCst), 2);
+
+    let (status, after) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(metric_value(&after, "requests_dispatched_total"), 1);
+    assert_eq!(metric_value(&after, "upstream_attempts_total"), 3);
+    assert_eq!(metric_value(&after, "upstream_http_failures_total"), 2);
+    assert_eq!(metric_value(&after, "credential_quarantines_total"), 1);
+    assert_eq!(metric_value(&after, "candidate_fallbacks_total"), 1);
+    assert_eq!(metric_value(&after, "upstream_success_total"), 1);
+    assert_eq!(metric_value(&after, "active_requests"), 0);
+    assert_eq!(metric_value(&after, "upstream_invalid_responses_total"), 0);
+    assert!(!after.contains("secret"));
+    assert!(!after.contains("BAD"));
+    assert_eq!(after.matches("# TYPE guvna_").count(), 17);
+
+    let (status, _) = call(router.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, later) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&later, "upstream_attempts_total"), 5);
+    assert_eq!(metric_value(&later, "credential_quarantines_total"), 1);
+    assert_eq!(metric_value(&later, "upstream_success_total"), 2);
+}
+
+#[tokio::test]
+async fn metrics_stream_success_failure_and_client_disconnect() {
+    let (success_url, _) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let app = make_app(&success_url, &success_url);
+    let response = app
+        .clone()
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let (_, metrics) = get_metrics(app, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "chat_stream_completed_total"), 1);
+    assert_eq!(metric_value(&metrics, "upstream_success_total"), 1);
+    assert_eq!(metric_value(&metrics, "chat_stream_cancelled_total"), 0);
+    assert_eq!(metric_value(&metrics, "active_requests"), 0);
+
+    let (truncated_url, _) = start_sse(vec![SSE_START]).await;
+    let app = make_app(&truncated_url, &truncated_url);
+    let response = app
+        .clone()
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let (_, metrics) = get_metrics(app, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "chat_stream_failed_total"), 1);
+    assert_eq!(metric_value(&metrics, "chat_stream_cancelled_total"), 0);
+    assert_eq!(metric_value(&metrics, "chat_stream_completed_total"), 0);
+    assert_eq!(metric_value(&metrics, "active_requests"), 0);
+
+    let (stalled_url, drops) = start_stalled_sse().await;
+    let app = make_app(&stalled_url, &stalled_url);
+    let response = app
+        .clone()
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+    use http_body_util::BodyExt;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(first.into_data().unwrap().starts_with(b"data: "));
+    let (_, snapshot) = get_metrics(app.clone(), Some("client")).await;
+    assert_eq!(metric_value(&snapshot, "active_requests"), 1);
+    drop(body);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while drops.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (_, metrics) = get_metrics(app, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "chat_stream_cancelled_total"), 1);
+    assert_eq!(metric_value(&metrics, "chat_stream_completed_total"), 0);
+    assert_eq!(metric_value(&metrics, "active_requests"), 0);
+}
+
+#[tokio::test]
+async fn metrics_responses_stream_terminal_outcomes() {
+    let (url, _) = start_sse(vec![RESP_START_A, RESP_START_B, RESP_END, SSE_DONE]).await;
+    let app = make_app(&url, &url);
+    let response = app
+        .clone()
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hi","stream":true
+        })))
+        .await
+        .unwrap();
+    to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let (_, metrics) = get_metrics(app, Some("client")).await;
+    assert_eq!(
+        metric_value(&metrics, "responses_stream_completed_total"),
+        1
+    );
+    assert_eq!(metric_value(&metrics, "responses_stream_failed_total"), 0);
+    assert_eq!(
+        metric_value(&metrics, "responses_stream_cancelled_total"),
+        0
+    );
+
+    let (url, _) = start_sse(vec![RESP_START_A, RESP_START_B, RESP_LENGTH_END, SSE_DONE]).await;
+    let app = make_app(&url, &url);
+    let response = app
+        .clone()
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hi","stream":true
+        })))
+        .await
+        .unwrap();
+    to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let (_, metrics) = get_metrics(app, Some("client")).await;
+    assert_eq!(
+        metric_value(&metrics, "responses_stream_incomplete_total"),
+        1
+    );
+    assert_eq!(
+        metric_value(&metrics, "responses_stream_completed_total"),
+        0
+    );
+
+    let (url, _) = start_sse(vec![RESP_START_A, RESP_START_B]).await;
+    let app = make_app(&url, &url);
+    let response = app
+        .clone()
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hi","stream":true
+        })))
+        .await
+        .unwrap();
+    to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let (_, metrics) = get_metrics(app, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "responses_stream_failed_total"), 1);
+    assert_eq!(
+        metric_value(&metrics, "responses_stream_cancelled_total"),
+        0
+    );
+    assert_eq!(
+        metric_value(&metrics, "responses_stream_completed_total"),
+        0
+    );
+
+    let (url, drops) = start_stalled_sse_frame(RESP_SINGLE).await;
+    let app = make_app(&url, &url);
+    let response = app
+        .clone()
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hi","stream":true
+        })))
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+    use http_body_util::BodyExt;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(first.into_data().unwrap().starts_with(b"event: "));
+    let (_, snapshot) = get_metrics(app.clone(), Some("client")).await;
+    assert_eq!(metric_value(&snapshot, "active_requests"), 1);
+    drop(body);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while drops.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (_, metrics) = get_metrics(app, Some("client")).await;
+    assert_eq!(
+        metric_value(&metrics, "responses_stream_cancelled_total"),
+        1
+    );
+    assert_eq!(
+        metric_value(&metrics, "responses_stream_completed_total"),
+        0
+    );
+    assert_eq!(metric_value(&metrics, "active_requests"), 0);
+}

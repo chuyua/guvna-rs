@@ -1,12 +1,13 @@
 //! Bounded Chat Completions SSE to Responses SSE conversion.
 //! The gateway upstream has already normalized and validated Chat SSE frames.
+use crate::metrics::Metrics;
 use axum::{
     body::{Body, Bytes},
     response::Response,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_TEXT: usize = 512 * 1024;
@@ -20,17 +21,55 @@ struct Tool {
     output_index: usize,
 }
 
-pub(crate) fn wrap(response: Response, model: String, metadata: Value) -> Response {
+struct StreamGuard {
+    metrics: Arc<Metrics>,
+    terminal_reported: bool,
+}
+impl StreamGuard {
+    fn emitted(&mut self, frame: &[u8]) {
+        if frame.starts_with(b"event: response.completed\n") {
+            Metrics::inc(&self.metrics.responses_stream_completed);
+            self.terminal_reported = true;
+        } else if frame.starts_with(b"event: response.incomplete\n") {
+            Metrics::inc(&self.metrics.responses_stream_incomplete);
+            self.terminal_reported = true;
+        } else if frame.starts_with(b"event: response.failed\n")
+            || frame.starts_with(b"event: error\n")
+        {
+            Metrics::inc(&self.metrics.responses_stream_failed);
+            self.terminal_reported = true;
+        }
+    }
+}
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        if !self.terminal_reported {
+            Metrics::inc(&self.metrics.responses_stream_cancelled);
+        }
+    }
+}
+
+pub(crate) fn wrap(
+    response: Response,
+    model: String,
+    metadata: Value,
+    metrics: Arc<Metrics>,
+) -> Response {
     let source = response.into_body().into_data_stream();
     let translator = ResponsesSse::new(model, metadata);
+    let guard = StreamGuard {
+        metrics,
+        terminal_reported: false,
+    };
     let output = futures_util::stream::unfold(
-        (source, translator, VecDeque::<Bytes>::new(), false),
-        |(mut source, mut t, mut pending, mut stopped)| async move {
+        (source, translator, VecDeque::<Bytes>::new(), false, guard),
+        |(mut source, mut t, mut pending, mut stopped, mut guard)| async move {
             loop {
                 if let Some(next) = pending.pop_front() {
+                    guard.emitted(&next);
                     return Some((
                         Ok::<Bytes, std::io::Error>(next),
-                        (source, t, pending, stopped),
+                        (source, t, pending, stopped, guard),
                     ));
                 }
                 if stopped {
