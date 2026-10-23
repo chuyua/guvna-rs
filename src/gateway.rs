@@ -295,7 +295,8 @@ async fn responses(
                             "function_call requires arguments",
                         );
                     };
-                    if serde_json::from_str::<Value>(arguments).is_err()
+                    if !serde_json::from_str::<Value>(arguments)
+                        .is_ok_and(|value| value.is_object())
                         || item.as_object().is_none_or(|map| {
                             map.keys().any(|key| {
                                 !["type", "call_id", "name", "arguments", "id", "status"]
@@ -761,6 +762,26 @@ async fn responses(
             "Upstream chat response id is missing",
         );
     };
+    if chat
+        .get("created")
+        .is_some_and(|created| created.as_i64().is_none_or(|timestamp| timestamp < 0))
+    {
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "invalid_chat_created",
+            "Upstream created timestamp must be a nonnegative integer",
+        );
+    }
+    if chat
+        .get("model")
+        .is_some_and(|model| model.as_str().is_none_or(str::is_empty))
+    {
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "invalid_chat_model",
+            "Upstream chat model must be a nonempty string",
+        );
+    }
     let created_at = chat["created"].as_i64();
     let calls = chat["choices"][0]["message"]["tool_calls"].as_array();
     if calls.is_some_and(|items| !items.is_empty()) {
@@ -809,7 +830,7 @@ async fn responses(
                 );
             };
             if call["type"] != "function"
-                || serde_json::from_str::<Value>(arguments).is_err()
+                || !serde_json::from_str::<Value>(arguments).is_ok_and(|value| value.is_object())
                 || !seen_ids.insert(id)
             {
                 return error(
