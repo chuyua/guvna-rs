@@ -34,6 +34,7 @@ pub struct AppState {
     client_keys: Vec<String>,
     inflight: Arc<Semaphore>,
     model_catalog: Value,
+    model_details: HashMap<String, Value>,
 }
 
 impl AppState {
@@ -57,9 +58,30 @@ impl AppState {
             .redirect(reqwest::redirect::Policy::none()) // Do not redirect provider credentials.
             .build()
             .map_err(|e| format!("building HTTP client: {e}"))?;
-        let model_catalog = json!({"object":"list","data": config.chains.iter().map(|ch| json!({"id":ch.name,"object":"model","owned_by":"guvna"})).collect::<Vec<_>>()});
+        // Expose configured named chains and explicitly catalogued provider models.
+        let mut model_details = HashMap::new();
+        for chain in &config.chains {
+            model_details.insert(
+                chain.name.clone(),
+                json!({"id":chain.name,"object":"model","owned_by":"guvna"}),
+            );
+        }
+        for provider in &config.providers {
+            for prefix in provider.prefixes() {
+                for model in &provider.models {
+                    let id = format!("{prefix}/{model}");
+                    model_details.entry(id.clone()).or_insert_with(
+                        || json!({"id":id,"object":"model","owned_by":provider.name}),
+                    );
+                }
+            }
+        }
+        let mut data: Vec<_> = model_details.values().cloned().collect();
+        data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        let model_catalog = json!({"object":"list","data":data});
         Ok(Self {
             model_catalog,
+            model_details,
             config,
             client,
             pools,
@@ -137,12 +159,8 @@ async fn model_detail(
     if !state.allowed(&headers) {
         return unauthorized();
     }
-    match state.config.chains.iter().find(|chain| chain.name == model) {
-        Some(chain) => (
-            StatusCode::OK,
-            Json(json!({"id":chain.name,"object":"model","owned_by":"guvna"})),
-        )
-            .into_response(),
+    match state.model_details.get(&model) {
+        Some(detail) => (StatusCode::OK, Json(detail.clone())).into_response(),
         None => error(StatusCode::NOT_FOUND, "model_not_found", "Unknown model"),
     }
 }
