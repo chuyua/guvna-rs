@@ -62,6 +62,15 @@ request across several network writes, including the terminal marker, and
 still requires every event sequence and response to complete correctly.
 These deterministic checks supplement the existing 200-request/16-client
 SSE wave, but do not replace dedicated prolonged soak or fuzzing.
+## Opt-in breaker pressure and routing gate
+
+A second real Linux --release instance runs with circuit breaking enabled on
+the injected-fault provider. Out of 64 nonconcurrent requests, the first
+three upstream failures must open the circuit; 61 later calls must bypass that
+provider entirely, and all 64 must still succeed via the healthy fallback.
+Every telemetry counter is reconciled to actual mock requests and RSS,
+FD/thread resource limits are checked. The normal default-disabled baseline
+remains unchanged for compatibility and prior load comparisons.
 ## Planned broader gates
 
 - Deterministic random fault matrix (429/5xx/invalid JSON/stalled response/

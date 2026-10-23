@@ -13,6 +13,10 @@ pub struct Metrics {
     pub credential_quarantines: AtomicU64,
     pub candidate_fallbacks: AtomicU64,
     pub admission_rejections: AtomicU64,
+    pub circuit_bypasses: AtomicU64,
+    pub circuit_openings: AtomicU64,
+    pub circuit_probe_success: AtomicU64,
+    pub circuit_probe_failures: AtomicU64,
     pub chat_stream_completed: AtomicU64,
     pub chat_stream_failed: AtomicU64,
     pub chat_stream_cancelled: AtomicU64,
@@ -27,7 +31,7 @@ impl Metrics {
     }
 
     /// No labels: zero user data exposure and constant memory independent of models/providers.
-    pub fn prometheus(&self, active_requests: usize) -> String {
+    pub fn prometheus(&self, active_requests: usize, open_providers: usize) -> String {
         let mut result = String::with_capacity(1200);
         macro_rules! emit {
             ($name:literal, $field:expr) => {{
@@ -52,6 +56,10 @@ impl Metrics {
         emit!("credential_quarantines_total", self.credential_quarantines);
         emit!("candidate_fallbacks_total", self.candidate_fallbacks);
         emit!("admission_rejections_total", self.admission_rejections);
+        emit!("circuit_bypasses_total", self.circuit_bypasses);
+        emit!("circuit_openings_total", self.circuit_openings);
+        emit!("circuit_probe_success_total", self.circuit_probe_success);
+        emit!("circuit_probe_failures_total", self.circuit_probe_failures);
         emit!("chat_stream_completed_total", self.chat_stream_completed);
         emit!("chat_stream_failed_total", self.chat_stream_failed);
         emit!("chat_stream_cancelled_total", self.chat_stream_cancelled);
@@ -73,6 +81,9 @@ impl Metrics {
         );
         result.push_str("# TYPE guvna_active_requests gauge\nguvna_active_requests ");
         result.push_str(&active_requests.to_string());
+        result
+            .push_str("\n# TYPE guvna_circuit_open_providers gauge\nguvna_circuit_open_providers ");
+        result.push_str(&open_providers.to_string());
         result.push('\n');
         result
     }
@@ -87,11 +98,12 @@ mod tests {
         for _ in 0..100 {
             Metrics::inc(&metrics.upstream_attempts);
         }
-        let rendered = metrics.prometheus(7);
+        let rendered = metrics.prometheus(7, 2);
         assert!(rendered.contains("guvna_upstream_attempts_total 100\n"));
         assert!(rendered.contains("guvna_active_requests 7\n"));
         assert!(!rendered.contains('{'));
         assert!(rendered.len() < 2000);
-        assert_eq!(rendered.matches("# TYPE guvna_").count(), 17);
+        assert!(rendered.contains("guvna_circuit_open_providers 2\n"));
+        assert_eq!(rendered.matches("# TYPE guvna_").count(), 22);
     }
 }
