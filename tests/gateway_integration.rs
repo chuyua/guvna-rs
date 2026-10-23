@@ -3045,6 +3045,43 @@ async fn stream_only_invalid_or_missing_done_falls_back_before_returning_json() 
 }
 
 #[tokio::test]
+async fn chain_default_n_is_used_by_stream_and_stream_only_aggregation() {
+    // The client omits n, but this chain explicitly requests two choices.
+    // Both SSE validation and SSE-to-JSON synthesis must use the actual
+    // per-candidate payload rather than the original client's default n=1.
+    const TWO_START: &[u8] = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"one\"},\"finish_reason\":null},{\"index\":1,\"delta\":{\"content\":\"two\"},\"finish_reason\":null}]}\n\n";
+    const TWO_END: &[u8] = b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"},{\"index\":1,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+    let (url, hits) = start_sse(vec![TWO_START, TWO_END, SSE_DONE]).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: stream\n    type: openai\n    base_url: {url}\n    key_env: STREAM_KEY\n    stream_only: true\nchains:\n  - name: two\n    steps:\n      - provider: stream\n        model: m\n        params:\n          n: 2\n"
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("STREAM_KEY".into(), "test-secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+
+    let streaming = router
+        .clone()
+        .oneshot(request("two", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(streaming.status(), StatusCode::OK);
+    let bytes = to_bytes(streaming.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    assert!(text.contains("\"index\":1"), "{text}");
+
+    let (status, aggregated) = call(router, request("two", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{aggregated}");
+    assert_eq!(aggregated["choices"].as_array().unwrap().len(), 2);
+    assert_eq!(aggregated["choices"][1]["message"]["content"], "two");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn auto_basic_uses_ordered_chain_without_remote_management_or_scoring() {
     let frames = vec![SSE_START.to_vec(), SSE_END.to_vec(), SSE_DONE.to_vec()];
     let (a, hits, streaming) = start_strict_stream_only(frames).await;
