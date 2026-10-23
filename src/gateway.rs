@@ -224,6 +224,85 @@ async fn responses(
         Value::Array(items) if !items.is_empty() => {
             let mut messages = Vec::with_capacity(items.len());
             for item in items {
+                if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+                    let Some(call_id) = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                    else {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_output",
+                            "function_call_output requires call_id",
+                        );
+                    };
+                    let Some(output) = item.get("output").and_then(Value::as_str) else {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_output",
+                            "function_call_output requires string output",
+                        );
+                    };
+                    if item.as_object().is_none_or(|map| {
+                        map.keys()
+                            .any(|key| !["type", "call_id", "output"].contains(&key.as_str()))
+                    }) {
+                        return error(
+                            StatusCode::NOT_IMPLEMENTED,
+                            "function_output_unsupported",
+                            "Unsupported function output fields",
+                        );
+                    }
+                    messages.push(json!({"role":"tool","tool_call_id":call_id,"content":output}));
+                    continue;
+                }
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    let Some(call_id) = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                    else {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_call",
+                            "function_call requires call_id",
+                        );
+                    };
+                    let Some(name) = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                    else {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_call",
+                            "function_call requires name",
+                        );
+                    };
+                    let Some(arguments) = item.get("arguments").and_then(Value::as_str) else {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_call",
+                            "function_call requires arguments",
+                        );
+                    };
+                    if serde_json::from_str::<Value>(arguments).is_err()
+                        || item.as_object().is_none_or(|map| {
+                            map.keys().any(|key| {
+                                !["type", "call_id", "name", "arguments", "id", "status"]
+                                    .contains(&key.as_str())
+                            })
+                        })
+                    {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_call",
+                            "Invalid function call arguments or fields",
+                        );
+                    }
+                    messages.push(json!({"role":"assistant","content":Value::Null,"tool_calls":[{"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}}]}));
+                    continue;
+                }
                 let Some(role) = item.get("role").and_then(Value::as_str) else {
                     return error(
                         StatusCode::BAD_REQUEST,
