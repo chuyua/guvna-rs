@@ -40,7 +40,7 @@ fn stream_error() -> Bytes {
 
 pub(super) async fn start(
     upstream: reqwest::Response,
-    expected: u64,
+    parser: ChatSse,
     owner: Arc<AppState>,
     provider_index: usize,
     lease: Lease,
@@ -64,7 +64,7 @@ pub(super) async fn start(
         provider_index,
         lease,
         upstream,
-        parser: ChatSse::new(expected).map_err(|_| ())?,
+        parser,
         pending: VecDeque::new(),
         terminated: false,
         terminal_reported: false,

@@ -27,6 +27,10 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
     }
     let mut indices = HashSet::new();
     let mut tool_call_ids = HashSet::new();
+    let tool_choice = request.get("tool_choice");
+    let required_name = tool_choice
+        .and_then(|choice| choice.pointer("/function/name"))
+        .and_then(Value::as_str);
     for choice in choices {
         let index = match choice.get("index") {
             Some(index) => match index.as_u64() {
@@ -94,6 +98,13 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
         if finished_with_tools != calls.is_some_and(|calls| !calls.is_empty()) {
             return false;
         }
+        if (tool_choice.and_then(Value::as_str) == Some("none") && finished_with_tools)
+            || ((tool_choice.and_then(Value::as_str) == Some("required")
+                || required_name.is_some())
+                && !finished_with_tools)
+        {
+            return false;
+        }
         if let Some(calls) = calls {
             for call in calls {
                 let Some(id) = call
@@ -110,7 +121,10 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
                     && call
                         .pointer("/function/name")
                         .and_then(Value::as_str)
-                        .is_some_and(|s| !s.is_empty())
+                        .is_some_and(|name| {
+                            !name.is_empty()
+                                && required_name.is_none_or(|required| required == name)
+                        })
                     && call
                         .pointer("/function/arguments")
                         .and_then(Value::as_str)
@@ -292,6 +306,34 @@ mod response_contract_tests {
                 "finish_reason":"tool_calls"
             }]})
         ));
+    }
+
+    #[test]
+    fn chat_tool_choice_must_be_honored_by_upstream() {
+        let tool = |name: &str| {
+            json!({"choices":[{
+                "index":0,
+                "message":{"role":"assistant","content":null,"tool_calls":[{
+                    "id":"call_1","type":"function","function":{"name":name,"arguments":"{}"}
+                }]},
+                "finish_reason":"tool_calls"
+            }]})
+        };
+        let text = json!({"choices":[assistant(0)]});
+        let named = json!({"tool_choice":{"type":"function","function":{"name":"lookup"}}});
+        assert!(!validate_chat(&json!({"tool_choice":"required"}), &text));
+        assert!(!validate_chat(
+            &json!({"tool_choice":"none"}),
+            &tool("lookup")
+        ));
+        assert!(!validate_chat(&named, &text));
+        assert!(!validate_chat(&named, &tool("other")));
+        assert!(validate_chat(&named, &tool("lookup")));
+        assert!(validate_chat(
+            &json!({"tool_choice":"required"}),
+            &tool("lookup")
+        ));
+        assert!(validate_chat(&json!({"tool_choice":"auto"}), &text));
     }
 
     #[test]

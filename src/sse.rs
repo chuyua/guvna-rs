@@ -21,6 +21,13 @@ struct StreamToolCall {
 #[derive(Debug, Clone, Copy)]
 pub struct SseError;
 
+#[derive(Debug)]
+enum ToolChoice {
+    None,
+    Required,
+    Named(String),
+}
+
 #[derive(Debug, Default)]
 pub struct ChatSse {
     line: Vec<u8>,
@@ -29,6 +36,7 @@ pub struct ChatSse {
     tool_calls_mask: u64,
     tool_calls: Vec<StreamToolCall>,
     tool_argument_bytes: usize,
+    tool_choice: Option<ToolChoice>,
     expected: u64,
     done: bool,
 }
@@ -46,6 +54,21 @@ impl ChatSse {
 
     pub fn is_done(&self) -> bool {
         self.done
+    }
+
+    /// Preserve the caller's tool constraint through SSE validation. An
+    /// upstream 200 cannot silently override a required or forbidden tool.
+    pub fn with_tool_choice(mut self, choice: Option<&Value>) -> Self {
+        self.tool_choice = match choice {
+            Some(Value::String(value)) if value == "none" => Some(ToolChoice::None),
+            Some(Value::String(value)) if value == "required" => Some(ToolChoice::Required),
+            Some(Value::Object(_)) => choice
+                .and_then(|value| value.pointer("/function/name"))
+                .and_then(Value::as_str)
+                .map(|name| ToolChoice::Named(name.to_owned())),
+            _ => None,
+        };
+        self
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Bytes>, SseError> {
@@ -157,6 +180,11 @@ impl ChatSse {
         }
         let mut has_tool_delta = false;
         if let Some(calls) = delta.get("tool_calls") {
+            // Reject before forwarding: consumers may act on tool deltas
+            // before an eventual finish event arrives.
+            if matches!(self.tool_choice, Some(ToolChoice::None)) {
+                return Err(SseError);
+            }
             let calls = calls
                 .as_array()
                 .filter(|calls| !calls.is_empty())
@@ -183,6 +211,19 @@ impl ChatSse {
             let has_tools = has_tool_delta || self.tool_calls_mask & (1u64 << index) != 0;
             if (reason == "tool_calls" && !has_tools) || (reason == "stop" && has_tools) {
                 return Err(SseError);
+            }
+            match &self.tool_choice {
+                Some(ToolChoice::None) if has_tools => return Err(SseError),
+                Some(ToolChoice::Required) if !has_tools => return Err(SseError),
+                Some(ToolChoice::Named(name))
+                    if !has_tools
+                        || self.tool_calls.iter().any(|tool| {
+                            tool.choice == index && tool.name.as_deref() != Some(name.as_str())
+                        }) =>
+                {
+                    return Err(SseError);
+                }
+                _ => {}
             }
             if reason == "tool_calls"
                 && self
@@ -229,6 +270,11 @@ impl ChatSse {
                     .ok_or(SseError)
             })
             .transpose()?;
+        if let Some(ToolChoice::Named(required)) = &self.tool_choice
+            && name.is_some_and(|name| name != required)
+        {
+            return Err(SseError);
+        }
         let fragment = function
             .and_then(|obj| obj.get("arguments"))
             .map(|value| value.as_str().ok_or(SseError))
@@ -425,6 +471,46 @@ mod tests {
         parser.push(tool_finish).unwrap();
         parser.push(b"data: [DONE]\n\n").unwrap();
         assert!(parser.finish().is_ok());
+    }
+
+    #[test]
+    fn streamed_tool_choice_must_be_honored() {
+        let tool = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{
+            "index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}
+        }]},"finish_reason":null}]});
+        let tool_event = format!("data: {tool}\n\n");
+        let finish = b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+
+        let mut required = ChatSse::new(1)
+            .unwrap()
+            .with_tool_choice(Some(&serde_json::json!("required")));
+        required.push(START).unwrap();
+        assert!(
+            required.push(END).is_err(),
+            "required tool choice accepted plain text"
+        );
+
+        let mut none = ChatSse::new(1)
+            .unwrap()
+            .with_tool_choice(Some(&serde_json::json!("none")));
+        assert!(
+            none.push(tool_event.as_bytes()).is_err(),
+            "tool_choice none forwarded a forbidden tool delta"
+        );
+
+        let named = serde_json::json!({"type":"function","function":{"name":"weather"}});
+        let mut wrong = ChatSse::new(1).unwrap().with_tool_choice(Some(&named));
+        assert!(
+            wrong.push(tool_event.as_bytes()).is_err(),
+            "named tool choice forwarded another function"
+        );
+
+        let named = serde_json::json!({"type":"function","function":{"name":"lookup"}});
+        let mut valid = ChatSse::new(1).unwrap().with_tool_choice(Some(&named));
+        valid.push(tool_event.as_bytes()).unwrap();
+        valid.push(finish).unwrap();
+        valid.push(b"data: [DONE]\n\n").unwrap();
+        assert!(valid.finish().is_ok());
     }
 
     #[test]

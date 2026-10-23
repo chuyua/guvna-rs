@@ -257,7 +257,9 @@ pub(super) async fn dispatch(
                 if streaming {
                     match chat_stream::start(
                         upstream,
-                        expected,
+                        ChatSse::new(expected)
+                            .expect("validated stream n")
+                            .with_tool_choice(payload.get("tool_choice")),
                         state.clone(),
                         step.provider_index,
                         lease.clone(),
