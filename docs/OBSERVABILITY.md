@@ -44,6 +44,14 @@ connected clients. Long-running streams retain their permits.
 - guvna_responses_stream_completed_total, responses_stream_incomplete_total,
   responses_stream_failed_total, responses_stream_cancelled_total: translated
   Responses SSE lifecycle.
+- guvna_circuit_openings_total: provider circuits opened/reopened after
+  failures, including failed recovery probes.
+- guvna_circuit_bypasses_total: candidate calls skipped due to a currently
+  open/half-open breaker, without any upstream request.
+- guvna_circuit_probe_success_total / circuit_probe_failures_total:
+  single half-open recovery probe outcomes.
+- guvna_circuit_open_providers: per-process number of open/half-open
+  circuits; a gauge without provider labels.
 - guvna_active_requests: currently acquired admission permits.
 
 Chat stream counters also include the upstream Chat SSE part of a Responses

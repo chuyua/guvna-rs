@@ -131,6 +131,10 @@ async fn start_upstream(status: StatusCode) -> (String, Arc<AtomicUsize>) {
 }
 
 fn make_app(a: &str, b: &str) -> Router {
+    make_app_with_circuit(a, b, false)
+}
+
+fn make_app_with_circuit(a: &str, b: &str, enabled: bool) -> Router {
     let yaml = format!(
         r#"
 providers:
@@ -138,6 +142,11 @@ providers:
     type: openai
     base_url: {a}
     key_env: FIRST
+    circuit_breaker:
+      enabled: {enabled}
+      failure_threshold: 3
+      cooldown: 100ms
+      max_cooldown: 400ms
   - name: healthy
     type: openai
     base_url: {b}
@@ -1404,7 +1413,10 @@ async fn metrics_auth_privacy_retry_fallback_and_credential_quarantine() {
     assert_eq!(metric_value(&after, "upstream_invalid_responses_total"), 0);
     assert!(!after.contains("secret"));
     assert!(!after.contains("BAD"));
-    assert_eq!(after.matches("# TYPE guvna_").count(), 17);
+    assert_eq!(after.matches("# TYPE guvna_").count(), 22);
+    assert_eq!(metric_value(&after, "circuit_open_providers"), 0);
+    assert_eq!(metric_value(&after, "circuit_bypasses_total"), 0);
+    assert_eq!(metric_value(&after, "circuit_openings_total"), 0);
 
     let (status, _) = call(router.clone(), request("demo", "", "client")).await;
     assert_eq!(status, StatusCode::OK);
@@ -1577,4 +1589,162 @@ async fn metrics_responses_stream_terminal_outcomes() {
         0
     );
     assert_eq!(metric_value(&metrics, "active_requests"), 0);
+}
+
+#[derive(Clone)]
+struct ChangingProvider {
+    hits: Arc<AtomicUsize>,
+    healthy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+async fn changing_provider(State(state): State<ChangingProvider>) -> impl IntoResponse {
+    state.hits.fetch_add(1, Ordering::SeqCst);
+    // Keep the half-open probe active long enough to test concurrent callers.
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    if !state.healthy.load(Ordering::SeqCst) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({"error":"offline"})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "id":"mock","object":"chat.completion",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"recovered"},
+                "finish_reason":"stop"}]
+        })),
+    )
+        .into_response()
+}
+
+async fn changing_upstream() -> (String, Arc<AtomicUsize>, Arc<std::sync::atomic::AtomicBool>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let healthy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let router = Router::new()
+        .route("/v1/chat/completions", post(changing_provider))
+        .with_state(ChangingProvider {
+            hits: hits.clone(),
+            healthy: healthy.clone(),
+        });
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(socket, router).await.unwrap() });
+    (format!("http://{addr}"), hits, healthy)
+}
+
+#[tokio::test]
+async fn circuit_breaker_skips_repeated_failed_upstream_then_single_probe_recovers() {
+    let (down, down_hits, online) = changing_upstream().await;
+    let (fallback, healthy_hits) = start_upstream(StatusCode::OK).await;
+    let app = make_app_with_circuit(&down, &fallback, true);
+    for _ in 0..3 {
+        let (status, value) = call(app.clone(), request("demo", "", "client")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["choices"][0]["message"]["content"], "success");
+    }
+    assert_eq!(down_hits.load(Ordering::SeqCst), 3);
+    let (_, metrics) = get_metrics(app.clone(), Some("client")).await;
+    assert_eq!(metric_value(&metrics, "circuit_openings_total"), 1);
+    assert_eq!(metric_value(&metrics, "circuit_open_providers"), 1);
+    assert_eq!(metric_value(&metrics, "circuit_bypasses_total"), 0);
+    // The provider is open, so multiple requests must bypass it entirely.
+    let results = futures_util::future::join_all((0..12).map(|_| {
+        let app = app.clone();
+        async move { call(app, request("demo", "", "client")).await.0 }
+    }))
+    .await;
+    assert!(results.iter().all(|status| *status == StatusCode::OK));
+    assert_eq!(down_hits.load(Ordering::SeqCst), 3);
+    let (_, metrics) = get_metrics(app.clone(), Some("client")).await;
+    assert_eq!(metric_value(&metrics, "circuit_bypasses_total"), 12);
+    assert_eq!(metric_value(&metrics, "upstream_success_total"), 15);
+    // One-provider passthrough cannot fall back: fail fast with a Retry-After
+    // instead of manufacturing a 502 or making an upstream HTTP call.
+    let response = app
+        .clone()
+        .oneshot(request("broken/direct", "", "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    let payload: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(payload["error"]["code"], "provider_circuit_open");
+    assert_eq!(down_hits.load(Ordering::SeqCst), 3);
+
+    tokio::time::sleep(std::time::Duration::from_millis(110)).await;
+    online.store(true, Ordering::SeqCst);
+    // 24 callers race after cooldown. Exactly one may probe the previously
+    // failed provider; all others use the healthy fallback.
+    let results = futures_util::future::join_all((0..24).map(|_| {
+        let app = app.clone();
+        async move { call(app, request("demo", "", "client")).await.0 }
+    }))
+    .await;
+    assert!(results.iter().all(|status| *status == StatusCode::OK));
+    assert_eq!(down_hits.load(Ordering::SeqCst), 4);
+    let (_, metrics) = get_metrics(app.clone(), Some("client")).await;
+    assert_eq!(metric_value(&metrics, "circuit_probe_success_total"), 1);
+    assert_eq!(metric_value(&metrics, "circuit_probe_failures_total"), 0);
+    assert_eq!(metric_value(&metrics, "circuit_open_providers"), 0);
+    let (status, recovered) = call(app.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recovered["choices"][0]["message"]["content"], "recovered");
+    assert_eq!(down_hits.load(Ordering::SeqCst), 5);
+    assert!(healthy_hits.load(Ordering::SeqCst) >= 15);
+}
+
+#[tokio::test]
+async fn client_errors_never_open_provider_circuit_or_quarantine_credential() {
+    let (down, down_hits) = start_upstream(StatusCode::BAD_REQUEST).await;
+    let (fallback, _) = start_upstream(StatusCode::OK).await;
+    let app = make_app_with_circuit(&down, &fallback, true);
+    for _ in 0..10 {
+        let (status, _) = call(app.clone(), request("demo", "", "client")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(down_hits.load(Ordering::SeqCst), 10);
+    let (_, metrics) = get_metrics(app, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "circuit_openings_total"), 0);
+    assert_eq!(metric_value(&metrics, "circuit_bypasses_total"), 0);
+    assert_eq!(metric_value(&metrics, "circuit_open_providers"), 0);
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 1); // BAD fallback key only
+}
+
+#[tokio::test]
+async fn broken_midstream_counts_as_provider_failure_without_replaying_partial_output() {
+    let (down, down_hits) = start_sse(vec![SSE_START]).await;
+    let (fallback, fallback_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let app = make_app_with_circuit(&down, &fallback, true);
+    for _ in 0..3 {
+        let response = app
+            .clone()
+            .oneshot(request("demo", r#","stream":true"#, "client"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("upstream_stream_incomplete"), "{text}");
+        assert!(!text.contains("data: [DONE]\n\n"), "{text}");
+    }
+    assert_eq!(down_hits.load(Ordering::SeqCst), 3);
+    let (_, metrics) = get_metrics(app.clone(), Some("client")).await;
+    assert_eq!(metric_value(&metrics, "circuit_openings_total"), 1);
+    assert_eq!(metric_value(&metrics, "chat_stream_failed_total"), 3);
+    let response = app
+        .clone()
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert!(bytes.ends_with(b"data: [DONE]\n\n"));
+    assert_eq!(down_hits.load(Ordering::SeqCst), 3);
+    assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+    let (_, metrics) = get_metrics(app, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "circuit_bypasses_total"), 1);
+    assert_eq!(metric_value(&metrics, "chat_stream_completed_total"), 1);
 }
