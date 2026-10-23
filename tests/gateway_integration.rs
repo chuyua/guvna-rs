@@ -726,6 +726,10 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(assistant_text["output_text"], "success");
     assert_eq!(hits.load(Ordering::SeqCst), 13);
     for invalid_input in [
+        json!([{"type":"function_call","call_id":"x","name":"lookup","arguments":"{}","status":"in_progress"},{"type":"function_call_output","call_id":"x","output":"ok"}]),
+        json!([{"type":"function_call","call_id":"x","name":"lookup","arguments":"{}","status":false},{"type":"function_call_output","call_id":"x","output":"ok"}]),
+        json!([{"type":"function_call","call_id":"x","name":"lookup","arguments":"{}","id":12},{"type":"function_call_output","call_id":"x","output":"ok"}]),
+        json!([{"type":"function_call","call_id":"x","name":"lookup","arguments":"{}","id":""},{"type":"function_call_output","call_id":"x","output":"ok"}]),
         json!([{"role":"user","content":[{"type":"output_text","text":"wrong role"}]}]),
         json!([{"type":"function_call_output","call_id":"orphan","output":"x"}]),
         json!([{"type":"function_call","call_id":"dup","name":"lookup","arguments":"{}"},{"type":"function_call","call_id":"dup","name":"lookup","arguments":"{}"}]),
@@ -741,6 +745,8 @@ async fn responses_text_bridge_and_unsupported_modes() {
     }
     assert_eq!(hits.load(Ordering::SeqCst), 13);
     for bad_request in [
+        json!({"model":"demo","input":"hello","tool_choice":"required"}),
+        json!({"model":"demo","input":"hello","tool_choice":{"type":"function","name":"lookup"}}),
         json!({"model":"demo","input":"hello","temperature":-0.1}),
         json!({"model":"demo","input":"hello","temperature":2.1}),
         json!({"model":"demo","input":"hello","top_p":-0.01}),

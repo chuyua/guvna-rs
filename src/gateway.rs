@@ -309,6 +309,17 @@ async fn responses(
                             "Invalid function call arguments or fields",
                         );
                     }
+                    if item
+                        .get("id")
+                        .is_some_and(|v| v.as_str().is_none_or(str::is_empty))
+                        || item.get("status").is_some_and(|v| v != "completed")
+                    {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_call",
+                            "Function call id and status must be valid",
+                        );
+                    }
                     if !seen_calls.insert(call_id.to_owned())
                         || !pending_calls.insert(call_id.to_owned())
                     {
@@ -638,6 +649,17 @@ async fn responses(
                 "Invalid tool choice",
             );
         }
+    }
+    if object
+        .get("tool_choice")
+        .is_some_and(|choice| choice == "required" || choice.is_object())
+        && declared_functions.is_empty()
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "missing_tools",
+            "A required tool choice needs declared tools",
+        );
     } // Instructions become a leading system message, not a provider-specific field.
     // Validate before moving any data into the shared chat dispatcher.
     let instructions = match object.remove("instructions") {
