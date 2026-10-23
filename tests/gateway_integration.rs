@@ -52,6 +52,7 @@ async fn upstream(State(state): State<UpstreamState>, request: Request<Body>) ->
             "id":"mock","object":"chat.completion","model":model,
             "choices":[{"index":0,"message":{"role":"assistant","content":"success"},
             "finish_reason":if value["messages"][0]["content"] == "truncate" { "length" } else { "stop" }}],
+            "usage": if value["messages"][0]["content"] == "usage" { json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}) } else if value["messages"][0]["content"] == "badusage" { json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":7}) } else { Value::Null },
             "debug_seed": value["seed"]
         })),
     )
@@ -634,6 +635,20 @@ async fn responses_text_bridge_and_unsupported_modes() {
         "max_output_tokens"
     );
     assert_eq!(hits.load(Ordering::SeqCst), 4);
+    let (status, usage) = call(router.clone(), req(json!({"model":"demo","input":"usage"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        usage["usage"],
+        json!({"input_tokens":5,"output_tokens":3,"total_tokens":8})
+    );
+    let (status, invalid) = call(
+        router.clone(),
+        req(json!({"model":"demo","input":"badusage"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(invalid["error"]["code"], "invalid_upstream_usage");
+    assert_eq!(hits.load(Ordering::SeqCst), 6);
     for payload in [
         json!({"model":"demo","input":"hello","stream":true}),
         json!({"model":"demo","input":"hello","tools":[]}),
@@ -656,5 +671,5 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = call(router, req(json!({"input":"hello"}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    assert_eq!(hits.load(Ordering::SeqCst), 6);
 }
