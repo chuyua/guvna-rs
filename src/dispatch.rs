@@ -2,8 +2,8 @@
 //! walk. Retry, credential quarantine, failover, breaker and timeout policies
 //! must remain here, never duplicated per API endpoint.
 use super::{
-    AppState, MAX_BODY_BYTES, chat_stream, error, record_circuit_failure, record_circuit_success,
-    response_validation, retry_after_delay,
+    AppState, MAX_BODY_BYTES, chat_aggregate, chat_stream, error, record_circuit_failure,
+    record_circuit_success, response_validation, retry_after_delay,
 };
 use crate::{
     metrics::Metrics,
@@ -142,12 +142,34 @@ pub(super) async fn dispatch(
     let mut candidates_visited = 0usize;
     let mut attempted_network = false;
     let mut bypassed_circuit = false;
+    let mut aggregation_busy = false;
     // Exactly ONE candidate loop for chat + embedding. Key failover is confined to this loop.
     for step in steps {
         let provider = &state.config.providers[step.provider_index];
-        if provider.stream_only && !streaming {
-            continue; // A stream-only upstream cannot serve non-streaming requests.
+        if provider.stream_only && !streaming && !matches!(endpoint, Endpoint::Chat) {
+            continue; // Only Chat has a validated SSE-to-JSON adapter.
         }
+        // Four permits bound at most 8 MiB of buffered JSON output globally.
+        // After two seconds, try the next candidate without consuming any
+        // provider key or altering circuit state.
+        let _aggregate_budget = if provider.stream_only && !streaming {
+            match tokio::time::timeout(
+                Duration::from_secs(2),
+                state.aggregation_slots.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => Some(permit),
+                _ => {
+                    Metrics::inc(&state.metrics.aggregation_busy);
+                    crate::ops_log::warn("aggregate_capacity");
+                    aggregation_busy = true;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         if candidates_visited != 0 {
             Metrics::inc(&state.metrics.candidate_fallbacks);
         }
@@ -166,6 +188,11 @@ pub(super) async fn dispatch(
         let mut payload = request.clone();
         let object = payload.as_object_mut().expect("checked above");
         object.insert("model".into(), Value::String(step.model.clone()));
+        let upstream_stream =
+            streaming || (provider.stream_only && matches!(endpoint, Endpoint::Chat));
+        if upstream_stream && !streaming {
+            object.insert("stream".into(), Value::Bool(true));
+        }
         for (name, value) in &step.params {
             object.entry(name).or_insert_with(|| value.clone()); // caller always wins.
         }
@@ -248,18 +275,35 @@ pub(super) async fn dispatch(
                         } // preflight rejected
                     }
                 }
-                match tokio::time::timeout_at(deadline, bounded_json(upstream)).await {
+                let result = if upstream_stream && !streaming {
+                    tokio::time::timeout_at(
+                        deadline,
+                        chat_aggregate::aggregate(upstream, expected, &step.model),
+                    )
+                    .await
+                } else {
+                    tokio::time::timeout_at(deadline, bounded_json(upstream)).await
+                };
+                match result {
                     Ok(Ok(value))
                         if response_validation::valid_result(endpoint, &payload, &value) =>
                     {
                         state.pools[step.provider_index].record_success(&lease);
                         record_circuit_success(&mut circuit_ticket, &state.metrics);
                         Metrics::inc(&state.metrics.upstream_success);
+                        if upstream_stream && !streaming {
+                            Metrics::inc(&state.metrics.aggregation_completed);
+                            ops_log::info("aggregation_completed");
+                        }
                         return (StatusCode::OK, Json(value)).into_response();
                     }
                     _ => {
                         Metrics::inc(&state.metrics.upstream_invalid_responses);
-                        ops_log::warn("upstream_invalid");
+                        if upstream_stream && !streaming {
+                            ops_log::warn("aggregation_failed");
+                        } else {
+                            ops_log::warn("upstream_invalid");
+                        }
                         record_circuit_failure(&mut circuit_ticket, &state.metrics);
                         break;
                     } // next step
@@ -280,6 +324,19 @@ pub(super) async fn dispatch(
             }
             break; // 4xx or 5xx: next chain step; no uncontrolled retries
         }
+    }
+    if aggregation_busy && !attempted_network {
+        crate::ops_log::warn("aggregate_capacity");
+        let mut response = error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "aggregate_busy",
+            "SSE aggregation capacity is temporarily exhausted",
+        );
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+        return response;
     }
     if bypassed_circuit && !attempted_network {
         ops_log::warn("provider_circuit_open");

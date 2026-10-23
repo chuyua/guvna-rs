@@ -1,0 +1,72 @@
+name: Manual Linux x86_64 binary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-manual-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux-x86_64:
+    name: Verify and build Linux x86_64 executable
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Source and behavioral validation
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+      - name: Compile and identify the actual ELF executable
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          mkdir -p dist
+          cp target/release/guvna dist/guvna-linux-x86_64
+          chmod 755 dist/guvna-linux-x86_64
+          test -x dist/guvna-linux-x86_64
+          file dist/guvna-linux-x86_64 | tee dist/binary-info.txt
+          readelf -h dist/guvna-linux-x86_64 | grep -E 'Class:|Machine:' | tee -a dist/binary-info.txt
+          ./dist/guvna-linux-x86_64 --version | tee -a dist/binary-info.txt
+          ldd dist/guvna-linux-x86_64 | tee -a dist/binary-info.txt
+          printf 'commit: %s\n' "$(git rev-parse HEAD)" >> dist/binary-info.txt
+          (cd dist && sha256sum guvna-linux-x86_64 > guvna-linux-x86_64.sha256)
+          (cd dist && sha256sum -c guvna-linux-x86_64.sha256)
+      - name: Run Linux release-binary adversarial gate
+        run: |
+          python3 scripts/quality_gate.py \
+            --binary dist/guvna-linux-x86_64 \
+            --requests 2000 --clients 64 --idle-seconds 10 \
+            --max-idle-rss-mib 16 --max-peak-rss-mib 48 \
+            --max-rss-growth-mib 6 \
+            --out dist/quality-results.json
+      - name: Publish executable, SHA256 and quality report
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guvna-linux-x86_64-${{ github.sha }}
+          path: |
+            dist/guvna-linux-x86_64
+            dist/guvna-linux-x86_64.sha256
+            dist/binary-info.txt
+            dist/quality-results.json
+          retention-days: 30
+          if-no-files-found: error
+      - name: Preserve quality report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guvna-linux-build-failure-${{ github.run_id }}
+          path: dist/quality-results.json
+          if-no-files-found: ignore
