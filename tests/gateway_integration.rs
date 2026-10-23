@@ -869,3 +869,54 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(hits.load(Ordering::SeqCst), 34);
 }
+
+#[tokio::test]
+async fn responses_stateless_metadata_and_mode_contract() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&url, &url);
+    let req = |payload: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    };
+    let (status, result) = call(router.clone(), req(json!({"model":"demo","input":"hello","metadata":{"job":"abc","tag":"small"},"store":false,"background":false,"truncation":"disabled"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["metadata"], json!({"job":"abc","tag":"small"}));
+    assert_eq!(result["output_text"], "success");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let (status, tool) = call(router.clone(), req(json!({"model":"demo","input":"call","metadata":{"job":"tools"},"store":false,"tools":[{"type":"function","name":"lookup"}]}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tool["metadata"]["job"], "tools");
+    assert_eq!(tool["output"][0]["type"], "function_call");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    for payload in [
+        json!({"store":true}),
+        json!({"background":true}),
+        json!({"truncation":"auto"}),
+        json!({"metadata":[]}),
+        json!({"metadata":{"a":12}}),
+        json!({"metadata":serde_json::Map::from_iter((0..17).map(|n| (format!("key{n}"),json!("value"))))}),
+        json!({"metadata":{"":"x"}}),
+        json!({"metadata":{"x":"a".repeat(513)}}),
+        json!({"metadata":{("x".repeat(65)):"a"}}),
+    ] {
+        let mut request = json!({"model":"demo","input":"hello"});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(payload.as_object().unwrap().clone());
+        let (status, result) = call(router.clone(), req(request)).await;
+        assert!(
+            matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::NOT_IMPLEMENTED
+            ),
+            "{result}"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
