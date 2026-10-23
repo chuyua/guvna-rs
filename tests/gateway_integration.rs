@@ -233,3 +233,20 @@ async fn incomplete_stream_never_fails_over_after_first_event() {
     assert_eq!(first_hits.load(Ordering::SeqCst), 1);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn duplicate_choice_index_fails_over_before_first_event() {
+    let duplicate = b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null},{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n";
+    let (a, bad_hits) = start_sse(vec![duplicate]).await;
+    let (b, good_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let response = make_app(&a, &b)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    assert_eq!(bad_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(good_hits.load(Ordering::SeqCst), 1);
+}

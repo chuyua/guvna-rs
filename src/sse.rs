@@ -82,8 +82,15 @@ impl ChatSse {
         {
             return Err(SseError);
         }
+        // At most 64 choices are permitted, so a bitset avoids a hot-path allocation.
+        let mut seen_indices = 0u64;
         for choice in choices {
-            self.process_choice(choice)?;
+            let index = self.process_choice(choice)?;
+            let bit = 1u64 << index;
+            if seen_indices & bit != 0 {
+                return Err(SseError);
+            }
+            seen_indices |= bit;
         }
         let mut normalized = Vec::with_capacity(data.len() + 8);
         normalized.extend_from_slice(b"data: ");
@@ -93,7 +100,7 @@ impl ChatSse {
         Ok(())
     }
 
-    fn process_choice(&mut self, choice: &Value) -> Result<(), SseError> {
+    fn process_choice(&mut self, choice: &Value) -> Result<u64, SseError> {
         let index = choice
             .get("index")
             .and_then(Value::as_u64)
@@ -119,7 +126,7 @@ impl ChatSse {
             }
             self.finished.insert(index);
         }
-        Ok(())
+        Ok(index)
     }
 
     fn process_field(&mut self, line: &[u8]) -> Result<(), SseError> {
@@ -190,6 +197,15 @@ mod tests {
     fn rejects_large_line() {
         let mut parser = ChatSse::new(1).unwrap();
         assert!(parser.push(&vec![b'x'; MAX_EVENT_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn duplicate_choice_index_in_single_event_is_rejected() {
+        let mut parser = ChatSse::new(1).unwrap();
+        let frame = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":null},{"index":0,"delta":{},"finish_reason":null}]}
+
+"#;
+        assert!(parser.push(frame).is_err());
     }
 
     #[test]
