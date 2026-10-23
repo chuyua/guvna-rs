@@ -262,6 +262,54 @@ def run_responses_sse_wave(url: str, requests: int, clients: int, pid: int):
     return {"requests": requests, "clients": clients,
             "peak_rss_kib": peak_rss, "p95_ms": round(p95, 2),
             "statuses": results}
+
+def verify_metrics(url: str, requests: int, sse_requests: int) -> dict:
+    # The observability endpoint must not be public even on a loopback deployment.
+    try:
+        with urlopen(url, timeout=3) as _:
+            raise AssertionError("metrics endpoint leaked without bearer authorization")
+    except HTTPError as error:
+        check(error.code == 401, f"unauthenticated metrics returned {error.code}")
+
+    req = Request(url, headers={"Authorization": "Bearer only-for-local-test"})
+    with urlopen(req, timeout=3) as response:
+        check(response.status == 200, "metrics returned non-200")
+        check(response.headers.get_content_type() == "text/plain", "metrics MIME mismatch")
+        raw = response.read(8 << 10).decode("utf-8")
+    check("fake-live-key" not in raw and "fake-down-key" not in raw
+          and "only-for-local-test" not in raw and '{' not in raw,
+          "metrics contained credentials or labels")
+    values = {}
+    for line in raw.splitlines():
+        if line.startswith("guvna_"):
+            metric, _, value = line.partition(" ")
+            check(metric not in values, f"duplicate metric: {metric}")
+            values[metric] = int(value)
+
+    expected = {
+        "guvna_requests_dispatched_total": requests * 2 + sse_requests,
+        "guvna_upstream_attempts_total": requests * 3 + sse_requests,
+        "guvna_candidate_fallbacks_total": requests,
+        "guvna_upstream_success_total": requests * 2 + sse_requests,
+        "guvna_chat_stream_completed_total": sse_requests,
+        "guvna_responses_stream_completed_total": sse_requests,
+        "guvna_responses_stream_incomplete_total": 0,
+        "guvna_responses_stream_failed_total": 0,
+        "guvna_responses_stream_cancelled_total": 0,
+        "guvna_chat_stream_failed_total": 0,
+        "guvna_chat_stream_cancelled_total": 0,
+        "guvna_admission_rejections_total": 0,
+        "guvna_active_requests": 0,
+    }
+    for metric, wanted in expected.items():
+        check(values.get(metric) == wanted,
+              f"{metric}: expected {wanted}, got {values.get(metric)}")
+    check(values.get("guvna_upstream_invalid_responses_total", 0) > 0,
+          "invalid primary upstream responses were not observed")
+    check(values.get("guvna_upstream_http_failures_total", 0) > 0,
+          "provider HTTP failures were not observed")
+    return values
+
 def idle(pid: int, seconds: float):
     samples = []
     cpu_first = proc_info(pid)
@@ -391,6 +439,9 @@ chains:
                       "Responses SSE leaked file descriptors")
                 check(summary["post_sse_idle"]["threads"] - summary["post_wave2"]["threads"] <= 8,
                       "Responses SSE leaked threads")
+                summary["metrics"] = verify_metrics(
+                    f"http://127.0.0.1:{gateway_port}/metrics",
+                    a.requests, stream_requests)
                 check(mock1.calls == a.requests, f"chaos attempt count {mock1.calls} != {a.requests}")
                 check(mock2.calls == a.requests * 2 + stream_requests,
                       f"healthy provider call count {mock2.calls} != {a.requests * 2 + stream_requests}")

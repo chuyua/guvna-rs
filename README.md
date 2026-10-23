@@ -62,6 +62,18 @@ See [Go audit migration gates](docs/audit/MIGRATION_GATES.md) and the
 findings, not proof that current Go main still contains those defects.
 All P0 gates must have deterministic regression tests before release.
 
+## Telemetry and runtime diagnosis
+
+The authenticated GET /metrics endpoint exposes a fixed set of Prometheus
+counters and the active admission-permit gauge. It reports actual upstream
+attempts, credential quarantine, candidate fallback, malformed upstream
+responses, bounded admission rejection, stream completion, error and client
+disconnects without including model/key/IP labels or request content. Counters
+use atomics and are reset on restart, with no telemetry database or background
+exporter. The Linux release gate reconciles these counters with mock provider
+call counts and verifies unauthorized access is denied.
+
+See [observability and metric semantics](docs/OBSERVABILITY.md).
 ## Performance and fault-injection quality gates
 
 [Linux resource and pressure acceptance criteria](docs/QUALITY_GATES.md) are
