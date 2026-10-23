@@ -62,6 +62,15 @@ See [Go audit migration gates](docs/audit/MIGRATION_GATES.md) and the
 findings, not proof that current Go main still contains those defects.
 All P0 gates must have deterministic regression tests before release.
 
+## Outage resilience and bounded upstream suppression
+
+For unreliable model providers, opt into a per-provider circuit breaker with
+a configurable failure threshold, exponential cooldown, and a single
+half-open recovery probe. Once a provider repeatedly fails, the gateway skips
+it and uses a configured fallback without wasting another outbound HTTP call.
+Client 4xx errors and downstream cancellation do not open the breaker. This
+feature is disabled by default to preserve existing routing semantics.
+See [circuit breaker configuration](docs/CIRCUIT_BREAKER.md).
 ## Telemetry and runtime diagnosis
 
 The authenticated GET /metrics endpoint exposes a fixed set of Prometheus

@@ -1,4 +1,5 @@
 //! Guvna Rust core. Keep request policy in one place; never clone handler walks.
+pub mod circuit;
 pub mod config;
 pub mod gateway;
 pub mod keypool;

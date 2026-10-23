@@ -314,6 +314,11 @@ def verify_metrics(url: str, requests: int, sse_requests: int) -> dict:
         "guvna_chat_stream_cancelled_total": 0,
         "guvna_admission_rejections_total": 0,
         "guvna_active_requests": 0,
+        "guvna_circuit_bypasses_total": 0,
+        "guvna_circuit_openings_total": 0,
+        "guvna_circuit_probe_success_total": 0,
+        "guvna_circuit_probe_failures_total": 0,
+        "guvna_circuit_open_providers": 0,
     }
     for metric, wanted in expected.items():
         check(values.get(metric) == wanted,
@@ -323,6 +328,89 @@ def verify_metrics(url: str, requests: int, sse_requests: int) -> dict:
     check(values.get("guvna_upstream_http_failures_total", 0) > 0,
           "provider HTTP failures were not observed")
     return values
+
+
+def exercise_opt_in_circuit_gate(binary: str, config: Path, root: str, env: dict,
+                                 mock1: Stub, mock2: Stub) -> dict:
+    """Run a separate release process so the legacy/default-disabled gate
+    remains byte-for-byte comparable to previous runs."""
+    breaker_port = port()
+    breaker_cfg = Path(root) / "circuit-enabled.yaml"
+    original = config.read_text(encoding="utf-8")
+    check("    key_env: DOWN_KEY\n" in original, "missing breaker insertion anchor")
+    revised = original.replace(f"port: {original.splitlines()[0].split(': ')[1]}",
+                               f"port: {breaker_port}", 1)
+    revised = revised.replace("    key_env: DOWN_KEY\n",
+                              "    key_env: DOWN_KEY\n"
+                              "    circuit_breaker:\n"
+                              "      enabled: true\n"
+                              "      failure_threshold: 3\n"
+                              "      cooldown: 30s\n"
+                              "      max_cooldown: 30s\n", 1)
+    breaker_cfg.write_text(revised, encoding="utf-8")
+    proc = subprocess.Popen(
+        [str(Path(binary).resolve()), "serve", "-config", str(breaker_cfg),
+         "-data", root],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
+    try:
+        health = f"http://127.0.0.1:{breaker_port}/healthz"
+        started = time.monotonic()
+        while time.monotonic() - started < 2:
+            check(proc.poll() is None, "breaker gateway terminated at startup")
+            if get_status(health, timeout=0.1) == 200:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("breaker gateway startup timeout")
+        initial_primary = mock1.calls
+        initial_healthy = mock2.calls
+        target = f"http://127.0.0.1:{breaker_port}/v1/chat/completions"
+        # Nonconcurrent calls make the expected 3-attempt threshold exact.
+        wave = run_wave(target, "chaos", 64, 1, proc.pid)
+        avoided = mock1.calls - initial_primary
+        check(avoided == 3, f"breaker failed to suppress primary requests: {avoided}/64")
+        check(mock2.calls - initial_healthy == 64,
+              "breaker chain did not preserve healthy fallback")
+        req = Request(f"http://127.0.0.1:{breaker_port}/metrics",
+                      headers={"Authorization": "Bearer only-for-local-test"})
+        with urlopen(req, timeout=3) as response:
+            metrics = {}
+            for line in response.read(8 << 10).decode("utf-8").splitlines():
+                if line.startswith("guvna_"):
+                    name, _, value = line.partition(" ")
+                    metrics[name] = int(value)
+        expected = {
+            "guvna_requests_dispatched_total": 64,
+            "guvna_upstream_attempts_total": 67,
+            "guvna_upstream_success_total": 64,
+            "guvna_candidate_fallbacks_total": 64,
+            "guvna_circuit_openings_total": 1,
+            "guvna_circuit_bypasses_total": 61,
+            "guvna_circuit_probe_success_total": 0,
+            "guvna_circuit_probe_failures_total": 0,
+            "guvna_circuit_open_providers": 1,
+            "guvna_active_requests": 0,
+        }
+        for name, wanted in expected.items():
+            check(metrics.get(name) == wanted,
+                  f"breaker metric mismatch {name}: {metrics.get(name)} != {wanted}")
+        # Read /proc after the new wave; never silently skip RSS/leak checks.
+        usage = proc_info(proc.pid)
+        check(usage["VmRSS"] <= 16 * 1024, "breaker instance RSS exceeded 16 MiB")
+        check(usage["fd"] <= 20, "breaker instance leaked file descriptors")
+        check(usage["Threads"] <= 12, "breaker instance leaked threads")
+        return {"wave": wave, "primary_attempts": avoided,
+                "requests_avoiding_primary": 61,
+                "metrics": metrics,
+                "rss_kib": usage["VmRSS"], "fds": usage["fd"],
+                "threads": usage["Threads"]}
+    finally:
+        proc.terminate()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate(timeout=5)
 
 def idle(pid: int, seconds: float):
     samples = []
@@ -463,6 +551,8 @@ chains:
                 summary["faults"] = mock1.faults
                 check(all(count > 0 for count in mock1.faults.values()),
                       "fault injection did not cover every variant")
+                summary["opt_in_circuit_gate"] = exercise_opt_in_circuit_gate(
+                    a.binary, cfg, directory, env, mock1, mock2)
                 summary["passed"] = True
             finally:
                 proc.terminate()

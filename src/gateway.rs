@@ -17,6 +17,7 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
+    circuit::{Circuit, Ticket},
     config::Config,
     keypool::{KeyPool, Lease},
     metrics::Metrics,
@@ -32,6 +33,7 @@ pub struct AppState {
     pub config: Config,
     client: reqwest::Client,
     pools: Vec<KeyPool>,
+    circuits: Vec<Option<Arc<Circuit>>>,
     client_keys: Vec<String>,
     inflight: Arc<Semaphore>,
     metrics: Arc<Metrics>,
@@ -53,6 +55,11 @@ impl AppState {
             .providers
             .iter()
             .map(|p| KeyPool::new(p, &credentials))
+            .collect::<Result<Vec<_>, _>>()?;
+        let circuits = config
+            .providers
+            .iter()
+            .map(|p| Circuit::new(&p.circuit_breaker))
             .collect::<Result<Vec<_>, _>>()?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -86,6 +93,7 @@ impl AppState {
             config,
             client,
             pools,
+            circuits,
             client_keys,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             metrics: Arc::new(Metrics::default()),
@@ -130,6 +138,29 @@ fn unauthorized() -> Response {
     )
 }
 
+// Keep one classification path for all candidate and SSE circuit outcomes.
+fn record_circuit_failure(ticket: &mut Option<Ticket>, metrics: &Metrics) {
+    if let Some(ticket) = ticket {
+        let probe = ticket.is_probe();
+        if ticket.failure() {
+            Metrics::inc(&metrics.circuit_openings);
+        }
+        if probe {
+            Metrics::inc(&metrics.circuit_probe_failures);
+        }
+    }
+}
+
+fn record_circuit_success(ticket: &mut Option<Ticket>, metrics: &Metrics) {
+    if let Some(ticket) = ticket {
+        let probe = ticket.is_probe();
+        ticket.success();
+        if probe {
+            Metrics::inc(&metrics.circuit_probe_success);
+        }
+    }
+}
+
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -159,7 +190,15 @@ async fn metrics_endpoint(State(state): State<Arc<AppState>>, headers: HeaderMap
             ("content-type", "text/plain; version=0.0.4; charset=utf-8"),
             ("cache-control", "no-store"),
         ],
-        state.metrics.prometheus(active),
+        state.metrics.prometheus(
+            active,
+            state
+                .circuits
+                .iter()
+                .filter_map(Option::as_ref)
+                .filter(|c| c.is_open())
+                .count(),
+        ),
     )
         .into_response()
 }
@@ -1077,6 +1116,8 @@ async fn dispatch(
 
     // Count actual candidate transitions, not provider-key retries.
     let mut candidates_visited = 0usize;
+    let mut attempted_network = false;
+    let mut bypassed_circuit = false;
     // Exactly ONE candidate loop for chat + embedding. Key failover is confined to this loop.
     for step in steps {
         let provider = &state.config.providers[step.provider_index];
@@ -1087,6 +1128,17 @@ async fn dispatch(
             Metrics::inc(&state.metrics.candidate_fallbacks);
         }
         candidates_visited += 1;
+        let mut circuit_ticket = match &state.circuits[step.provider_index] {
+            Some(circuit) => match circuit.admit() {
+                Some(ticket) => Some(ticket),
+                None => {
+                    Metrics::inc(&state.metrics.circuit_bypasses);
+                    bypassed_circuit = true;
+                    continue; // No HTTP calls while open or a recovery probe runs.
+                }
+            },
+            None => None, // Preserve existing routing behavior by default.
+        };
         let mut payload = request.clone();
         let object = payload.as_object_mut().expect("checked above");
         object.insert("model".into(), Value::String(step.model.clone()));
@@ -1100,6 +1152,7 @@ async fn dispatch(
         while let Some(lease) = state.pools[step.provider_index].acquire(&tried) {
             tried.insert(lease.env.clone());
             let url = provider.endpoint(endpoint.path());
+            attempted_network = true;
             Metrics::inc(&state.metrics.upstream_attempts);
             // A request-wide reqwest timeout would terminate a healthy SSE
             // generation after 90s despite regular progress. Time only the
@@ -1116,6 +1169,7 @@ async fn dispatch(
                 Ok(result) => result,
                 Err(_) => {
                     Metrics::inc(&state.metrics.upstream_transport_failures);
+                    record_circuit_failure(&mut circuit_ticket, &state.metrics);
                     break;
                 }
             };
@@ -1123,6 +1177,7 @@ async fn dispatch(
                 Ok(response) => response,
                 Err(_) => {
                     Metrics::inc(&state.metrics.upstream_transport_failures);
+                    record_circuit_failure(&mut circuit_ticket, &state.metrics);
                     break;
                 } // key-neutral
             };
@@ -1144,12 +1199,14 @@ async fn dispatch(
                         step.provider_index,
                         lease.clone(),
                         &mut permit,
+                        &mut circuit_ticket,
                     )
                     .await
                     {
                         Ok(stream_response) => return stream_response,
                         Err(_) => {
                             Metrics::inc(&state.metrics.upstream_invalid_responses);
+                            record_circuit_failure(&mut circuit_ticket, &state.metrics);
                             break;
                         } // preflight rejected
                     }
@@ -1157,18 +1214,43 @@ async fn dispatch(
                 match tokio::time::timeout_at(deadline, bounded_json(upstream)).await {
                     Ok(Ok(value)) if valid_result(endpoint, &payload, &value) => {
                         state.pools[step.provider_index].record_success(&lease);
+                        record_circuit_success(&mut circuit_ticket, &state.metrics);
                         Metrics::inc(&state.metrics.upstream_success);
                         return (StatusCode::OK, Json(value)).into_response();
                     }
                     _ => {
                         Metrics::inc(&state.metrics.upstream_invalid_responses);
+                        record_circuit_failure(&mut circuit_ticket, &state.metrics);
                         break;
                     } // next step
                 }
             }
             Metrics::inc(&state.metrics.upstream_http_failures);
+            if outcome == Outcome::ProviderTransient
+                && let Some(ticket) = &mut circuit_ticket
+            {
+                let probe = ticket.is_probe();
+                if ticket.failure() {
+                    Metrics::inc(&state.metrics.circuit_openings);
+                }
+                if probe {
+                    Metrics::inc(&state.metrics.circuit_probe_failures);
+                }
+            }
             break; // 4xx or 5xx: next chain step; no uncontrolled retries
         }
+    }
+    if bypassed_circuit && !attempted_network {
+        let mut response = error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "provider_circuit_open",
+            "All eligible providers are temporarily unavailable",
+        );
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+        return response;
     }
     error(
         StatusCode::BAD_GATEWAY,
@@ -1190,6 +1272,7 @@ struct ChatStreamState {
     terminated: bool,
     terminal_reported: bool,
     _permit: Option<OwnedSemaphorePermit>,
+    circuit_ticket: Option<Ticket>,
 }
 
 impl Drop for ChatStreamState {
@@ -1211,6 +1294,7 @@ async fn start_chat_stream(
     provider_index: usize,
     lease: Lease,
     permit: &mut Option<OwnedSemaphorePermit>,
+    circuit_ticket: &mut Option<Ticket>,
 ) -> Result<Response, ()> {
     let content_type = upstream
         .headers()
@@ -1234,9 +1318,11 @@ async fn start_chat_stream(
         terminated: false,
         terminal_reported: false,
         _permit: None,
+        circuit_ticket: None,
     };
     preflight_stream(&mut state).await?;
     state._permit = permit.take();
+    state.circuit_ticket = circuit_ticket.take();
     Ok(stream_response(state))
 }
 
@@ -1264,6 +1350,7 @@ fn stream_response(state: ChatStreamState) -> Response {
             if let Some(event) = state.pending.pop_front() {
                 if event == Bytes::from_static(b"data: [DONE]\n\n") {
                     state.owner.pools[state.provider_index].record_success(&state.lease);
+                    record_circuit_success(&mut state.circuit_ticket, &state.owner.metrics);
                     Metrics::inc(&state.owner.metrics.upstream_success);
                     Metrics::inc(&state.owner.metrics.chat_stream_completed);
                     state.terminal_reported = true;
@@ -1292,6 +1379,7 @@ fn stream_response(state: ChatStreamState) -> Response {
             }
             if state.terminated {
                 Metrics::inc(&state.owner.metrics.chat_stream_failed);
+                record_circuit_failure(&mut state.circuit_ticket, &state.owner.metrics);
                 state.terminal_reported = true;
                 return Some((Ok(stream_error()), state));
             }
@@ -1537,7 +1625,7 @@ mod tests {
         assert!(
             state
                 .metrics
-                .prometheus(MAX_INFLIGHT_REQUESTS)
+                .prometheus(MAX_INFLIGHT_REQUESTS, 0)
                 .contains("guvna_active_requests 128\n")
         );
         drop(all_permits);

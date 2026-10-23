@@ -41,6 +41,8 @@ pub struct Provider {
     #[serde(default)]
     pub quarantine: QuarantineConfig,
     #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+    #[serde(default)]
     pub models: Vec<String>,
     #[serde(default)]
     pub prefixes: Vec<String>,
@@ -56,6 +58,45 @@ pub struct QuarantineConfig {
     pub transient: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CircuitBreakerConfig {
+    pub enabled: bool,
+    pub failure_threshold: u32,
+    pub cooldown: String,
+    pub max_cooldown: String,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            failure_threshold: 3,
+            cooldown: "2s".into(),
+            max_cooldown: "30s".into(),
+        }
+    }
+}
+
+impl CircuitBreakerConfig {
+    pub fn timings(&self) -> Result<(Duration, Duration), String> {
+        if !(1..=32).contains(&self.failure_threshold) {
+            return Err("circuit_breaker failure_threshold must be 1..32".into());
+        }
+        let cooldown = parse_duration(&self.cooldown)?;
+        let max = parse_duration(&self.max_cooldown)?;
+        if cooldown < Duration::from_millis(100)
+            || max < cooldown
+            || max > Duration::from_secs(3600)
+        {
+            return Err(
+                "circuit_breaker cooldown must be >=100ms and max_cooldown >= cooldown and <=1h"
+                    .into(),
+            );
+        }
+        Ok((cooldown, max))
+    }
+}
 impl QuarantineConfig {
     pub fn auth(&self) -> Result<Duration, String> {
         parse_duration(self.auth.as_deref().unwrap_or("24h"))
@@ -216,6 +257,7 @@ impl Config {
             p.quarantine.auth()?;
             p.quarantine.rate_limit()?;
             p.quarantine.transient()?;
+            p.circuit_breaker.timings()?;
             for prefix in p.prefixes() {
                 if prefix.is_empty() || !prefixes.insert(prefix.to_owned()) {
                     return Err(format!("duplicate/empty provider prefix: {prefix:?}"));
