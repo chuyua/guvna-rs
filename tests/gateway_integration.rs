@@ -268,3 +268,20 @@ async fn sse_truncated_finish_event_never_claims_success() {
     assert!(!text.contains("data: [DONE]"), "{text}");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn duplicate_choice_index_fails_over_before_first_event() {
+    let duplicate = b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null},{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n";
+    let (a, bad_hits) = start_sse(vec![duplicate]).await;
+    let (b, good_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let response = make_app(&a, &b)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    assert_eq!(bad_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(good_hits.load(Ordering::SeqCst), 1);
+}
