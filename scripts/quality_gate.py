@@ -412,6 +412,74 @@ def exercise_opt_in_circuit_gate(binary: str, config: Path, root: str, env: dict
             proc.kill()
             proc.communicate(timeout=5)
 
+def verify_release_chain_management(binary: str, config: Path, directory: str) -> dict:
+    """Proof of local CLI persistence/recovery on the actual Linux release binary."""
+    workspace = Path(directory) / "offline-chain-fixture"
+    data = workspace / "data"
+    workspace.mkdir()
+    chain = workspace / "chain.yaml"
+    chain.write_text("name: cli-fixture\nsteps:\n  - provider: live\n    model: first\n",
+                     encoding="utf-8")
+    binary = str(Path(binary).resolve())
+    env = dict(os.environ)
+    for name in ("API_KEYS", "ADMIN_KEY", "DOWN_KEY", "LIVE_KEY"):
+        env.pop(name, None)
+
+    def cli(*args: str, allowed: bool = True) -> str:
+        process = subprocess.run(
+            [binary, "chains", *args, "-config", str(config), "-data", str(data)],
+            text=True, capture_output=True, env=env, timeout=5)
+        if allowed:
+            check(process.returncode == 0,
+                  f"chains CLI failure {args}: {process.stderr}")
+        else:
+            check(process.returncode != 0,
+                  f"chains CLI accepted invalid request {args}")
+        return process.stdout if allowed else process.stderr
+
+    original = json.loads(cli("list"))
+    check(len(original) == 2, "CLI did not list static chains")
+    check(not data.exists(), "read-only CLI created a data directory")
+    check("created" in cli("set", "-file", str(chain)), "runtime set did not create")
+    target = data / "chains.yaml"
+    first = target.read_bytes()
+    check(target.stat().st_mode & 0o777 == 0o600,
+          "runtime chains file must be mode 0600 on Linux")
+    listed = json.loads(cli("list"))
+    check(len(listed) == 3 and listed[-1]["name"] == "cli-fixture",
+          "CLI runtime list was not served from committed chains.yaml")
+
+    chain.write_text("name: cli-fixture\nsteps:\n  - provider: live\n    model: second\n",
+                     encoding="utf-8")
+    check("updated" in cli("set", "-file", str(chain)), "runtime set did not update")
+    check((data / "chains.yaml.bak").read_bytes() == first,
+          "backup does not contain the prior committed version")
+    second = target.read_bytes()
+    check(b"second" in second, "second update not committed")
+    check("deleted" in cli("delete", "-name", "cli-fixture"), "delete failed")
+
+    corrupt = b"version: [\ninvalid corrupted on-disk file\n"
+    target.write_bytes(corrupt)
+    check("malformed" in cli("validate", allowed=False),
+          "corrupt YAML was silently accepted")
+    check("malformed" in cli("set", "-file", str(chain), allowed=False),
+          "CLI silently rewrote corrupt live file")
+    check(target.read_bytes() == corrupt, "invalid set modified damaged file")
+    check("recovered 1 runtime" in cli("recover"), "recover failed")
+    check(target.read_bytes() == second, "recover did not restore known-good backup")
+    snapshots = list(data.glob("chains.yaml.before-recovery-*.bak"))
+    check(len(snapshots) == 1 and snapshots[0].read_bytes() == corrupt,
+          "damaged original was not preserved byte-for-byte")
+    check(snapshots[0].stat().st_mode & 0o777 == 0o600,
+          "forensic backup must not be world-readable")
+    check("1 runtime" in cli("validate"), "CLI did not validate recovered file")
+    check(target.stat().st_mode & 0o777 == 0o600,
+          "recovered chains file lost mode 0600")
+    return {"passed": True, "static_routes": 2, "recovered_routes": 1,
+            "corrupt_bytes_preserved": len(corrupt),
+            "atomic_backup_matches_prior": True, "mode": "0600"}
+
+
 def idle(pid: int, seconds: float):
     samples = []
     cpu_first = proc_info(pid)
@@ -488,6 +556,8 @@ chains:
             env = dict(os.environ)
             env.update({"API_KEYS": "only-for-local-test", "DOWN_KEY": "fake-down-key",
                         "LIVE_KEY": "fake-live-key", "GUVNA_BIND_ADDR": "127.0.0.1"})
+            summary["release_chain_cli_gate"] = verify_release_chain_management(
+                a.binary, cfg, directory)
             started = time.monotonic()
             proc = subprocess.Popen(
                 [str(Path(a.binary).resolve()), "serve", "-config", str(cfg), "-data", directory],

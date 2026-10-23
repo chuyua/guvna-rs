@@ -29,6 +29,12 @@ global P0 list, which is authoritative here.
 | G10 · Credential cool-off | Apply the right provider-configured auth vs 429 window. Concurrent late failures cannot exponentially extend cool-off (lease generation fencing). | Fake clock, concurrent generation test |
 | G11 · Persistent chain recovery | Bad chains file does not disappear or permanently brick edits; recovery path must exist and be exercised through public command path. | Corrupt-file recovery via CLI |
 
+Implementation note (G11): the CLI now supports offline version-1 runtime
+chain add/update/delete, validation and explicit backup-based recovery. The
+unit and Linux release-binary tests exercise malformed-file preservation,
+atomic commits and concurrent writers. Live daemon hot reload and online
+management are separate, still-unimplemented future milestones.
+
 ## Architecture rules derived from the remaining 72 findings
 
 1. **One candidate walk** for Chat, Embeddings and future Responses/Auto.

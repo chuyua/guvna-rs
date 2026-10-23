@@ -1,0 +1,304 @@
+use guvna::config::Config;
+use serde_json::Value;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+    sync::{Arc, Barrier},
+    thread,
+};
+use tempfile::TempDir;
+
+fn setup() -> (TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.yaml");
+    fs::write(
+        &config,
+        "providers:\n  - name: p\n    type: openai\n    base_url: https://example.org\n    key_env: KEY\nchains:\n  - name: immutable\n    steps:\n      - provider: p\n        model: static\n",
+    )
+    .unwrap();
+    let data = dir.path().join("data");
+    (dir, config, data)
+}
+
+fn run(config: &Path, data: &Path, params: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_guvna"))
+        .arg("chains")
+        .args(params)
+        .arg("--config")
+        .arg(config)
+        .arg("--data")
+        .arg(data)
+        .output()
+        .unwrap()
+}
+
+fn success(output: &Output) -> String {
+    assert!(
+        output.status.success(),
+        "exit: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout.clone()).unwrap()
+}
+
+fn failure(output: &Output, contains: &str) {
+    assert!(!output.status.success(), "unexpected success: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(contains),
+        "wanted {contains:?} in {stderr:?}"
+    );
+}
+
+fn definition(path: &Path, name: &str, model: &str) {
+    fs::write(
+        path,
+        format!("name: {name}\nsteps:\n  - provider: p\n    model: {model}\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn cli_set_replace_delete_and_corrupt_recovery_preserve_every_original_byte() {
+    let (dir, config, data) = setup();
+    let static_list = success(&run(&config, &data, &["list"]));
+    let items: Vec<Value> = serde_json::from_str(&static_list).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], "immutable");
+    assert_eq!(items[0]["source"], "config");
+    assert!(success(&run(&config, &data, &["validate"])).contains("0 runtime"));
+    assert!(!data.exists(), "read-only CLI must not create a data dir");
+
+    let definition_file = dir.path().join("chain.yaml");
+    definition(&definition_file, "user-route", "model-v1");
+    let path = definition_file.to_str().unwrap();
+    assert!(
+        success(&run(&config, &data, &["set", "--file", path]))
+            .contains("created runtime chain user-route")
+    );
+    let loaded = Config::load(&config)
+        .unwrap()
+        .with_runtime_chains(&data)
+        .unwrap();
+    assert_eq!(loaded.chains.len(), 2);
+    assert_eq!(loaded.chains[1].steps[0].model, "model-v1");
+
+    // Real second update: backup is byte-for-byte the previous valid file.
+    let before_update = fs::read(data.join("chains.yaml")).unwrap();
+    definition(&definition_file, "user-route", "model-v2");
+    assert!(
+        success(&run(&config, &data, &["set", "--file", path]))
+            .contains("updated runtime chain user-route")
+    );
+    assert_eq!(
+        fs::read(data.join("chains.yaml.bak")).unwrap(),
+        before_update
+    );
+    let listed: Vec<Value> =
+        serde_json::from_str(&success(&run(&config, &data, &["list"]))).unwrap();
+    assert_eq!(listed[1]["source"], "runtime");
+    assert_eq!(listed[1]["steps"][0]["model"], "model-v2");
+
+    // A base-defined route is not a mutable runtime chain.
+    failure(
+        &run(&config, &data, &["delete", "--name", "immutable"]),
+        "read-only",
+    );
+    definition(&definition_file, "immutable", "hijack");
+    failure(
+        &run(&config, &data, &["set", "--file", path]),
+        "owned by config.yaml",
+    );
+    let newest_valid = fs::read(data.join("chains.yaml")).unwrap();
+
+    // Invalid edits can never destroy the most recently committed file.
+    fs::write(
+        &definition_file,
+        "name: broken\nsteps:\n  - provider: unknown\n    model: x\n",
+    )
+    .unwrap();
+    failure(
+        &run(&config, &data, &["set", "--file", path]),
+        "missing provider",
+    );
+    assert_eq!(fs::read(data.join("chains.yaml")).unwrap(), newest_valid);
+
+    assert!(
+        success(&run(&config, &data, &["delete", "--name", "user-route"]))
+            .contains("deleted runtime chain")
+    );
+    let removed_list: Vec<Value> =
+        serde_json::from_str(&success(&run(&config, &data, &["list"]))).unwrap();
+    assert_eq!(removed_list.len(), 1);
+
+    // Simulate disk corruption, require explicit recovery, and retain the bad
+    // original for forensics rather than overwriting it without a copy.
+    let broken = b"version: [\nchains: ???\n";
+    fs::write(data.join("chains.yaml"), broken).unwrap();
+    failure(&run(&config, &data, &["validate"]), "malformed chains.yaml");
+    failure(
+        &run(&config, &data, &["set", "--file", path]),
+        "missing provider",
+    );
+    assert_eq!(fs::read(data.join("chains.yaml")).unwrap(), broken);
+
+    let invalid_recovery = dir.path().join("bad-backup.yaml");
+    fs::write(&invalid_recovery, "version: [\n").unwrap();
+    failure(
+        &run(
+            &config,
+            &data,
+            &["recover", "--from", invalid_recovery.to_str().unwrap()],
+        ),
+        "malformed chains.yaml",
+    );
+    assert_eq!(fs::read(data.join("chains.yaml")).unwrap(), broken);
+
+    let recovery = success(&run(&config, &data, &["recover"]));
+    assert!(
+        recovery.contains("recovered 1 runtime chains"),
+        "{recovery}"
+    );
+    let preserved = fs::read_dir(&data)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("chains.yaml.before-recovery-")
+        })
+        .expect("an explicit forensic copy of corrupt chains.yaml");
+    assert_eq!(fs::read(&preserved).unwrap(), broken);
+    assert_eq!(fs::read(data.join("chains.yaml")).unwrap(), newest_valid);
+    assert!(success(&run(&config, &data, &["validate"])).contains("1 runtime"));
+
+    // Recovered file is usable by the *same* daemon loading path.
+    let loaded = Config::load(&config)
+        .unwrap()
+        .with_runtime_chains(&data)
+        .unwrap();
+    assert_eq!(loaded.chains[1].steps[0].model, "model-v2");
+}
+
+#[test]
+fn concurrent_separate_processes_cannot_lose_runtime_chain_updates() {
+    let (dir, config, data) = setup();
+    let barrier = Arc::new(Barrier::new(9));
+    let mut handles = vec![];
+    for i in 0..8 {
+        let input = dir.path().join(format!("route-{i}.yaml"));
+        definition(&input, &format!("route-{i}"), &format!("model-{i}"));
+        let barrier = Arc::clone(&barrier);
+        let config = config.clone();
+        let data = data.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            let input = input.to_string_lossy().to_string();
+            let output = run(&config, &data, &["set", "--file", &input]);
+            success(&output)
+        }));
+    }
+    barrier.wait();
+    for handle in handles {
+        assert!(handle.join().unwrap().contains("runtime chain route-"));
+    }
+    let items: Vec<Value> =
+        serde_json::from_str(&success(&run(&config, &data, &["list"]))).unwrap();
+    assert_eq!(items.len(), 9, "one static plus all 8 committed routes");
+    let runtime = items
+        .iter()
+        .filter(|entry| entry["source"] == "runtime")
+        .collect::<Vec<_>>();
+    assert_eq!(runtime.len(), 8);
+    for i in 0..8 {
+        assert!(runtime.iter().any(|entry| {
+            entry["name"] == format!("route-{i}")
+                && entry["steps"][0]["model"] == format!("model-{i}")
+        }));
+    }
+    // One atomic rename per commit. No abandoned partial temp files.
+    let files = fs::read_dir(&data)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        files.iter().all(|name| {
+            name == "chains.yaml" || name == "chains.yaml.bak" || name == ".chains.yaml.lock"
+        }),
+        "temporary files leaked: {files:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_symlink_target_without_touching_the_target_file() {
+    use std::os::unix::fs::symlink;
+    let (dir, config, data) = setup();
+    fs::create_dir_all(&data).unwrap();
+    let outside = dir.path().join("outside.yaml");
+    fs::write(&outside, "private-not-for-chains").unwrap();
+    symlink(&outside, data.join("chains.yaml")).unwrap();
+    let input = dir.path().join("new.yaml");
+    definition(&input, "safe", "gpt");
+    failure(
+        &run(&config, &data, &["set", "--file", input.to_str().unwrap()]),
+        "regular file",
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"private-not-for-chains");
+}
+
+#[test]
+fn invalid_runtime_versions_duplicates_and_unknown_fields_fail_without_editing() {
+    let (dir, config, data) = setup();
+    fs::create_dir_all(&data).unwrap();
+    let file = data.join("chains.yaml");
+    let input = dir.path().join("valid.yaml");
+    definition(&input, "valid", "safe");
+
+    for raw in [
+        "version: 2\nchains: []\n",
+        "version: 1\nunknown_field: 3\nchains: []\n",
+        "version: 1\nchains:\n  - name: repeat\n    steps: [{provider: p, model: x}]\n  - name: repeat\n    steps: [{provider: p, model: y}]\n",
+        "version: 1\nchains:\n  - name: immutable\n    steps: [{provider: p, model: override}]\n",
+    ] {
+        fs::write(&file, raw).unwrap();
+        failure(&run(&config, &data, &["validate"]), "guvna:");
+        failure(
+            &run(&config, &data, &["set", "-file", input.to_str().unwrap()]),
+            "guvna:",
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), raw);
+    }
+}
+
+#[test]
+fn file_persistence_preserves_large_integer_parameters_without_float_rounding() {
+    let (dir, config, data) = setup();
+    let input = dir.path().join("big-int.yaml");
+    fs::write(
+        &input,
+        "name: big-int\nsteps:\n  - provider: p\n    model: gpt\n    params:\n      seed: 12345678901234567890\n      response_format:\n        type: json_object\n",
+    )
+    .unwrap();
+    success(&run(
+        &config,
+        &data,
+        &["set", "-file", input.to_str().unwrap()],
+    ));
+    let route = Config::load(&config)
+        .unwrap()
+        .with_runtime_chains(&data)
+        .unwrap();
+    let params = &route.chains[1].steps[0].params;
+    assert_eq!(
+        params["seed"].as_u64(),
+        Some(12_345_678_901_234_567_890_u64)
+    );
+    assert_eq!(params["response_format"]["type"], "json_object");
+    let persisted = fs::read_to_string(data.join("chains.yaml")).unwrap();
+    assert!(persisted.contains("12345678901234567890"), "{persisted}");
+}

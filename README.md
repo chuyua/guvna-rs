@@ -8,7 +8,7 @@ duplicated routing state machines.
 
 ## First executable milestone (M1)
 
-- Go-style `config.yaml` parsing and read-only import of `chains.yaml`.
+- Go-style `config.yaml` parsing and validated import and offline atomic management of `chains.yaml`.
 - Explicit CLI `-config` file selection; no hidden home-directory override.
 - `/healthz`, `/v1/models`, non-streaming
   `/v1/chat/completions`, `/v1/embeddings`.
@@ -39,7 +39,7 @@ Unsupported reasoning, image, audio, stateful continuation, and other
 advanced Responses modes remain explicitly unsupported. The gateway must not
 be treated as full OpenAI Responses parity or a production drop-in replacement.
 
-Not yet shipped: Auto, CLI management, persistent chain mutation,
+Not yet shipped: Auto, general remote management,
 complete Go protocol parity and full multi-modal streaming.
 
 POST /v1/chat/completions, /v1/embeddings and /v1/responses authenticate
@@ -49,6 +49,22 @@ invalid credentials are rejected without consuming a slow or unbounded body.
 Authorized requests acquire a shared admission permit before reading the
 request body, preventing slow uploads from evading the global 128-request
 limit. Permits remain held through dispatch and streamed response delivery.
+
+## Local runtime chain management (offline)
+
+Manage additional routing chains with the built-in local CLI:
+
+    guvna chains list -config config.yaml -data /var/lib/guvna
+    guvna chains set -file my-chain.yaml -config config.yaml -data /var/lib/guvna
+    guvna chains delete -name my-chain -config config.yaml -data /var/lib/guvna
+    guvna chains recover -config config.yaml -data /var/lib/guvna
+
+Writes are atomic and serialized across processes. The CLI backs up the
+previous good version before edits and preserves damaged files during
+explicit recovery. Static chains remain read-only. Running servers do not
+reload routes: validate and restart manually. Management needs filesystem
+access but no remote management port or API key.
+See [the chain management contract](docs/CHAIN_MANAGEMENT.md).
 
 ## Development
 

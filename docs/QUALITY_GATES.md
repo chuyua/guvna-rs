@@ -71,6 +71,16 @@ provider entirely, and all 64 must still succeed via the healthy fallback.
 Every telemetry counter is reconciled to actual mock requests and RSS,
 FD/thread resource limits are checked. The normal default-disabled baseline
 remains unchanged for compatibility and prior load comparisons.
+## Offline chain management on the Release binary
+
+The Linux resource gate runs real CLI commands before serving: static list,
+local add/replace/delete, single rolling backup, rejecting corrupted YAML,
+explicit recovery with byte-for-byte preservation of the damaged file and
+mode-0600 persisted files. No client/provider API keys are needed. The Rust
+integration suite also races eight independent CLI writers and verifies that
+all named chains survive, with no abandoned temporary files. A running
+daemon intentionally requires a restart to load newly committed chains.
+
 ## Planned broader gates
 
 - Deterministic random fault matrix (429/5xx/invalid JSON/stalled response/
