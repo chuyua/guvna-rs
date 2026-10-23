@@ -351,6 +351,10 @@ impl Drop for DropSignal {
 }
 
 async fn start_stalled_sse() -> (String, Arc<AtomicUsize>) {
+    start_stalled_sse_frame(SSE_START).await
+}
+
+async fn start_stalled_sse_frame(frame: &'static [u8]) -> (String, Arc<AtomicUsize>) {
     let drops = Arc::new(AtomicUsize::new(0));
     let signal = drops.clone();
     let router = Router::new().route(
@@ -360,14 +364,14 @@ async fn start_stalled_sse() -> (String, Arc<AtomicUsize>) {
             async move {
                 let output = futures_util::stream::unfold(
                     (false, DropSignal(signal)),
-                    |(sent, guard)| async move {
+                    move |(sent, guard)| async move {
                         if sent {
                             std::future::pending::<
                                 Option<(Result<Bytes, std::io::Error>, (bool, DropSignal))>,
                             >()
                             .await
                         } else {
-                            Some((Ok(Bytes::from_static(SSE_START)), (true, guard)))
+                            Some((Ok(Bytes::from_static(frame)), (true, guard)))
                         }
                     },
                 );
@@ -846,7 +850,6 @@ async fn responses_text_bridge_and_unsupported_modes() {
     }
     assert_eq!(hits.load(Ordering::SeqCst), 34);
     for payload in [
-        json!({"model":"demo","input":"hello","stream":true}),
         json!({"model":"demo","input":"hello","tools":[{"type":"web_search"}]}),
         json!({"model":"demo","input":"hello","n":2}),
         json!({"model":"demo","input":"hello","unknown_option":42}),
@@ -919,4 +922,350 @@ async fn responses_stateless_metadata_and_mode_contract() {
         );
     }
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+fn responses_stream_req(payload: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("authorization", "Bearer client")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap()
+}
+
+const RESP_START_A: &[u8] = b"data: {\"id\":\"chat1\",\"created\":123,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",";
+const RESP_START_B: &[u8] = b"\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
+const RESP_END: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\n";
+const RESP_LENGTH_END: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"length\"}]}\n\n";
+const RESP_USAGE: &[u8] = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n";
+
+#[tokio::test]
+async fn responses_sse_real_upstream_fragmentation_metadata_usage() {
+    let (url, hits) = start_sse(vec![
+        RESP_START_A,
+        RESP_START_B,
+        RESP_END,
+        RESP_USAGE,
+        SSE_DONE,
+    ])
+    .await;
+    let response = make_app(&url, &url)
+        .oneshot(responses_stream_req(json!({"model":"demo","input":"hello",
+            "stream":true,"metadata":{"job":"sse"},"store":false,"max_output_tokens":32})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(text.contains("event: response.created"), "{text}");
+    assert!(text.contains("event: response.in_progress"), "{text}");
+    assert!(text.contains("event: response.output_item.added"), "{text}");
+    assert_eq!(text.matches("event: response.output_text.delta").count(), 2);
+    assert_eq!(text.matches("event: response.completed").count(), 1);
+    assert!(!text.contains("event: response.failed"), "{text}");
+    assert!(!text.contains("data: [DONE]"));
+    let events: Vec<Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|json| serde_json::from_str(json).unwrap())
+        .collect();
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event["sequence_number"], json!(index), "{event}");
+    }
+    let completed = events.last().unwrap();
+    assert_eq!(completed["response"]["status"], "completed");
+    assert_eq!(completed["response"]["model"], "demo");
+    assert_eq!(completed["response"]["output_text"], "hi!");
+    assert_eq!(completed["response"]["metadata"]["job"], "sse");
+    assert_eq!(completed["response"]["usage"]["total_tokens"], 7);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn responses_sse_length_incomplete_and_truncated_failed() {
+    let (url, hits) = start_sse(vec![RESP_START_A, RESP_START_B, RESP_LENGTH_END, SSE_DONE]).await;
+    let response = make_app(&url, &url)
+        .oneshot(responses_stream_req(
+            json!({"model":"demo","input":"hello","stream":true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(text.contains("event: response.incomplete"), "{text}");
+    assert!(text.contains("max_output_tokens"), "{text}");
+    assert!(!text.contains("event: response.completed"), "{text}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    let (url, hits) = start_sse(vec![RESP_START_A, RESP_START_B]).await;
+    let response = make_app(&url, &url)
+        .oneshot(responses_stream_req(
+            json!({"model":"demo","input":"hello","stream":true}),
+        ))
+        .await
+        .unwrap();
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(text.matches("event: response.failed").count(), 1, "{text}");
+    assert!(!text.contains("event: response.completed"), "{text}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn responses_sse_unsupported_tool_stream_fails_closed() {
+    let tool_call = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call1\"}]},\"finish_reason\":null}]}\n\n";
+    let (url, hits) = start_sse(vec![RESP_START_A, RESP_START_B, tool_call, SSE_DONE]).await;
+    let response = make_app(&url, &url)
+        .oneshot(responses_stream_req(
+            json!({"model":"demo","input":"hello","stream":true,
+            "tools":[{"type":"function","name":"lookup"}]}),
+        ))
+        .await
+        .unwrap();
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(text.matches("event: response.failed").count(), 1, "{text}");
+    assert!(!text.contains("event: response.completed"), "{text}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn responses_sse_multiple_concurrent_clients_complete_without_mixups() {
+    let (url, hits) = start_sse(vec![RESP_START_A, RESP_START_B, RESP_END, SSE_DONE]).await;
+    let app = make_app(&url, &url);
+    let tasks = (0..12).map(|index| {
+        let app = app.clone();
+        async move {
+            let resp = app.oneshot(responses_stream_req(json!({
+                "model":"demo","input":"hello","stream":true,"metadata":{"request":format!("{index}")}
+            }))).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let text = String::from_utf8(to_bytes(resp.into_body(), 4 << 20).await.unwrap().to_vec()).unwrap();
+            assert!(text.contains(&format!("\"request\":\"{index}\"")));
+            assert_eq!(text.matches("event: response.completed").count(), 1);
+            assert!(!text.contains("event: response.failed"));
+        }
+    });
+    futures_util::future::join_all(tasks).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 12);
+}
+
+const TOOL_FIRST: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"city\\\":\"}}]},\"finish_reason\":null}]}\n\n";
+const TOOL_MORE: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Paris\\\"}\"}}]},\"finish_reason\":null}]}\n\n";
+const TOOL_SECOND: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"weather\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n";
+const TOOL_FINISH: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+const TOOL_BAD_FINISH: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+
+#[tokio::test]
+async fn responses_sse_function_calls_and_mixed_text_work() {
+    let (url, hits) = start_sse(vec![
+        RESP_START_A,
+        RESP_START_B,
+        TOOL_FIRST,
+        TOOL_MORE,
+        TOOL_SECOND,
+        TOOL_FINISH,
+        SSE_DONE,
+    ])
+    .await;
+    let response = make_app(&url, &url)
+        .oneshot(responses_stream_req(
+            json!({"model":"demo","input":"hello","stream":true,
+            "tools":[{"type":"function","name":"lookup"},{"type":"function","name":"weather"}],
+            "parallel_tool_calls":true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        text.matches("event: response.output_item.added").count(),
+        3,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("event: response.function_call_arguments.delta")
+            .count(),
+        3,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("event: response.function_call_arguments.done")
+            .count(),
+        2,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("event: response.completed").count(),
+        1,
+        "{text}"
+    );
+    let response_event: Value = serde_json::from_str(
+        text.lines()
+            .rev()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap(),
+    )
+    .unwrap();
+    let result = &response_event["response"];
+    assert_eq!(result["output_text"], "hi");
+    assert_eq!(result["output"].as_array().unwrap().len(), 3);
+    assert_eq!(result["output"][0]["type"], "message");
+    assert_eq!(result["output"][1]["type"], "function_call");
+    assert_eq!(result["output"][1]["call_id"], "call_1");
+    assert_eq!(result["output"][1]["arguments"], r#"{"city":"Paris"}"#);
+    assert_eq!(result["output"][2]["name"], "weather");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn responses_sse_tool_only_and_invalid_tool_finish() {
+    let (url, hits) = start_sse(vec![TOOL_FIRST, TOOL_MORE, TOOL_FINISH, SSE_DONE]).await;
+    let response = make_app(&url, &url)
+        .oneshot(responses_stream_req(
+            json!({"model":"demo","input":"call","stream":true,
+            "tools":[{"type":"function","name":"lookup"}]}),
+        ))
+        .await
+        .unwrap();
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(!text.contains("event: response.output_text.done"), "{text}");
+    assert_eq!(
+        text.matches("event: response.completed").count(),
+        1,
+        "{text}"
+    );
+    let final_event: Value = serde_json::from_str(
+        text.lines()
+            .rev()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        final_event["response"]["output"][0]["type"],
+        "function_call"
+    );
+    assert_eq!(
+        final_event["response"]["output"][0]["arguments"],
+        r#"{"city":"Paris"}"#
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    let (url, hits) = start_sse(vec![TOOL_FIRST, TOOL_MORE, TOOL_BAD_FINISH, SSE_DONE]).await;
+    let response = make_app(&url, &url)
+        .oneshot(responses_stream_req(
+            json!({"model":"demo","input":"call","stream":true}),
+        ))
+        .await
+        .unwrap();
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(text.matches("event: response.failed").count(), 1, "{text}");
+    assert!(!text.contains("event: response.completed"), "{text}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+const RESP_SINGLE: &[u8] = b"data: {\"id\":\"stream_stalled\",\"created\":123,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"start\"},\"finish_reason\":null}]}\n\n";
+
+#[tokio::test]
+async fn responses_sse_downstream_disconnect_drops_provider_stream() {
+    let (url, drops) = start_stalled_sse_frame(RESP_SINGLE).await;
+    let response = make_app(&url, &url)
+        .oneshot(responses_stream_req(
+            json!({"model":"demo","input":"hello","stream":true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    use http_body_util::BodyExt;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+        .await
+        .expect("response did not start")
+        .expect("response body ended")
+        .unwrap();
+    assert!(
+        first
+            .into_data()
+            .unwrap()
+            .starts_with(b"event: response.created")
+    );
+    drop(body);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while drops.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnect did not release the upstream stream");
+}
+
+#[tokio::test]
+async fn responses_sse_stalled_provider_reports_one_failure_not_success() {
+    let (url, drops) = start_stalled_sse_frame(RESP_SINGLE).await;
+    let response = make_app(&url, &url)
+        .oneshot(responses_stream_req(
+            json!({"model":"demo","input":"hello","stream":true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(19),
+        to_bytes(response.into_body(), 4 << 20),
+    )
+    .await
+    .expect("stalled source was not timed out")
+    .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(text.matches("event: response.failed").count(), 1, "{text}");
+    assert!(!text.contains("event: response.completed"), "{text}");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while drops.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed-out provider body was not dropped");
 }
