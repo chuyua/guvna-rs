@@ -3068,3 +3068,211 @@ async fn four_aggregation_slots_bound_memory_and_busy_candidate_uses_backup() {
     let (_, metrics) = get_metrics(router, Some("client")).await;
     assert_eq!(metric_value(&metrics, "active_requests"), 0);
 }
+
+fn aggregate_chat_frame(event: Value) -> Vec<u8> {
+    format!("data: {event}\n\n").into_bytes()
+}
+
+#[tokio::test]
+async fn sse_only_aggregate_preserves_reasoning_and_refusal_without_replaying_to_backup() {
+    let scenarios = [
+        (
+            vec![
+                aggregate_chat_frame(json!({"id":"reasoned","choices":[{"index":0,"delta":{
+                    "role":"assistant","reasoning":"chain ", "reasoning_content":"first ", "content":"answer "
+                },"finish_reason":null}]})),
+                aggregate_chat_frame(json!({"id":"reasoned","choices":[{"index":0,"delta":{
+                    "reasoning":"complete","reasoning_content":"second","content":"done"
+                },"finish_reason":"stop"}]})),
+            ],
+            "answer done",
+            Some("first second"),
+            None,
+        ),
+        (
+            vec![
+                aggregate_chat_frame(json!({"id":"refused","choices":[{"index":0,"delta":{
+                    "role":"assistant","refusal":"I cannot "
+                },"finish_reason":null}]})),
+                aggregate_chat_frame(json!({"id":"refused","choices":[{"index":0,"delta":{
+                    "refusal":"help with that."
+                },"finish_reason":"stop"}]})),
+            ],
+            "",
+            None,
+            Some("I cannot help with that."),
+        ),
+    ];
+    for (mut frames, content, reasoning, refusal) in scenarios {
+        frames.push(b"data: [DONE]\n\n".to_vec());
+        let (primary, primary_hits, _) = start_strict_stream_only(frames).await;
+        let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+        let router = app_with_stream_only_and_auto(&primary, &backup, false);
+        let (status, output) = call(router, request("ordered", "", "client")).await;
+        assert_eq!(status, StatusCode::OK, "{output}");
+        let message = &output["choices"][0]["message"];
+        assert_eq!(message["content"].as_str().unwrap_or_default(), content);
+        assert_eq!(message["reasoning_content"].as_str(), reasoning);
+        if reasoning.is_some() {
+            assert_eq!(message["reasoning"].as_str(), Some("chain complete"));
+        } else {
+            assert!(message.get("reasoning").is_none());
+        }
+        assert_eq!(message["refusal"].as_str(), refusal);
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn sse_only_aggregate_fails_over_for_unrepresentable_and_invalid_deltas() {
+    let failures = vec![
+        aggregate_chat_frame(json!({"choices":[{"index":0,"delta":{
+            "role":"assistant","audio":{"data":"abcd"}
+        },"finish_reason":null}]})),
+        aggregate_chat_frame(json!({"choices":[{"index":0,"delta":{
+            "role":"assistant","refusal":{"invalid":"object"}
+        },"finish_reason":null}]})),
+        aggregate_chat_frame(json!({"choices":[{"index":0,"delta":{
+            "role":"assistant","reasoning_content":["invalid"]
+        },"finish_reason":null}]})),
+    ];
+    for bad in failures {
+        let (primary, hits, _) = start_strict_stream_only(vec![
+            bad,
+            aggregate_chat_frame(
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+            ),
+            b"data: [DONE]\n\n".to_vec(),
+        ])
+        .await;
+        let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+        let router = app_with_stream_only_and_auto(&primary, &backup, false);
+        let (status, output) = call(router, request("ordered", "", "client")).await;
+        assert_eq!(status, StatusCode::OK, "{output}");
+        assert_eq!(output["choices"][0]["message"]["content"], "success");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn sse_only_aggregate_bounds_reasoning_and_refusal_combined_with_text() {
+    let text = "r".repeat(680_000);
+    let frames = vec![
+        aggregate_chat_frame(json!({"choices":[{"index":0,"delta":{
+            "role":"assistant","reasoning_content":text
+        },"finish_reason":null}]})),
+        aggregate_chat_frame(json!({"choices":[{"index":0,"delta":{
+            "refusal":text
+        },"finish_reason":null}]})),
+        aggregate_chat_frame(json!({"choices":[{"index":0,"delta":{
+            "reasoning_content":text
+        },"finish_reason":null}]})),
+        aggregate_chat_frame(json!({"choices":[{"index":0,"delta":{
+            "content":text
+        },"finish_reason":"stop"}]})),
+        b"data: [DONE]\n\n".to_vec(),
+    ];
+    let (primary, hits, _) = start_strict_stream_only(frames).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let router = app_with_stream_only_and_auto(&primary, &backup, false);
+    let (status, output) = call(router, request("ordered", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(output["choices"][0]["message"]["content"], "success");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+}
+
+async fn start_bad_named_tool_then_stall() -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let hits = counted.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let first = aggregate_chat_frame(json!({"choices":[{
+                    "index":0, "delta":{
+                        "role":"assistant","tool_calls":[{
+                            "index":0,"id":"call_bad","type":"function",
+                            "function":{"name":"wrong_function","arguments":"{}"}
+                        }]
+                    }, "finish_reason":null
+                }]}));
+                let output =
+                    futures_util::stream::unfold(Some(Bytes::from(first)), |state| async move {
+                        if let Some(frame) = state {
+                            Some((Ok::<Bytes, std::io::Error>(frame), None))
+                        } else {
+                            std::future::pending::<
+                                Option<(Result<Bytes, std::io::Error>, Option<Bytes>)>,
+                            >()
+                            .await
+                        }
+                    });
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(output),
+                )
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(socket, router).await.unwrap() });
+    (format!("http://{addr}"), hits)
+}
+
+#[tokio::test]
+async fn sse_only_wrong_named_tool_fails_over_before_idle_timeout() {
+    let (primary, hits) = start_bad_named_tool_then_stall().await;
+    let (backup, fallback_hits) = start_upstream(StatusCode::OK).await;
+    let router = app_with_stream_only_and_auto(&primary, &backup, false);
+    // The healthy JSON fallback mock produces a lookup tool response when
+    // the input says call, satisfying the original named-tool constraint.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", "Bearer client")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "model": "ordered",
+                "messages": [{"role": "user", "content": "call"}],
+                "tool_choice": {"type": "function", "function": {"name": "lookup"}}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let (status, output) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), call(router, req))
+            .await
+            .expect("bad named tool must fall back immediately, not after 15-second idle");
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(output["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(
+        output["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "lookup"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn sse_only_logprobs_request_never_returns_silently_lost_logprobs() {
+    let (primary, primary_hits, _) = start_strict_stream_only(vec![
+        SSE_START.to_vec(),
+        SSE_END.to_vec(),
+        SSE_DONE.to_vec(),
+    ])
+    .await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let router = app_with_stream_only_and_auto(&primary, &backup, false);
+    let (status, output) = call(router, request("ordered", r#","logprobs":true"#, "client")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{output}");
+    assert_eq!(output["error"]["code"], "upstream_unavailable");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+}

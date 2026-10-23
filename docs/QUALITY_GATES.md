@@ -110,6 +110,16 @@ and fail over for exactly 10 invalid streams. The gate reconciles upstream
 calls, success/fallback/invalid/aggregate counters and RSS/FD/thread limits,
 and audits sampled local diagnostic logs for credentials and prompt leakage.
 
+SSE-to-JSON completeness regression also verifies that optional refusal
+and reasoning/reasoning_content deltas survive aggregation, mixed prompt/body data
+never appears in local stderr diagnostics, unsupported audio deltas trigger
+bounded candidate failover instead of success, and requests for token
+logprobs never return a synthesized JSON response missing the requested
+log-probabilities. A named-tool mismatch is rejected as soon as its
+first invalid tool delta arrives rather than waiting for an idle timeout.
+The original 64-request load count and fallback reconciliation remain
+unchanged.
+
 manual-linux-build.yml is explicitly dispatched from main and uploads a
 real Linux executable with SHA256, ELF/glibc metadata and the same quality
 report. CI is necessary but not sufficient to prove real-provider behavior.

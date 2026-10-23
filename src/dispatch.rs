@@ -143,11 +143,23 @@ pub(super) async fn dispatch(
     let mut attempted_network = false;
     let mut bypassed_circuit = false;
     let mut aggregation_busy = false;
+    let mut unsupported_aggregate_logprobs = false;
     // Exactly ONE candidate loop for chat + embedding. Key failover is confined to this loop.
     for step in steps {
         let provider = &state.config.providers[step.provider_index];
         if provider.stream_only && !streaming && !matches!(endpoint, Endpoint::Chat) {
             continue; // Only Chat has a validated SSE-to-JSON adapter.
+        }
+        // Ordinary Chat JSON can carry token log-probabilities, but this
+        // bounded SSE synthesizer does not aggregate them. Prefer another
+        // candidate to returning an apparently complete but lossy response.
+        if provider.stream_only
+            && !streaming
+            && (request.get("logprobs") == Some(&Value::Bool(true))
+                || request.get("top_logprobs").is_some())
+        {
+            unsupported_aggregate_logprobs = true;
+            continue;
         }
         // Four permits bound at most 8 MiB of buffered JSON output globally.
         // After two seconds, try the next candidate without consuming any
@@ -280,7 +292,12 @@ pub(super) async fn dispatch(
                 let result = if upstream_stream && !streaming {
                     tokio::time::timeout_at(
                         deadline,
-                        chat_aggregate::aggregate(upstream, expected, &step.model),
+                        chat_aggregate::aggregate(
+                            upstream,
+                            expected,
+                            &step.model,
+                            payload.get("tool_choice"),
+                        ),
                     )
                     .await
                 } else {
@@ -326,6 +343,13 @@ pub(super) async fn dispatch(
             }
             break; // 4xx or 5xx: next chain step; no uncontrolled retries
         }
+    }
+    if unsupported_aggregate_logprobs && !attempted_network {
+        return error(
+            StatusCode::NOT_IMPLEMENTED,
+            "aggregate_logprobs_unsupported",
+            "SSE-only Chat aggregation cannot preserve token logprobs; use a JSON-capable provider",
+        );
     }
     if aggregation_busy && !attempted_network {
         crate::ops_log::warn("aggregate_capacity");
