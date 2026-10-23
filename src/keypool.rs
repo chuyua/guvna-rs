@@ -106,9 +106,24 @@ impl KeyPool {
 
     /// Returns true only when this result actually changed the current key state.
     pub fn record(&self, lease: &Lease, outcome: Outcome) -> bool {
+        self.record_with_retry_after(lease, outcome, None)
+    }
+
+    /// A valid server Retry-After may extend 429 isolation, but cannot shorten
+    /// the configured quarantine or extend a key already fenced by another result.
+    pub fn record_with_retry_after(
+        &self,
+        lease: &Lease,
+        outcome: Outcome,
+        retry_after: Option<Duration>,
+    ) -> bool {
         let delay = match outcome {
             Outcome::CredentialAuth => self.auth_cooldown,
-            Outcome::RateLimited => self.rate_cooldown,
+            Outcome::RateLimited => self.rate_cooldown.max(
+                retry_after
+                    .unwrap_or_default()
+                    .min(Duration::from_secs(24 * 3600)),
+            ),
             _ => return false, // Never quarantine keys for 5xx, 400, DNS or cancellation.
         };
         let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
@@ -196,6 +211,46 @@ quarantine:
         assert!(pool.record(&old, Outcome::CredentialAuth));
         pool.record_success(&old);
         assert!(pool.acquire(&HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn retry_after_is_bounded_and_cannot_be_overridden_by_late_results() {
+        let mut provider = provider();
+        provider.quarantine.rate_limit = Some("100ms".into());
+        provider.key_envs = vec!["A".into()];
+        let credentials = HashMap::from([("A".into(), "safe-test-key".into())]);
+        let pool = KeyPool::new(&provider, &credentials).unwrap();
+        let lease = pool.acquire(&HashSet::new()).unwrap();
+        assert!(pool.record_with_retry_after(
+            &lease,
+            Outcome::RateLimited,
+            Some(Duration::from_secs(7200)),
+        ));
+        let remaining = pool.inner.lock().unwrap().credentials[0]
+            .blocked_until
+            .unwrap()
+            .saturating_duration_since(Instant::now());
+        assert!(remaining > Duration::from_secs(7190));
+        assert!(!pool.record_with_retry_after(
+            &lease,
+            Outcome::RateLimited,
+            Some(Duration::from_secs(86400 * 365)),
+        ));
+        assert!(pool.acquire(&HashSet::new()).is_none());
+
+        let pool = KeyPool::new(&provider, &credentials).unwrap();
+        let lease = pool.acquire(&HashSet::new()).unwrap();
+        assert!(pool.record_with_retry_after(
+            &lease,
+            Outcome::RateLimited,
+            Some(Duration::from_secs(86400 * 365)),
+        ));
+        let remaining = pool.inner.lock().unwrap().credentials[0]
+            .blocked_until
+            .unwrap()
+            .saturating_duration_since(Instant::now());
+        assert!(remaining <= Duration::from_secs(86400));
+        assert!(remaining > Duration::from_secs(86390));
     }
 }
 
