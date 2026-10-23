@@ -467,3 +467,39 @@ async fn oversized_later_sse_chunk_returns_incomplete_without_failover() {
     assert_eq!(first_hits.load(Ordering::SeqCst), 1);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn admission_control_bounds_concurrent_streams_and_recovers_after_disconnect() {
+    let (upstream, dropped) = start_stalled_sse().await;
+    let router = make_app(&upstream, &upstream);
+    let mut bodies = Vec::new();
+    for _ in 0..128 {
+        let response = router
+            .clone()
+            .oneshot(request("demo", r#","stream":true"#, "client"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        bodies.push(response.into_body());
+    }
+    let overloaded = router
+        .clone()
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(overloaded.headers()["retry-after"], "1");
+    let bytes = to_bytes(overloaded.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["error"]["code"],
+        "gateway_overloaded"
+    );
+    drop(bodies);
+    let recovered = router
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+    drop(recovered);
+    assert!(dropped.load(Ordering::SeqCst) > 0);
+}

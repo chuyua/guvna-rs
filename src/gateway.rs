@@ -14,6 +14,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     config::Config,
@@ -24,12 +25,14 @@ use crate::{
 };
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_INFLIGHT_REQUESTS: usize = 128;
 
 pub struct AppState {
     pub config: Config,
     client: reqwest::Client,
     pools: Vec<KeyPool>,
     client_keys: Vec<String>,
+    inflight: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -58,6 +61,7 @@ impl AppState {
             client,
             pools,
             client_keys,
+            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
         })
     }
 
@@ -228,6 +232,23 @@ async fn dispatch(
         }
     };
 
+    // Reject overload immediately instead of building unbounded waiting tasks.
+    let mut permit = Some(match state.inflight.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let mut response = error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "gateway_overloaded",
+                "Too many concurrent upstream requests",
+            );
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+            return response;
+        }
+    });
+
     // Exactly ONE candidate loop for chat + embedding. Key failover is confined to this loop.
     for step in steps {
         let provider = &state.config.providers[step.provider_index];
@@ -241,6 +262,8 @@ async fn dispatch(
             object.entry(name).or_insert_with(|| value.clone()); // caller always wins.
         }
 
+        // Serialize once per candidate, not once for every credential retry.
+        let payload_json = payload.to_string();
         let mut tried = HashSet::new();
         while let Some(lease) = state.pools[step.provider_index].acquire(&tried) {
             tried.insert(lease.env.clone());
@@ -250,7 +273,7 @@ async fn dispatch(
                 .post(url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .bearer_auth(&lease.secret)
-                .body(payload.to_string())
+                .body(payload_json.clone())
                 .send()
                 .await;
             let upstream = match response {
@@ -271,6 +294,7 @@ async fn dispatch(
                         state.clone(),
                         step.provider_index,
                         lease.clone(),
+                        &mut permit,
                     )
                     .await
                     {
@@ -307,6 +331,7 @@ struct ChatStreamState {
     parser: ChatSse,
     pending: VecDeque<Bytes>,
     terminated: bool,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 fn stream_error() -> Bytes {
@@ -319,6 +344,7 @@ async fn start_chat_stream(
     owner: Arc<AppState>,
     provider_index: usize,
     lease: Lease,
+    permit: &mut Option<OwnedSemaphorePermit>,
 ) -> Result<Response, ()> {
     let content_type = upstream
         .headers()
@@ -336,8 +362,10 @@ async fn start_chat_stream(
         parser: ChatSse::new(expected).map_err(|_| ())?,
         pending: VecDeque::new(),
         terminated: false,
+        _permit: None,
     };
     preflight_stream(&mut state).await?;
+    state._permit = permit.take();
     Ok(stream_response(state))
 }
 
