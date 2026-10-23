@@ -258,6 +258,16 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
                 );
             }
             let name = map["name"].as_str().expect("validated above");
+            // Chat providers enforce the OpenAI function identifier grammar.
+            // Reject locally rather than wasting a provider attempt or leaking
+            // invalid declarations into the shared fallback candidate walk.
+            if !valid_function_name(name) {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_function_name",
+                    "Function names must be 1-64 ASCII letters, digits, '_' or '-'",
+                );
+            }
             if !declared_functions.insert(name.to_owned()) {
                 return error(
                     StatusCode::BAD_REQUEST,
@@ -405,6 +415,16 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     translate_chat_result(chat, logical_model, metadata)
 }
 
+// Match Chat Completions' function name contract. Byte-based validation
+// also rejects visually deceptive Unicode identifiers and oversized names.
+fn valid_function_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
 // Map input text or complete message/function-call history into
 // Chat messages. Preserve all original rejection codes and requirements.
 fn translate_input(input: Value) -> Result<Value, Box<Response>> {
@@ -486,6 +506,13 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                             "function_call requires arguments",
                         )));
                     };
+                    if !valid_function_name(name) {
+                        return Err(Box::new(error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_function_name",
+                            "Function names must be 1-64 ASCII letters, digits, '_' or '-'",
+                        )));
+                    }
                     if !serde_json::from_str::<Value>(arguments)
                         .is_ok_and(|value| value.is_object())
                         || item.as_object().is_none_or(|map| {
