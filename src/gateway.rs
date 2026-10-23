@@ -236,11 +236,16 @@ async fn dispatch(
     let mut permit = Some(match state.inflight.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            return error(
+            let mut response = error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "gateway_overloaded",
                 "Too many concurrent upstream requests",
             );
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+            return response;
         }
     });
 
@@ -257,6 +262,8 @@ async fn dispatch(
             object.entry(name).or_insert_with(|| value.clone()); // caller always wins.
         }
 
+        // Serialize once per candidate, not once for every credential retry.
+        let payload_json = payload.to_string();
         let mut tried = HashSet::new();
         while let Some(lease) = state.pools[step.provider_index].acquire(&tried) {
             tried.insert(lease.env.clone());
@@ -266,7 +273,7 @@ async fn dispatch(
                 .post(url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .bearer_auth(&lease.secret)
-                .body(payload.to_string())
+                .body(payload_json.clone())
                 .send()
                 .await;
             let upstream = match response {

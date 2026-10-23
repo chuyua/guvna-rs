@@ -488,6 +488,7 @@ async fn admission_control_bounds_concurrent_streams_and_recovers_after_disconne
         .await
         .unwrap();
     assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(overloaded.headers()["retry-after"], "1");
     let bytes = to_bytes(overloaded.into_body(), 1 << 20).await.unwrap();
     assert_eq!(
         serde_json::from_slice::<Value>(&bytes).unwrap()["error"]["code"],
