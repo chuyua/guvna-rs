@@ -140,22 +140,34 @@ fn unauthorized() -> Response {
 
 // Authenticate before invoking Bytes::from_request: the normal Bytes handler
 // extractor buffers the body before handler-level authorization can run.
+enum RequestBodyError {
+    Unauthorized,
+    Invalid(StatusCode),
+}
+
+impl RequestBodyError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Unauthorized => unauthorized(),
+            Self::Invalid(status) => error(
+                status,
+                "invalid_body",
+                "Request body is invalid or exceeds the configured limit",
+            ),
+        }
+    }
+}
+
 async fn authenticated_body(
     state: &Arc<AppState>,
     request: Request<Body>,
-) -> Result<Bytes, Response> {
+) -> Result<Bytes, RequestBodyError> {
     if !state.allowed(request.headers()) {
-        return Err(unauthorized());
+        return Err(RequestBodyError::Unauthorized);
     }
     Bytes::from_request(request, state)
         .await
-        .map_err(|rejection| {
-            error(
-                rejection.status(),
-                "invalid_body",
-                "Request body is invalid or exceeds the configured limit",
-            )
-        })
+        .map_err(|rejection| RequestBodyError::Invalid(rejection.status()))
 }
 
 // Keep one classification path for all candidate and SSE circuit outcomes.
@@ -247,7 +259,7 @@ async fn model_detail(
 async fn responses(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
     let body = match authenticated_body(&state, request).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let mut value: Value = match serde_json::from_slice::<Value>(&body) {
         Ok(value) if value.is_object() => value,
@@ -1017,14 +1029,14 @@ impl Endpoint {
 async fn chat(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
     let body = match authenticated_body(&state, request).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     dispatch(state, body, Endpoint::Chat).await
 }
 async fn embeddings(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
     let body = match authenticated_body(&state, request).await {
         Ok(body) => body,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     dispatch(state, body, Endpoint::Embeddings).await
 }
