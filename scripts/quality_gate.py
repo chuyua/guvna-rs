@@ -475,7 +475,63 @@ def verify_release_chain_management(binary: str, config: Path, directory: str) -
     check("1 runtime" in cli("validate"), "CLI did not validate recovered file")
     check(target.stat().st_mode & 0o777 == 0o600,
           "recovered chains file lost mode 0600")
+
+    def startup_rejected(expected: str) -> None:
+        process = subprocess.run(
+            [binary, "serve", "-config", str(config),
+             "-data", str(data), "--healthcheck"],
+            text=True, capture_output=True, env=env, timeout=3)
+        check(process.returncode != 0 and expected in process.stderr,
+              f"daemon startup did not reject unsafe runtime chains: "
+              f"{expected}: {process.returncode}, {process.stderr}")
+
+    # Validate actual Linux release startup, not only CLI. Duplicate and
+    # shadowing runtime entries used to be quietly ignored or duplicated.
+    invalid_runtime_cases = (
+        ("version: 1\nchains:\n  - name: healthy\n"
+         "    steps: [{provider: live, model: hijacked}]\n",
+         "shadows config.yaml"),
+        ("version: 1\nchains:\n  - name: repeated\n"
+         "    steps: [{provider: live, model: one}]\n"
+         "  - name: repeated\n"
+         "    steps: [{provider: live, model: two}]\n",
+         "duplicate runtime chain"),
+        ("version: 999\nchains: []\n", "unsupported chains.yaml version"),
+    )
+    saved = target.read_bytes()
+    rejected = 0
+    for raw, expected in invalid_runtime_cases:
+        target.write_text(raw, encoding="utf-8")
+        startup_rejected(expected)
+        check(expected in cli("validate", allowed=False),
+              "manager and daemon gave different validation results")
+        check(target.read_text(encoding="utf-8") == raw,
+              "validation modified unsafe input")
+        rejected += 1
+
+    target.write_bytes(b"version: 1\nchains: []\n"
+                       + b"#" * (1024 * 1024))
+    startup_rejected("at most 1 MiB")
+    check("at most 1 MiB" in cli("validate", allowed=False),
+          "manager accepted oversized runtime file")
+    rejected += 1
+
+    # Linux open(O_NOFOLLOW) must reject a symlink, even if its target is
+    # well-formed. The target is not touched.
+    target.unlink()
+    exterior = workspace / "external-chains.yaml"
+    exterior.write_bytes(saved)
+    target.symlink_to(exterior)
+    startup_rejected("regular file")
+    check("regular file" in cli("validate", allowed=False),
+          "manager followed runtime symlink")
+    check(exterior.read_bytes() == saved, "symlink target was modified")
+    rejected += 1
+    target.unlink()
+    target.write_bytes(saved)
+
     return {"passed": True, "static_routes": 2, "recovered_routes": 1,
+            "startup_rejection_cases": rejected,
             "corrupt_bytes_preserved": len(corrupt),
             "atomic_backup_matches_prior": True, "mode": "0600"}
 

@@ -8,7 +8,7 @@ use serde_json::json;
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -28,18 +28,40 @@ fn runtime_path(data_dir: &Path) -> PathBuf {
 }
 
 fn read_limited(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
+    // Open the checked inode, not the pathname after a separate metadata
+    // check. Linux O_NOFOLLOW closes the symlink swap race between stat/open.
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("stat {}: {err}", path.display())),
+        Err(err) => {
+            return Err(format!(
+                "opening {} (requires a regular file, no symlinks): {err}",
+                path.display()
+            ));
+        }
     };
+    let meta = file
+        .metadata()
+        .map_err(|err| format!("stat open {}: {err}", path.display()))?;
     if !meta.file_type().is_file() || meta.len() > MAX_CHAIN_FILE_BYTES as u64 {
         return Err(format!(
             "{} must be a regular file of at most 1 MiB",
             path.display()
         ));
     }
-    let bytes = fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    // Bound the allocation even if an uncooperative writer extends a file
+    // during the read. Metadata length alone is not a sufficient limit.
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_CHAIN_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("reading {}: {err}", path.display()))?;
     if bytes.len() > MAX_CHAIN_FILE_BYTES {
         return Err(format!("{} exceeds 1 MiB", path.display()));
     }
@@ -121,16 +143,40 @@ fn lock_directory(data_dir: &Path) -> Result<(PathBuf, File), String> {
     {
         return Err(format!("refusing non-regular lock file {}", path.display()));
     }
-    let lock = OpenOptions::new()
+    let mut options = OpenOptions::new();
+    options
         .create(true)
-        .truncate(false) // never erase the advisory lock file between processes
+        .truncate(false) // preserve the same inode for advisory locks
         .read(true)
-        .write(true)
+        .write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+    }
+    let lock = options
         .open(&path)
         .map_err(|e| format!("opening {}: {e}", path.display()))?;
+    if !lock
+        .metadata()
+        .map_err(|e| format!("lock metadata: {e}"))?
+        .is_file()
+    {
+        return Err(format!("lock {} must be a regular file", path.display()));
+    }
     lock.lock_exclusive()
         .map_err(|e| format!("locking {}: {e}", path.display()))?;
     Ok((directory, lock))
+}
+
+/// Share one strict runtime format and size contract between the CLI and
+/// daemon startup. A malformed file always fails closed; nothing silently
+/// shadows or disappears when the process restarts.
+pub(crate) fn load_runtime(config: &Config, data_dir: &Path) -> Result<RuntimeChains, String> {
+    let path = runtime_path(data_dir);
+    let bytes = read_limited(&path)?;
+    validate_data(bytes.as_deref(), config)
+        .map_err(|e| format!("invalid {} (not modified): {e}", path.display()))
 }
 
 fn serialize(state: &RuntimeChains) -> Result<Vec<u8>, String> {

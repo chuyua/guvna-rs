@@ -58,7 +58,7 @@ async fn run() -> Result<(), String> {
             }
             "--help" | "-h" | "help" => {
                 println!(
-                    "guvna serve [-config config.yaml] [-data DIR]\n  --healthcheck probes /healthz\n  --version"
+                    "guvna serve [-config config.yaml] [-data DIR]\n  --healthcheck probes /healthz\nguvna chains list|validate [-config FILE] [-data DIR]\nguvna chains set -file CHAIN.yaml [-config FILE] [-data DIR]\nguvna chains delete -name NAME [-config FILE] [-data DIR]\nguvna chains recover [-from BACKUP] [-config FILE] [-data DIR]\n  --version"
                 );
                 return Ok(());
             }

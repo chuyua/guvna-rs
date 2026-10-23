@@ -288,6 +288,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "httpdate",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
