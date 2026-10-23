@@ -67,7 +67,11 @@ fn walk_expired(deadline: Option<tokio::time::Instant>) -> bool {
     deadline.is_some_and(|until| tokio::time::Instant::now() >= until)
 }
 
-fn walk_timeout() -> Response {
+fn walk_timeout(metrics: &Metrics) -> Response {
+    // Deadline errors are local policy, not malformed upstream 2xx, a
+    // credential problem, or an upstream 5xx. Count them independently
+    // exactly once at the terminal response construction site.
+    Metrics::inc(&metrics.walk_deadline_exhaustions);
     ops_log::warn("walk_deadline_exhausted");
     error(
         StatusCode::GATEWAY_TIMEOUT,
@@ -201,7 +205,7 @@ async fn dispatch_inner(
     // Exactly ONE candidate loop for chat + embedding. Key failover is confined to this loop.
     for step in steps {
         if walk_expired(walk_deadline) {
-            return walk_timeout();
+            return walk_timeout(&state.metrics);
         }
         let provider = &state.config.providers[step.provider_index];
         if provider.stream_only && !streaming && !matches!(endpoint, Endpoint::Chat) {
@@ -245,7 +249,7 @@ async fn dispatch_inner(
                 Ok(Ok(permit)) => Some(permit),
                 _ => {
                     if walk_expired(walk_deadline) {
-                        return walk_timeout();
+                        return walk_timeout(&state.metrics);
                     }
                     Metrics::inc(&state.metrics.aggregation_busy);
                     crate::ops_log::warn("aggregate_capacity");
@@ -299,7 +303,7 @@ async fn dispatch_inner(
         let mut tried = HashSet::new();
         while let Some(lease) = state.pools[step.provider_index].acquire(&tried) {
             if walk_expired(walk_deadline) {
-                return walk_timeout();
+                return walk_timeout(&state.metrics);
             }
             tried.insert(lease.env.clone());
             let url = provider.endpoint(endpoint.path());
@@ -322,7 +326,7 @@ async fn dispatch_inner(
                 Ok(result) => result,
                 Err(_) => {
                     if walk_expired(walk_deadline) {
-                        return walk_timeout();
+                        return walk_timeout(&state.metrics);
                     }
                     Metrics::inc(&state.metrics.upstream_transport_failures);
                     ops_log::warn("transport_failure");
@@ -413,7 +417,7 @@ async fn dispatch_inner(
                     tokio::time::timeout_at(deadline, bounded_json(upstream)).await
                 };
                 if walk_expired(walk_deadline) {
-                    return walk_timeout();
+                    return walk_timeout(&state.metrics);
                 }
                 match result {
                     Ok(Ok(value))
@@ -462,7 +466,7 @@ async fn dispatch_inner(
         }
     }
     if walk_expired(walk_deadline) {
-        return walk_timeout();
+        return walk_timeout(&state.metrics);
     }
     if all_candidates_rate_limited && let Some(delay) = rate_limit_retry {
         // A *bounded* delta-seconds retry hint, rounded up so fast retries do
