@@ -589,6 +589,26 @@ async fn responses(
             );
         }
     };
+    // Validate and translate usage once for both text and function-call responses.
+    let usage = &chat["usage"];
+    let translated_usage = match (
+        usage["prompt_tokens"].as_u64(),
+        usage["completion_tokens"].as_u64(),
+        usage["total_tokens"].as_u64(),
+    ) {
+        (Some(input), Some(output), Some(total)) if input.checked_add(output) == Some(total) => {
+            json!({"input_tokens":input,"output_tokens":output,"total_tokens":total})
+        }
+        (None, None, None) => Value::Null,
+        _ => {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_upstream_usage",
+                "Inconsistent upstream token usage",
+            );
+        }
+    };
+    let created_at = chat["created"].as_i64();
     let calls = chat["choices"][0]["message"]["tool_calls"].as_array();
     if calls.is_some_and(|items| !items.is_empty()) {
         if chat["choices"][0]["finish_reason"] != "tool_calls" {
@@ -634,7 +654,7 @@ async fn responses(
             StatusCode::OK,
             Json(json!({
                 "id":chat["id"], "object":"response", "status":"completed", "model":logical_model,
-                "output":output, "output_text":"", "usage":Value::Null,
+                "output":output, "output_text":"", "usage":translated_usage, "created_at":created_at, "incomplete_details":Value::Null,
             })),
         )
             .into_response();
@@ -660,25 +680,7 @@ async fn responses(
             );
         }
     };
-    let created_at = chat["created"].as_i64();
     let output_status = response_status;
-    let usage = &chat["usage"];
-    let input_tokens = usage["prompt_tokens"].as_u64();
-    let output_tokens = usage["completion_tokens"].as_u64();
-    let total_tokens = usage["total_tokens"].as_u64();
-    let translated_usage = match (input_tokens, output_tokens, total_tokens) {
-        (Some(input), Some(output), Some(total)) if input.checked_add(output) == Some(total) => {
-            json!({"input_tokens":input,"output_tokens":output,"total_tokens":total})
-        }
-        (None, None, None) => Value::Null,
-        _ => {
-            return error(
-                StatusCode::BAD_GATEWAY,
-                "invalid_upstream_usage",
-                "Inconsistent upstream token usage",
-            );
-        }
-    };
     (StatusCode::OK, Json(json!({
         "id":chat["id"], "object":"response", "status":response_status, "incomplete_details":incomplete_details, "created_at":created_at, "model":logical_model,
         "output":[{"id":format!("msg_{}",chat["id"].as_str().unwrap_or("generated")), "type":"message", "status":output_status, "role":"assistant", "content":[{"type":"output_text","text":content,"annotations":[]}]}],
