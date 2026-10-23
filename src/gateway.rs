@@ -431,6 +431,43 @@ async fn responses(
             );
         }
     };
+    for (name, min, max) in [("temperature", 0.0, 2.0), ("top_p", 0.0, 1.0)] {
+        if value.get(name).is_some_and(|parameter| {
+            parameter
+                .as_f64()
+                .is_none_or(|number| !number.is_finite() || number < min || number > max)
+        }) {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_sampling_parameter",
+                "Sampling parameter is outside its valid range",
+            );
+        }
+    }
+    if value
+        .get("max_output_tokens")
+        .is_some_and(|v| v.as_u64().is_none_or(|n| n == 0))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_max_output_tokens",
+            "max_output_tokens must be a positive integer",
+        );
+    }
+    if value.get("user").is_some_and(|v| !v.is_string()) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_user",
+            "user must be a string",
+        );
+    }
+    if value.get("instructions").is_some_and(|v| !v.is_string()) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_instructions",
+            "instructions must be a string",
+        );
+    }
     if value.get("n").is_some_and(|n| n.as_u64() != Some(1)) {
         return error(
             StatusCode::NOT_IMPLEMENTED,
@@ -499,7 +536,8 @@ async fn responses(
             "invalid_parallel_tool_calls",
             "parallel_tool_calls must be boolean",
         );
-    } // Map the supported Responses function-tool declaration to Chat Completions.
+    }
+    // Map the supported Responses function-tool declaration to Chat Completions.
     let mut declared_functions = std::collections::HashSet::<String>::new();
     if let Some(tools) = object.get_mut("tools") {
         let Some(items) = tools.as_array_mut() else {
