@@ -383,8 +383,16 @@ async fn dispatch_inner(
                     }
                 }
                 let result = if upstream_stream && !streaming {
-                    tokio::time::timeout_at(
-                        deadline,
+                    // JSON-capable providers retain a bounded body read.
+                    // SSE-only generations have both a 15s idle limit and a
+                    // 10min absolute cap. The shared non-streaming walk
+                    // budget still wins if shorter, preventing indefinite
+                    // retries or heartbeats across multiple candidates.
+                    let lifetime =
+                        tokio::time::Instant::now() + chat_aggregate::MAX_AGGREGATION_LIFETIME;
+                    let lifetime = walk_deadline.map_or(lifetime, |until| until.min(lifetime));
+                    let aggregated = tokio::time::timeout_at(
+                        lifetime,
                         chat_aggregate::aggregate(
                             upstream,
                             effective_n,
@@ -392,8 +400,11 @@ async fn dispatch_inner(
                             payload.get("tool_choice"),
                         ),
                     )
-                    .await
-                    .map(|value| {
+                    .await;
+                    if aggregated.is_err() {
+                        ops_log::warn("aggregation_lifetime_timeout");
+                    }
+                    aggregated.map(|value| {
                         value.map_err(|error| {
                             ops_log::warn(error.log_event());
                         })

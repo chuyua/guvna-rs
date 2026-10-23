@@ -2959,6 +2959,15 @@ async fn start_strict_stream_only(
 }
 
 fn app_with_stream_only_and_auto(streaming_url: &str, healthy_url: &str, auto: bool) -> Router {
+    app_with_stream_only_and_auto_walk(streaming_url, healthy_url, auto, "100s")
+}
+
+fn app_with_stream_only_and_auto_walk(
+    streaming_url: &str,
+    healthy_url: &str,
+    auto: bool,
+    walk: &str,
+) -> Router {
     let auto_yaml = if auto {
         r#"
 auto:
@@ -2994,6 +3003,8 @@ chains:
       - provider: backup
         model: backup-model
 {auto_yaml}
+timeout:
+  walk: {walk}
 "#
     );
     let config: Config = serde_yaml::from_str(&yaml).unwrap();
@@ -3006,6 +3017,174 @@ chains:
         vec!["client".into()],
     )
     .unwrap())
+}
+
+// The stream-only Chat -> JSON bridge must not inherit the non-stream
+// 90-second JSON read deadline. Use virtual time and real network sockets,
+// rather than imposing a 10-minute wall-clock delay on every CI build.
+#[derive(Clone)]
+struct ProgressingAggregation {
+    hits: Arc<AtomicUsize>,
+    terminal: bool,
+}
+
+async fn serve_progressing_aggregation(
+    State(state): State<ProgressingAggregation>,
+) -> impl IntoResponse {
+    state.hits.fetch_add(1, Ordering::SeqCst);
+    let terminal = state.terminal;
+    let chunks = futures_util::stream::unfold(0usize, move |index| async move {
+        match index {
+            0 => Some((Ok::<_, std::io::Error>(Bytes::from_static(SSE_START)), 1)),
+            21 if terminal => Some((Ok(Bytes::from_static(SSE_END)), 22)),
+            22 if terminal => Some((Ok(Bytes::from_static(SSE_DONE)), 23)),
+            23 if terminal => None,
+            _ => {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Some((
+                    Ok(Bytes::from_static(b": bounded stream heartbeat\n\n")),
+                    index + 1,
+                ))
+            }
+        }
+    });
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+        Body::from_stream(chunks),
+    )
+}
+
+async fn start_progressing_aggregation(terminal: bool) -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route("/v1/chat/completions", post(serve_progressing_aggregation))
+        .with_state(ProgressingAggregation {
+            hits: hits.clone(),
+            terminal,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (format!("http://{addr}"), hits)
+}
+
+async fn drive_aggregating_progress(
+    terminal: bool,
+    walk: &str,
+) -> (StatusCode, Value, std::time::Duration, usize, usize) {
+    let (primary, primary_hits) = start_progressing_aggregation(terminal).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let app = app_with_stream_only_and_auto_walk(&primary, &backup, false, walk);
+    let task = tokio::spawn(async move { call(app, request("ordered", "", "client")).await });
+    // Keep real time running through the TCP connect and HTTP headers.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if primary_hits.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("upstream should receive the first aggregation request");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    for _ in 0..40 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    for _ in 0..160 {
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        for _ in 0..30 {
+            tokio::task::yield_now().await;
+        }
+        if task.is_finished() {
+            break;
+        }
+    }
+    let elapsed = started.elapsed();
+    tokio::time::resume();
+    let (status, payload) = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+        .await
+        .expect("progressing SSE aggregation must resolve within its bounded deadline")
+        .unwrap();
+    (
+        status,
+        payload,
+        elapsed,
+        primary_hits.load(Ordering::SeqCst),
+        backup_hits.load(Ordering::SeqCst),
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_only_aggregation_survives_ninety_seconds_of_valid_progress() {
+    let (status, result, elapsed, primary, backup) = drive_aggregating_progress(true, "12m").await;
+    assert!(elapsed > std::time::Duration::from_secs(90), "{elapsed:?}");
+    assert!(elapsed < std::time::Duration::from_secs(10 * 60));
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["choices"][0]["message"]["content"], "hi");
+    assert_eq!(result["choices"][0]["finish_reason"], "stop");
+    assert_eq!(primary, 1);
+    assert_eq!(backup, 0, "successful progress must not replay to backup");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_only_infinite_heartbeat_expires_and_uses_healthy_json_backup() {
+    let (status, result, elapsed, primary, backup) = drive_aggregating_progress(false, "12m").await;
+    assert!(
+        elapsed >= std::time::Duration::from_secs(9 * 60),
+        "{elapsed:?}"
+    );
+    assert!(
+        elapsed <= std::time::Duration::from_secs(11 * 60),
+        "{elapsed:?}"
+    );
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["choices"][0]["message"]["content"], "success");
+    assert_eq!(primary, 1, "no repeated attempts on a drip-fed primary");
+    assert_eq!(backup, 1, "hard deadline must allow exactly one fallback");
+}
+
+// Issue #65's shared walk budget is authoritative even if an SSE-only
+// upstream keeps sending heartbeats: it cannot silently monopolize a
+// non-streaming slot for the entire 10min per-stream cap.
+#[tokio::test(flavor = "current_thread")]
+async fn sse_only_progressing_heartbeat_cannot_bypass_shared_walk_budget() {
+    let (status, result, elapsed, primary, backup) =
+        drive_aggregating_progress(false, "100s").await;
+    assert!(elapsed >= std::time::Duration::from_secs(90), "{elapsed:?}");
+    assert!(elapsed < std::time::Duration::from_secs(150), "{elapsed:?}");
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{result}");
+    assert_eq!(result["error"]["code"], "upstream_walk_timeout");
+    assert_eq!(primary, 1, "do not replay a drip-fed candidate");
+    assert_eq!(backup, 0, "no fallback after exhausting the shared budget");
+}
+
+#[tokio::test]
+async fn sse_only_large_usage_metadata_is_included_in_output_budget() {
+    let mut frames = vec![];
+    for _ in 0..2 {
+        frames.push(aggregate_chat_frame(json!({
+            "choices":[{"index":0, "delta":{"content":"x".repeat(800_000)},
+                "finish_reason":null}]
+        })));
+    }
+    frames.push(aggregate_chat_frame(json!({
+        "choices":[],
+        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,
+            "provider_detail":"y".repeat(550_000)}
+    })));
+    frames.push(SSE_END.to_vec());
+    frames.push(SSE_DONE.to_vec());
+    let (primary, primary_hits, _) = start_strict_stream_only(frames).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let app = app_with_stream_only_and_auto(&primary, &backup, false);
+    let (status, payload) = call(app, request("ordered", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["choices"][0]["message"]["content"], "success");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

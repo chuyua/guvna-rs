@@ -161,6 +161,27 @@ and privacy-safe sampled local logs are checked. The original multiwave
 throughput and SSE aggregation gates remain unchanged; this PR does not
 initiate the manual GitHub Release publishing workflow.
 
+## Long-lived SSE-only JSON aggregation and bounded metadata
+
+SSE-only providers use two independent safety clocks: the existing
+15-second stream-idle watchdog and a separate 10-minute absolute lifetime
+for completing one aggregated Chat response. The ordinary bounded JSON-body
+read and upstream HTTP-header deadline remain 90 seconds. A healthy SSE
+generation with valid progress beyond 90 seconds must not spuriously
+fail over, while a drip-fed infinite heartbeat stream must eventually
+release the aggregation permit and use the next candidate.
+
+Metadata fields including usage details, message identifiers, tool IDs,
+tool names and finish reasons now count toward the shared 2 MiB aggregated
+output budget, along with content, reasoning and arguments. A large metadata
+object cannot evade the same bounded-memory failure/fallback contract.
+
+The Linux tests include virtual-time >90s healthy SSE and unending progress,
+plus memory-accounting tests and existing adversarial resource gates.
+The local opt-in log category aggregation_lifetime_timeout uses its own
+sample counter so rare hard-deadline failures are not buried by unrelated
+transport warnings.
+
 ## Planned broader gates
 
 - Deterministic random fault matrix (429/5xx/invalid JSON/stalled response/
