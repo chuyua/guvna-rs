@@ -63,6 +63,8 @@ impl TimeoutConfig {
 pub struct AutoConfig {
     pub enabled: bool,
     pub candidates: Vec<AutoCandidate>,
+    /// Bound the number of upstream candidates attempted per Auto request.
+    pub max_candidates: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -321,6 +323,13 @@ impl Config {
                     return Err(format!("duplicate/empty provider prefix: {prefix:?}"));
                 }
             }
+        }
+        if self
+            .auto
+            .max_candidates
+            .is_some_and(|limit| !(1..=32).contains(&limit))
+        {
+            return Err("auto max_candidates must be 1..=32".into());
         }
         if self.auto.enabled {
             if self.auto.candidates.is_empty() || self.auto.candidates.len() > 32 {

@@ -61,6 +61,7 @@ pub fn resolve_auto(config: &Config, input_bytes: usize) -> Result<Vec<ResolvedS
     // Stable tie-break preserves configured order, avoiding non-deterministic
     // model selection on restart or across concurrent requests.
     ranked.sort_by_key(|(position, candidate)| (candidate.priority, *position));
+    ranked.truncate(config.auto.max_candidates.unwrap_or(32));
     ranked
         .into_iter()
         .map(|(_, candidate)| {
@@ -163,6 +164,7 @@ providers:
     models: [beta]
 auto:
   enabled: true
+  max_candidates: 1
   candidates:
     - provider: backup
       model: beta
@@ -185,9 +187,8 @@ auto:
         assert!(resolve_auto(&cfg, 181).unwrap().is_empty());
         for size in [100, 150, 180] {
             let steps = resolve_auto(&cfg, size).unwrap();
-            assert_eq!(steps.len(), 2);
+            assert_eq!(steps.len(), 1);
             assert_eq!(steps[0].model, "alpha");
-            assert_eq!(steps[1].model, "beta");
         }
     }
     #[test]
