@@ -1193,6 +1193,60 @@ async fn responses_text_bridge_and_unsupported_modes() {
 }
 
 #[tokio::test]
+async fn responses_reject_malformed_function_names_before_provider_dispatch() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&url, &url);
+    let invalid_names = vec![
+        "bad+name".into(),
+        "bad name".into(),
+        "bad.name".into(),
+        "bad/name".into(),
+        "bad\\nname".into(),
+        "a".repeat(65),
+    ];
+    for name in &invalid_names {
+        let payload = json!({
+            "model": "demo", "input": "hello",
+            "tools": [{"type": "function", "name": name}]
+        });
+        let (status, output) = call(router.clone(), responses_stream_req(payload)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {output}");
+        assert_eq!(output["error"]["code"], "invalid_function_name", "{name}");
+    }
+    for name in ["bad name".to_owned(), "bad.name".to_owned(), "a".repeat(65)] {
+        let payload = json!({
+            "model": "demo",
+            "input": [
+                {"type":"function_call", "call_id":"call_1", "name":name, "arguments":"{}"},
+                {"type":"function_call_output", "call_id":"call_1", "output":"done"}
+            ]
+        });
+        let (status, output) = call(router.clone(), responses_stream_req(payload)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {output}");
+        assert_eq!(output["error"]["code"], "invalid_function_name", "{name}");
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "invalid tool names must never reach providers"
+    );
+    for name in [
+        "lookup".to_owned(),
+        "find_data-v2".to_owned(),
+        "A1".to_owned(),
+        "a".repeat(64),
+    ] {
+        let payload = json!({
+            "model":"demo", "input":"hello",
+            "tools":[{"type":"function", "name":name}]
+        });
+        let (status, _) = call(router.clone(), responses_stream_req(payload)).await;
+        assert_eq!(status, StatusCode::OK, "valid function name {name}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
 async fn responses_stateless_metadata_and_mode_contract() {
     let (url, hits) = start_upstream(StatusCode::OK).await;
     let router = make_app(&url, &url);
