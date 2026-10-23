@@ -36,6 +36,7 @@ pub struct ChatSse {
     tool_calls_mask: u64,
     tool_calls: Vec<StreamToolCall>,
     tool_argument_bytes: usize,
+    usage_seen: bool,
     tool_choice: Option<ToolChoice>,
     expected: u64,
     done: bool,
@@ -121,11 +122,25 @@ impl ChatSse {
             .get("choices")
             .and_then(Value::as_array)
             .ok_or(SseError)?;
-        if choices.is_empty()
-            && (self.finished_mask.count_ones() as u64 != self.expected
-                || !event.get("usage").is_some_and(Value::is_object))
-        {
-            return Err(SseError);
+        if choices.is_empty() {
+            // Stream usage is optional, but if present it must be complete
+            // and occur only once after every choice has finished. Otherwise
+            // malformed accounting can be forwarded as a successful response.
+            if self.finished_mask.count_ones() as u64 != self.expected || self.usage_seen {
+                return Err(SseError);
+            }
+            let usage = event.get("usage").ok_or(SseError)?;
+            let (Some(prompt), Some(completion), Some(total)) = (
+                usage.get("prompt_tokens").and_then(Value::as_u64),
+                usage.get("completion_tokens").and_then(Value::as_u64),
+                usage.get("total_tokens").and_then(Value::as_u64),
+            ) else {
+                return Err(SseError);
+            };
+            if prompt.checked_add(completion) != Some(total) {
+                return Err(SseError);
+            }
+            self.usage_seen = true;
         }
         // At most 64 choices are permitted, so a bitset avoids a hot-path allocation.
         let mut seen_indices = 0u64;
@@ -506,6 +521,44 @@ mod tests {
                 "rejected valid text finish {reason}"
             );
         }
+    }
+
+    #[test]
+    fn usage_frames_must_be_complete_consistent_and_unique() {
+        let finished = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+"#;
+        let valid_usage = br#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}
+
+"#;
+        for invalid in [
+            r#"{"choices":[],"usage":{}}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":7}}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":-1,"completion_tokens":3,"total_tokens":2}}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":18446744073709551615,"completion_tokens":1,"total_tokens":0}}"#,
+        ] {
+            let mut parser = ChatSse::new(1).unwrap();
+            parser.push(finished).unwrap();
+            assert!(
+                parser
+                    .push(format!("data: {invalid}\n\n").as_bytes())
+                    .is_err(),
+                "invalid usage accepted: {invalid}"
+            );
+        }
+        let mut parser = ChatSse::new(1).unwrap();
+        parser.push(finished).unwrap();
+        parser.push(valid_usage).unwrap();
+        assert!(
+            parser.push(valid_usage).is_err(),
+            "duplicate usage accepted"
+        );
+
+        let mut parser = ChatSse::new(1).unwrap();
+        parser.push(finished).unwrap();
+        parser.push(valid_usage).unwrap();
+        parser.push(b"data: [DONE]\n\n").unwrap();
+        assert!(parser.finish().is_ok());
     }
 
     #[test]
