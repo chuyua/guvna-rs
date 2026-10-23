@@ -180,6 +180,11 @@ impl ChatSse {
         }
         let mut has_tool_delta = false;
         if let Some(calls) = delta.get("tool_calls") {
+            // Reject before forwarding: consumers may act on tool deltas
+            // before an eventual finish event arrives.
+            if matches!(self.tool_choice, Some(ToolChoice::None)) {
+                return Err(SseError);
+            }
             let calls = calls
                 .as_array()
                 .filter(|calls| !calls.is_empty())
@@ -265,6 +270,11 @@ impl ChatSse {
                     .ok_or(SseError)
             })
             .transpose()?;
+        if let Some(ToolChoice::Named(required)) = &self.tool_choice
+            && name.is_some_and(|name| name != required)
+        {
+            return Err(SseError);
+        }
         let fragment = function
             .and_then(|obj| obj.get("arguments"))
             .map(|value| value.as_str().ok_or(SseError))
@@ -483,18 +493,16 @@ mod tests {
         let mut none = ChatSse::new(1)
             .unwrap()
             .with_tool_choice(Some(&serde_json::json!("none")));
-        none.push(tool_event.as_bytes()).unwrap();
         assert!(
-            none.push(finish).is_err(),
-            "tool_choice none accepted a tool call"
+            none.push(tool_event.as_bytes()).is_err(),
+            "tool_choice none forwarded a forbidden tool delta"
         );
 
         let named = serde_json::json!({"type":"function","function":{"name":"weather"}});
         let mut wrong = ChatSse::new(1).unwrap().with_tool_choice(Some(&named));
-        wrong.push(tool_event.as_bytes()).unwrap();
         assert!(
-            wrong.push(finish).is_err(),
-            "named tool choice accepted another function"
+            wrong.push(tool_event.as_bytes()).is_err(),
+            "named tool choice forwarded another function"
         );
 
         let named = serde_json::json!({"type":"function","function":{"name":"lookup"}});
