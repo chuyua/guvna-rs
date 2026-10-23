@@ -3601,3 +3601,204 @@ async fn sse_only_aggregation_accepts_exactly_sixty_four_choices() {
     assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
 }
+
+#[derive(Clone)]
+struct SlowWalkProvider {
+    calls: Arc<AtomicUsize>,
+    delay: std::time::Duration,
+    status: StatusCode,
+}
+
+async fn slow_walk_upstream(
+    State(state): State<SlowWalkProvider>,
+    request: Request<Body>,
+) -> impl IntoResponse {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    tokio::time::sleep(state.delay).await;
+    if !state.status.is_success() {
+        return (state.status, axum::Json(json!({"error":"injected"}))).into_response();
+    }
+    let bytes = to_bytes(request.into_body(), 1 << 20).await.unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "id":"slow-ok",
+            "object":"chat.completion",
+            "model":value["model"],
+            "choices":[{"index":0,"message":{"role":"assistant","content":"late-success"},
+                        "finish_reason":"stop"}]
+        })),
+    )
+        .into_response()
+}
+
+async fn start_slow_walk_provider(
+    delay: std::time::Duration,
+    status: StatusCode,
+) -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route("/v1/chat/completions", post(slow_walk_upstream))
+        .with_state(SlowWalkProvider {
+            calls: calls.clone(),
+            delay,
+            status,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (format!("http://{addr}"), calls)
+}
+
+fn walk_budget_router(primary: &str, backup: &str, walk: &str, stream_only: bool) -> Router {
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+timeout:
+  walk: {walk}
+providers:
+  - name: first
+    type: openai
+    base_url: {primary}
+    key_env: FIRST
+    stream_only: {stream_only}
+  - name: backup
+    type: openai
+    base_url: {backup}
+    key_env: BACKUP
+chains:
+  - name: budget
+    steps:
+      - provider: first
+        model: one
+      - provider: backup
+        model: two
+"#
+    ))
+    .unwrap();
+    app(AppState::new(
+        config,
+        HashMap::from([
+            ("FIRST".into(), "firstsecret".into()),
+            ("BACKUP".into(), "backupsecret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap())
+}
+
+#[tokio::test]
+async fn issue65_total_walk_budget_cancels_slow_fallback_before_a_late_success() {
+    use std::time::{Duration, Instant};
+    // Prior behavior: both candidates each receive a fresh 90s deadline,
+    // allowing a 190s+ walk through Cloudflare's 120s proxy. These scaled
+    // delays deterministically prove that the SECOND attempt has only the
+    // time remaining in the ONE shared walk budget.
+    let (first, first_hits) =
+        start_slow_walk_provider(Duration::from_millis(180), StatusCode::SERVICE_UNAVAILABLE).await;
+    let (second, second_hits) =
+        start_slow_walk_provider(Duration::from_millis(250), StatusCode::OK).await;
+    let router = walk_budget_router(&first, &second, "270ms", false);
+    let begin = Instant::now();
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(3),
+        call(router.clone(), request("budget", "", "client")),
+    )
+    .await
+    .expect("non-streaming fallback must have a bounded lifetime");
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(body["error"]["code"], "upstream_walk_timeout");
+    assert!(begin.elapsed() < Duration::from_secs(2));
+    assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+    assert!(second_hits.load(Ordering::SeqCst) <= 1);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "active_requests"), 0);
+}
+
+#[tokio::test]
+async fn issue65_healthy_fallback_finishes_if_total_budget_suffices() {
+    use std::time::Duration;
+    let (first, first_hits) =
+        start_slow_walk_provider(Duration::from_millis(65), StatusCode::SERVICE_UNAVAILABLE).await;
+    let (second, second_hits) =
+        start_slow_walk_provider(Duration::from_millis(65), StatusCode::OK).await;
+    let router = walk_budget_router(&first, &second, "2s", false);
+    let (status, body) = call(router, request("budget", "", "client")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["choices"][0]["message"]["content"], "late-success");
+    assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+}
+
+async fn delayed_stream_upstream(State(calls): State<Arc<AtomicUsize>>) -> impl IntoResponse {
+    calls.fetch_add(1, Ordering::SeqCst);
+    let output = futures_util::stream::unfold(0u8, |index| async move {
+        match index {
+            0 => Some((
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(SSE_START)),
+                1,
+            )),
+            1 => {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                Some((Ok(Bytes::from_static(SSE_END)), 2))
+            }
+            2 => Some((Ok(Bytes::from_static(SSE_DONE)), 3)),
+            _ => None,
+        }
+    });
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+        Body::from_stream(output),
+    )
+        .into_response()
+}
+
+async fn start_delayed_stream() -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route("/v1/chat/completions", post(delayed_stream_upstream))
+        .with_state(calls.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (format!("http://{addr}"), calls)
+}
+
+#[tokio::test]
+async fn issue65_sse_only_aggregation_obeys_walk_budget_but_client_sse_keeps_progress() {
+    use std::time::Duration;
+    let (first, calls) = start_delayed_stream().await;
+    let router = walk_budget_router(&first, &first, "130ms", true);
+    // JSON aggregation reads the SSE source; it MUST obey the total walk
+    // budget even though the HTTP stream itself remains healthy.
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(3),
+        call(router.clone(), request("first/demo", "", "client")),
+    )
+    .await
+    .expect("aggregation cannot run indefinitely");
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(body["error"]["code"], "upstream_walk_timeout");
+
+    // The identical stream source via client-facing SSE must remain alive
+    // well beyond timeout.walk as long as it keeps valid progress.
+    let response = router
+        .clone()
+        .oneshot(request("first/demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = tokio::time::timeout(
+        Duration::from_secs(3),
+        to_bytes(response.into_body(), 1 << 20),
+    )
+    .await
+    .expect("healthy SSE should continue beyond the JSON-only deadline")
+    .unwrap();
+    assert!(
+        bytes.ends_with(SSE_DONE),
+        "{:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
