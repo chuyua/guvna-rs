@@ -1425,6 +1425,7 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
         return false;
     }
     let mut indices = HashSet::new();
+    let mut tool_call_ids = HashSet::new();
     for choice in choices {
         let index = match choice.get("index") {
             Some(index) => match index.as_u64() {
@@ -1440,6 +1441,9 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
         let Some(message) = choice.get("message").and_then(Value::as_object) else {
             return false;
         };
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            return false;
+        }
         if !choice
             .get("finish_reason")
             .and_then(Value::as_str)
@@ -1461,11 +1465,17 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
                 return false;
             };
             for call in calls {
-                let valid = call
+                let Some(id) = call
                     .get("id")
                     .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty())
-                    && call.get("type").and_then(Value::as_str) == Some("function")
+                    .filter(|s| !s.is_empty())
+                else {
+                    return false;
+                };
+                if !tool_call_ids.insert(id) {
+                    return false;
+                }
+                let valid = call.get("type").and_then(Value::as_str) == Some("function")
                     && call
                         .pointer("/function/name")
                         .and_then(Value::as_str)
@@ -1473,7 +1483,9 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
                     && call
                         .pointer("/function/arguments")
                         .and_then(Value::as_str)
-                        .is_some_and(|s| serde_json::from_str::<Value>(s).is_ok());
+                        .is_some_and(|s| {
+                            serde_json::from_str::<Value>(s).is_ok_and(|args| args.is_object())
+                        });
                 if !valid {
                     return false;
                 }
@@ -1687,13 +1699,54 @@ mod response_contract_tests {
         let request = json!({"n":1});
         let item = |args: &str| {
             json!({"choices":[{
-                "index":0,"message":{"tool_calls":[{
+                "index":0,"message":{"role":"assistant","tool_calls":[{
                     "id":"call_1","type":"function","function":{"name":"read","arguments":args}
                 }]},"finish_reason":"tool_calls"
             }]})
         };
         assert!(validate_chat(&request, &item(r#"{"path":"/tmp"}"#)));
         assert!(!validate_chat(&request, &item(r#"{"path":"#)));
+        assert!(!validate_chat(&request, &item("null")));
+        assert!(!validate_chat(&request, &item("[]")));
+        assert!(!validate_chat(&request, &item("42")));
+    }
+
+    #[test]
+    fn chat_rejects_missing_or_non_assistant_role() {
+        let request = json!({});
+        for message in [
+            json!({"content":"ok"}),
+            json!({"role":"user","content":"ok"}),
+            json!({"role":"tool","content":"ok"}),
+            json!({"role":null,"content":"ok"}),
+        ] {
+            let response =
+                json!({"choices":[{"index":0,"message":message,"finish_reason":"stop"}]});
+            assert!(!validate_chat(&request, &response));
+        }
+        assert!(validate_chat(&request, &json!({"choices":[assistant(0)]})));
+    }
+
+    #[test]
+    fn chat_rejects_duplicate_tool_call_ids_across_choices() {
+        let tool_choice = |index| {
+            json!({
+                "index":index,
+                "message":{"role":"assistant","tool_calls":[
+                    {"id":"call_shared","type":"function","function":{"name":"read","arguments":"{}"}}
+                ]},
+                "finish_reason":"tool_calls"
+            })
+        };
+        let request = json!({"n":2});
+        assert!(!validate_chat(
+            &request,
+            &json!({"choices":[tool_choice(0),tool_choice(1)]})
+        ));
+        assert!(validate_chat(
+            &request,
+            &json!({"choices":[tool_choice(0),assistant(1)]})
+        ));
     }
 
     #[test]
