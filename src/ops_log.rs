@@ -11,6 +11,10 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static AGGREGATION_SUCCESS_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static AGGREGATION_FAILED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static AGGREGATION_INVALID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static AGGREGATION_TIMEOUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static AGGREGATION_TRANSPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static AGGREGATION_LIMIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn enabled() -> bool {
     *ENABLED.get_or_init(|| {
@@ -45,6 +49,10 @@ fn emit(level: &'static str, event: &'static str) {
     let counter = match event {
         "aggregation_completed" => &AGGREGATION_SUCCESS_SEQUENCE,
         "aggregation_failed" => &AGGREGATION_FAILED_SEQUENCE,
+        "aggregation_invalid_sse" => &AGGREGATION_INVALID_SEQUENCE,
+        "aggregation_idle_timeout" => &AGGREGATION_TIMEOUT_SEQUENCE,
+        "aggregation_transport_failure" => &AGGREGATION_TRANSPORT_SEQUENCE,
+        "aggregation_resource_limit" => &AGGREGATION_LIMIT_SEQUENCE,
         _ => &SEQUENCE,
     };
     let sequence = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -68,6 +76,25 @@ mod tests {
         assert!(super::should_emit(128));
         assert!(!super::should_emit(129));
         assert!(super::should_emit(256));
+    }
+    #[test]
+    fn aggregation_failure_categories_have_separate_sample_slots() {
+        // A flood of unrelated 5xx or successful aggregations must not
+        // suppress the first few rare SSE timeout/overflow failures.
+        for category in [
+            "aggregation_failed",
+            "aggregation_invalid_sse",
+            "aggregation_idle_timeout",
+            "aggregation_transport_failure",
+            "aggregation_resource_limit",
+        ] {
+            assert!(category.starts_with("aggregation_"));
+            assert!(
+                category
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            );
+        }
     }
     #[test]
     fn explicitly_opt_in_without_exposing_request_or_credential_details() {

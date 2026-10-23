@@ -100,6 +100,23 @@ completions, reconciles metrics, and checks bounded RSS/FD/thread counts.
 Local warning JSON-line stderr events are restricted to fixed metadata
 fields, contain no API key values and are rate limited to ten lines.
 
+## SSE-only aggregation capability + failure classification
+
+SSE->JSON synthesis is bounded to n=1..64, while native Chat JSON candidates
+may support larger n. In the shared candidate loop, unsupported SSE-only n
+skips the provider before acquiring any key or issuing HTTP traffic; a
+JSON-capable fallback is still attempted. When all candidates are SSE-only,
+the gateway returns HTTP 422 aggregate_n_unsupported instead of a misleading
+502 upstream failure. Regression covers n=0, 65, 512, Auto, JSON fallback,
+and the accepted 64-choice upper boundary. Invalid requests must not consume
+upstream attempts.
+
+With GUVNA_LOG_EVENTS=1, local stderr aggregation failures are subdivided
+into invalid_sse, idle_timeout, transport_failure and resource_limit; each
+fixed event name uses independent sampling so rare classes are not lost in
+a high-volume success stream. No user information or provider identifiers are
+logged, and no new remote management interface is introduced.
+
 ## SSE-only provider: bounded JSON synthesis and local logging
 
 The Linux --release gate runs 64 JSON Chat requests against a fixture that

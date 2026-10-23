@@ -3414,3 +3414,145 @@ async fn sse_only_logprobs_request_never_returns_silently_lost_logprobs() {
     assert_eq!(primary_hits.load(Ordering::SeqCst), 0);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
 }
+
+async fn start_variable_choice_upstream() -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: Bytes| {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let n = request.get("n").and_then(Value::as_u64).unwrap_or(1);
+                let choices = (0..n)
+                    .map(|index| {
+                        json!({
+                            "index":index,
+                            "message":{"role":"assistant","content":"json fallback"},
+                            "finish_reason":"stop"
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({"id":"fallback","object":"chat.completion",
+                        "choices": choices})),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (format!("http://{addr}"), hits)
+}
+
+#[tokio::test]
+async fn sse_only_aggregate_declines_unsupported_n_before_network_but_keeps_json_fallback() {
+    let sse = vec![SSE_START.to_vec(), SSE_END.to_vec(), SSE_DONE.to_vec()];
+    let (primary, streaming_hits, _) = start_strict_stream_only(sse).await;
+    let (backup, backup_hits) = start_variable_choice_upstream().await;
+    let router = app_with_stream_only_and_auto(&primary, &backup, true);
+
+    for n in [0_u64, 65, 512] {
+        // A direct passthrough has no other eligible candidate. Report the
+        // stream aggregator's capability limit clearly without HTTP traffic.
+        let (status, output) = call(
+            router.clone(),
+            request("streaming/model", &format!(",\"n\":{n}"), "client"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{output}");
+        assert_eq!(output["error"]["code"], "aggregate_n_unsupported");
+        assert_eq!(streaming_hits.load(Ordering::SeqCst), 0);
+
+        // The fallback JSON provider may support n > 64; do not reject the
+        // entire chain merely because the SSE-only candidate cannot.
+        if n > 64 {
+            let (status, output) = call(
+                router.clone(),
+                request("ordered", &format!(",\"n\":{n}"), "client"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{output}");
+            assert_eq!(output["choices"].as_array().unwrap().len(), n as usize);
+            assert_eq!(output["choices"][0]["message"]["content"], "json fallback");
+            assert_eq!(streaming_hits.load(Ordering::SeqCst), 0);
+        }
+    }
+    // Auto routes through precisely the same single dispatch loop and skips
+    // the unsupported SSE-only candidate without consuming any credential.
+    let auto_req = Request::builder()
+        .method("POST")
+        .uri("/v1/auto")
+        .header("authorization", "Bearer client")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "model":"auto", "messages":[{"role":"user","content":"test"}], "n":65
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let (status, output) = call(router.clone(), auto_req).await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(output["choices"].as_array().unwrap().len(), 65);
+    assert_eq!(streaming_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 3);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "upstream_attempts_total"), 3);
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn valid_single_choice_still_aggregates_from_stream_only_primary() {
+    let (primary, primary_hits, _) = start_strict_stream_only(vec![
+        SSE_START.to_vec(),
+        SSE_END.to_vec(),
+        SSE_DONE.to_vec(),
+    ])
+    .await;
+    let (backup, backup_hits) = start_variable_choice_upstream().await;
+    let router = app_with_stream_only_and_auto(&primary, &backup, false);
+    let (status, output) = call(router, request("ordered", ",\"n\":1", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(output["choices"][0]["message"]["content"], "hi");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn sse_only_aggregation_accepts_exactly_sixty_four_choices() {
+    let choices = (0..64)
+        .map(|index| {
+            json!({
+                "index": index,
+                "delta": {"role":"assistant","content":format!("answer-{index}")},
+                "finish_reason": "stop"
+            })
+        })
+        .collect::<Vec<_>>();
+    let primary_stream = vec![
+        aggregate_chat_frame(json!({"id":"sixty-four","choices":choices})),
+        b"data: [DONE]\n\n".to_vec(),
+    ];
+    let (primary, primary_hits, _) = start_strict_stream_only(primary_stream).await;
+    let (backup, backup_hits) = start_variable_choice_upstream().await;
+    let app = app_with_stream_only_and_auto(&primary, &backup, false);
+    let (status, body) = call(app, request("ordered", ",\"n\":64", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let completed = body["choices"].as_array().unwrap();
+    assert_eq!(completed.len(), 64);
+    for (i, choice) in completed.iter().enumerate() {
+        assert_eq!(choice["index"], i);
+        assert_eq!(choice["message"]["content"], format!("answer-{i}"));
+        assert_eq!(choice["finish_reason"], "stop");
+    }
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+}
