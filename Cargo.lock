@@ -270,6 +270,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "http-body-util",
+ "httpdate",
  "reqwest",
  "serde",
  "serde_json",

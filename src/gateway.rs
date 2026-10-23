@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -136,6 +136,26 @@ fn unauthorized() -> Response {
         "invalid_api_key",
         "Bearer API key is required",
     )
+}
+
+// RFC Retry-After permits delta seconds or an HTTP date. Apply only to a
+// rate-limited credential, cap upstream hints at one day, and retain the
+// configured cooldown if the hint is malformed or already expired.
+fn retry_after_delay(headers: &reqwest::header::HeaderMap, now: SystemTime) -> Option<Duration> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    let delay = if !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        Duration::from_secs(raw.parse::<u64>().unwrap_or(u64::MAX))
+    } else {
+        httpdate::parse_http_date(raw)
+            .ok()?
+            .duration_since(now)
+            .ok()?
+    };
+    Some(delay.min(Duration::from_secs(24 * 3600)))
 }
 
 // Authenticate before invoking Bytes::from_request: the normal Bytes handler
@@ -1204,7 +1224,16 @@ async fn dispatch(state: Arc<AppState>, body: Bytes, endpoint: Endpoint) -> Resp
             let outcome = classify(Some(status));
             if outcome.quarantine_credential() {
                 Metrics::inc(&state.metrics.upstream_http_failures);
-                if state.pools[step.provider_index].record(&lease, outcome) {
+                let retry_after = if outcome == Outcome::RateLimited {
+                    retry_after_delay(upstream.headers(), SystemTime::now())
+                } else {
+                    None
+                };
+                if state.pools[step.provider_index].record_with_retry_after(
+                    &lease,
+                    outcome,
+                    retry_after,
+                ) {
                     Metrics::inc(&state.metrics.credential_quarantines);
                 }
                 continue; // try a different key; each key is attempted once
@@ -1610,6 +1639,39 @@ fn validate_embeddings(request: &Value, response: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_parser_accepts_delta_and_date_with_saturating_bounds() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let make_headers = |value: &str| {
+            reqwest::header::HeaderMap::from_iter([(
+                reqwest::header::RETRY_AFTER,
+                reqwest::header::HeaderValue::from_str(value).unwrap(),
+            )])
+        };
+        assert_eq!(
+            retry_after_delay(&make_headers("37"), now),
+            Some(Duration::from_secs(37))
+        );
+        assert_eq!(
+            retry_after_delay(&make_headers("999999999999999999999999999999"), now),
+            Some(Duration::from_secs(86400))
+        );
+        assert_eq!(
+            retry_after_delay(&make_headers("0"), now),
+            Some(Duration::ZERO)
+        );
+        let future = httpdate::fmt_http_date(now + Duration::from_secs(75));
+        assert_eq!(
+            retry_after_delay(&make_headers(&future), now),
+            Some(Duration::from_secs(75))
+        );
+        let expired = httpdate::fmt_http_date(now - Duration::from_secs(30));
+        assert_eq!(retry_after_delay(&make_headers(&expired), now), None);
+        assert_eq!(retry_after_delay(&make_headers("not-a-date"), now), None);
+        assert_eq!(retry_after_delay(&make_headers("-5"), now), None);
+    }
+
     #[tokio::test]
     async fn admission_limit_rejects_immediately_without_contacting_provider() {
         let config: Config = serde_yaml::from_str(

@@ -49,3 +49,13 @@ fall back successfully, and metrics/RSS/FD/thread limits are verified.
 
 Do not mistake the provider breaker for key-level 429/auth quarantine or
 the global request admission limiter.
+
+## Per-credential HTTP 429 Retry-After
+
+HTTP 429 never counts against the provider circuit breaker. Instead, only the
+credential used by that request is isolated. Valid upstream Retry-After
+delta-seconds and HTTP-date values can extend its configured rate-limit
+cooldown, up to 24 hours of server-requested delay. Invalid/expired hints use
+the configured duration. A server hint never shortens the configured cooldown,
+and stale overlapping requests cannot lengthen an already fenced quarantine.
+Healthy keys are still tried immediately without sleeping the request thread.
