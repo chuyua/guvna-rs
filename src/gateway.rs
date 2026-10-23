@@ -310,8 +310,6 @@ async fn responses(
     }
     let object = value.as_object_mut().expect("checked above");
     for key in [
-        "tools",
-        "tool_choice",
         "previous_response_id",
         "conversation",
         "reasoning",
@@ -350,6 +348,8 @@ async fn responses(
             "top_p",
             "user",
             "instructions",
+            "tools",
+            "tool_choice",
         ]
         .contains(&key.as_str())
         {
@@ -360,7 +360,82 @@ async fn responses(
             );
         }
     }
-    // Instructions become a leading system message, not a provider-specific field.
+    // Map the supported Responses function-tool declaration to Chat Completions.
+    if let Some(tools) = object.get_mut("tools") {
+        let Some(items) = tools.as_array_mut() else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_tools",
+                "tools must be an array",
+            );
+        };
+        if items.is_empty() {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_tools",
+                "tools must not be empty",
+            );
+        }
+        for tool in items {
+            let Some(map) = tool.as_object() else {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tools",
+                    "tool must be an object",
+                );
+            };
+            if map.get("type").and_then(Value::as_str) != Some("function")
+                || map
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                || map.keys().any(|key| {
+                    !["type", "name", "description", "parameters", "strict"].contains(&key.as_str())
+                })
+            {
+                return error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "responses_tools_unsupported",
+                    "Only named function tools are supported",
+                );
+            }
+            let mut function = map.clone();
+            function.remove("type");
+            *tool = json!({"type":"function","function":function});
+        }
+    }
+    if let Some(choice) = object.get_mut("tool_choice") {
+        if let Some(name) = choice.as_str() {
+            if !matches!(name, "auto" | "none" | "required") {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_tool_choice",
+                    "Unsupported tool choice",
+                );
+            }
+        } else if let Some(map) = choice.as_object() {
+            if map.get("type").and_then(Value::as_str) != Some("function")
+                || map
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                || map.len() != 2
+            {
+                return error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "responses_tool_choice_unsupported",
+                    "Unsupported tool choice",
+                );
+            }
+            *choice = json!({"type":"function","function":{"name":map["name"]}});
+        } else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_tool_choice",
+                "Invalid tool choice",
+            );
+        }
+    } // Instructions become a leading system message, not a provider-specific field.
     // Validate before moving any data into the shared chat dispatcher.
     let instructions = match object.remove("instructions") {
         Some(Value::String(text)) => Some(text),
@@ -413,6 +488,56 @@ async fn responses(
             );
         }
     };
+    let calls = chat["choices"][0]["message"]["tool_calls"].as_array();
+    if calls.is_some_and(|items| !items.is_empty()) {
+        if chat["choices"][0]["finish_reason"] != "tool_calls" {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_tool_finish",
+                "Tool calls require tool_calls finish reason",
+            );
+        }
+        let mut output = Vec::with_capacity(calls.map_or(0, Vec::len));
+        for call in calls.expect("checked above") {
+            let Some(id) = call["id"].as_str() else {
+                return error(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid_tool_call",
+                    "Missing tool call id",
+                );
+            };
+            let Some(name) = call["function"]["name"].as_str() else {
+                return error(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid_tool_call",
+                    "Missing function name",
+                );
+            };
+            let Some(arguments) = call["function"]["arguments"].as_str() else {
+                return error(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid_tool_call",
+                    "Missing function arguments",
+                );
+            };
+            if call["type"] != "function" || serde_json::from_str::<Value>(arguments).is_err() {
+                return error(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid_tool_call",
+                    "Invalid function call arguments",
+                );
+            }
+            output.push(json!({"type":"function_call","id":id,"call_id":id,"name":name,"arguments":arguments,"status":"completed"}));
+        }
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "id":chat["id"], "object":"response", "status":"completed", "model":logical_model,
+                "output":output, "output_text":"", "usage":Value::Null,
+            })),
+        )
+            .into_response();
+    }
     let content = chat["choices"][0]["message"]["content"].as_str();
     let Some(content) = content else {
         return error(

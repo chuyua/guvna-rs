@@ -50,8 +50,8 @@ async fn upstream(State(state): State<UpstreamState>, request: Request<Body>) ->
         StatusCode::OK,
         axum::Json(json!({
             "id":"mock","object":"chat.completion","model":model,
-            "choices":[{"index":0,"message":{"role":"assistant","content":"success"},
-            "finish_reason":if value["messages"][0]["content"] == "truncate" { "length" } else { "stop" }}],
+            "choices":[{"index":0,"message":if value["messages"][0]["content"] == "call" { json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_123","type":"function","function":{"name":"lookup","arguments":json!({"city":"Paris"}).to_string()}}]}) } else { json!({"role":"assistant","content":"success"}) },
+            "finish_reason":if value["messages"][0]["content"] == "truncate" { "length" } else if value["messages"][0]["content"] == "call" { "tool_calls" } else { "stop" }}],
             "usage": if value["messages"][0]["content"] == "usage" { json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}) } else if value["messages"][0]["content"] == "badusage" { json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":7}) } else { Value::Null },
             "debug_seed": value["seed"]
         })),
@@ -649,9 +649,15 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(invalid["error"]["code"], "invalid_upstream_usage");
     assert_eq!(hits.load(Ordering::SeqCst), 6);
+    let (status, tool_result) = call(router.clone(), req(json!({"model":"demo","input":"call","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"auto"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tool_result["output"][0]["type"], "function_call");
+    assert_eq!(tool_result["output"][0]["name"], "lookup");
+    assert_eq!(tool_result["output"][0]["call_id"], "call_123");
+    assert_eq!(hits.load(Ordering::SeqCst), 7);
     for payload in [
         json!({"model":"demo","input":"hello","stream":true}),
-        json!({"model":"demo","input":"hello","tools":[]}),
+        json!({"model":"demo","input":"hello","tools":[{"type":"web_search"}]}),
         json!({"model":"demo","input":"hello","n":2}),
         json!({"model":"demo","input":"hello","unknown_option":42}),
         json!({"model":"demo","input":"hello","messages":[]}),
@@ -671,5 +677,5 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = call(router, req(json!({"input":"hello"}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(hits.load(Ordering::SeqCst), 6);
+    assert_eq!(hits.load(Ordering::SeqCst), 7);
 }
