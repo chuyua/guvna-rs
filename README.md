@@ -35,6 +35,15 @@ no silent provider replay after streaming begins.
 Responses streaming limits: 512 KiB combined generated text and function
 arguments, 256 KiB per function's arguments, 32 parallel function calls,
 1 MiB maximum framed SSE chunk, and 15 seconds of upstream idle time.
+Responses now also maps text.format to the equivalent Chat Completions
+response_format for plain text, JSON-object and strict JSON-schema requests,
+including streaming. JSON-schema names, field types, and unsupported options
+are checked before contacting providers, and nested schemas retain integer
+precision. The gateway validates parseable JSON before reporting completion
+(non-streaming: failover; streaming: response.failed, never replay after data
+has been sent). JSON-schema adherence beyond JSON syntax remains the
+responsibility of the upstream model/provider.
+
 Unsupported reasoning, image, audio, stateful continuation, and other
 advanced Responses modes remain explicitly unsupported. The gateway must not
 be treated as full OpenAI Responses parity or a production drop-in replacement.

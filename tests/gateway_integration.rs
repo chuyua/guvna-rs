@@ -1994,3 +1994,352 @@ async fn broken_midstream_counts_as_provider_failure_without_replaying_partial_o
     assert_eq!(metric_value(&metrics, "circuit_bypasses_total"), 1);
     assert_eq!(metric_value(&metrics, "chat_stream_completed_total"), 1);
 }
+
+#[derive(Clone)]
+struct FormatProbeState {
+    seen: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    output: &'static str,
+}
+
+async fn format_probe(
+    State(state): State<FormatProbeState>,
+    request: Request<Body>,
+) -> axum::response::Response {
+    let bytes = to_bytes(request.into_body(), 32 << 20).await.unwrap();
+    let payload: Value = serde_json::from_slice(&bytes).unwrap();
+    state.seen.lock().await.push(payload.clone());
+    if payload["stream"] == true {
+        let stream_content = json!({
+            "id":"format_probe_1",
+            "choices":[{"index":0,"delta":{"role":"assistant","content":state.output},
+                "finish_reason":null}]
+        });
+        let stream_finish = json!({
+            "id":"format_probe_1",
+            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]
+        });
+        return (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            Body::from(format!(
+                "data: {stream_content}\n\ndata: {stream_finish}\n\ndata: [DONE]\n\n"
+            )),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "id":"format_probe_1",
+            "object":"chat.completion",
+            "choices":[{"index":0,"message":{"role":"assistant","content":state.output},
+                "finish_reason":"stop"}],
+            "usage":null,
+        })),
+    )
+        .into_response()
+}
+
+async fn start_format_probe(output: &'static str) -> (String, Arc<tokio::sync::Mutex<Vec<Value>>>) {
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let state = FormatProbeState {
+        seen: seen.clone(),
+        output,
+    };
+    let app = Router::new()
+        .route("/v1/chat/completions", post(format_probe))
+        .with_state(state);
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+    (format!("http://{addr}"), seen)
+}
+
+#[tokio::test]
+async fn responses_text_format_maps_all_supported_types_to_real_upstream_payloads() {
+    let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
+    let app = make_app(&url, &url);
+    let schema = json!({
+        "type":"json_schema",
+        "name":"good_result",
+        "schema":{"type":"object",
+            "properties":{"large":{"const":12345678901234567890u64}},
+            "required":["large"],"additionalProperties":false},
+        "strict":true,
+        "description":"Format data"
+    });
+    let cases = [
+        (json!({}), Value::Null),
+        (json!({"text":{}}), Value::Null),
+        (
+            json!({"text":{"format":{"type":"text"}}}),
+            json!({"type":"text"}),
+        ),
+        (
+            json!({"text":{"format":{"type":"json_object"}}}),
+            json!({"type":"json_object"}),
+        ),
+        (
+            json!({"text":{"format":schema.clone()}}),
+            json!({"type":"json_schema","json_schema":{
+                "name":"good_result",
+                "schema":schema["schema"],
+                "strict":true,
+                "description":"Format data"
+            }}),
+        ),
+    ];
+    for (mut extras, expected) in cases {
+        extras["model"] = json!("demo");
+        extras["input"] = json!("hello");
+        let (status, value) = call(app.clone(), responses_stream_req(extras)).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["output_text"], r#"{"ok":true}"#);
+        let latest = seen.lock().await.last().unwrap().clone();
+        assert_eq!(latest["response_format"], expected);
+        assert!(
+            latest.get("text").is_none(),
+            "Responses text leaked: {latest}"
+        );
+        assert_eq!(latest["model"], "one");
+        assert_eq!(latest["messages"][0]["content"], "hello");
+    }
+    assert_eq!(seen.lock().await.len(), 5);
+}
+
+#[tokio::test]
+async fn responses_json_schema_and_tools_are_combined_without_loss_or_duplicate_routing() {
+    let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
+    let app = make_app(&url, &url);
+    let schema = json!({"type":"json_schema","name":"result_7",
+        "schema":{"type":"object","properties":{"ok":{"type":"boolean"}}},"strict":true});
+    let input = json!({"model":"demo","input":"hello","stream":false,
+        "metadata":{"job":"format"},
+        "text":{"format":schema},
+        "tools":[{"type":"function","name":"lookup",
+            "parameters":{"type":"object","properties":{"id":{"type":"integer"}}}}],
+        "tool_choice":{"type":"function","name":"lookup"},
+        "max_output_tokens":256});
+    let (status, output) = call(app, responses_stream_req(input)).await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(output["metadata"]["job"], "format");
+    assert_eq!(output["output_text"], r#"{"ok":true}"#);
+    let latest = seen.lock().await.last().unwrap().clone();
+    assert_eq!(latest["response_format"]["type"], "json_schema");
+    assert_eq!(latest["response_format"]["json_schema"]["name"], "result_7");
+    assert_eq!(latest["tools"][0]["function"]["name"], "lookup");
+    assert_eq!(
+        latest["tools"][0]["function"]["parameters"]["type"],
+        "object"
+    );
+    assert_eq!(latest["tool_choice"]["function"]["name"], "lookup");
+    assert_eq!(latest["max_tokens"], 256);
+    assert!(latest.get("max_output_tokens").is_none());
+    assert!(latest.get("metadata").is_none());
+}
+
+#[tokio::test]
+async fn responses_json_text_format_preserves_stream_lifecycle_and_no_false_terminals() {
+    let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
+    let app = make_app(&url, &url);
+    for format in [
+        json!({"type":"json_object"}),
+        json!({"type":"json_schema","name":"stream_data",
+            "schema":{"type":"object"},"strict":true}),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(responses_stream_req(json!({
+                "model":"demo","input":"hello","stream":true,
+                "text":{"format":format}
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let bytes = to_bytes(response.into_body(), 2 << 20).await.unwrap();
+        let frames = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(
+            frames.matches("event: response.completed").count(),
+            1,
+            "{frames}"
+        );
+        assert!(!frames.contains("event: response.failed"), "{frames}");
+        assert!(!frames.contains("data: [DONE]"), "{frames}");
+        let last_event: Value = serde_json::from_str(
+            frames
+                .lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .next_back()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(last_event["response"]["output_text"], r#"{"ok":true}"#);
+        let seen_payload = seen.lock().await.last().unwrap().clone();
+        assert_eq!(seen_payload["response_format"]["type"], format["type"]);
+        assert_eq!(seen_payload["stream"], true);
+        assert!(seen_payload.get("text").is_none());
+    }
+    assert_eq!(seen.lock().await.len(), 2);
+}
+
+#[tokio::test]
+async fn unsupported_or_corrupt_format_is_rejected_without_any_provider_calls() {
+    let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
+    let app = make_app(&url, &url);
+    let cases = [
+        (
+            json!({"text":null}),
+            StatusCode::BAD_REQUEST,
+            "invalid_text_format",
+        ),
+        (
+            json!({"text":{"format":null}}),
+            StatusCode::BAD_REQUEST,
+            "invalid_text_format",
+        ),
+        (
+            json!({"text":{"format":{"type":"json_schema","name":"wrong name","schema":{}}}}),
+            StatusCode::BAD_REQUEST,
+            "invalid_text_format",
+        ),
+        (
+            json!({"text":{"format":{"type":"json_schema","name":"a","schema":[]}}}),
+            StatusCode::BAD_REQUEST,
+            "invalid_text_format",
+        ),
+        (
+            json!({"text":{"format":{"type":"json_schema","name":"a","schema":{},"strict":1}}}),
+            StatusCode::BAD_REQUEST,
+            "invalid_text_format",
+        ),
+        (
+            json!({"text":{"format":{"type":"json_schema","name":"a","schema":{},
+            "description":null}}}),
+            StatusCode::BAD_REQUEST,
+            "invalid_text_format",
+        ),
+        (
+            json!({"text":{"format":{"type":"json_schema","name":"a","schema":{},
+            "hidden":"ignored"}}}),
+            StatusCode::NOT_IMPLEMENTED,
+            "responses_text_format_unsupported",
+        ),
+        (
+            json!({"text":{"format":{"type":"audio"}}}),
+            StatusCode::NOT_IMPLEMENTED,
+            "responses_text_format_unsupported",
+        ),
+        (
+            json!({"text":{"verbosity":"low"}}),
+            StatusCode::NOT_IMPLEMENTED,
+            "responses_text_format_unsupported",
+        ),
+        (
+            json!({"text":{"format":{"type":"json_object","undocumented":true}}}),
+            StatusCode::NOT_IMPLEMENTED,
+            "responses_text_format_unsupported",
+        ),
+        (
+            json!({"response_format":{"type":"json_object"}}),
+            StatusCode::NOT_IMPLEMENTED,
+            "responses_parameter_unsupported",
+        ),
+        (
+            json!({"reasoning":{"effort":"high"}}),
+            StatusCode::NOT_IMPLEMENTED,
+            "responses_feature_unsupported",
+        ),
+    ];
+    for (extra, expected_status, expected_code) in cases {
+        let mut request = json!({"model":"demo","input":"hello"});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (status, output) = call(app.clone(), responses_stream_req(request)).await;
+        assert_eq!(status, expected_status, "{output}");
+        assert_eq!(output["error"]["code"], expected_code, "{output}");
+    }
+    assert!(
+        seen.lock().await.is_empty(),
+        "invalid requests reached upstream"
+    );
+}
+
+#[tokio::test]
+async fn unparseable_json_mode_upstream_200_fails_over_to_valid_json_provider() {
+    let (bad_url, bad_seen) = start_format_probe("prose instead of json").await;
+    let (good_url, good_seen) = start_format_probe(r#"{"result":12345678901234567890}"#).await;
+    let app = make_app(&bad_url, &good_url);
+    let (status, result) = call(
+        app.clone(),
+        responses_stream_req(json!({
+            "model":"demo","input":"hello","text":{"format":{"type":"json_object"}}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["output_text"], r#"{"result":12345678901234567890}"#);
+    assert_eq!(bad_seen.lock().await.len(), 1);
+    assert_eq!(good_seen.lock().await.len(), 1);
+    // When both candidates ignore json_object, no false HTTP 200 is returned.
+    let only_bad = make_app(&bad_url, &bad_url);
+    let (bad_status, bad_output) = call(
+        only_bad,
+        responses_stream_req(json!({
+            "model":"demo","input":"hello","text":{"format":{"type":"json_object"}}
+        })),
+    )
+    .await;
+    assert_eq!(bad_status, StatusCode::BAD_GATEWAY, "{bad_output}");
+    assert_eq!(bad_output["error"]["code"], "upstream_unavailable");
+    assert_eq!(bad_seen.lock().await.len(), 3);
+}
+
+#[tokio::test]
+async fn invalid_json_stream_must_never_emit_a_completed_response_or_replay() {
+    let (url, seen) = start_format_probe("upstream ignored json output mode").await;
+    let app = make_app(&url, &url);
+    let response = app
+        .clone()
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hello","stream":true,
+            "text":{"format":{"type":"json_object"}}
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let frames = String::from_utf8(
+        to_bytes(response.into_body(), 2 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        frames.matches("event: response.failed").count(),
+        1,
+        "{frames}"
+    );
+    assert_eq!(
+        frames.matches("event: response.completed").count(),
+        0,
+        "{frames}"
+    );
+    assert_eq!(
+        frames.matches("event: response.output_text.delta").count(),
+        1
+    );
+    assert!(!frames.contains("data: [DONE]"), "{frames}");
+    assert_eq!(
+        seen.lock().await.len(),
+        1,
+        "never retry after emitting deltas"
+    );
+    let (_, metrics) = get_metrics(app, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "responses_stream_failed_total"), 1);
+    assert_eq!(
+        metric_value(&metrics, "responses_stream_completed_total"),
+        0
+    );
+}

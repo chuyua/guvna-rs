@@ -68,6 +68,27 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
                 None => return false,
             },
         };
+        // JSON output is an opt-in upstream contract. A provider that ignores
+        // response_format and returns ordinary text must not be marked healthy
+        // and committed as a completed JSON result. Check before the shared
+        // dispatcher accepts the provider so normal failover still works.
+        // A max-token truncated output remains incomplete and is not required
+        // to be parseable. Tool calls are separate from requested text output.
+        if choice.get("finish_reason").and_then(Value::as_str) == Some("stop")
+            && let Some(format) = request
+                .pointer("/response_format/type")
+                .and_then(Value::as_str)
+            && matches!(format, "json_object" | "json_schema")
+        {
+            let valid_json = message
+                .get("content")
+                .and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .is_some_and(|parsed| format != "json_object" || parsed.is_object());
+            if !valid_json {
+                return false;
+            }
+        }
         let finished_with_tools =
             choice.get("finish_reason").and_then(Value::as_str) == Some("tool_calls");
         if finished_with_tools != calls.is_some_and(|calls| !calls.is_empty()) {
@@ -326,6 +347,29 @@ mod response_contract_tests {
             &request,
             &json!({"choices":[tool_choice(0),assistant(1)]})
         ));
+    }
+
+    #[test]
+    fn json_output_format_requires_parseable_content_before_provider_success() {
+        let chat = |content: &str, reason: &str| {
+            json!({"choices":[{"index":0,"message":{"role":"assistant","content":content},
+                "finish_reason":reason}]})
+        };
+        for format in ["json_object", "json_schema"] {
+            let request = json!({"response_format":{"type":format}});
+            assert!(validate_chat(&request, &chat(r#"{"ok":true}"#, "stop")));
+            assert!(!validate_chat(&request, &chat("ordinary prose", "stop")));
+            assert!(!validate_chat(&request, &chat("{broken", "stop")));
+            // The original meaning of length is incomplete output, not
+            // a validation failure requiring replay of truncated tokens.
+            assert!(validate_chat(&request, &chat("{", "length")));
+        }
+        let object_mode = json!({"response_format":{"type":"json_object"}});
+        assert!(!validate_chat(&object_mode, &chat("[1,2]", "stop")));
+        assert!(!validate_chat(&object_mode, &chat("null", "stop")));
+        let schema_mode = json!({"response_format":{"type":"json_schema"}});
+        assert!(validate_chat(&schema_mode, &chat("[1,2]", "stop")));
+        assert!(validate_chat(&json!({}), &chat("ordinary prose", "stop")));
     }
 
     #[test]
