@@ -65,6 +65,8 @@ pub struct AutoConfig {
     pub candidates: Vec<AutoCandidate>,
     /// Bound the number of upstream candidates attempted per Auto request.
     pub max_candidates: Option<usize>,
+    /// Opt-in live failure-weighted priority (defaults to V1 deterministic order).
+    pub health_aware: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -330,6 +332,9 @@ impl Config {
             .is_some_and(|limit| !(1..=32).contains(&limit))
         {
             return Err("auto max_candidates must be 1..=32".into());
+        }
+        if self.auto.health_aware && !self.auto.enabled {
+            return Err("auto health_aware requires enabled: true".into());
         }
         if self.auto.enabled {
             if self.auto.candidates.is_empty() || self.auto.candidates.len() > 32 {

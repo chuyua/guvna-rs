@@ -77,6 +77,8 @@ or provider identifiers. No remote management endpoint. Local SQLite telemetry i
 An opt-in Auto V1 selects model candidates using configured priority
 and a bounded encoded-input-length filter. POST /v1/auto or Chat model
 auto delegates to existing failover and circuit logic; Auto is off by default.
+With auto.health_aware: true, in-memory failure hints can temporarily demote
+unhealthy providers without replacing configured priorities or fallback.
 
 Set GUVNA_LOG_EVENTS=1 for sparse local stderr JSON-lines, including
 sampled SSE aggregation successes and failures, without prompt, provider URL,

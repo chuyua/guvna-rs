@@ -103,6 +103,9 @@ fn stream_response(state: ChatStreamState) -> Response {
                     state.owner.pools[state.provider_index].record_success(&state.lease);
                     record_circuit_success(&mut state.circuit_ticket, &state.owner.metrics);
                     Metrics::inc(&state.owner.metrics.upstream_success);
+                    if let Some(health) = &state.owner.auto_health {
+                        health.mark_success(state.provider_index);
+                    }
                     Metrics::inc(&state.owner.metrics.chat_stream_completed);
                     state.terminal_reported = true;
                 }

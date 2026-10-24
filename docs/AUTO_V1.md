@@ -77,3 +77,22 @@ response caching, tokenizer-based context classification, cross-request
 model reliability weighting, or semantic prompt profiling. Existing
 credential quarantine and provider circuit breaking handle known failures.
 Further Auto intelligence should follow deterministic real-world tests.
+
+## Auto V2: optional in-process health-aware ordering
+
+Add health_aware: true under auto to enable a bounded failure-weighted health
+hint. The default is false and leaves the original V1 priority order intact.
+The same config candidates, context budget, max_candidates limit and single
+upstream failover loop still apply.
+
+When enabled, each configured provider uses only a few in-memory atomic
+counters. Three recent transport/provider failures can demote an unhealthy
+provider behind a healthy fallback before max_candidates is applied. HTTP
+429 can also contribute; caller-side 4xx and credential auth errors do not.
+Each successful validated response reduces the penalty. Recovery hysteresis
+requires enough successes to reset demotion, and a 300-second freshness limit
+expires old health penalties without a background timer. No remote scorer,
+prompts, keys, provider labels, extra HTTP calls or request-path SQL reads.
+
+This is deliberately a small V2 foundation, not a learned model capability
+engine or durable per-provider scoring history. Scores reset on restart.

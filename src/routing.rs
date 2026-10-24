@@ -40,6 +40,15 @@ pub fn auto_input_bytes(messages: Option<&Value>) -> usize {
 /// length heuristic, not a black-box performance claim or remote-model ranking.
 /// The returned candidates use the SAME dispatch/failover loop as named chains.
 pub fn resolve_auto(config: &Config, input_bytes: usize) -> Result<Vec<ResolvedStep>, String> {
+    resolve_auto_with_health(config, input_bytes, &[])
+}
+
+/// Scores are fixed-size in-memory hints supplied by the gateway; never SQL queries.
+pub fn resolve_auto_with_health(
+    config: &Config,
+    input_bytes: usize,
+    penalties: &[u8],
+) -> Result<Vec<ResolvedStep>, String> {
     if !config.auto.enabled {
         return Err("auto routing is disabled".into());
     }
@@ -60,7 +69,20 @@ pub fn resolve_auto(config: &Config, input_bytes: usize) -> Result<Vec<ResolvedS
         .collect::<Vec<_>>();
     // Stable tie-break preserves configured order, avoiding non-deterministic
     // model selection on restart or across concurrent requests.
-    ranked.sort_by_key(|(position, candidate)| (candidate.priority, *position));
+    ranked.sort_by_key(|(position, candidate)| {
+        let penalty = if config.auto.health_aware {
+            config
+                .providers
+                .iter()
+                .position(|provider| provider.name == candidate.provider)
+                .and_then(|index| penalties.get(index))
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        (penalty, candidate.priority, *position)
+    });
     ranked.truncate(config.auto.max_candidates.unwrap_or(32));
     ranked
         .into_iter()
@@ -216,6 +238,49 @@ auto:
         let cfg: Config = serde_yaml::from_str(base).unwrap();
         cfg.validate().unwrap();
         assert_eq!(resolve_auto(&cfg, 0).unwrap().len(), 1);
+    }
+    #[test]
+    fn auto_v2_demotes_unhealthy_provider_only_when_explicitly_enabled() {
+        let yaml = r#"
+providers:
+  - name: fast
+    type: openai
+    base_url: https://fast.example
+    key_env: F
+    models: [alpha]
+  - name: backup
+    type: openai
+    base_url: https://backup.example
+    key_env: B
+    models: [beta]
+auto:
+  enabled: true
+  health_aware: true
+  max_candidates: 1
+  candidates:
+    - provider: fast
+      model: alpha
+      priority: 1
+    - provider: backup
+      model: beta
+      priority: 99
+"#;
+        let enabled: Config = serde_yaml::from_str(yaml).unwrap();
+        enabled.validate().unwrap();
+        assert_eq!(resolve_auto(&enabled, 50).unwrap()[0].model, "alpha");
+        assert_eq!(
+            resolve_auto_with_health(&enabled, 50, &[100, 0]).unwrap()[0].model,
+            "beta"
+        );
+
+        let disabled: Config =
+            serde_yaml::from_str(&yaml.replace("health_aware: true", "health_aware: false"))
+                .unwrap();
+        disabled.validate().unwrap();
+        assert_eq!(
+            resolve_auto_with_health(&disabled, 50, &[100, 0]).unwrap()[0].model,
+            "alpha",
+        );
     }
     #[test]
     fn chain_and_namespaced_passthrough() {

@@ -110,5 +110,5 @@ locked database cannot block the gateway. New fixed-cardinality metrics:
 guvna_telemetry_written_total, guvna_telemetry_dropped_total, and
 guvna_telemetry_write_failures_total.
 
-Provider/model history and Auto V2 health scoring are separate unfinished
-features. The telemetry directory is local and limited to the service user.
+Provider/model history and learned Auto scoring remain unfinished; the
+optional bounded in-memory health-aware Auto ranking is separate from SQLite. The telemetry directory is local and limited to the service user.

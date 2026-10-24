@@ -18,6 +18,7 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
+    auto_health::AutoHealth,
     circuit::{Circuit, Ticket},
     config::Config,
     keypool::KeyPool,
@@ -54,6 +55,7 @@ pub struct AppState {
     aggregation_slots: Arc<Semaphore>,
     metrics: Arc<Metrics>,
     telemetry: Option<Telemetry>,
+    auto_health: Option<AutoHealth>,
     model_catalog: Value,
     model_details: HashMap<String, Value>,
 }
@@ -110,6 +112,10 @@ impl AppState {
         let mut data: Vec<_> = model_details.values().cloned().collect();
         data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         let model_catalog = json!({"object":"list","data":data});
+        let auto_health = config
+            .auto
+            .health_aware
+            .then(|| AutoHealth::new(config.providers.len()));
         Ok(Self {
             model_catalog,
             model_details,
@@ -122,6 +128,7 @@ impl AppState {
             aggregation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_AGGREGATIONS)),
             metrics: Arc::new(Metrics::default()),
             telemetry: None,
+            auto_health,
         })
     }
 

@@ -78,6 +78,17 @@ pub(super) async fn dispatch(
     response
 }
 
+fn mark_auto_failure(state: &AppState, provider_index: usize) {
+    if let Some(health) = &state.auto_health {
+        health.mark_failure(provider_index);
+    }
+}
+
+fn mark_auto_success(state: &AppState, provider_index: usize) {
+    if let Some(health) = &state.auto_health {
+        health.mark_success(provider_index);
+    }
+}
 fn walk_expired(deadline: Option<tokio::time::Instant>) -> bool {
     deadline.is_some_and(|until| tokio::time::Instant::now() >= until)
 }
@@ -180,7 +191,12 @@ async fn dispatch_inner(
     // for context size; no remote tokenizer or prompt logging is involved.
     let steps = match if auto_enabled {
         let input_bytes = routing::auto_input_bytes(request.get("messages"));
-        routing::resolve_auto(&state.config, input_bytes)
+        let penalties = state
+            .auto_health
+            .as_ref()
+            .map(|health| health.penalties())
+            .unwrap_or_default();
+        routing::resolve_auto_with_health(&state.config, input_bytes, &penalties)
     } else {
         routing::resolve(&state.config, model)
     } {
@@ -346,6 +362,7 @@ async fn dispatch_inner(
                     Metrics::inc(&state.metrics.upstream_transport_failures);
                     ops_log::warn("transport_failure");
                     record_circuit_failure(&mut circuit_ticket, &state.metrics);
+                    mark_auto_failure(&state, step.provider_index);
                     break;
                 }
             };
@@ -355,6 +372,7 @@ async fn dispatch_inner(
                     Metrics::inc(&state.metrics.upstream_transport_failures);
                     ops_log::warn("transport_failure");
                     record_circuit_failure(&mut circuit_ticket, &state.metrics);
+                    mark_auto_failure(&state, step.provider_index);
                     break;
                 } // key-neutral
             };
@@ -374,6 +392,9 @@ async fn dispatch_inner(
                     retry_after,
                 ) {
                     Metrics::inc(&state.metrics.credential_quarantines);
+                }
+                if outcome == Outcome::RateLimited {
+                    mark_auto_failure(&state, step.provider_index);
                 }
                 continue; // try a different key; each key is attempted once
             }
@@ -397,6 +418,7 @@ async fn dispatch_inner(
                             Metrics::inc(&state.metrics.upstream_invalid_responses);
                             ops_log::warn("stream_preflight_failure");
                             record_circuit_failure(&mut circuit_ticket, &state.metrics);
+                            mark_auto_failure(&state, step.provider_index);
                             break;
                         } // preflight rejected
                     }
@@ -440,6 +462,7 @@ async fn dispatch_inner(
                     {
                         state.pools[step.provider_index].record_success(&lease);
                         record_circuit_success(&mut circuit_ticket, &state.metrics);
+                        mark_auto_success(&state, step.provider_index);
                         Metrics::inc(&state.metrics.upstream_success);
                         if upstream_stream && !streaming {
                             Metrics::inc(&state.metrics.aggregation_completed);
@@ -455,12 +478,16 @@ async fn dispatch_inner(
                             ops_log::warn("upstream_invalid");
                         }
                         record_circuit_failure(&mut circuit_ticket, &state.metrics);
+                        mark_auto_failure(&state, step.provider_index);
                         break;
                     } // next step
                 }
             }
             Metrics::inc(&state.metrics.upstream_http_failures);
             ops_log::warn("provider_http_failure");
+            if outcome == Outcome::ProviderTransient {
+                mark_auto_failure(&state, step.provider_index);
+            }
             if outcome == Outcome::ProviderTransient
                 && let Some(ticket) = &mut circuit_ticket
             {
