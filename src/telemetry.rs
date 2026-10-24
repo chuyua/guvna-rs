@@ -974,6 +974,69 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
     #[test]
+    fn readonly_database_rejects_writes_without_changing_existing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly.sqlite3");
+        let mut writer = open_database(&path).unwrap();
+        write_batch(&mut writer, &[event(100, "p", "m", 200, 1, "success")]).unwrap();
+        drop(writer);
+
+        let mut reader =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert!(write_batch(&mut reader, &[event(101, "p", "m", 503, 1, "provider_5xx")]).is_err());
+        let rows: i64 = reader
+            .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn sqlite_page_limit_rolls_back_whole_batch_without_partial_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full.sqlite3");
+        let mut conn = open_database(&path).unwrap();
+        let pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        let limit = pages + 1;
+        let effective: i64 = conn
+            .query_row(&format!("PRAGMA max_page_count = {limit}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(effective, limit);
+
+        let rows: Vec<_> = (0..256)
+            .map(|index| {
+                event(
+                    7200 + index,
+                    "provider",
+                    &format!("model-{index}"),
+                    503,
+                    1,
+                    "provider_5xx",
+                )
+            })
+            .collect();
+        assert!(
+            write_batch(&mut conn, &rows).is_err(),
+            "page cap must fail atomic batch"
+        );
+        for table in [
+            "request_events",
+            "failure_events",
+            "hourly_stats",
+            "provider_health",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} retained part of a failed transaction");
+        }
+    }
+    #[test]
     fn locked_database_rejects_batch_without_leaking_partial_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.sqlite3");
