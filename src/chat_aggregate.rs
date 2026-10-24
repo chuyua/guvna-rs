@@ -15,8 +15,9 @@ const MAX_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TOTAL_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AGGREGATED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 // Reasoning models may emit one SSE event per reasoning token. Keep this
-// count high enough for long generations while the independent byte budgets
-// below remain the primary memory bound.
+// count high enough for long generations while the 8 MiB input-byte ceiling
+// makes this event limit a secondary defensive bound, not a promised number
+// of accepted frames.
 const MAX_EVENTS: usize = 262_144;
 // A long prompt can leave a reasoning model silent for more than 15 seconds.
 // The separate 10-minute absolute lifetime and shared walk budget still bound

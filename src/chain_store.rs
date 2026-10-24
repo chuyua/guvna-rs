@@ -227,6 +227,15 @@ fn preserve_original(dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|e| format!("writing preserved original {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    File::open(dir)
+        .and_then(|parent| parent.sync_all())
+        .map_err(|e| {
+            format!(
+                "syncing preserved original directory {}: {e}",
+                dir.display()
+            )
+        })?;
     Ok(path)
 }
 

@@ -112,6 +112,11 @@ downstream request is recorded once; failed intermediate provider candidates are
 also retained in failure history and hourly attempt statistics. hourly_stats.request_count
 counts provider attempts and failure_count counts failed outcomes. SSE terminal failure
 adds a failure row without counting the same attempt twice.
+For streaming terminal failures, a separate hourly failure row intentionally
+has request_count=0 and failure_count=1. Therefore, failure_count is an event
+count, **not** an attempt-failure ratio numerator; it may exceed request_count.
+Do not divide hourly failure_count by request_count without reconciling the
+separate terminal stream observations.
 
 A 512-item nonblocking sync queue feeds a single SQLite WAL worker (batches
 up to 64 rows, 250ms collection wait). The SQLite worker attempts to limit its

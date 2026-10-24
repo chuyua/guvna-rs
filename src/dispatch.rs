@@ -525,6 +525,10 @@ async fn dispatch_inner(
             object.insert("model".into(), original);
         }
         let mut tried = HashSet::new();
+        // Several credentials can independently return 429 for one logical
+        // candidate. Rate-limit the keys individually, but count one health
+        // observation rather than demoting Auto from one client request.
+        let mut rate_limit_health_recorded = false;
         while let Some(lease) = state.pools[step.provider_index].acquire(&tried) {
             if walk_expired(walk_deadline) {
                 let mut context = telemetry_context.take();
@@ -616,7 +620,8 @@ async fn dispatch_inner(
                 ) {
                     Metrics::inc(&state.metrics.credential_quarantines);
                 }
-                if outcome == Outcome::RateLimited {
+                if outcome == Outcome::RateLimited && !rate_limit_health_recorded {
+                    rate_limit_health_recorded = true;
                     state.mark_auto_failure(step.provider_index, &step.model);
                 }
                 continue; // try a different key; each key is attempted once
@@ -830,22 +835,14 @@ async fn dispatch_inner(
             }
             Metrics::inc(&state.metrics.upstream_http_failures);
             ops_log::warn("provider_http_failure");
-            if outcome == Outcome::ProviderTransient {
+            if outcome.blame_provider() {
                 if state.pools[step.provider_index].record(&lease, outcome) {
                     Metrics::inc(&state.metrics.credential_quarantines);
                 }
                 state.mark_auto_failure(step.provider_index, &step.model);
             }
-            if outcome == Outcome::ProviderTransient
-                && let Some(ticket) = &mut circuit_ticket
-            {
-                let probe = ticket.is_probe();
-                if ticket.failure() {
-                    Metrics::inc(&state.metrics.circuit_openings);
-                }
-                if probe {
-                    Metrics::inc(&state.metrics.circuit_probe_failures);
-                }
+            if outcome.blame_provider() {
+                record_circuit_failure(&mut circuit_ticket, &state.metrics);
             }
             break; // 4xx or 5xx: next chain step; no uncontrolled retries
         }

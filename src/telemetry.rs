@@ -575,11 +575,9 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
             }
             if let Some(failed) = health_failure(event) {
                 let failed = i64::from(failed);
-                // Per-model observations coexist with the provider-wide
-                // aggregate that restores conservative health on startup.
-                for model in [event.model.as_str(), "*"] {
-                    health.execute(params![event.provider, model, failed, event.ts])?;
-                }
+                // Restore uses per-provider/model candidate rows, never '*'.
+                // Avoid writing redundant provider-wide rows on every event.
+                health.execute(params![event.provider, event.model, failed, event.ts])?;
             }
         }
     }
@@ -601,7 +599,7 @@ fn prune_expired(conn: &mut Connection, now: i64) -> rusqlite::Result<()> {
         params![now - HISTORY_RETENTION_SECS, now.saturating_add(3600)],
     )?;
     tx.execute(
-        "DELETE FROM provider_health WHERE updated_ts < ?1 OR updated_ts > ?2",
+        "DELETE FROM provider_health WHERE model='*' OR updated_ts < ?1 OR updated_ts > ?2",
         params![now - HISTORY_RETENTION_SECS, now.saturating_add(300)],
     )?;
     tx.commit()
@@ -988,10 +986,18 @@ mod tests {
         ).unwrap();
         assert_eq!(hourly, (1, 1, 51, 51));
         let health: (i64, i64, i64) = db.query_row(
-            "SELECT penalty,consecutive_failures,demoted FROM provider_health WHERE provider='provider_A' AND model='*'",
+            "SELECT penalty,consecutive_failures,demoted FROM provider_health WHERE provider='provider_A' AND model='model/alpha'",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
         assert_eq!(health, (35, 1, 0));
+        let redundant: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM provider_health WHERE model='*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(redundant, 0);
     }
 
     #[test]
