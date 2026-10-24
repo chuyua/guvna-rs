@@ -1,4 +1,4 @@
-//! Bounded opt-in provider health hints, no network requests, user data or timers.
+//! Bounded opt-in Auto candidate health hints, no network requests, user data or timers.
 use std::{
     sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -70,7 +70,7 @@ impl AutoHealth {
         }
     }
 
-    /// Restore only the bounded provider summary persisted by SQLite at startup.
+    /// Restore only a bounded provider/model candidate summary from SQLite at startup.
     pub fn restore(
         &self,
         index: usize,

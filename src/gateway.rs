@@ -121,7 +121,7 @@ impl AppState {
         let auto_health = config
             .auto
             .health_aware
-            .then(|| AutoHealth::new(config.providers.len()));
+            .then(|| AutoHealth::new(config.auto.candidates.len()));
         Ok(Self {
             model_catalog,
             model_details,
@@ -141,6 +141,30 @@ impl AppState {
         })
     }
 
+    fn auto_candidate_index(&self, provider_index: usize, model: &str) -> Option<usize> {
+        let provider = self.config.providers.get(provider_index)?;
+        self.config
+            .auto
+            .candidates
+            .iter()
+            .position(|candidate| candidate.provider == provider.name && candidate.model == model)
+    }
+
+    fn mark_auto_failure(&self, provider_index: usize, model: &str) {
+        if let Some(health) = &self.auto_health
+            && let Some(index) = self.auto_candidate_index(provider_index, model)
+        {
+            health.mark_failure(index);
+        }
+    }
+
+    fn mark_auto_success(&self, provider_index: usize, model: &str) {
+        if let Some(health) = &self.auto_health
+            && let Some(index) = self.auto_candidate_index(provider_index, model)
+        {
+            health.mark_success(index);
+        }
+    }
     /// Optional local-only telemetry. Main enables this explicitly; test AppStates stay off.
     pub fn enable_telemetry(&mut self, data_dir: &std::path::Path) -> Result<(), String> {
         let restored = if self.auto_health.is_some() {
@@ -150,9 +174,12 @@ impl AppState {
         };
         let telemetry = Telemetry::start(data_dir, Arc::clone(&self.metrics))?;
         if let Some(health) = &self.auto_health {
-            for (index, provider) in self.config.providers.iter().enumerate() {
-                let provider_label = Telemetry::normalize_label(&provider.name);
-                if let Some(snapshot) = restored.iter().find(|item| item.provider == provider_label)
+            for (index, candidate) in self.config.auto.candidates.iter().enumerate() {
+                let provider_label = Telemetry::normalize_label(&candidate.provider);
+                let model_label = Telemetry::normalize_label(&candidate.model);
+                if let Some(snapshot) = restored
+                    .iter()
+                    .find(|item| item.provider == provider_label && item.model == model_label)
                 {
                     health.restore(
                         index,
@@ -460,6 +487,48 @@ async fn embeddings(State(state): State<Arc<AppState>>, request: Request<Body>) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn auto_model_health_isolated_within_shared_provider() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: shared
+    type: openai
+    base_url: https://shared.example
+    key_env: SHARED
+    models: [unstable, stable]
+auto:
+  enabled: true
+  health_aware: true
+  candidates:
+    - provider: shared
+      model: unstable
+      priority: 1
+    - provider: shared
+      model: stable
+      priority: 2
+"#,
+        )
+        .unwrap();
+        let state = AppState::new(
+            config,
+            HashMap::from([("SHARED".to_owned(), "placeholder".to_owned())]),
+            vec!["local-client".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(state.auto_candidate_index(0, "unstable"), Some(0));
+        assert_eq!(state.auto_candidate_index(0, "stable"), Some(1));
+        assert_eq!(state.auto_candidate_index(0, "other"), None);
+        for _ in 0..3 {
+            state.mark_auto_failure(0, "unstable");
+        }
+        let health = state.auto_health.as_ref().unwrap();
+        assert_eq!(health.penalties(), vec![100, 0]);
+        state.mark_auto_success(0, "stable");
+        assert_eq!(health.penalties(), vec![100, 0]);
+        state.mark_auto_success(0, "unstable");
+        assert_eq!(health.penalties(), vec![80, 0]);
+    }
     #[test]
     fn retry_after_parser_accepts_delta_and_date_with_saturating_bounds() {
         let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
