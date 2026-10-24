@@ -123,3 +123,14 @@ restored at startup only if the last failure is within the 300-second freshness
 window. Failed intermediate candidates are recorded separately from the single
 downstream request row, so fallback failures survive restart without double-counting
 the request. If SQLite is disabled or unreadable, routing falls back to in-memory hints.
+## Issue #129: optional dynamic chain discovery
+
+When auto.enabled: true, auto.discover_from_chains: true can add
+provider/model candidates from validated named chains at gateway startup.
+Explicit auto.candidates remain first, duplicate provider/model pairs are
+removed, the configured default_chain is considered first, and discovery
+never produces more than 32 candidates. Steps with custom params or models
+missing from an explicitly declared provider model catalog are not silently
+coerced into Auto candidates. Missing candidates after discovery
+cause startup to fail safely. This discovery is a startup snapshot, not live
+reconfiguration; it does not enable remote management or a second scheduler.

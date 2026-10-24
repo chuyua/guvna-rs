@@ -106,11 +106,15 @@ impl AppState {
             .is_none_or(|telemetry| telemetry.flush(deadline))
     }
     pub fn new(
-        config: Config,
+        mut config: Config,
         credentials: HashMap<String, String>,
         client_keys: Vec<String>,
     ) -> Result<Self, String> {
         config.validate()?;
+        config.discover_auto_candidates();
+        if config.auto.enabled && config.auto.candidates.is_empty() {
+            return Err("auto discovery produced no eligible provider/model candidates".into());
+        }
         if client_keys.is_empty() || client_keys.iter().any(String::is_empty) {
             return Err("API_KEYS or ADMIN_KEY is required".into());
         }

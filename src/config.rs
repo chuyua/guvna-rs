@@ -67,6 +67,8 @@ pub struct AutoConfig {
     pub max_candidates: Option<usize>,
     /// Opt-in live failure-weighted priority (defaults to V1 deterministic order).
     pub health_aware: bool,
+    /// Opt-in discovery of additional candidates from validated named chains.
+    pub discover_from_chains: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -352,14 +354,16 @@ impl Config {
             return Err("auto health_aware requires enabled: true".into());
         }
         if self.auto.enabled {
-            if self.auto.candidates.is_empty() || self.auto.candidates.len() > 32 {
+            if (self.auto.candidates.is_empty() && !self.auto.discover_from_chains)
+                || self.auto.candidates.len() > 32
+            {
                 return Err("auto enabled requires 1..32 configured candidates".into());
             }
             if self.chains.iter().any(|chain| chain.name == "auto") {
                 return Err("configured chain name auto is reserved when Auto is enabled".into());
             }
-        } else if !self.auto.candidates.is_empty() {
-            return Err("auto candidates require enabled: true".into());
+        } else if !self.auto.candidates.is_empty() || self.auto.discover_from_chains {
+            return Err("auto candidates/discovery require enabled: true".into());
         }
         let mut auto_keys = HashSet::new();
         for candidate in &self.auto.candidates {
@@ -394,6 +398,60 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    /// Materialize a stable bounded snapshot before dispatch, never on the request hot path.
+    /// Explicit candidates take precedence; only parameter-free, catalogue-compatible
+    /// named-chain steps can be discovered without silently dropping step parameters.
+    pub fn discover_auto_candidates(&mut self) {
+        if !self.auto.enabled || !self.auto.discover_from_chains {
+            return;
+        }
+        let mut seen: HashSet<(String, String)> = self
+            .auto
+            .candidates
+            .iter()
+            .map(|c| (c.provider.clone(), c.model.clone()))
+            .collect();
+        let mut chains: Vec<_> = self.chains.iter().collect();
+        chains.sort_by_key(|chain| {
+            if chain.name == self.default_chain {
+                0
+            } else {
+                1
+            }
+        });
+        for chain in chains {
+            for step in &chain.steps {
+                if self.auto.candidates.len() >= 32 {
+                    return;
+                }
+                if !step.params.is_empty() || step.model.is_empty() {
+                    continue;
+                }
+                let Some(provider) = self.providers.iter().find(|p| p.name == step.provider) else {
+                    continue;
+                };
+                if !provider.models.is_empty() && !provider.models.contains(&step.model) {
+                    continue;
+                }
+                if !seen.insert((step.provider.clone(), step.model.clone())) {
+                    continue;
+                }
+                let priority = 100_u16.saturating_add(self.auto.candidates.len() as u16);
+                self.auto.candidates.push(AutoCandidate {
+                    provider: step.provider.clone(),
+                    model: step.model.clone(),
+                    priority,
+                    min_input_bytes: 0,
+                    max_input_bytes: None,
+                    max_context_tokens: None,
+                    supports_tools: None,
+                    supports_images: None,
+                    supports_json_schema: None,
+                });
+            }
+        }
     }
 
     pub(crate) fn validate_chain(&self, chain: &Chain) -> Result<(), String> {
@@ -444,6 +502,68 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_discovery_deduplicates_default_chain_and_skips_parameterized_or_unknown_models() {
+        let config = r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://upstream.example
+    key_env: KEY
+    models: [known, next, explicit]
+chains:
+  - name: other
+    steps:
+      - provider: p
+        model: next
+      - provider: p
+        model: known
+      - provider: p
+        model: unknown
+  - name: primary
+    steps:
+      - provider: p
+        model: known
+      - provider: p
+        model: special
+        params: {temperature: 0.5}
+default_chain: primary
+auto:
+  enabled: true
+  discover_from_chains: true
+  candidates:
+    - provider: p
+      model: explicit
+      priority: 1
+"#;
+        let mut cfg: Config = serde_yaml::from_str(config).unwrap();
+        cfg.validate().unwrap();
+        cfg.discover_auto_candidates();
+        let list: Vec<_> = cfg
+            .auto
+            .candidates
+            .iter()
+            .map(|c| c.model.as_str())
+            .collect();
+        assert_eq!(list, vec!["explicit", "known", "next"]);
+        assert_eq!(cfg.auto.candidates[0].priority, 1);
+        cfg.discover_auto_candidates();
+        assert_eq!(cfg.auto.candidates.len(), 3);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn discovery_requires_explicit_enable_and_missing_routes_fail_at_state_construction() {
+        let disabled: Config = serde_yaml::from_str("auto: {discover_from_chains: true}").unwrap();
+        assert!(disabled.validate().is_err());
+        let allowed_for_runtime: Config =
+            serde_yaml::from_str("auto: {enabled: true, discover_from_chains: true}").unwrap();
+        assert!(allowed_for_runtime.validate().is_ok());
+        let mut cfg = allowed_for_runtime;
+        cfg.discover_auto_candidates();
+        assert!(cfg.auto.candidates.is_empty());
+    }
 
     #[test]
     fn fail_closed_invalid_ports_quarantine_and_duplicate_chain_steps() {
