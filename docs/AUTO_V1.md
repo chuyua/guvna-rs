@@ -215,3 +215,15 @@ headers does not count as a completed first-attempt success; cancelled SSE
 streams are not yet a complete outcome dataset. An old, unmigrated SQLite
 database returns null request_metrics until the telemetry writer migrates
 it. All existing aggregate scoring fields remain compatible.
+
+## Shadow comparison persistence
+
+When both Shadow and SQLite telemetry are enabled, the bounded telemetry
+writer also records one shadow_events row per evaluated request. It stores
+the internal request_id, baseline and suggested provider/model labels,
+availability and top-choice disagreement, with seven-day retention and
+bounded recovery on full disks. The read-only scoring response exposes
+shadow_metrics for comparison coverage and disagreements; the shadow route
+is **never executed** and is not credited with a hypothetical success.
+Operators may correlate shadow_events with request_events by request_id
+offline. Old databases without the new table return null shadow_metrics.

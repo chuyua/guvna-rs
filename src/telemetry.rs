@@ -155,6 +155,15 @@ fn allowed_failure_type(value: &'static str) -> &'static str {
 }
 
 #[derive(Clone, Debug)]
+struct ShadowRecord {
+    baseline_provider: String,
+    baseline_model: String,
+    suggested_provider: Option<String>,
+    suggested_model: Option<String>,
+    disagreed: bool,
+}
+
+#[derive(Clone, Debug)]
 struct Event {
     ts: i64,
     endpoint: &'static str,
@@ -170,6 +179,7 @@ struct Event {
     request_id: Option<String>,
     attempt_index: Option<u16>,
     stream_requested: bool,
+    shadow: Option<ShadowRecord>,
 }
 
 impl Telemetry {
@@ -243,6 +253,51 @@ impl Telemetry {
         self.enqueue_observation("chat", status, elapsed, context, false, metrics);
     }
 
+    /// A bounded asynchronous Shadow observation. Never claim the suggested
+    /// route was executed; actual outcomes are separate request_events rows.
+    pub(crate) fn observe_shadow(
+        &self,
+        request_id: &str,
+        baseline: (&str, &str),
+        suggested: Option<(&str, &str)>,
+        metrics: &Metrics,
+    ) {
+        if request_id.is_empty() {
+            return;
+        }
+        let record = ShadowRecord {
+            baseline_provider: safe_label(baseline.0),
+            baseline_model: safe_label(baseline.1),
+            suggested_provider: suggested.map(|s| safe_label(s.0)),
+            suggested_model: suggested.map(|s| safe_label(s.1)),
+            disagreed: suggested.is_some_and(|s| s != baseline),
+        };
+        let event = Event {
+            ts: now_secs(),
+            endpoint: "chat",
+            provider: "unknown".into(),
+            model: "unknown".into(),
+            status: 0,
+            elapsed_ms: 0,
+            sse_headers: false,
+            failure_type: "success",
+            record_request: false,
+            count_attempt: false,
+            health_observation: false,
+            request_id: Some(request_id.to_owned()),
+            attempt_index: None,
+            stream_requested: false,
+            shadow: Some(record),
+        };
+        if self
+            .sender
+            .try_send(TelemetryMessage::Record(event))
+            .is_err()
+        {
+            Metrics::inc(&metrics.telemetry_dropped);
+        }
+    }
+
     /// Persist a failed intermediate candidate attempt separately from the downstream request row.
     pub fn observe_attempt(
         &self,
@@ -279,6 +334,7 @@ impl Telemetry {
             request_id: context.request_id,
             attempt_index: context.attempt_index,
             stream_requested: context.stream_requested,
+            shadow: None,
         };
         if self
             .sender
@@ -319,6 +375,7 @@ impl Telemetry {
             request_id,
             attempt_index: context.attempt_index,
             stream_requested,
+            shadow: None,
         };
         if self
             .sender
@@ -440,6 +497,17 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
             PRIMARY KEY (provider, model)
         );
         CREATE INDEX IF NOT EXISTS provider_health_updated_ts ON provider_health(updated_ts);
+        CREATE TABLE IF NOT EXISTS shadow_events (
+            ts INTEGER NOT NULL,
+            request_id TEXT NOT NULL,
+            baseline_provider TEXT NOT NULL,
+            baseline_model TEXT NOT NULL,
+            suggested_provider TEXT,
+            suggested_model TEXT,
+            available INTEGER NOT NULL CHECK (available IN (0,1)),
+            disagreed INTEGER NOT NULL CHECK (disagreed IN (0,1))
+        );
+        CREATE INDEX IF NOT EXISTS shadow_events_ts ON shadow_events(ts);
     ",
     )?;
     for table in ["request_events", "failure_events"] {
@@ -530,6 +598,11 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
              total_elapsed_ms=total_elapsed_ms+excluded.total_elapsed_ms,
              max_elapsed_ms=MAX(max_elapsed_ms,excluded.max_elapsed_ms)",
         )?;
+        let mut shadow = tx.prepare_cached(
+            "INSERT INTO shadow_events
+             (ts,request_id,baseline_provider,baseline_model,suggested_provider,suggested_model,available,disagreed)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        )?;
         let mut health = tx.prepare_cached(
             "INSERT INTO provider_health
              (provider,model,penalty,consecutive_failures,demoted,last_failure_ts,last_success_ts,updated_ts)
@@ -560,6 +633,18 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
              updated_ts=?4",
         )?;
         for event in batch {
+            if let Some(observation) = &event.shadow {
+                shadow.execute(params![
+                    event.ts,
+                    event.request_id,
+                    observation.baseline_provider,
+                    observation.baseline_model,
+                    observation.suggested_provider,
+                    observation.suggested_model,
+                    i64::from(observation.suggested_provider.is_some()),
+                    i64::from(observation.disagreed),
+                ])?;
+            }
             if event.record_request {
                 request.execute(params![
                     event.ts,
@@ -652,6 +737,10 @@ fn prune_expired(conn: &mut Connection, now: i64) -> rusqlite::Result<()> {
         params![now - HISTORY_RETENTION_SECS, now.saturating_add(3600)],
     )?;
     tx.execute(
+        "DELETE FROM shadow_events WHERE ts < ?1 OR ts > ?2",
+        params![now - REQUEST_RETENTION_SECS, now.saturating_add(300)],
+    )?;
+    tx.execute(
         "DELETE FROM provider_health WHERE model='*' OR updated_ts < ?1 OR updated_ts > ?2",
         params![now - HISTORY_RETENTION_SECS, now.saturating_add(300)],
     )?;
@@ -676,6 +765,11 @@ fn recover_page_capacity(conn: &mut Connection, now: i64) -> rusqlite::Result<bo
     tx.execute(
         "DELETE FROM failure_events WHERE rowid IN
          (SELECT rowid FROM failure_events ORDER BY ts LIMIT 2048)",
+        [],
+    )?;
+    tx.execute(
+        "DELETE FROM shadow_events WHERE rowid IN
+         (SELECT rowid FROM shadow_events ORDER BY ts LIMIT 2048)",
         [],
     )?;
     tx.commit()?;
@@ -906,7 +1000,83 @@ mod tests {
             request_id: None,
             attempt_index: None,
             stream_requested: false,
+            shadow: None,
         }
+    }
+
+    #[test]
+    fn shadow_records_are_bounded_advisory_only_and_never_count_as_real_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let telemetry = Telemetry::start(dir.path(), Arc::clone(&metrics)).unwrap();
+        telemetry.observe_shadow("trace-a", ("base", "one"), Some(("other", "two")), &metrics);
+        telemetry.observe_shadow("trace-b", ("base", "one"), None, &metrics);
+        assert!(telemetry.flush(Duration::from_secs(3)));
+        let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        let (total, available, disagreed): (i64, i64, i64) = db
+            .query_row(
+                "SELECT COUNT(*),SUM(available),SUM(disagreed) FROM shadow_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((total, available, disagreed), (2, 1, 1));
+        let request_count: i64 = db
+            .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
+            .unwrap();
+        let health_count: i64 = db
+            .query_row("SELECT COUNT(*) FROM provider_health", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((request_count, health_count), (0, 0));
+        let summary = crate::scoring::read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(summary["shadow_metrics"]["evaluations"], 2);
+        assert_eq!(summary["shadow_metrics"]["valid_rankings"], 1);
+        assert_eq!(summary["shadow_metrics"]["top_candidate_disagreements"], 1);
+        assert_eq!(summary["shadow_metrics"]["disagreement_rate"], 1.0);
+        assert_eq!(summary["request_metrics"]["traced_requests"], 0);
+    }
+
+    #[test]
+    fn shadow_trace_links_to_actual_failure_without_inventing_proposal_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let telemetry = Telemetry::start(dir.path(), Arc::clone(&metrics)).unwrap();
+        telemetry.observe_shadow(
+            "trace-joined",
+            ("base", "one"),
+            Some(("other", "two")),
+            &metrics,
+        );
+        let mut context = TelemetryContext::new("base", "one", "provider_5xx");
+        context.set_trace("trace-joined", 1, false);
+        telemetry.submit(
+            "chat",
+            502,
+            Duration::from_millis(12),
+            false,
+            Some(context),
+            &metrics,
+        );
+        assert!(telemetry.flush(Duration::from_secs(3)));
+        let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        let (status, actual, suggestion): (i64, String, String) = db
+            .query_row(
+                "SELECT r.status,r.model,s.suggested_model FROM shadow_events s
+             JOIN request_events r ON s.request_id=r.request_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (status, actual, suggestion),
+            (502, "one".into(), "two".into())
+        );
+        let summary = crate::scoring::read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(summary["shadow_metrics"]["top_candidate_disagreements"], 1);
+        assert_eq!(
+            summary["request_metrics"]["first_attempt_successes_nonstream"],
+            0
+        );
     }
 
     #[test]

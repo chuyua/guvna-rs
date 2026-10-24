@@ -182,6 +182,31 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
     } else {
         None
     };
+    let shadow_metrics = if conn
+        .prepare("SELECT request_id,available,disagreed FROM shadow_events LIMIT 0")
+        .is_ok()
+    {
+        let (total, available, disagreements): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),COALESCE(SUM(available),0),COALESCE(SUM(disagreed),0)
+             FROM shadow_events WHERE ts >= ?1",
+                params![since],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|_| "cannot read shadow comparison summary")?;
+        Some(json!({
+            "evaluations":total,
+            "valid_rankings":available,
+            "unavailable_rankings":total.saturating_sub(available),
+            "top_candidate_disagreements":disagreements,
+            "disagreement_rate":if available > 0 {
+                Some(disagreements as f64 / available as f64)
+            } else {None},
+            "advisory_only":true,
+        }))
+    } else {
+        None
+    };
     Ok(json!({
         "enabled":true,"source":"local_sqlite_read_only",
         "window_hours":hours,
@@ -191,6 +216,7 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
         "candidate_count":candidates.len(),
         "candidates":candidates,
         "request_metrics":request_metrics,
+        "shadow_metrics":shadow_metrics,
          "request_metrics_notes":"Only traced terminal request rows count toward fallback rate; the first-attempt success rate is restricted to nonstream completions, not unverified SSE headers. Old SQLite databases report null until migrated.",
          "notes":"raw success_rate includes all failure classes; observed_success_rate counts only confirmed nonstream successes and attempted upstream provider failures, excluding caller/local/credential errors and unverified stream starts. Qualification requires 20 observed samples. p95 separates nonstream completion from SSE response-header latency, sampled from up to 512 recent downstream rows per candidate; neither is a counterfactual outcome or complete SSE duration.",
     }))
@@ -238,6 +264,7 @@ mod tests {
             .unwrap();
         }
         let result = read_scoring(dir.path(), 1).unwrap();
+        assert!(result["shadow_metrics"].is_null());
         assert_eq!(result["request_metrics"]["traced_requests"], 4);
         assert_eq!(result["request_metrics"]["requests_with_fallback"], 1);
         assert_eq!(result["request_metrics"]["fallback_rate"], 0.25);

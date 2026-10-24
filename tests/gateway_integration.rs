@@ -183,10 +183,24 @@ async fn failed_first_candidate_is_correlated_with_one_terminal_request_and_scor
     let (bad, bad_calls) = start_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
     let (good, good_calls) = start_upstream(StatusCode::OK).await;
     let config: Config = serde_yaml::from_str(&format!(
-        "providers:\n  - name: broken\n    type: openai\n    base_url: {bad}\n    key_env: FIRST\n\
-         - name: healthy\n    type: openai\n    base_url: {good}\n    key_env: SECOND\n\
-         chains:\n  - name: demo\n    steps:\n      - provider: broken\n        model: one\n\
-               - provider: healthy\n        model: two\n"
+        r#"
+providers:
+  - name: broken
+    type: openai
+    base_url: {bad}
+    key_env: FIRST
+  - name: healthy
+    type: openai
+    base_url: {good}
+    key_env: SECOND
+chains:
+  - name: demo
+    steps:
+      - provider: broken
+        model: one
+      - provider: healthy
+        model: two
+"#
     ))
     .unwrap();
     let mut state = AppState::new(

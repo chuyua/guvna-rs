@@ -364,6 +364,7 @@ async fn dispatch_inner(
             let owner = Arc::clone(&state);
             let selector = Arc::clone(decider);
             let baseline = steps.clone();
+            let trace_id = request_id.to_owned();
             tokio::spawn(async move {
                 let choice = selector
                     .rank(
@@ -374,6 +375,26 @@ async fn dispatch_inner(
                         requirements,
                     )
                     .await;
+                if let (Some(telemetry), Some(expected)) = (&owner.telemetry, baseline.first()) {
+                    let expected_provider = &owner.config.providers[expected.provider_index].name;
+                    let suggested =
+                        choice
+                            .as_ref()
+                            .and_then(|ranked| ranked.first())
+                            .and_then(|step| {
+                                owner
+                                    .config
+                                    .providers
+                                    .get(step.provider_index)
+                                    .map(|provider| (provider.name.as_str(), step.model.as_str()))
+                            });
+                    telemetry.observe_shadow(
+                        &trace_id,
+                        (expected_provider, expected.model.as_str()),
+                        suggested,
+                        &owner.metrics,
+                    );
+                }
                 match choice {
                     Some(proposal) => {
                         owner.shadow_total.fetch_add(1, Ordering::Relaxed);
