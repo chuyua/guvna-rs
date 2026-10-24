@@ -4,7 +4,10 @@ use serde_json::Value;
 
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 // Track only tool calls, and cap the cumulative memory retained across frames.
-const MAX_STREAM_TOOL_CALLS: usize = 128;
+// Each of up to 64 choices may contain 32 tool calls. Keep the global cap
+// consistent with both advertised per-choice limits; argument bytes remain
+// bounded independently.
+const MAX_STREAM_TOOL_CALLS: usize = 64 * 32;
 const MAX_STREAM_TOOL_ARGUMENTS: usize = 1024 * 1024;
 const MAX_TOOL_IDENTIFIER_BYTES: usize = 256;
 
@@ -16,6 +19,7 @@ struct StreamToolCall {
     name: Option<String>,
     function_type: bool,
     arguments: String,
+    arguments_seen: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -182,10 +186,14 @@ impl ChatSse {
         if index >= self.expected || (self.finished_mask & (1u64 << index) != 0) {
             return Err(SseError);
         }
-        let delta = choice
-            .get("delta")
-            .and_then(Value::as_object)
-            .ok_or(SseError)?;
+        let empty_delta = serde_json::Map::new();
+        let delta = match choice.get("delta") {
+            Some(Value::Object(delta)) => delta,
+            Some(Value::Null) if choice.get("finish_reason").is_some_and(|v| !v.is_null()) => {
+                &empty_delta
+            }
+            _ => return Err(SseError),
+        };
         if delta.get("role").is_some_and(|role| role != "assistant")
             || delta
                 .get("content")
@@ -219,14 +227,16 @@ impl ChatSse {
             // A truncated/filtered tool stream must never look like a
             // completed function invocation. Legacy function_call deltas
             // are unsupported, so only tool_calls may terminate tool data.
-            if (reason == "tool_calls") != has_tools {
+            if (reason == "tool_calls" && !has_tools) || (reason == "stop" && has_tools) {
                 return Err(SseError);
             }
             match &self.tool_choice {
                 Some(ToolChoice::None) if has_tools => return Err(SseError),
-                Some(ToolChoice::Required) if !has_tools => return Err(SseError),
+                Some(ToolChoice::Required) if !has_tools && reason == "stop" => {
+                    return Err(SseError);
+                }
                 Some(ToolChoice::Named(name))
-                    if !has_tools
+                    if (!has_tools && reason == "stop")
                         || self.tool_calls.iter().any(|tool| {
                             tool.choice == index && tool.name.as_deref() != Some(name.as_str())
                         }) =>
@@ -244,8 +254,10 @@ impl ChatSse {
                         tool.id.is_none()
                             || tool.name.is_none()
                             || !tool.function_type
-                            || !serde_json::from_str::<Value>(&tool.arguments)
-                                .is_ok_and(|value| value.is_object())
+                            || !tool.arguments_seen
+                            || (!tool.arguments.is_empty()
+                                && !serde_json::from_str::<Value>(&tool.arguments)
+                                    .is_ok_and(|value| value.is_object()))
                     })
             {
                 return Err(SseError);
@@ -318,6 +330,7 @@ impl ChatSse {
                     name: None,
                     function_type: false,
                     arguments: String::new(),
+                    arguments_seen: false,
                 });
                 self.tool_calls.len() - 1
             }
@@ -348,6 +361,7 @@ impl ChatSse {
         }
         tool.function_type |= call.get("type").and_then(Value::as_str) == Some("function");
         if let Some(part) = fragment {
+            tool.arguments_seen = true;
             tool.arguments.push_str(part);
             self.tool_argument_bytes += part.len();
         }
@@ -488,18 +502,20 @@ mod tests {
         let tool_delta = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[
             {"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"key\":"}}
         ]},"finish_reason":null}]});
-        for reason in ["length", "content_filter", "function_call"] {
+        for reason in ["length", "content_filter"] {
             let mut parser = ChatSse::new(1).unwrap();
             parser
                 .push(format!("data: {tool_delta}\n\n").as_bytes())
                 .unwrap();
             let finish =
                 serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}]});
+            parser
+                .push(format!("data: {finish}\n\n").as_bytes())
+                .unwrap();
+            parser.push(b"data: [DONE]\n\n").unwrap();
             assert!(
-                parser
-                    .push(format!("data: {finish}\n\n").as_bytes())
-                    .is_err(),
-                "accepted incomplete tool call with finish_reason={reason}"
+                parser.finish().is_ok(),
+                "a truncated tool response is incomplete, not invalid"
             );
         }
         let mut parser = ChatSse::new(1).unwrap();
@@ -521,6 +537,58 @@ mod tests {
                 "rejected valid text finish {reason}"
             );
         }
+    }
+
+    #[test]
+    fn terminal_null_delta_empty_arguments_and_required_length_are_compatible() {
+        let terminal = serde_json::json!({"choices":[{"index":0,
+            "delta":null,"finish_reason":"length"}]});
+        let mut required = ChatSse::new(1)
+            .unwrap()
+            .with_tool_choice(Some(&serde_json::json!("required")));
+        required
+            .push(format!("data: {terminal}\n\n").as_bytes())
+            .unwrap();
+        required.push(b"data: [DONE]\n\n").unwrap();
+        required.finish().unwrap();
+
+        let mut tools = ChatSse::new(1).unwrap();
+        let delta = serde_json::json!({"choices":[{"index":0,
+            "delta":{"tool_calls":[{"index":0,"id":"zero","type":"function",
+                "function":{"name":"no_params","arguments":""}}]},"finish_reason":null}]});
+        tools.push(format!("data: {delta}\n\n").as_bytes()).unwrap();
+        let finish = serde_json::json!({"choices":[{"index":0,
+            "delta":null,"finish_reason":"tool_calls"}]});
+        tools
+            .push(format!("data: {finish}\n\n").as_bytes())
+            .unwrap();
+        tools.push(b"data: [DONE]\n\n").unwrap();
+        tools.finish().unwrap();
+    }
+
+    #[test]
+    fn multi_choice_tool_calls_do_not_hit_an_unadvertised_global_128_cap() {
+        let mut parser = ChatSse::new(5).unwrap();
+        for choice in 0..5u64 {
+            for index in 0..26u64 {
+                let delta = serde_json::json!({"choices":[{"index":choice,
+                    "delta":{"tool_calls":[{"index":index,
+                        "id":format!("call_{choice}_{index}"),"type":"function",
+                        "function":{"name":"run","arguments":"{}"}}]},
+                    "finish_reason":null}]});
+                parser
+                    .push(format!("data: {delta}\n\n").as_bytes())
+                    .unwrap();
+            }
+            let finish = serde_json::json!({"choices":[{"index":choice,
+                "delta":null,"finish_reason":"tool_calls"}]});
+            parser
+                .push(format!("data: {finish}\n\n").as_bytes())
+                .unwrap();
+        }
+        parser.push(b"data: [DONE]\n\n").unwrap();
+        assert_eq!(parser.tool_calls.len(), 130);
+        parser.finish().unwrap();
     }
 
     #[test]

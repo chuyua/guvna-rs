@@ -15,6 +15,11 @@ duplicated routing state machines.
 - Bearer auth, named fallback chains, direct provider-prefixed models. The
   matched prefix is gateway-local and is stripped before forwarding; nested
   upstream namespaces such as `openai/gpt-4o` remain intact.
+- Optional `default_chain: <configured-chain-name>` routes otherwise unknown
+  model names to a configured named chain. Exact chain and provider-prefixed
+  names take precedence; invalid default chains fail startup validation.
+  Without this setting, unknown models return 404. Auto's explicit enable
+  and eligibility rules remain unchanged.
 - Credential rotation, failure-class isolation and generation fencing.
 - One candidate walk shared by Chat and Embeddings.
 - Bounded 8 MiB inbound request bodies and 32 MiB upstream response buffering;
@@ -120,8 +125,9 @@ standard application/json Chat Completion. A caller's stream:true request
 continues using incremental Chat SSE passthrough.
 
 The synthesis is bounded: at most 4 parallel aggregations, 8 MiB of received
-SSE data per attempt, 2 MiB of generated text and tool arguments, a 15-second
-upstream idle limit and a 90-second total attempt deadline. Invalid, truncated
+SSE data per attempt, 2 MiB of generated text and tool arguments, a 60-second
+upstream idle limit and a 10-minute aggregation lifetime (capped sooner by
+the configured total non-streaming walk deadline). Invalid, truncated
 or stalled streams fail closed and use the existing next-chain candidate
 before any downstream JSON response is emitted. Results must pass the same
 upstream Chat contract checks as ordinary JSON Chat completions.
@@ -144,7 +150,7 @@ candidate, whose returned logprobs must also be validated. This is a
 documented capability boundary, not silent data loss.
 
 Aggregation warnings now distinguish invalid SSE framing/content,
-15-second SSE idle timeout, transport interruption and resource ceilings.
+60-second SSE idle timeout, transport interruption and resource ceilings.
 Log keys have constant cardinality, independent sampling and contain no
 prompt, API keys, model names or provider addresses. These diagnostics are
 local stderr lines only; no new management or logging HTTP endpoint is added.
@@ -203,10 +209,11 @@ boundaries and invariants.
 ## SSE-only provider aggregation safety
 
 SSE-only upstream Chat providers can supply ordinary JSON completions via
-the existing bounded Chat stream aggregator. It enforces 15-second idle
+the existing bounded Chat stream aggregator. It enforces 60-second idle
 timeout, a separate 10-minute overall aggregation limit and a 2 MiB combined
 output/metadata budget. Ordinary non-streaming JSON reads still use their
-90-second total deadline. Invalid or incomplete SSE fails over before
+90-second per-attempt upstream body-read deadline. The configurable
+non-streaming walk deadline can end aggregation sooner. Invalid or incomplete SSE fails over before
 returning JSON; no partially synthesized result is returned as success.
 Local opt-in stderr events report fixed aggregation failure categories.
 See docs/QUALITY_GATES.md for real Linux stress checks.

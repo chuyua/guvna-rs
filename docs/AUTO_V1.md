@@ -73,10 +73,13 @@ fixed-cardinality scheme keeps rare aggregation failures visible even when
 successes vastly outnumber them.
 Logs are disabled by default.
 
-Warning kinds: transport_failure, provider_http_failure, upstream_invalid,
+Warning kinds include transport_failure, provider_http_failure, upstream_invalid,
 stream_preflight_failure, provider_circuit_open, rate_limit_exhausted,
-aggregate_capacity and
-aggregation_failed. Informational event: aggregation_completed. All
+aggregate_capacity, aggregation_failed, aggregation_lifetime_timeout,
+upstream_body_timeout and walk_deadline_exhausted. Additional bounded
+aggregation failure categories (such as aggregation_invalid_sse and
+aggregation_idle_timeout) are also emitted. Informational event:
+aggregation_completed. All
 events are local-only and sampled; no per-user or per-provider data is logged.
 
 The pre-existing authenticated /metrics endpoint still works but this

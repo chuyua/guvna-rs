@@ -377,6 +377,12 @@ impl Config {
             }
             self.validate_chain(chain)?;
         }
+        if !self.default_chain.is_empty() && !names.contains(self.default_chain.as_str()) {
+            return Err(format!(
+                "default_chain must reference a configured named chain: {:?}",
+                self.default_chain
+            ));
+        }
         Ok(())
     }
 
@@ -492,5 +498,13 @@ chains:
         )
         .unwrap();
         assert!(config.validate().unwrap_err().contains("forbidden"));
+    }
+
+    #[test]
+    fn default_chain_must_exist_at_startup() {
+        let cfg: Config = serde_yaml::from_str("providers: []\ndefault_chain: missing\n").unwrap();
+        assert!(cfg.validate().unwrap_err().contains("default_chain"));
+        let cfg: Config = serde_yaml::from_str("providers: []\n").unwrap();
+        assert!(cfg.validate().is_ok(), "legacy config remains valid");
     }
 }

@@ -1,7 +1,13 @@
 #[cfg(unix)]
 mod control_socket;
 use guvna::{chain_store, config::Config, gateway};
-use std::{collections::HashMap, env, path::PathBuf};
+use std::{
+    collections::HashMap,
+    env,
+    future::{Future, IntoFuture},
+    path::PathBuf,
+    time::Duration,
+};
 
 #[tokio::main]
 async fn main() {
@@ -215,10 +221,58 @@ async fn run() -> Result<(), String> {
     let _control_server = control_socket::spawn(&data_dir, runtime_state).await?;
     #[cfg(not(unix))]
     let _ = runtime_state;
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| format!("serving: {e}"))?;
+    serve_until_shutdown(listener, app, shutdown_signal(), Duration::from_secs(30)).await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+        } else {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn serve_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    shutdown: impl Future<Output = ()>,
+    drain: Duration,
+) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = rx.await;
+        })
+        .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result.map_err(|e| format!("serving: {e}")),
+        () = shutdown => {
+            eprintln!("guvna-rs shutting down; draining in-flight requests");
+            let _ = tx.send(());
+            match tokio::time::timeout(drain, &mut server).await {
+                Ok(result) => result.map_err(|e| format!("serving during shutdown: {e}")),
+                Err(_) => {
+                    // Dropping the server future bounds stop time even when a
+                    // remote upstream keeps an SSE body open indefinitely.
+                    eprintln!("guvna-rs shutdown drain expired; closing remaining connections");
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 fn local_probe_host(bind: &str) -> Result<&str, String> {
@@ -238,7 +292,110 @@ fn local_probe_host(bind: &str) -> Result<&str, String> {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::local_probe_host;
+    use super::{local_probe_host, serve_until_shutdown};
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::{Notify, oneshot};
+
+    #[tokio::test]
+    async fn graceful_shutdown_drains_started_requests() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let router = axum::Router::new().route(
+            "/slow",
+            axum::routing::get({
+                let entered = entered.clone();
+                let release = release.clone();
+                move || {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        "completed before shutdown"
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            serve_until_shutdown(
+                listener,
+                router,
+                async {
+                    let _ = shutdown_rx.await;
+                },
+                Duration::from_secs(3),
+            )
+            .await
+        });
+        let request = tokio::spawn(async move {
+            reqwest::get(format!("http://{address}/slow"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        shutdown_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        release.notify_one();
+        assert_eq!(request.await.unwrap(), "completed before shutdown");
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_has_hard_deadline_for_stalled_request() {
+        let entered = Arc::new(Notify::new());
+        let router = axum::Router::new().route(
+            "/forever",
+            axum::routing::get({
+                let entered = entered.clone();
+                move || {
+                    let entered = entered.clone();
+                    async move {
+                        entered.notify_one();
+                        std::future::pending::<&'static str>().await
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            serve_until_shutdown(
+                listener,
+                router,
+                async {
+                    let _ = shutdown_rx.await;
+                },
+                Duration::from_millis(100),
+            )
+            .await
+        });
+        let request = tokio::spawn(async move {
+            let _ = reqwest::get(format!("http://{address}/forever")).await;
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("shutdown must not wait on a stuck request")
+            .unwrap()
+            .unwrap();
+        request.abort();
+    }
 
     #[test]
     fn healthcheck_never_probes_an_untrusted_remote_host() {

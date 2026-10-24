@@ -841,7 +841,9 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
                 );
             };
             if call["type"] != "function"
-                || !serde_json::from_str::<Value>(arguments).is_ok_and(|value| value.is_object())
+                || (!arguments.is_empty()
+                    && !serde_json::from_str::<Value>(arguments)
+                        .is_ok_and(|value| value.is_object()))
                 || !seen_ids.insert(id)
             {
                 return error(
@@ -850,7 +852,7 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
                     "Invalid or duplicate function call",
                 );
             }
-            output.push(json!({"type":"function_call","id":id,"call_id":id,"name":name,"arguments":arguments,"status":"completed"}));
+            output.push(json!({"type":"function_call","id":id,"call_id":id,"name":name,"arguments":if arguments.is_empty() {"{}"} else {arguments},"status":"completed"}));
         }
         return (StatusCode::OK, Json(json!({
             "id":chat["id"], "object":"response", "status":"completed", "model":logical_model,
