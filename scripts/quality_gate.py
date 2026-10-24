@@ -1059,15 +1059,17 @@ auto:
         db = sqlite3.connect(db_uri, uri=True, timeout=1)
         try:
             request_rows = db.execute("SELECT COUNT(*) FROM request_events").fetchone()[0]
-            failed_candidates = db.execute(
-                "SELECT COUNT(*) FROM failure_events WHERE provider='down' AND model='down' "
-                "AND status=503 AND failure_type='provider_5xx'").fetchone()[0]
+            failure_breakdown = db.execute(
+                "SELECT status,failure_type,COUNT(*) FROM failure_events "
+                "WHERE provider='down' AND model='down' "
+                "GROUP BY status,failure_type ORDER BY status,failure_type").fetchall()
+            failed_candidates = sum(count for _status, _reason, count in failure_breakdown)
             down_health = db.execute(
                 "SELECT penalty,consecutive_failures,demoted FROM provider_health "
                 "WHERE provider='down' AND model='*'").fetchone()
             down_hourly = db.execute(
-                "SELECT request_count,failure_count FROM hourly_stats "
-                "WHERE provider='down' AND model='down' AND failure_type='provider_5xx'").fetchone()
+                "SELECT SUM(request_count),SUM(failure_count) FROM hourly_stats "
+                "WHERE provider='down' AND model='down'").fetchone()
             journal_mode = db.execute("PRAGMA journal_mode").fetchone()[0].lower()
             max_pages = db.execute("PRAGMA max_page_count").fetchone()[0]
             columns = {row[1].lower() for row in db.execute("PRAGMA table_info(request_events)")}
@@ -1075,7 +1077,10 @@ auto:
             db.close()
         check(request_rows == 64, f"SQLite request rows={request_rows}, expected 64")
         check(failed_candidates == 64,
-              f"fallback provider failures were not retained: {failed_candidates}")
+              f"fallback provider failures were not retained: {failed_candidates} / {failure_breakdown}")
+        check(failure_breakdown == [(200, "invalid_response", 8),
+                                    (503, "provider_5xx", 56)],
+              f"adversarial 503/invalid/truncated fault classes mismatched: {failure_breakdown}")
         check(down_hourly == (64, 64),
               f"hourly supplier attempt/failure totals incorrect: {down_hourly}")
         check(down_health is not None and down_health[0] == 100
@@ -1104,6 +1109,7 @@ auto:
             "telemetry_write_failures": telemetry_write_failures,
             "sqlite_request_rows": request_rows,
             "sqlite_fallback_failure_rows": failed_candidates,
+            "sqlite_failure_breakdown": failure_breakdown,
             "sqlite_down_provider_hourly": {"attempts": down_hourly[0], "failures": down_hourly[1]},
             "sqlite_down_provider_health": {"penalty": down_health[0], "consecutive_failures": down_health[1], "demoted": bool(down_health[2])},
             "sqlite_bytes_with_wal": db_size,
