@@ -100,6 +100,11 @@ impl AppState {
     pub fn record_telemetry_start_failure(&self) {
         Metrics::inc(&self.metrics.telemetry_write_failures);
     }
+    pub fn flush_telemetry(&self, deadline: Duration) -> bool {
+        self.telemetry
+            .as_ref()
+            .is_none_or(|telemetry| telemetry.flush(deadline))
+    }
     pub fn new(
         config: Config,
         credentials: HashMap<String, String>,

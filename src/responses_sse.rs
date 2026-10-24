@@ -771,12 +771,12 @@ mod tests {
                 &mut events,
             )
             .unwrap();
-        translator.feed(b"data: [DONE]\\n\\n", &mut events).unwrap();
+        translator.feed(b"data: [DONE]\n\n", &mut events).unwrap();
         let done: Vec<usize> = events
             .iter()
             .filter_map(|frame| {
                 let text = std::str::from_utf8(frame).ok()?;
-                if !text.starts_with("event: response.output_item.done\\n") {
+                if !text.starts_with("event: response.output_item.done\n") {
                     return None;
                 }
                 let data = text.lines().find_map(|line| line.strip_prefix("data: "))?;

@@ -118,11 +118,17 @@ up to 64 rows, 250ms collection wait). The SQLite worker attempts to limit its
 own main database growth to 32MiB and targets a 1MiB journal. These are
 connection-local settings, not global database or filesystem quotas; external
 writers may exceed them. Use a filesystem quota for a hard storage ceiling.
-Request details are retained for seven days; failure details and hourly aggregates
-for 30 days. Legacy request tables are migrated without discarding existing rows.
+Request details are retained for up to seven days; failure details and hourly
+aggregates for up to 30 days. The worker also prunes on idle timeouts and
+rejects far-future timestamps. At its connection-local page ceiling it first
+prunes expired rows, then may evict a bounded oldest slice to preserve future
+write availability rather than permanently disabling telemetry. Legacy request tables are migrated without discarding existing rows.
 Write failures trigger bounded reconnect backoff and privacy-safe sampled local
 warning events. Optional telemetry startup failures are nonfatal; a full or locked
-database cannot block the gateway. New fixed-cardinality metrics:
+database cannot block the gateway. On graceful SIGTERM the gateway drains
+active requests, then waits up to three seconds for a telemetry queue
+barrier; failures emit `telemetry_shutdown_flush_failed`.
+New fixed-cardinality metrics:
 guvna_telemetry_written_total, guvna_telemetry_dropped_total, and
 guvna_telemetry_write_failures_total.
 

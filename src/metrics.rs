@@ -134,6 +134,7 @@ mod tests {
         assert!(rendered.contains("guvna_telemetry_written_total 0\n"));
         assert!(rendered.contains("guvna_telemetry_dropped_total 0\n"));
         assert!(rendered.contains("guvna_telemetry_write_failures_total 0\n"));
-        assert_eq!(rendered.matches("# TYPE guvna_").count(), 29);
+        assert_eq!(rendered.matches("# TYPE guvna_").count(), 30);
+        assert!(rendered.contains("guvna_aggregation_failures_total 0\n"));
     }
 }

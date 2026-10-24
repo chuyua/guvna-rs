@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -22,7 +22,12 @@ const MAX_LABEL_CHARS: usize = 96;
 
 #[derive(Clone)]
 pub struct Telemetry {
-    sender: SyncSender<Event>,
+    sender: SyncSender<TelemetryMessage>,
+}
+
+enum TelemetryMessage {
+    Record(Event),
+    Flush(SyncSender<bool>),
 }
 
 /// Attached to a downstream response as an internal extension, never serialized to HTTP.
@@ -147,6 +152,28 @@ struct Event {
 }
 
 impl Telemetry {
+    /// A bounded FIFO barrier for the final SQLite batch on graceful shutdown.
+    pub fn flush(&self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        let (ack, receipt) = mpsc::sync_channel(1);
+        let mut message = TelemetryMessage::Flush(ack);
+        loop {
+            match self.sender.try_send(message) {
+                Ok(()) => break,
+                Err(TrySendError::Full(pending)) => {
+                    if started.elapsed() >= timeout {
+                        return false;
+                    }
+                    message = pending;
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
+            }
+        }
+        receipt
+            .recv_timeout(timeout.saturating_sub(started.elapsed()))
+            .unwrap_or(false)
+    }
     pub fn start(data_dir: &Path, metrics: Arc<Metrics>) -> Result<Self, String> {
         let directory = data_dir.join("telemetry");
         if std::fs::symlink_metadata(&directory).is_ok_and(|m| !m.file_type().is_dir()) {
@@ -228,7 +255,11 @@ impl Telemetry {
             count_attempt,
             health_observation: context.is_upstream,
         };
-        if self.sender.try_send(event).is_err() {
+        if self
+            .sender
+            .try_send(TelemetryMessage::Record(event))
+            .is_err()
+        {
             Metrics::inc(&metrics.telemetry_dropped);
         }
     }
@@ -259,7 +290,11 @@ impl Telemetry {
             count_attempt: true,
             health_observation: context.is_upstream,
         };
-        if self.sender.try_send(event).is_err() {
+        if self
+            .sender
+            .try_send(TelemetryMessage::Record(event))
+            .is_err()
+        {
             Metrics::inc(&metrics.telemetry_dropped);
         }
     }
@@ -548,22 +583,46 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
 fn prune_expired(conn: &mut Connection, now: i64) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
     tx.execute(
-        "DELETE FROM request_events WHERE ts < ?1",
-        [now - REQUEST_RETENTION_SECS],
+        "DELETE FROM request_events WHERE ts < ?1 OR ts > ?2",
+        params![now - REQUEST_RETENTION_SECS, now.saturating_add(300)],
     )?;
     tx.execute(
-        "DELETE FROM failure_events WHERE ts < ?1",
-        [now - HISTORY_RETENTION_SECS],
+        "DELETE FROM failure_events WHERE ts < ?1 OR ts > ?2",
+        params![now - HISTORY_RETENTION_SECS, now.saturating_add(300)],
     )?;
     tx.execute(
-        "DELETE FROM hourly_stats WHERE hour_ts < ?1",
-        [now - HISTORY_RETENTION_SECS],
+        "DELETE FROM hourly_stats WHERE hour_ts < ?1 OR hour_ts > ?2",
+        params![now - HISTORY_RETENTION_SECS, now.saturating_add(3600)],
     )?;
     tx.execute(
-        "DELETE FROM provider_health WHERE updated_ts < ?1",
-        [now - HISTORY_RETENTION_SECS],
+        "DELETE FROM provider_health WHERE updated_ts < ?1 OR updated_ts > ?2",
+        params![now - HISTORY_RETENTION_SECS, now.saturating_add(300)],
     )?;
     tx.commit()
+}
+
+/// Prefer availability to losing all future telemetry when the writer
+/// reaches its page ceiling; reclaim only a bounded oldest slice.
+fn recover_page_capacity(conn: &mut Connection, now: i64) -> rusqlite::Result<bool> {
+    prune_expired(conn, now)?;
+    let pages: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let ceiling: i64 = conn.query_row("PRAGMA max_page_count", [], |row| row.get(0))?;
+    if pages.saturating_add(16) < ceiling {
+        return Ok(false);
+    }
+    let tx = conn.transaction()?;
+    let removed = tx.execute(
+        "DELETE FROM request_events WHERE rowid IN
+         (SELECT rowid FROM request_events ORDER BY ts LIMIT 8192)",
+        [],
+    )?;
+    tx.execute(
+        "DELETE FROM failure_events WHERE rowid IN
+         (SELECT rowid FROM failure_events ORDER BY ts LIMIT 2048)",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(removed > 0)
 }
 
 fn now_secs() -> i64 {
@@ -624,7 +683,7 @@ fn drop_batch(batch: &[Event], metrics: &Metrics) {
     Metrics::inc(&metrics.telemetry_write_failures);
 }
 
-fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
+fn worker(receiver: Receiver<TelemetryMessage>, path: PathBuf, metrics: Arc<Metrics>) {
     let mut conn = match open_database(&path) {
         Ok(database) => Some(database),
         Err(_) => {
@@ -642,13 +701,36 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
     }
     let mut batches: usize = 0;
     let mut consecutive_failures: u32 = 0;
-    while let Ok(first) = receiver.recv() {
+    loop {
+        let first = match receiver.recv_timeout(Duration::from_secs(300)) {
+            Ok(TelemetryMessage::Record(event)) => event,
+            Ok(TelemetryMessage::Flush(ack)) => {
+                let _ = ack.send(true);
+                continue;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if conn
+                    .as_mut()
+                    .is_some_and(|db| prune_expired(db, now_secs()).is_err())
+                {
+                    Metrics::inc(&metrics.telemetry_write_failures);
+                    crate::ops_log::warn("telemetry_prune_failed");
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         let mut batch = Vec::with_capacity(BATCH_CAPACITY);
         batch.push(first);
+        let mut flush_ack = None;
         let until = Instant::now() + BATCH_WAIT;
         while batch.len() < BATCH_CAPACITY {
             match receiver.recv_timeout(until.saturating_duration_since(Instant::now())) {
-                Ok(event) => batch.push(event),
+                Ok(TelemetryMessage::Record(event)) => batch.push(event),
+                Ok(TelemetryMessage::Flush(ack)) => {
+                    flush_ack = Some(ack);
+                    break;
+                }
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -657,6 +739,9 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
                 Ok(database) => conn = Some(database),
                 Err(_) => {
                     drop_batch(&batch, &metrics);
+                    if let Some(ack) = flush_ack.take() {
+                        let _ = ack.send(false);
+                    }
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     if consecutive_failures.is_power_of_two() {
                         crate::ops_log::warn("telemetry_open_failed");
@@ -670,9 +755,25 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
             }
         }
         let write_result = write_batch(conn.as_mut().expect("opened above"), &batch);
+        let write_result = match write_result {
+            Err(error)
+                if matches!(&error, rusqlite::Error::SqliteFailure(sqlite, _)
+                    if sqlite.code == rusqlite::ErrorCode::DiskFull)
+                    && conn.as_mut().is_some_and(|db| {
+                        recover_page_capacity(db, now_secs()).unwrap_or(false)
+                    }) =>
+            {
+                crate::ops_log::warn("telemetry_page_capacity_recovered");
+                write_batch(conn.as_mut().expect("connection held"), &batch)
+            }
+            result => result,
+        };
         match write_result {
             Ok(()) => {
                 secure_sidecars(&path);
+                if let Some(ack) = flush_ack.take() {
+                    let _ = ack.send(true);
+                }
                 consecutive_failures = 0;
                 metrics
                     .telemetry_written
@@ -680,6 +781,9 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
             }
             Err(_) => {
                 drop_batch(&batch, &metrics);
+                if let Some(ack) = flush_ack.take() {
+                    let _ = ack.send(false);
+                }
                 if conn
                     .as_mut()
                     .is_some_and(|database| prune_expired(database, now_secs()).is_err())
@@ -743,6 +847,23 @@ mod tests {
             count_attempt: true,
             health_observation: true,
         }
+    }
+
+    #[test]
+    fn flush_barrier_persists_pending_events_before_acknowledging() {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let telemetry = Telemetry::start(dir.path(), Arc::clone(&metrics)).unwrap();
+        for _ in 0..40 {
+            telemetry.submit("chat", 200, Duration::from_millis(1), false, None, &metrics);
+        }
+        assert!(telemetry.flush(Duration::from_secs(3)));
+        let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        let written: i64 = db
+            .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(written, 40);
+        assert_eq!(metrics.telemetry_dropped.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -943,6 +1064,26 @@ mod tests {
         assert!(stale.is_empty());
     }
     #[test]
+    fn future_timestamp_metadata_is_pruned_without_waiting_for_clock_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_database(&dir.path().join("skew.sqlite3")).unwrap();
+        let now = 100 * 24 * 3600;
+        write_batch(
+            &mut conn,
+            &[
+                event(now, "p", "m", 200, 1, "success"),
+                event(now + 7200, "p", "m", 200, 1, "success"),
+            ],
+        )
+        .unwrap();
+        prune_expired(&mut conn, now).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
     fn retention_is_seven_days_for_requests_and_thirty_for_failure_history() {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = open_database(&dir.path().join("test.sqlite3")).unwrap();
@@ -1018,7 +1159,14 @@ mod tests {
         let worker_path = path.clone();
         let handle = thread::spawn(move || worker(receiver, worker_path, worker_metrics));
         sender
-            .try_send(event(123, "provider", "model", 503, 1, "provider_5xx"))
+            .try_send(TelemetryMessage::Record(event(
+                123,
+                "provider",
+                "model",
+                503,
+                1,
+                "provider_5xx",
+            )))
             .unwrap();
         drop(sender);
         handle.join().unwrap();

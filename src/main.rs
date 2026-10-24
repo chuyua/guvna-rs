@@ -6,6 +6,7 @@ use std::{
     env,
     future::{Future, IntoFuture},
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 
@@ -226,10 +227,11 @@ async fn run() -> Result<(), String> {
     );
     let (app, runtime_state) = gateway::app_with_state(state);
     #[cfg(unix)]
-    let _control_server = control_socket::spawn(&data_dir, runtime_state).await?;
-    #[cfg(not(unix))]
-    let _ = runtime_state;
+    let _control_server = control_socket::spawn(&data_dir, Arc::clone(&runtime_state)).await?;
     serve_until_shutdown(listener, app, shutdown_signal(), Duration::from_secs(30)).await?;
+    if !runtime_state.flush_telemetry(Duration::from_secs(3)) {
+        guvna::ops_log::warn("telemetry_shutdown_flush_failed");
+    }
     Ok(())
 }
 
