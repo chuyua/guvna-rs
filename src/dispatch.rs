@@ -250,6 +250,7 @@ async fn dispatch_inner(
     let steps = match if auto_enabled {
         let input_bytes = routing::auto_input_bytes(request.get("messages"));
         let context_estimate = routing::auto_context_estimate(&request);
+        let requirements = routing::auto_requirements(&request);
         let penalties = state
             .auto_health
             .as_ref()
@@ -259,6 +260,7 @@ async fn dispatch_inner(
             &state.config,
             input_bytes,
             context_estimate,
+            requirements,
             &penalties,
             state.auto_generation,
         )

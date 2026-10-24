@@ -12,11 +12,63 @@ const AUTO_CACHE_CAPACITY: usize = 128;
 const AUTO_CACHE_TTL: Duration = Duration::from_secs(30);
 const CONTEXT_SAFETY_MARGIN_PERCENT: usize = 20;
 
+/// Only well-known Chat request features are examined; no text or image bytes are retained.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AutoRequirements {
+    tools: bool,
+    images: bool,
+    json_schema: bool,
+}
+
+pub fn auto_requirements(request: &Value) -> AutoRequirements {
+    let tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+        || request
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message.get("tool_calls").is_some()
+                        || message.get("role").and_then(Value::as_str) == Some("tool")
+                })
+            });
+    let images = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            matches!(
+                                part.get("type").and_then(Value::as_str),
+                                Some("image_url" | "image")
+                            )
+                        })
+                    })
+            })
+        });
+    let json_schema = request
+        .get("response_format")
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        == Some("json_schema");
+    AutoRequirements {
+        tools,
+        images,
+        json_schema,
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CacheKey {
     generation: u64,
     input_bytes: usize,
     context_estimate: usize,
+    requirements: AutoRequirements,
     penalties: Vec<u8>,
 }
 struct CacheEntry {
@@ -47,6 +99,7 @@ impl AutoRouteCache {
         config: &Config,
         input_bytes: usize,
         context_estimate: usize,
+        requirements: AutoRequirements,
         penalties: &[u8],
         generation: u64,
     ) -> Result<Vec<ResolvedStep>, String> {
@@ -54,6 +107,7 @@ impl AutoRouteCache {
             generation,
             input_bytes,
             context_estimate,
+            requirements,
             penalties: if config.auto.health_aware {
                 penalties.to_vec()
             } else {
@@ -79,7 +133,13 @@ impl AutoRouteCache {
             }
         }
 
-        let steps = resolve_auto_with_estimate(config, input_bytes, context_estimate, penalties)?;
+        let steps = resolve_auto_with_requirements(
+            config,
+            input_bytes,
+            context_estimate,
+            requirements,
+            penalties,
+        )?;
         let mut state = self
             .state
             .lock()
@@ -194,6 +254,24 @@ pub fn resolve_auto_with_estimate(
     context_estimate: usize,
     penalties: &[u8],
 ) -> Result<Vec<ResolvedStep>, String> {
+    resolve_auto_with_requirements(
+        config,
+        input_bytes,
+        context_estimate,
+        AutoRequirements::default(),
+        penalties,
+    )
+}
+
+/// Hard-exclude candidates only for capabilities explicitly declared unsupported.
+/// Unknown capability flags remain eligible for backward compatibility.
+pub fn resolve_auto_with_requirements(
+    config: &Config,
+    input_bytes: usize,
+    context_estimate: usize,
+    requirements: AutoRequirements,
+    penalties: &[u8],
+) -> Result<Vec<ResolvedStep>, String> {
     if !config.auto.enabled {
         return Err("auto routing is disabled".into());
     }
@@ -215,6 +293,9 @@ pub fn resolve_auto_with_estimate(
                             .any(|model| model == &candidate.model)
                 });
             model_supported
+                && (!requirements.tools || candidate.supports_tools != Some(false))
+                && (!requirements.images || candidate.supports_images != Some(false))
+                && (!requirements.json_schema || candidate.supports_json_schema != Some(false))
                 && candidate
                     .max_context_tokens
                     .is_none_or(|max| context_estimate <= max)
@@ -446,11 +527,17 @@ auto:
         cfg.validate().unwrap();
         let cache = AutoRouteCache::new();
         assert_eq!(
-            cache.resolve(&cfg, 50, 60, &[0, 0], 7).unwrap()[0].model,
+            cache
+                .resolve(&cfg, 50, 60, AutoRequirements::default(), &[0, 0], 7)
+                .unwrap()[0]
+                .model,
             "alpha"
         );
         assert_eq!(
-            cache.resolve(&cfg, 50, 60, &[100, 0], 7).unwrap()[0].model,
+            cache
+                .resolve(&cfg, 50, 60, AutoRequirements::default(), &[100, 0], 7)
+                .unwrap()[0]
+                .model,
             "beta"
         );
     }
@@ -488,6 +575,79 @@ auto:
         assert_eq!(recovered[0].model, "unhealthy-model");
     }
     #[test]
+    fn explicit_capability_exclusions_are_hard_filters_and_cache_keys_are_distinct() {
+        let cfg: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: shared
+    type: openai
+    base_url: https://shared.example
+    key_env: KEY
+    models: [basic,rich]
+auto:
+  enabled: true
+  max_candidates: 1
+  candidates:
+    - provider: shared
+      model: basic
+      priority: 1
+      supports_tools: false
+      supports_images: false
+      supports_json_schema: false
+    - provider: shared
+      model: rich
+      priority: 2
+      supports_tools: true
+      supports_images: true
+      supports_json_schema: true
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let image_request = serde_json::json!({
+            "messages": [{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,YQ=="}}]}],
+            "tools": [{"type":"function","function":{"name":"search"}}],
+            "response_format": {"type":"json_schema","json_schema":{"name":"result","schema":{"type":"object"}}}
+        });
+        let features = auto_requirements(&image_request);
+        assert_eq!(
+            features,
+            AutoRequirements {
+                tools: true,
+                images: true,
+                json_schema: true
+            }
+        );
+        let cache = AutoRouteCache::new();
+        let fallback = cache.resolve(&cfg, 50, 100, features, &[], 55).unwrap();
+        assert_eq!(fallback[0].model, "rich");
+        // Identical size and health data cannot reuse an incompatible cache entry.
+        let plain = cache
+            .resolve(&cfg, 50, 100, AutoRequirements::default(), &[], 55)
+            .unwrap();
+        assert_eq!(plain[0].model, "basic");
+        let mut single = features;
+        single.images = false;
+        single.json_schema = false;
+        assert_eq!(
+            resolve_auto_with_requirements(&cfg, 50, 100, single, &[]).unwrap()[0].model,
+            "rich"
+        );
+        assert_eq!(cache.state.lock().unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn tool_message_history_requires_tool_support_even_without_tools_declaration() {
+        let request = serde_json::json!({
+            "messages": [{"role":"tool","tool_call_id":"call_123","content":"ready"}]
+        });
+        assert!(auto_requirements(&request).tools);
+        assert!(
+            !auto_requirements(&serde_json::json!({"messages":[{"role":"user","content":"hi"}]}))
+                .tools
+        );
+    }
+    #[test]
     fn auto_route_cache_is_bounded_ttl_limited_and_generation_fenced() {
         let cfg: Config = serde_yaml::from_str(
             r#"
@@ -508,21 +668,27 @@ auto:
         cfg.validate().unwrap();
         let cache = AutoRouteCache::new();
         for size in 0..(AUTO_CACHE_CAPACITY + 8) {
-            cache.resolve(&cfg, size, size, &[], 11).unwrap();
+            cache
+                .resolve(&cfg, size, size, AutoRequirements::default(), &[], 11)
+                .unwrap();
         }
         {
             let state = cache.state.lock().unwrap();
             assert_eq!(state.entries.len(), AUTO_CACHE_CAPACITY);
             assert_eq!(state.generation, Some(11));
         }
-        cache.resolve(&cfg, 1, 1, &[], 12).unwrap();
+        cache
+            .resolve(&cfg, 1, 1, AutoRequirements::default(), &[], 12)
+            .unwrap();
         {
             let mut state = cache.state.lock().unwrap();
             assert_eq!(state.generation, Some(12));
             assert_eq!(state.entries.len(), 1);
             state.entries[0].expires_at = Instant::now() - Duration::from_secs(1);
         }
-        cache.resolve(&cfg, 1, 1, &[], 12).unwrap();
+        cache
+            .resolve(&cfg, 1, 1, AutoRequirements::default(), &[], 12)
+            .unwrap();
         let state = cache.state.lock().unwrap();
         assert_eq!(state.entries.len(), 1);
         assert!(state.entries[0].expires_at > Instant::now());

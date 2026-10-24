@@ -33,6 +33,13 @@ max_completion_tokens/max_tokens (or 1024 tokens by default). This intentionally
 overestimates tokens and includes tool/schema payloads, without a remote tokenizer.
 If provider.models is non-empty, a candidate model must match that catalog exactly;
 an empty catalog means capability is unknown and does not hard-reject candidates.
+A candidate may also declare supports_tools, supports_images, or
+supports_json_schema as false to hard-exclude incompatible Chat requests.
+When omitted, capability is unknown and old configurations remain eligible;
+true is an explicit local assertion, not runtime verification of the model.
+Capability requirements derive only from Chat tool declarations/history, image
+content-part types, and response_format.type=json_schema. The cache key
+includes these capability requirements to prevent cross-request misrouting.
 The process-local cache stores route metadata only (max 128 entries, 30s TTL),
 keys results by request-size estimates and live health scores, and clears on a
 route-config generation change. It never stores prompts or request bodies.

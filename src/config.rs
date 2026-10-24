@@ -80,6 +80,11 @@ pub struct AutoCandidate {
     pub min_input_bytes: usize,
     pub max_input_bytes: Option<usize>,
     pub max_context_tokens: Option<usize>,
+    /// Explicit negative declarations make incompatible requests ineligible.
+    /// None means unknown and preserves legacy routing behavior.
+    pub supports_tools: Option<bool>,
+    pub supports_images: Option<bool>,
+    pub supports_json_schema: Option<bool>,
 }
 
 fn default_auto_priority() -> u16 {
