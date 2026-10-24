@@ -4,30 +4,61 @@ use super::dispatch::Endpoint;
 use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
+#[cfg(test)]
 pub(super) fn valid_result(endpoint: Endpoint, request: &Value, response: &Value) -> bool {
+    valid_result_with_params(endpoint, request, &BTreeMap::new(), response)
+}
+
+pub(super) fn valid_result_with_params(
+    endpoint: Endpoint,
+    request: &Value,
+    params: &BTreeMap<String, Value>,
+    response: &Value,
+) -> bool {
     match endpoint {
-        Endpoint::Chat => validate_chat(request, response),
-        Endpoint::Embeddings => validate_embeddings(request, response),
+        Endpoint::Chat => validate_chat_with_params(request, params, response),
+        Endpoint::Embeddings => validate_embeddings_with_params(request, params, response),
     }
 }
 
+// Request fields win over chain defaults, matching the dispatch payload merge
+// without cloning a potentially large request merely to validate a response.
+fn request_value<'a>(
+    request: &'a Value,
+    params: &'a BTreeMap<String, Value>,
+    name: &str,
+) -> Option<&'a Value> {
+    request.get(name).or_else(|| params.get(name))
+}
+
 // A result is only usable when every choice completed; a partial 2xx is NOT success.
+#[cfg(test)]
 fn validate_chat(request: &Value, response: &Value) -> bool {
+    validate_chat_with_params(request, &BTreeMap::new(), response)
+}
+
+fn validate_chat_with_params(
+    request: &Value,
+    params: &BTreeMap<String, Value>,
+    response: &Value,
+) -> bool {
     let Some(choices) = response.get("choices").and_then(Value::as_array) else {
         return false;
     };
     if choices.is_empty() {
         return false;
     }
-    let expected = request.get("n").and_then(Value::as_u64).unwrap_or(1);
+    let expected = request_value(request, params, "n")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
     if choices.len() as u64 != expected {
         return false;
     }
     let mut indices = HashSet::new();
     let mut tool_call_ids = HashSet::new();
-    let tool_choice = request.get("tool_choice");
+    let tool_choice = request_value(request, params, "tool_choice");
     let required_name = tool_choice
         .and_then(|choice| choice.pointer("/function/name"))
         .and_then(Value::as_str);
@@ -59,7 +90,7 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
         // Logprobs are a requested output, not optional metadata that can
         // disappear silently when the upstream ignores the flag. A native
         // JSON fallback must also honor it before becoming a valid success.
-        if request.get("logprobs") == Some(&Value::Bool(true))
+        if request_value(request, params, "logprobs") == Some(&Value::Bool(true))
             && !choice.get("logprobs").is_some_and(Value::is_object)
         {
             return false;
@@ -78,8 +109,8 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
         // A max-token truncated output remains incomplete and is not required
         // to be parseable. Tool calls are separate from requested text output.
         if choice.get("finish_reason").and_then(Value::as_str) == Some("stop")
-            && let Some(format) = request
-                .pointer("/response_format/type")
+            && let Some(format) = request_value(request, params, "response_format")
+                .and_then(|format| format.pointer("/type"))
                 .and_then(Value::as_str)
             && matches!(format, "json_object" | "json_schema")
         {
@@ -140,8 +171,17 @@ fn validate_chat(request: &Value, response: &Value) -> bool {
 }
 
 // Do not accept duplicate / missing embeddings, mixed dimensions or corrupt vectors.
+#[cfg(test)]
 fn validate_embeddings(request: &Value, response: &Value) -> bool {
-    let expected = match request.get("input") {
+    validate_embeddings_with_params(request, &BTreeMap::new(), response)
+}
+
+fn validate_embeddings_with_params(
+    request: &Value,
+    params: &BTreeMap<String, Value>,
+    response: &Value,
+) -> bool {
+    let expected = match request_value(request, params, "input") {
         Some(Value::String(_)) => 1,
         Some(Value::Array(items)) if !items.is_empty() => items.len(),
         _ => return false,
@@ -152,12 +192,11 @@ fn validate_embeddings(request: &Value, response: &Value) -> bool {
     if data.len() != expected {
         return false;
     }
-    let desired_dim = request
-        .get("dimensions")
+    let desired_dim = request_value(request, params, "dimensions")
         .and_then(Value::as_u64)
         .and_then(|n| usize::try_from(n).ok())
         .filter(|n| *n > 0);
-    let encoding = request.get("encoding_format").and_then(Value::as_str);
+    let encoding = request_value(request, params, "encoding_format").and_then(Value::as_str);
     let mut observed_dimension = None;
     let mut observed_format = None;
     let mut indices = HashSet::new();
@@ -287,6 +326,35 @@ mod response_contract_tests {
         assert!(!validate_chat(&json!({}), &two));
         assert!(!validate_chat(&json!({"n":1}), &two));
         assert!(validate_chat(&json!({"n":2}), &two));
+    }
+
+    #[test]
+    fn validation_reads_chain_defaults_without_cloning_the_request() {
+        let request = json!({"model":"fallback"});
+        let params = BTreeMap::from([
+            ("n".to_owned(), json!(2)),
+            ("tool_choice".to_owned(), json!("required")),
+        ]);
+        let response = json!({"choices":[
+            {"index":0,"message":{"role":"assistant","tool_calls":[
+                {"id":"call-a","type":"function","function":{"name":"lookup","arguments":"{}"}}
+            ]},"finish_reason":"tool_calls"},
+            {"index":1,"message":{"role":"assistant","tool_calls":[
+                {"id":"call-b","type":"function","function":{"name":"lookup","arguments":"{}"}}
+            ]},"finish_reason":"tool_calls"}
+        ]});
+        assert!(valid_result_with_params(
+            Endpoint::Chat,
+            &request,
+            &params,
+            &response
+        ));
+        assert!(!valid_result_with_params(
+            Endpoint::Chat,
+            &json!({"model":"fallback","n":1}),
+            &params,
+            &response,
+        ));
     }
 
     #[test]

@@ -108,7 +108,8 @@ async fn upstream(State(state): State<UpstreamState>, request: Request<Body>) ->
             "choices":[{"index":0,"message":if value["messages"][0]["content"] == "calldup" { json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_dup","type":"function","function":{"name":"lookup","arguments":"{}"}},{"id":"call_dup","type":"function","function":{"name":"lookup","arguments":"{}"}}]}) } else if value["messages"][0]["content"] == "callmixed" { json!({"role":"assistant","content":"I will look that up","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}},{"id":"call_2","type":"function","function":{"name":"lookup","arguments":"{}"}}]}) } else if value["messages"][0]["content"] == "call" || value["messages"][0]["content"] == "callusage" { json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_123","type":"function","function":{"name":"lookup","arguments":json!({"city":"Paris"}).to_string()}}]}) } else { json!({"role":"assistant","content":"success"}) },
             "finish_reason":if value["messages"][0]["content"] == "truncate" { "length" } else if value["messages"][0]["content"] == "call" || value["messages"][0]["content"] == "callusage" || value["messages"][0]["content"] == "callmixed" || value["messages"][0]["content"] == "calldup" { "tool_calls" } else { "stop" }}],
             "usage": if value["messages"][0]["content"] == "usage" || value["messages"][0]["content"] == "callusage" { json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}) } else if value["messages"][0]["content"] == "badusage" { json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":7}) } else { Value::Null },
-            "debug_seed": value["seed"]
+            "debug_seed": value["seed"],
+            "debug_temperature": value["temperature"]
         })),
     )
         .into_response()
@@ -174,6 +175,25 @@ chains:
     .unwrap())
 }
 
+#[tokio::test]
+async fn uncatalogued_prefixed_model_strips_only_the_gateway_namespace_on_wire() {
+    let (upstream_url, calls) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: bridge\n    type: openai\n    base_url: {upstream_url}\n    key_env: BRIDGE\n"
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("BRIDGE".into(), "bridge-secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, result) = call(router, request("bridge/openai/gpt-4o", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["model"], "openai/gpt-4o");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 async fn call(router: Router, request: Request<Body>) -> (StatusCode, Value) {
     let response = router.oneshot(request).await.unwrap();
     let status = response.status();
@@ -211,6 +231,34 @@ async fn failover_skips_bad_provider_and_key_and_preserves_large_integers() {
     );
     assert_eq!(first_calls.load(Ordering::SeqCst), 1);
     assert_eq!(next_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn candidate_payload_overrides_do_not_leak_to_fallback_steps() {
+    let (first, first_calls) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
+    let (second, second_calls) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: first\n    type: openai\n    base_url: {first}\n    key_env: FIRST\n  - name: second\n    type: openai\n    base_url: {second}\n    key_env: SECOND\nchains:\n  - name: fallback\n    steps:\n      - provider: first\n        model: first-model\n        params:\n          temperature: 0.1\n      - provider: second\n        model: second-model\n"
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("FIRST".into(), "first-secret".into()),
+            ("SECOND".into(), "second-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, result) = call(router, request("fallback", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["model"], "second-model");
+    assert!(
+        result["debug_temperature"].is_null(),
+        "first-step defaults leaked: {result}"
+    );
+    assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(second_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -436,12 +484,12 @@ async fn unauthenticated_posts_never_poll_unbounded_request_bodies() {
 }
 
 #[tokio::test]
-async fn stalled_authenticated_uploads_cannot_bypass_global_admission() {
+async fn stalled_authenticated_uploads_cannot_bypass_payload_memory_gate() {
     let (url, calls) = start_upstream(StatusCode::OK).await;
     let router = make_app(&url, &url);
     let polls = Arc::new(AtomicUsize::new(0));
     let mut tasks = Vec::new();
-    for _ in 0..128 {
+    for _ in 0..8 {
         let polls = polls.clone();
         let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
             polls.fetch_add(1, Ordering::SeqCst);
@@ -457,14 +505,14 @@ async fn stalled_authenticated_uploads_cannot_bypass_global_admission() {
         tasks.push(tokio::spawn(async move { router.oneshot(request).await }));
     }
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while polls.load(Ordering::SeqCst) < 128 {
+        while polls.load(Ordering::SeqCst) < 8 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("all stalled uploads must reach body polling");
 
-    // A 129th request must fail before touching its own never-ending body.
+    // A ninth request must fail before touching its own never-ending body.
     for path in ["/v1/chat/completions", "/v1/embeddings", "/v1/responses"] {
         let body =
             Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
@@ -475,7 +523,7 @@ async fn stalled_authenticated_uploads_cannot_bypass_global_admission() {
             .body(body)
             .unwrap();
         let response = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(2),
             router.clone().oneshot(request),
         )
         .await
@@ -498,10 +546,10 @@ async fn stalled_authenticated_uploads_cannot_bypass_global_admission() {
 }
 
 #[tokio::test]
-async fn authorized_posts_still_enforce_the_32_mib_body_limit() {
+async fn authorized_posts_still_enforce_the_8_mib_body_limit() {
     let (url, calls) = start_upstream(StatusCode::OK).await;
     let router = make_app(&url, &url);
-    let too_large = vec![b'x'; 32 * 1024 * 1024 + 1];
+    let too_large = vec![b'x'; 8 * 1024 * 1024 + 1];
     for path in ["/v1/chat/completions", "/v1/embeddings", "/v1/responses"] {
         let request = Request::builder()
             .method("POST")
@@ -949,13 +997,12 @@ async fn oversized_later_sse_chunk_returns_incomplete_without_failover() {
 }
 
 #[tokio::test]
-async fn mixed_endpoint_slow_uploads_share_admission_telemetry_and_recover() {
+async fn mixed_endpoint_slow_uploads_share_payload_admission_telemetry_and_recover() {
     let (url, calls) = start_upstream(StatusCode::OK).await;
     let router = make_app(&url, &url);
-    let mut upload_tasks = Vec::with_capacity(128);
-    // Unlike the homogeneous Chat gate, exercise the same semaphore across
-    // simultaneous Chat, Embeddings and Responses request-body uploads.
-    for index in 0..128 {
+    let mut upload_tasks = Vec::with_capacity(8);
+    // Exercise the payload-memory gate across all three body-reading routes.
+    for index in 0..8 {
         let path = match index % 3 {
             0 => "/v1/chat/completions",
             1 => "/v1/embeddings",
@@ -975,7 +1022,7 @@ async fn mixed_endpoint_slow_uploads_share_admission_telemetry_and_recover() {
     tokio::time::timeout(std::time::Duration::from_secs(4), async {
         loop {
             let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
-            if metric_value(&metrics, "active_requests") == 128 {
+            if metric_value(&metrics, "active_requests") == 8 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -985,7 +1032,7 @@ async fn mixed_endpoint_slow_uploads_share_admission_telemetry_and_recover() {
     .expect("all mixed uploads must reserve admission permits");
     for path in ["/v1/chat/completions", "/v1/embeddings", "/v1/responses"] {
         let response = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(2),
             router.clone().oneshot(
                 Request::builder()
                     .method("POST")
@@ -1006,7 +1053,7 @@ async fn mixed_endpoint_slow_uploads_share_admission_telemetry_and_recover() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
     assert_eq!(metric_value(&metrics, "admission_rejections_total"), 3);
-    assert_eq!(metric_value(&metrics, "active_requests"), 128);
+    assert_eq!(metric_value(&metrics, "active_requests"), 8);
     for task in upload_tasks {
         task.abort();
         let _ = task.await;
@@ -3087,6 +3134,90 @@ async fn serve_progressing_aggregation(
     )
 }
 
+async fn start_idle_gap_aggregation() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let idle_wait_started = Arc::new(AtomicUsize::new(0));
+    let signal = hits.clone();
+    let idle_signal = idle_wait_started.clone();
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let signal = signal.clone();
+            let idle_signal = idle_signal.clone();
+            async move {
+                signal.fetch_add(1, Ordering::SeqCst);
+                let chunks = futures_util::stream::unfold(0u8, move |index| {
+                    let idle_signal = idle_signal.clone();
+                    async move {
+                        match index {
+                            0 => Some((Ok::<_, std::io::Error>(Bytes::from_static(SSE_START)), 1)),
+                            1 => {
+                                // Longer than the historical 15s timeout, shorter
+                                // than the reasoning-aware 60s idle limit.
+                                idle_signal.store(1, Ordering::SeqCst);
+                                tokio::time::sleep(std::time::Duration::from_secs(16)).await;
+                                Some((Ok(Bytes::from_static(SSE_END)), 2))
+                            }
+                            2 => Some((Ok(Bytes::from_static(SSE_DONE)), 3)),
+                            _ => None,
+                        }
+                    }
+                });
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(chunks),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (format!("http://{addr}"), hits, idle_wait_started)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_only_aggregation_tolerates_a_sixteen_second_reasoning_pause() {
+    let (primary, primary_hits, idle_wait_started) = start_idle_gap_aggregation().await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let router = app_with_stream_only_and_auto_walk(&primary, &backup, false, "100s");
+    let metrics_router = router.clone();
+    let task = tokio::spawn(async move { call(router, request("ordered", "", "client")).await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while idle_wait_started.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("upstream must enter the deliberate idle gap before virtual time advances");
+    // Let the client consume the first frame and arm its idle watchdog while
+    // the upstream is already blocked on the next frame.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    for _ in 0..40 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(16)).await;
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+        if task.is_finished() {
+            break;
+        }
+    }
+    tokio::time::resume();
+    let (status, result) = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+        .await
+        .expect("the long-thinking stream must finish within the walk budget")
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["choices"][0]["message"]["content"], "hi");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+    let (_, metrics) = get_metrics(metrics_router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "aggregation_completed_total"), 1);
+    assert_eq!(metric_value(&metrics, "active_requests"), 0);
+}
+
 async fn start_progressing_aggregation(terminal: bool) -> (String, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let router = Router::new()
@@ -3282,6 +3413,60 @@ data: [DONE]
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     assert_eq!(streaming.load(Ordering::SeqCst), 1);
     assert_eq!(backup.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn sse_only_aggregation_accepts_twenty_thousand_reasoning_deltas() {
+    // Reproduce a normal reasoning workload whose event count exceeded the
+    // former 16,384-frame cap, while keeping output and input under byte limits.
+    let mut frames = Vec::with_capacity(22_004);
+    frames.push(
+        br#"data: {"id":"long-reasoning","model":"stream-model","created":45,"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"r"},"finish_reason":null}]}
+
+"#
+        .to_vec(),
+    );
+    for _ in 0..19_999 {
+        frames.push(
+            br#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"r"},"finish_reason":null}]}
+
+"#
+            .to_vec(),
+        );
+    }
+    for _ in 0..2_000 {
+        frames.push(
+            br#"data: {"choices":[{"index":0,"delta":{"content":"c"},"finish_reason":null}]}
+
+"#
+            .to_vec(),
+        );
+    }
+    frames.push(SSE_END.to_vec());
+    frames.push(SSE_DONE.to_vec());
+    let (primary, primary_hits, streaming) = start_strict_stream_only(frames).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let router = app_with_stream_only_and_auto(&primary, &backup, false);
+    let (status, result) = call(router, request("ordered", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(
+        result["choices"][0]["message"]["reasoning_content"]
+            .as_str()
+            .unwrap()
+            .len(),
+        20_000
+    );
+    assert_eq!(
+        result["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .len(),
+        2_000
+    );
+    assert_eq!(result["choices"][0]["finish_reason"], "stop");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(streaming.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

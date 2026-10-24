@@ -13,8 +13,10 @@ production baseline until protocol parity and resource gates pass.
    must be printed with failures.
 3. Real binary `quality_gate.py`: idle startup RSS, idle CPU, two successive
    load waves, post-load idle RSS, HTTP status/error counters, process liveness,
-   file descriptor/thread count. Upstreams are isolated local stubs, no real
-   provider accounts or network requests.
+   file descriptor/thread count, plus eight concurrent 7 MiB JSON request
+   bodies against a separate Release process with an explicit 384 MiB peak-RSS
+   ceiling. Upstreams are isolated local stubs, no real provider accounts or
+   network requests.
 4. Linux CI uses `cargo build --release --locked`, runs hard gates, and
    saves JSON results as an artifact even on failure.
 5. Stress jobs MUST NOT be marked `continue-on-error` and no PR merge on
@@ -32,6 +34,7 @@ production baseline until protocol parity and resource gates pass.
 | Initial startup/health response | >2 s | <=1 s |
 | No-leak steady state | FD or thread growth >8 from post-wave1 to post-wave2 | 0 growth |
 | Healthy throughput test | Any non-200 among 2 waves | 100% successful |
+| Large request payload | Any of 8 concurrent 7 MiB requests fails, or peak RSS >384 MiB | 8/8 successful under the measured memory ceiling |
 | Local test P95 / P99 response time | >2000 ms / >5000 ms | <200 ms / <500 ms |
 | Chaos fallback with failing primary | Any failed request within controlled load | 100% recovered |
 | Open handles/process | After test the child process is terminated | No orphan |
@@ -47,6 +50,15 @@ deterministic quality control. It is NOT a substitute for 1,000+
 concurrent clients, large-body fuzzing, prolonged soak, or live upstream
 compatibility. Those are separate extended/nightly gates and must report
 peak memory, P95/P99, error rate and throughput with the machine size.
+
+Inbound request bodies are capped at 8 MiB, with at most eight requests
+simultaneously holding raw body buffers, parsed JSON trees, and per-candidate
+serialization buffers. Payload-slot wait is capped at one second and an
+authorized body read at 30 seconds, so a slow upload cannot pin a memory slot
+indefinitely. The separate 128-request admission limit remains for long-lived
+streams; payload slots are released when dispatch finishes. The candidate loop
+mutates/restores the small set of overridden fields in the parsed JSON tree
+instead of cloning the entire request for every candidate.
 
 ## Streaming fragmentation and worst-case parser gates
 
@@ -163,13 +175,19 @@ initiate the manual GitHub Release publishing workflow.
 
 ## Long-lived SSE-only JSON aggregation and bounded metadata
 
-SSE-only providers use two independent safety clocks: the existing
-15-second stream-idle watchdog and a separate 10-minute absolute lifetime
+SSE-only providers use two independent safety clocks: a reasoning-aware
+60-second stream-idle watchdog and a separate 10-minute absolute lifetime
 for completing one aggregated Chat response. The ordinary bounded JSON-body
 read and upstream HTTP-header deadline remain 90 seconds. A healthy SSE
 generation with valid progress beyond 90 seconds must not spuriously
 fail over, while a drip-fed infinite heartbeat stream must eventually
 release the aggregation permit and use the next candidate.
+
+The aggregator accepts up to 262,144 SSE events per response so long reasoning
+streams do not hit the former 16,384-event ceiling; independent chunk, total
+stream, output-byte and lifetime limits remain authoritative. A regression
+fixture includes 20,000 reasoning deltas and 2,000 content deltas, plus a
+16-second silent-thinking interval.
 
 Metadata fields including usage details, message identifiers, tool IDs,
 tool names and finish reasons now count toward the shared 2 MiB aggregated

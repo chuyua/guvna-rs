@@ -12,10 +12,13 @@ duplicated routing state machines.
 - Explicit CLI `-config` file selection; no hidden home-directory override.
 - `/healthz`, `/v1/models`, non-streaming
   `/v1/chat/completions`, `/v1/embeddings`.
-- Bearer auth, named fallback chains, direct provider-prefixed models.
+- Bearer auth, named fallback chains, direct provider-prefixed models. The
+  matched prefix is gateway-local and is stripped before forwarding; nested
+  upstream namespaces such as `openai/gpt-4o` remain intact.
 - Credential rotation, failure-class isolation and generation fencing.
 - One candidate walk shared by Chat and Embeddings.
-- Bounded 32 MiB upstream body buffering, no credential-bearing redirects.
+- Bounded 8 MiB inbound request bodies and 32 MiB upstream response buffering;
+  no credential-bearing redirects.
 
 Chat Completions SSE now supports bounded incremental framing, finish-reason
 and [DONE] checks, and fallback before the first valid event. After the first
@@ -52,12 +55,16 @@ Not yet shipped: learned Auto scoring, complete Go protocol parity and full mult
 The current Auto cache stores only route metadata (128 entries, 30s TTL); it does not learn from or retain prompts.
 
 POST /v1/chat/completions, /v1/embeddings and /v1/responses authenticate
-request headers **before** buffering the request body. The existing 32 MiB
+request headers **before** buffering the request body. The 8 MiB
 body limit is enforced for authorized requests, including chunked requests;
 invalid credentials are rejected without consuming a slow or unbounded body.
 Authorized requests acquire a shared admission permit before reading the
 request body, preventing slow uploads from evading the global 128-request
-limit. Permits remain held through dispatch and streamed response delivery.
+limit. A separate eight-slot payload-memory gate bounds concurrent body reads,
+JSON parsing and per-candidate serialization without reducing the number of
+already-started streams. Waiting for a payload slot is capped at one second,
+and authorized body reads at 30 seconds; payload slots release after dispatch,
+while admission permits remain held through streamed response delivery.
 
 ## Basic Auto routing and local diagnostics
 

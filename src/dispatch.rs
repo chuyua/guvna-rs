@@ -171,7 +171,7 @@ async fn dispatch_inner(
     admission: OwnedSemaphorePermit,
     started: tokio::time::Instant,
 ) -> Response {
-    let request: Value = match serde_json::from_slice(&body) {
+    let mut request: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
             return error(
@@ -181,6 +181,9 @@ async fn dispatch_inner(
             );
         }
     };
+    // The parsed Value owns its strings; release the raw body buffer before
+    // routing and candidate serialization to reduce the per-request peak.
+    drop(body);
     if !request.is_object() {
         return error(
             StatusCode::BAD_REQUEST,
@@ -426,22 +429,15 @@ async fn dispatch_inner(
             },
             None => None, // Preserve existing routing behavior by default.
         };
-        let mut payload = request.clone();
-        let object = payload.as_object_mut().expect("checked above");
-        object.insert("model".into(), Value::String(step.model.clone()));
         let upstream_stream =
             streaming || (provider.stream_only && matches!(endpoint, Endpoint::Chat));
-        if upstream_stream && !streaming {
-            object.insert("stream".into(), Value::Bool(true));
-        }
-        for (name, value) in &step.params {
-            object.entry(name).or_insert_with(|| value.clone()); // caller always wins.
-        }
-
         // Chain defaults are applied per candidate. An injected n must drive
         // the SSE parser and SSE-to-JSON aggregator just like a caller n;
         // otherwise valid multi-choice streams are rejected as malformed.
-        let effective_n = payload.get("n").map_or(1, |v| v.as_u64().unwrap_or(0));
+        let effective_n = request
+            .get("n")
+            .or_else(|| step.params.get("n"))
+            .map_or(1, |v| v.as_u64().unwrap_or(0));
         if upstream_stream && ChatSse::new(effective_n).is_err() {
             if let Some(context) = telemetry_context.as_mut() {
                 context.set_failure_type("capability_mismatch");
@@ -450,8 +446,39 @@ async fn dispatch_inner(
             continue;
         }
 
-        // Serialize once per candidate, not once for every credential retry.
-        let payload_json = Bytes::from(payload.to_string());
+        // Apply candidate-only overrides in place, serialize once for this
+        // candidate, then restore the original request before any await. This
+        // avoids cloning a potentially multi-megabyte JSON tree for each step.
+        let object = request.as_object_mut().expect("checked above");
+        let original_model = object.insert("model".into(), Value::String(step.model.clone()));
+        let override_stream = upstream_stream && !streaming;
+        let original_stream = if override_stream {
+            object.insert("stream".into(), Value::Bool(true))
+        } else {
+            None
+        };
+        let mut injected_params = Vec::new();
+        for (name, value) in &step.params {
+            if !object.contains_key(name) {
+                object.insert(name.clone(), value.clone()); // caller always wins.
+                injected_params.push(name.clone());
+            }
+        }
+        let payload_json = Bytes::from(request.to_string());
+        let object = request.as_object_mut().expect("checked above");
+        for name in injected_params {
+            object.remove(&name);
+        }
+        if override_stream {
+            if let Some(original) = original_stream {
+                object.insert("stream".into(), original);
+            } else {
+                object.remove("stream");
+            }
+        }
+        if let Some(original) = original_model {
+            object.insert("model".into(), original);
+        }
         let mut tried = HashSet::new();
         while let Some(lease) = state.pools[step.provider_index].acquire(&tried) {
             if walk_expired(walk_deadline) {
@@ -555,7 +582,11 @@ async fn dispatch_inner(
                         upstream,
                         ChatSse::new(effective_n)
                             .expect("validated candidate stream n")
-                            .with_tool_choice(payload.get("tool_choice")),
+                            .with_tool_choice(
+                                request
+                                    .get("tool_choice")
+                                    .or_else(|| step.params.get("tool_choice")),
+                            ),
                         state.clone(),
                         chat_stream::StreamRoute {
                             provider_index: step.provider_index,
@@ -604,7 +635,9 @@ async fn dispatch_inner(
                             upstream,
                             effective_n,
                             &step.model,
-                            payload.get("tool_choice"),
+                            request
+                                .get("tool_choice")
+                                .or_else(|| step.params.get("tool_choice")),
                         ),
                     )
                     .await;
@@ -637,7 +670,12 @@ async fn dispatch_inner(
                 }
                 match result {
                     Ok(Ok(value))
-                        if response_validation::valid_result(endpoint, &payload, &value) =>
+                        if response_validation::valid_result_with_params(
+                            endpoint,
+                            &request,
+                            &step.params,
+                            &value,
+                        ) =>
                     {
                         state.pools[step.provider_index].record_success(&lease);
                         record_circuit_success(&mut circuit_ticket, &state.metrics);
