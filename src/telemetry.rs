@@ -149,10 +149,8 @@ struct Event {
 impl Telemetry {
     pub fn start(data_dir: &Path, metrics: Arc<Metrics>) -> Result<Self, String> {
         let directory = data_dir.join("telemetry");
-        if let Ok(meta) = std::fs::symlink_metadata(&directory) {
-            if !meta.file_type().is_dir() {
-                return Err("telemetry directory must be a real directory".into());
-            }
+        if std::fs::symlink_metadata(&directory).is_ok_and(|m| !m.file_type().is_dir()) {
+            return Err("telemetry directory must be a real directory".into());
         }
         std::fs::create_dir_all(&directory)
             .map_err(|e| format!("cannot create telemetry data directory: {e}"))?;
@@ -391,12 +389,10 @@ fn secure_sidecars(path: &Path) {
         let mut name = OsString::from(path.as_os_str());
         name.push(suffix);
         let sidecar = PathBuf::from(name);
-        if let Err(error) =
-            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600))
+        if std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600))
+            .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
         {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                crate::ops_log::warn("telemetry_permissions_failed");
-            }
+            crate::ops_log::warn("telemetry_permissions_failed");
         }
     }
 }
@@ -681,10 +677,11 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
             }
             Err(_) => {
                 drop_batch(&batch, &metrics);
-                if let Some(database) = conn.as_mut() {
-                    if prune_expired(database, now_secs()).is_err() {
-                        crate::ops_log::warn("telemetry_prune_failed");
-                    }
+                if conn
+                    .as_mut()
+                    .is_some_and(|database| prune_expired(database, now_secs()).is_err())
+                {
+                    crate::ops_log::warn("telemetry_prune_failed");
                 }
                 conn = None; // Reopen after busy, readonly, full-disk or corruption errors.
                 consecutive_failures = consecutive_failures.saturating_add(1);
