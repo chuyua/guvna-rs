@@ -232,6 +232,8 @@ mod tests {
         use std::collections::HashMap;
 
         let dir = tempfile::tempdir().unwrap();
+        let original_directory_mode =
+            fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
         let config: Config = serde_yaml::from_str(
             "providers:\n  - name: private-provider\n    type: openai\n    base_url: http://127.0.0.1:1\n    key_env: UPSTREAM_SECRET_ENV\n    models: [test-model]\n"
         ).unwrap();
@@ -251,7 +253,10 @@ mod tests {
         let mode = fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let directory_mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
-        assert_eq!(directory_mode, 0o700);
+        assert_eq!(
+            directory_mode, original_directory_mode,
+            "existing user-supplied directory permissions must be preserved"
+        );
 
         let response = query(dir.path()).await.unwrap().unwrap();
         let value: Value = serde_json::from_str(&response).unwrap();

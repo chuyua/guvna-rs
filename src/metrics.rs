@@ -16,6 +16,7 @@ pub struct Metrics {
     pub credential_quarantines: AtomicU64,
     pub candidate_fallbacks: AtomicU64,
     pub aggregation_busy: AtomicU64,
+    pub aggregation_failures: AtomicU64,
     pub rate_limit_exhaustions: AtomicU64,
     pub walk_deadline_exhaustions: AtomicU64,
     pub aggregation_completed: AtomicU64,
@@ -69,6 +70,7 @@ impl Metrics {
         emit!("credential_quarantines_total", self.credential_quarantines);
         emit!("candidate_fallbacks_total", self.candidate_fallbacks);
         emit!("aggregation_busy_total", self.aggregation_busy);
+        emit!("aggregation_failures_total", self.aggregation_failures);
         emit!("rate_limit_exhaustions_total", self.rate_limit_exhaustions);
         emit!(
             "walk_deadline_exhaustions_total",

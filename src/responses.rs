@@ -672,6 +672,12 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
 // Convert one fully buffered Chat Completion into a non-streaming Responses
 // document. This function performs no I/O, routing or retry decisions.
 fn reasoning_text(message: &Value) -> Result<Option<String>, ()> {
+    if let Some(ordered) = message.get("reasoning_ordered") {
+        return Ok(ordered
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned));
+    }
     let reasoning = message.get("reasoning").filter(|value| !value.is_null());
     let reasoning_content = message
         .get("reasoning_content")
@@ -913,6 +919,19 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
 #[cfg(test)]
 mod reasoning_tests {
     use super::*;
+
+    #[test]
+    fn nonstream_reasoning_prefers_arrival_order_and_deduplicates_mirrors() {
+        let ordered = json!({"reasoning":"continues",
+            "reasoning_content":"thinking ",
+            "reasoning_ordered":"thinking continues"});
+        assert_eq!(
+            reasoning_text(&ordered).unwrap(),
+            Some("thinking continues".into())
+        );
+        let mirrored = json!({"reasoning":"I think","reasoning_content":"I think"});
+        assert_eq!(reasoning_text(&mirrored).unwrap(), Some("I think".into()));
+    }
 
     #[tokio::test]
     async fn nonstream_reasoning_fields_are_preserved_in_responses_output() {

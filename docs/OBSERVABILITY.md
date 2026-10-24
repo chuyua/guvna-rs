@@ -36,6 +36,9 @@ Long-running SSE streams retain their permits until completion/cancellation.
 - guvna_upstream_invalid_responses_total: malformed non-streaming 2xx payloads
   or streams that failed initial SSE validation before relay.
 - guvna_aggregation_busy_total: SSE-to-JSON aggregation capacity rejections.
+- guvna_aggregation_failures_total: failed SSE-to-JSON aggregation attempts
+  (idle/lifetime timeout, protocol mismatch, limit or upstream transport).
+  Local aggregator limits do not count as provider breaker failures.
 - guvna_aggregation_completed_total: validated SSE-only upstream responses
   converted into ordinary JSON.
 - guvna_credential_quarantines_total: credential isolation decisions actually

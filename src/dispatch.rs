@@ -665,6 +665,7 @@ async fn dispatch_inner(
                     }
                 }
                 let mut aggregation_transient_failure = false;
+                let mut aggregation_upstream_transport = false;
                 let result = if upstream_stream && !streaming {
                     // JSON-capable providers retain a bounded body read.
                     // SSE-only generations have both a 60s idle limit and a
@@ -699,6 +700,8 @@ async fn dispatch_inner(
                             ) {
                                 aggregation_transient_failure = true;
                             }
+                            aggregation_upstream_transport =
+                                matches!(error, chat_aggregate::AggregateError::UpstreamTransport);
                             ops_log::warn(error.log_event());
                         })
                     })
@@ -706,6 +709,9 @@ async fn dispatch_inner(
                     tokio::time::timeout_at(deadline, bounded_json(upstream)).await
                 };
                 if walk_expired(walk_deadline) {
+                    if upstream_stream && !streaming {
+                        Metrics::inc(&state.metrics.aggregation_failures);
+                    }
                     let mut context = telemetry_context.take();
                     if let Some(context) = context.as_mut() {
                         context.set_failure_type("timeout");
@@ -740,20 +746,23 @@ async fn dispatch_inner(
                     }
                     Err(_) => {
                         if upstream_stream && !streaming {
+                            Metrics::inc(&state.metrics.aggregation_failures);
                             failed_aggregation_routes
                                 .insert((step.provider_index, step.model.clone()));
                             ops_log::warn("aggregation_failed");
                         } else {
                             ops_log::warn("upstream_body_timeout");
                         }
-                        Metrics::inc(&state.metrics.upstream_transport_failures);
-                        if state.pools[step.provider_index]
-                            .record(&lease, Outcome::TransportFailure)
-                        {
-                            Metrics::inc(&state.metrics.credential_quarantines);
+                        if !(upstream_stream && !streaming) {
+                            Metrics::inc(&state.metrics.upstream_transport_failures);
+                            if state.pools[step.provider_index]
+                                .record(&lease, Outcome::TransportFailure)
+                            {
+                                Metrics::inc(&state.metrics.credential_quarantines);
+                            }
+                            record_circuit_failure(&mut circuit_ticket, &state.metrics);
+                            state.mark_auto_failure(step.provider_index, &step.model);
                         }
-                        record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                        state.mark_auto_failure(step.provider_index, &step.model);
                         if let Some(context) = telemetry_context.as_mut() {
                             context.set_failure_type("timeout");
                         }
@@ -761,16 +770,17 @@ async fn dispatch_inner(
                     }
                     _ => {
                         if upstream_stream && !streaming {
+                            Metrics::inc(&state.metrics.aggregation_failures);
                             failed_aggregation_routes
                                 .insert((step.provider_index, step.model.clone()));
-                            if aggregation_transient_failure {
+                            if aggregation_upstream_transport {
                                 Metrics::inc(&state.metrics.upstream_transport_failures);
                                 if state.pools[step.provider_index]
                                     .record(&lease, Outcome::TransportFailure)
                                 {
                                     Metrics::inc(&state.metrics.credential_quarantines);
                                 }
-                            } else {
+                            } else if !aggregation_transient_failure {
                                 Metrics::inc(&state.metrics.upstream_invalid_responses);
                             }
                             ops_log::warn("aggregation_failed");
@@ -778,8 +788,13 @@ async fn dispatch_inner(
                             Metrics::inc(&state.metrics.upstream_invalid_responses);
                             ops_log::warn("upstream_invalid");
                         }
-                        record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                        state.mark_auto_failure(step.provider_index, &step.model);
+                        // Local aggregation policy (idle/lifetime, size or
+                        // incompatible SSE) is not evidence that the model
+                        // service has failed. Avoid cascading breaker opens.
+                        if !(upstream_stream && !streaming) || aggregation_upstream_transport {
+                            record_circuit_failure(&mut circuit_ticket, &state.metrics);
+                            state.mark_auto_failure(step.provider_index, &step.model);
+                        }
                         if let Some(context) = telemetry_context.as_mut() {
                             context.set_failure_type(if aggregation_transient_failure {
                                 "timeout"
