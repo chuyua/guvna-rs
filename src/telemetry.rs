@@ -73,6 +73,12 @@ impl TelemetryContext {
         self.stream_requested = stream;
     }
 
+    pub fn ensure_request_id(&mut self, request_id: &str) {
+        if self.request_id.is_none() {
+            self.request_id = Some(request_id.to_owned());
+        }
+    }
+
     pub fn set_failure_type(&mut self, failure_type: &'static str) {
         self.failure_type = allowed_failure_type(failure_type);
     }
@@ -88,7 +94,7 @@ impl TelemetryContext {
         self.is_upstream = enabled;
     }
 
-    fn local(status: u16, sse_headers: bool) -> Self {
+    pub(crate) fn local(status: u16, sse_headers: bool) -> Self {
         let failure_type = if (200..300).contains(&status) {
             if sse_headers {
                 "stream_started"
@@ -222,21 +228,19 @@ impl Telemetry {
     }
 
     /// Record a terminal stream outcome without duplicating its request row or attempt count.
-    pub fn observe_health(
+    pub fn observe_stream_health(
         &self,
-        endpoint: &'static str,
         provider: &str,
         model: &str,
         failure_type: &'static str,
         elapsed: Duration,
-        request_id: &str,
-        attempt_index: u16,
+        trace: (&str, u16),
         metrics: &Metrics,
     ) {
         let mut context = TelemetryContext::new(provider, model, failure_type);
-        context.set_trace(request_id, attempt_index, true);
+        context.set_trace(trace.0, trace.1, true);
         let status = if failure_type == "success" { 200 } else { 502 };
-        self.enqueue_observation(endpoint, status, elapsed, context, false, metrics);
+        self.enqueue_observation("chat", status, elapsed, context, false, metrics);
     }
 
     /// Persist a failed intermediate candidate attempt separately from the downstream request row.
@@ -293,30 +297,9 @@ impl Telemetry {
         context: Option<TelemetryContext>,
         metrics: &Metrics,
     ) {
-        self.submit_traced(
-            endpoint,
-            status,
-            elapsed,
-            sse_headers,
-            context,
-            None,
-            metrics,
-        );
-    }
-
-    pub fn submit_traced(
-        &self,
-        endpoint: &'static str,
-        status: u16,
-        elapsed: Duration,
-        sse_headers: bool,
-        context: Option<TelemetryContext>,
-        request_id: Option<&str>,
-        metrics: &Metrics,
-    ) {
         let context = context.unwrap_or_else(|| TelemetryContext::local(status, sse_headers));
         let stream_requested = context.stream_requested || sse_headers;
-        let request_id = request_id.map(str::to_owned).or(context.request_id.clone());
+        let request_id = context.request_id.clone();
         let event = Event {
             ts: SystemTime::now()
                 .duration_since(UNIX_EPOCH)

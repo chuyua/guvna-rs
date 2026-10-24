@@ -200,6 +200,59 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
 mod tests {
     use super::*;
     #[test]
+    fn request_rates_use_terminal_rows_and_exclude_unverified_sse_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().join("telemetry");
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = Connection::open(directory.join("requests.sqlite3")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE hourly_stats (
+                hour_ts INTEGER, provider TEXT, model TEXT, request_count INTEGER,
+                failure_count INTEGER, total_elapsed_ms INTEGER,
+                max_elapsed_ms INTEGER, failure_type TEXT
+             );
+             CREATE TABLE request_events (
+                ts INTEGER, provider TEXT, model TEXT, elapsed_ms INTEGER,
+                sse_headers INTEGER, request_id TEXT, attempt_index INTEGER,
+                stream_requested INTEGER, failure_type TEXT
+             );",
+        )
+        .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        // One direct success, one fallback success, one direct failure, and
+        // one SSE header-only start. Only one of three completed nonstreams
+        // succeeded on the first attempt.
+        for (id, attempt, stream, outcome) in [
+            ("a", 1, 0, "success"),
+            ("b", 2, 0, "success"),
+            ("c", 1, 0, "provider_5xx"),
+            ("d", 1, 1, "stream_started"),
+        ] {
+            db.execute(
+                "INSERT INTO request_events VALUES(?1,'p','m',20,?2,?3,?4,?5,?6)",
+                params![now, stream, id, attempt, stream, outcome],
+            )
+            .unwrap();
+        }
+        let result = read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(result["request_metrics"]["traced_requests"], 4);
+        assert_eq!(result["request_metrics"]["requests_with_fallback"], 1);
+        assert_eq!(result["request_metrics"]["fallback_rate"], 0.25);
+        assert_eq!(result["request_metrics"]["first_attempt_nonstream"], 3);
+        assert_eq!(
+            result["request_metrics"]["first_attempt_successes_nonstream"],
+            1
+        );
+        let rate = result["request_metrics"]["first_attempt_success_rate_nonstream"]
+            .as_f64()
+            .unwrap();
+        assert!((rate - 1.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn scoring_is_read_only_bounded_and_respects_sample_gate() {
         let dir = tempfile::tempdir().unwrap();
         let no_db = read_scoring(dir.path(), 1).unwrap();

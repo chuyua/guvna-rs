@@ -90,13 +90,17 @@ pub(super) async fn dispatch(
             Endpoint::Chat => "chat",
             Endpoint::Embeddings => "embeddings",
         };
-        telemetry.submit_traced(
+        let mut context = telemetry_context
+            .unwrap_or_else(|| TelemetryContext::local(response.status().as_u16(), sse_headers));
+        if let Some(request_id) = &request_id {
+            context.ensure_request_id(request_id);
+        }
+        telemetry.submit(
             label,
             response.status().as_u16(),
             started.elapsed(),
             sse_headers,
-            telemetry_context,
-            request_id.as_deref(),
+            Some(context),
             &metrics,
         );
     }

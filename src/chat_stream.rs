@@ -123,16 +123,14 @@ fn stream_response(state: ChatStreamState) -> Response {
 
                     if let Some(telemetry) = &state.owner.telemetry {
                         let provider = &state.owner.config.providers[state.provider_index].name;
-                        telemetry.observe_health(
-                            "chat",
+                        telemetry.observe_stream_health(
                             provider,
                             state
                                 .owner
                                 .telemetry_model_name(state.provider_index, &state.model),
                             "success",
                             state.started_at.elapsed(),
-                            &state.request_id,
-                            state.attempt_index,
+                            (&state.request_id, state.attempt_index),
                             &state.owner.metrics,
                         );
                     }
@@ -176,16 +174,14 @@ fn stream_response(state: ChatStreamState) -> Response {
 
                 if let Some(telemetry) = &state.owner.telemetry {
                     let provider = &state.owner.config.providers[state.provider_index].name;
-                    telemetry.observe_health(
-                        "chat",
+                    telemetry.observe_stream_health(
                         provider,
                         state
                             .owner
                             .telemetry_model_name(state.provider_index, &state.model),
                         "transport_error",
                         state.started_at.elapsed(),
-                        &state.request_id,
-                        state.attempt_index,
+                        (&state.request_id, state.attempt_index),
                         &state.owner.metrics,
                     );
                 }
