@@ -237,8 +237,17 @@ async fn dispatch_inner(
         );
     };
     let expected = request.get("n").map_or(1, |v| v.as_u64().unwrap_or(0));
-    if matches!(endpoint, Endpoint::Chat) && ChatSse::new(expected).is_err() {
-        return error(StatusCode::BAD_REQUEST, "invalid_n", "n must be 1..64");
+    // Reject malformed n for both JSON and SSE requests locally. The 64
+    // choice bound is specific to the streaming parser; a JSON-only provider
+    // may legitimately support larger positive n values.
+    if matches!(endpoint, Endpoint::Chat)
+        && (expected == 0 || (streaming && ChatSse::new(expected).is_err()))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_n",
+            "n must be a positive integer (stream n must be 1..64)",
+        );
     }
     let auto_enabled = model == "auto" && state.config.auto.enabled;
     // Keep byte-range eligibility and context-window budgeting separate.
