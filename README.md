@@ -179,6 +179,23 @@ Verify the binary with sha256sum -c guvna-linux-x86_64.sha256 and check
 binary-info.txt for glibc dependencies before using a Linux host.
 This workflow does not change deployed services or use remote management.
 
+### Optional GitHub Release (manual-only)
+
+On **Actions → Manual Linux x86_64 binary → Run workflow**, select `main`.
+Neither a push nor a tag publishes a GitHub Release automatically.
+
+- Both checkboxes off (default): run all Linux gates and retain the binary,
+  SHA256, binary information and resource report as Actions artifacts only.
+- **Publish a GitHub Release** on, **Stable release** off: after all gates
+  pass, create a uniquely tagged GitHub **pre-release** with those four assets.
+- Both checkboxes on, with `PUBLISH_STABLE` in **Stable confirmation**:
+  release `v<package.version>` as a stable GitHub Release, only if that tag
+  does not already exist. This is an explicit manual choice, never the default.
+
+Every mode uses Ubuntu 24.04 and publishes Linux x86_64 only. A failure in
+tests, Release compilation, binary verification or the resource gate prevents
+publication. The workflow does not deploy or restart the running service.
+
 ## Local runtime chain management (offline)
 
 Manage additional routing chains with the built-in local CLI:
