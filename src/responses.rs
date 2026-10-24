@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 // Strict stateless Responses compatibility adapter; unsupported modes fail closed.
 pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    let (body, permit) = match authenticated_body(&state, request).await {
+    let (body, permit, _payload_permit) = match authenticated_body(&state, request).await {
         Ok(result) => result,
         Err(error) => return error.into_response(),
     };
@@ -31,6 +31,9 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             );
         }
     };
+    // The translated Value owns its data; do not retain the original body
+    // buffer while validating and dispatching the translated request.
+    drop(body);
     let streaming = value.get("stream") == Some(&Value::Bool(true));
 
     if value.get("stream").is_some_and(|v| !v.is_boolean()) {

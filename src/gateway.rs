@@ -42,8 +42,14 @@ mod responses;
 #[path = "responses_format.rs"]
 mod responses_format;
 
+const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_INFLIGHT_REQUESTS: usize = 128;
+// Bound concurrent request-body buffers and JSON trees independently from
+// long-lived SSE responses, which may remain admitted after parsing is done.
+const MAX_INFLIGHT_PAYLOADS: usize = 4;
+const PAYLOAD_SLOT_WAIT: Duration = Duration::from_secs(1);
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_AGGREGATIONS: usize = 4;
 
 pub struct AppState {
@@ -53,6 +59,7 @@ pub struct AppState {
     circuits: Vec<Option<Arc<Circuit>>>,
     client_keys: Vec<String>,
     inflight: Arc<Semaphore>,
+    payload_slots: Arc<Semaphore>,
     aggregation_slots: Arc<Semaphore>,
     metrics: Arc<Metrics>,
     telemetry: Option<Telemetry>,
@@ -131,6 +138,7 @@ impl AppState {
             circuits,
             client_keys,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
+            payload_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_PAYLOADS)),
             aggregation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_AGGREGATIONS)),
             metrics: Arc::new(Metrics::default()),
             telemetry: None,
@@ -286,6 +294,7 @@ enum RequestBodyError {
     Unauthorized,
     Overloaded,
     Invalid(StatusCode),
+    Timeout,
 }
 
 impl RequestBodyError {
@@ -309,6 +318,11 @@ impl RequestBodyError {
                 "invalid_body",
                 "Request body is invalid or exceeds the configured limit",
             ),
+            Self::Timeout => error(
+                StatusCode::REQUEST_TIMEOUT,
+                "request_body_timeout",
+                "Request body was not fully received before the deadline",
+            ),
         }
     }
 }
@@ -316,20 +330,38 @@ impl RequestBodyError {
 async fn authenticated_body(
     state: &Arc<AppState>,
     request: Request<Body>,
-) -> Result<(Bytes, OwnedSemaphorePermit), RequestBodyError> {
+) -> Result<(Bytes, OwnedSemaphorePermit, OwnedSemaphorePermit), RequestBodyError> {
     if !state.allowed(request.headers()) {
         return Err(RequestBodyError::Unauthorized);
     }
-    // Reserve a slot before reading a potentially slow 32 MiB upload. The
-    // permit follows the request through parsing, routing and SSE delivery.
+    // Bound the number of waiting requests before waiting for a payload slot.
     let permit = state.inflight.clone().try_acquire_owned().map_err(|_| {
         Metrics::inc(&state.metrics.admission_rejections);
         RequestBodyError::Overloaded
     })?;
-    let body = Bytes::from_request(request, state)
+    // Reserve bounded payload memory before reading any body bytes. Waiting is
+    // short and bounded; body reads also have a hard deadline so slow uploads
+    // cannot monopolize the memory slots indefinitely.
+    let payload_permit = match tokio::time::timeout(
+        PAYLOAD_SLOT_WAIT,
+        state.payload_slots.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            Metrics::inc(&state.metrics.admission_rejections);
+            return Err(RequestBodyError::Overloaded);
+        }
+    };
+    let body = match tokio::time::timeout(REQUEST_BODY_TIMEOUT, Bytes::from_request(request, state))
         .await
-        .map_err(|rejection| RequestBodyError::Invalid(rejection.status()))?;
-    Ok((body, permit))
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(rejection)) => return Err(RequestBodyError::Invalid(rejection.status())),
+        Err(_) => return Err(RequestBodyError::Timeout),
+    };
+    Ok((body, permit, payload_permit))
 }
 
 // Keep one classification path for all candidate and SSE circuit outcomes.
@@ -370,7 +402,7 @@ pub fn app_with_state(state: AppState) -> (Router, Arc<AppState>) {
         .route("/v1/auto", post(auto))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/responses", post(responses::handle))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(Arc::clone(&state));
     (app, state)
 }
@@ -425,7 +457,7 @@ async fn model_detail(
 }
 
 async fn chat(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    let (body, permit) = match authenticated_body(&state, request).await {
+    let (body, permit, _payload_permit) = match authenticated_body(&state, request).await {
         Ok(result) => result,
         Err(error) => return error.into_response(),
     };
@@ -434,7 +466,7 @@ async fn chat(State(state): State<Arc<AppState>>, request: Request<Body>) -> Res
 /// Optional Auto Chat alias. It rewrites only the logical model name and
 /// then invokes the exact same dispatch loop as ordinary Chat completions.
 async fn auto(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    let (body, permit) = match authenticated_body(&state, request).await {
+    let (body, permit, _payload_permit) = match authenticated_body(&state, request).await {
         Ok(result) => result,
         Err(error) => return error.into_response(),
     };
@@ -476,7 +508,7 @@ async fn auto(State(state): State<Arc<AppState>>, request: Request<Body>) -> Res
 }
 
 async fn embeddings(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    let (body, permit) = match authenticated_body(&state, request).await {
+    let (body, permit, _payload_permit) = match authenticated_body(&state, request).await {
         Ok(result) => result,
         Err(error) => return error.into_response(),
     };
@@ -623,6 +655,129 @@ auto:
         drop(all_permits);
         assert_eq!(state.inflight.available_permits(), MAX_INFLIGHT_REQUESTS);
     }
+
+    #[tokio::test]
+    async fn payload_memory_gate_rejects_before_reading_body_and_releases_slots() {
+        let config: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: http://127.0.0.1:1\n    key_env: KEY\nchains:\n  - name: demo\n    steps:\n      - provider: p\n        model: test\n",
+        )
+        .unwrap();
+        let state = Arc::new(
+            AppState::new(
+                config,
+                HashMap::from([("KEY".to_owned(), "test-only".to_owned())]),
+                vec!["client".to_owned()],
+            )
+            .unwrap(),
+        );
+        let all_payload_slots = state
+            .payload_slots
+            .clone()
+            .try_acquire_many_owned(MAX_INFLIGHT_PAYLOADS as u32)
+            .unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::<Option<Result<Bytes, std::io::Error>>>::Pending
+        }));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer client")
+            .body(body)
+            .unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), authenticated_body(&state, request))
+                .await
+                .expect("payload overload should fail fast");
+        let response = match result {
+            Err(error) => error.into_response(),
+            Ok(_) => panic!("request was admitted without a payload-memory slot"),
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "body was polled before memory admission"
+        );
+        assert_eq!(
+            state.metrics.admission_rejections.load(Ordering::Relaxed),
+            1
+        );
+
+        drop(all_payload_slots);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer client")
+            .body(Body::from("{}"))
+            .unwrap();
+        let admitted = authenticated_body(&state, request)
+            .await
+            .expect("payload slot should recover after release");
+        drop(admitted);
+        assert_eq!(
+            state.payload_slots.available_permits(),
+            MAX_INFLIGHT_PAYLOADS
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_authorized_body_times_out_and_releases_both_permits() {
+        let config: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: http://127.0.0.1:1\n    key_env: KEY\nchains:\n  - name: demo\n    steps:\n      - provider: p\n        model: test\n",
+        )
+        .unwrap();
+        let state = Arc::new(
+            AppState::new(
+                config,
+                HashMap::from([("KEY".to_owned(), "test-only".to_owned())]),
+                vec!["client".to_owned()],
+            )
+            .unwrap(),
+        );
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::<Option<Result<Bytes, std::io::Error>>>::Pending
+        }));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer client")
+            .body(body)
+            .unwrap();
+        let state_for_task = Arc::clone(&state);
+        let task = tokio::spawn(async move { authenticated_body(&state_for_task, request).await });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if polls.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+        }
+        assert!(
+            polls.load(Ordering::SeqCst) > 0,
+            "body should be polled after admission"
+        );
+        tokio::time::advance(REQUEST_BODY_TIMEOUT).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if task.is_finished() {
+                break;
+            }
+        }
+        let result = task.await.unwrap();
+        assert!(matches!(result, Err(RequestBodyError::Timeout)));
+        assert_eq!(state.inflight.available_permits(), MAX_INFLIGHT_REQUESTS);
+        assert_eq!(
+            state.payload_slots.available_permits(),
+            MAX_INFLIGHT_PAYLOADS
+        );
+    }
+
     #[test]
     fn protects_credentials() {
         assert!(constant_time_equal(b"a", b"a"));

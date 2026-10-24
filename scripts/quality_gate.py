@@ -33,6 +33,7 @@ class Stub(ThreadingHTTPServer):
         self.lock = threading.Lock()
         self.calls = 0
         self.streaming_seen = 0
+        self.response_delay = 0.0
         self.faults = {"503": 0, "invalid_200": 0, "truncated_200": 0}
         self.structured = []
         super().__init__(("127.0.0.1", 0), StubHandler)
@@ -62,6 +63,8 @@ class StubHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if self.server.response_delay:
+            time.sleep(self.server.response_delay)
         requested_format = query.get("response_format")
         json_mode = isinstance(requested_format, dict) and (
             requested_format.get("type") in ("json_object", "json_schema"))
@@ -1234,6 +1237,94 @@ def verify_structured_output_on_release(endpoint: str, healthy_stub: Stub) -> di
             "json_number_preserved": True, "stream_fail_closed": True}
 
 
+def verify_release_large_payload_memory(binary: str, root: str, env: dict) -> dict:
+    """Exercise the real release binary with eight concurrent near-limit JSON bodies.
+
+    Keep this in a separate process from the normal 48 MiB RSS wave so the
+    large-payload peak has its own explicit, measured budget.
+    """
+    upstream = Stub("healthy")
+    upstream.response_delay = 0.5
+    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    thread.start()
+    gateway_port = port()
+    config = Path(root) / "large-payload-memory.yaml"
+    config.write_text(f"""port: {gateway_port}
+providers:
+  - name: live
+    type: openai
+    base_url: http://127.0.0.1:{upstream.server_address[1]}
+    key_env: LIVE_KEY
+chains:
+  - name: healthy
+    steps:
+      - provider: live
+        model: fast
+""", encoding="utf-8")
+    data = Path(root) / "large-payload-memory-data"
+    data.mkdir()
+    gateway_env = dict(env, API_KEYS="only-for-local-test", LIVE_KEY="fake-live-key",
+                       GUVNA_BIND_ADDR="127.0.0.1")
+    proc = subprocess.Popen(
+        [str(Path(binary).resolve()), "serve", "-config", str(config), "-data", str(data)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=gateway_env)
+    try:
+        health = f"http://127.0.0.1:{gateway_port}/healthz"
+        started = time.monotonic()
+        while time.monotonic() - started < 3:
+            check(proc.poll() is None, "large-payload gateway terminated at startup")
+            if get_status(health, timeout=0.1) == 200:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("large-payload gateway startup timeout")
+
+        content = "x" * (7 * 1024 * 1024)
+        payload = json.dumps({"model": "healthy", "messages": [
+            {"role": "user", "content": content}], "max_tokens": 8},
+            separators=(",", ":")).encode("utf-8")
+        check(len(payload) < 8 * 1024 * 1024,
+              f"test payload must fit under the 8 MiB request cap: {len(payload)}")
+        endpoint = f"http://127.0.0.1:{gateway_port}/v1/chat/completions"
+
+        def submit() -> int:
+            request = Request(endpoint, data=payload, method="POST", headers={
+                "Authorization": "Bearer only-for-local-test",
+                "Content-Type": "application/json",
+            })
+            with urlopen(request, timeout=30) as response:
+                result = json.loads(response.read())
+                check(result.get("choices", [{}])[0].get("finish_reason") == "stop",
+                      "large-payload response was malformed")
+                return response.status
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            statuses = [future.result(timeout=45) for future in
+                        [pool.submit(submit) for _ in range(8)]]
+        check(statuses == [200] * 8,
+              f"large-payload requests failed or were unexpectedly rejected: {statuses}")
+        check(upstream.calls == 8,
+              f"large-payload upstream attempts {upstream.calls} != 8")
+        usage = proc_info(proc.pid)
+        check(usage["VmHWM"] <= 384 * 1024,
+              f"eight concurrent 7 MiB requests exceeded 384 MiB peak RSS: {usage['VmHWM'] / 1024:.1f} MiB")
+        check(usage["fd"] <= 32, "large-payload gate leaked file descriptors")
+        check(usage["Threads"] <= 32, "large-payload gate leaked threads")
+        return {"passed": True, "payload_bytes": len(payload), "concurrent_requests": 8,
+                "successes": statuses.count(200), "peak_rss_mib": round(usage["VmHWM"] / 1024, 2),
+                "rss_after_kib": usage["VmRSS"], "fds": usage["fd"],
+                "threads": usage["Threads"]}
+    finally:
+        proc.terminate()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate(timeout=5)
+        upstream.shutdown()
+        upstream.server_close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", required=True)
@@ -1363,6 +1454,8 @@ chains:
                     a.binary, cfg, directory, env, mock1, mock2)
                 summary["structured_output_gate"] = verify_structured_output_on_release(
                     response_endpoint, mock2)
+                summary["large_payload_memory_gate"] = verify_release_large_payload_memory(
+                    a.binary, directory, env)
                 summary["post_structured_idle"] = idle(proc.pid, a.idle_seconds)
                 check(summary["post_structured_idle"]["rss_kib_max"] <=
                       a.max_idle_rss_mib * 1024, "structured output idle RSS exceeded")

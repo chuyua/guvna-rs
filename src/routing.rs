@@ -366,12 +366,11 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
             if suffix.is_empty() {
                 return Err("empty passthrough model".into());
             }
-            // Preserve nested model names unless the provider explicitly catalogues the suffix.
-            let wire_model = if provider.models.iter().any(|model| model == suffix) {
-                suffix.to_owned()
-            } else {
-                logical_model.to_owned()
-            };
+            // The matched prefix is a gateway-local namespace, not part of the
+            // upstream model name. Strip exactly one prefix while preserving
+            // nested upstream namespaces (e.g. alias/openai/gpt-4o -> openai/gpt-4o).
+            // Explicit chain steps remain untouched and can still name the exact wire model.
+            let wire_model = suffix.to_owned();
             return Ok(vec![ResolvedStep {
                 provider_index: i,
                 model: wire_model,
@@ -776,6 +775,7 @@ providers:
     type: openai
     base_url: https://bridge.example
     key_env: B
+    models: [gpt-something, openai/gpt-4o]
     prefixes: [openai, bridge]
 chains:
   - name: mychain
@@ -790,7 +790,15 @@ chains:
         assert_eq!(resolve(&cfg, "fast/model1").unwrap()[0].model, "model1");
         assert_eq!(
             resolve(&cfg, "openai/gpt-something").unwrap()[0].model,
-            "openai/gpt-something"
+            "gpt-something"
+        );
+        assert_eq!(
+            resolve(&cfg, "openai/gpt-uncatalogued").unwrap()[0].model,
+            "gpt-uncatalogued"
+        );
+        assert_eq!(
+            resolve(&cfg, "bridge/openai/gpt-4o").unwrap()[0].model,
+            "openai/gpt-4o"
         );
         assert!(resolve(&cfg, "missing").is_err());
     }
