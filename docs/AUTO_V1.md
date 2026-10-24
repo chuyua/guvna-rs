@@ -103,4 +103,6 @@ prompts, keys, provider labels, extra HTTP calls or request-path SQL reads.
 This remains a conservative V2 foundation, not a learned model capability engine.
 When SQLite telemetry is enabled, a bounded provider-level health summary is
 restored at startup only if the last failure is within the 300-second freshness
-window. If SQLite is disabled or unreadable, routing falls back to in-memory hints.
+window. Failed intermediate candidates are recorded separately from the single
+downstream request row, so fallback failures survive restart without double-counting
+the request. If SQLite is disabled or unreadable, routing falls back to in-memory hints.

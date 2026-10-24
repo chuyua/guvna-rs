@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -990,7 +991,7 @@ auto:
     auto_cfg.write_text(changed, encoding="utf-8")
     autodata = Path(root) / "auto-data"
     autodata.mkdir()
-    auto_env = dict(env, GUVNA_LOG_EVENTS="1")
+    auto_env = dict(env, GUVNA_LOG_EVENTS="1", GUVNA_TELEMETRY_SQLITE="1")
     proc = subprocess.Popen(
         [str(Path(binary).resolve()), "serve", "-config", str(auto_cfg),
          "-data", str(autodata)],
@@ -1028,6 +1029,69 @@ auto:
                      if line.startswith(key + "_total ")]
             check(len(lines) == 1 and int(lines[0].split()[1]) == expected,
                   f"Auto metrics {key} != {expected}: {lines}")
+        telemetry_deadline = time.monotonic() + 3
+        telemetry_written = telemetry_dropped = telemetry_write_failures = 0
+        while time.monotonic() < telemetry_deadline:
+            telemetry_req = Request(
+                f"http://127.0.0.1:{auto_port}/metrics",
+                headers={"Authorization": "Bearer only-for-local-test"})
+            with urlopen(telemetry_req, timeout=1) as resp:
+                telemetry_raw = resp.read(8192).decode("utf-8")
+            telemetry_values = {}
+            for line in telemetry_raw.splitlines():
+                if line.startswith("guvna_telemetry_"):
+                    name, _, value = line.partition(" ")
+                    telemetry_values[name] = int(value)
+            telemetry_written = telemetry_values.get("guvna_telemetry_written_total", 0)
+            telemetry_dropped = telemetry_values.get("guvna_telemetry_dropped_total", 0)
+            telemetry_write_failures = telemetry_values.get("guvna_telemetry_write_failures_total", 0)
+            if telemetry_written >= 128 or telemetry_dropped or telemetry_write_failures:
+                break
+            time.sleep(0.02)
+        check(telemetry_written >= 128,
+              f"SQLite telemetry did not persist 128 attempt/request events: {telemetry_written}")
+        check(telemetry_dropped == 0 and telemetry_write_failures == 0,
+              f"SQLite telemetry dropped/wrote-failed events: {telemetry_dropped}/{telemetry_write_failures}")
+
+        db_path = autodata / "telemetry" / "requests.sqlite3"
+        check(db_path.is_file(), "opt-in telemetry database was not created")
+        db_uri = db_path.resolve().as_uri() + "?mode=ro"
+        db = sqlite3.connect(db_uri, uri=True, timeout=1)
+        try:
+            request_rows = db.execute("SELECT COUNT(*) FROM request_events").fetchone()[0]
+            failed_candidates = db.execute(
+                "SELECT COUNT(*) FROM failure_events WHERE provider='down' AND model='down' "
+                "AND status=503 AND failure_type='provider_5xx'").fetchone()[0]
+            down_health = db.execute(
+                "SELECT penalty,consecutive_failures,demoted FROM provider_health "
+                "WHERE provider='down' AND model='*'").fetchone()
+            down_hourly = db.execute(
+                "SELECT request_count,failure_count FROM hourly_stats "
+                "WHERE provider='down' AND model='down' AND failure_type='provider_5xx'").fetchone()
+            journal_mode = db.execute("PRAGMA journal_mode").fetchone()[0].lower()
+            max_pages = db.execute("PRAGMA max_page_count").fetchone()[0]
+            columns = {row[1].lower() for row in db.execute("PRAGMA table_info(request_events)")}
+        finally:
+            db.close()
+        check(request_rows == 64, f"SQLite request rows={request_rows}, expected 64")
+        check(failed_candidates == 64,
+              f"fallback provider failures were not retained: {failed_candidates}")
+        check(down_hourly == (64, 64),
+              f"hourly supplier attempt/failure totals incorrect: {down_hourly}")
+        check(down_health is not None and down_health[0] == 100
+              and down_health[1] >= 3 and down_health[2] == 1,
+              f"provider health history was not persisted: {down_health}")
+        check(journal_mode == "wal", f"telemetry database journal mode={journal_mode}")
+        check(max_pages <= 8192, f"telemetry SQLite page cap unexpectedly grew: {max_pages}")
+        forbidden = {"prompt", "body", "request_body", "api_key", "authorization", "headers"}
+        check(not columns.intersection(forbidden),
+              f"telemetry schema contains sensitive payload columns: {columns.intersection(forbidden)}")
+        db_size = sum(path.stat().st_size for path in (
+            db_path, Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")
+        ) if path.exists())
+        check(db_size < 32 * 1024 * 1024,
+              f"telemetry database and WAL exceeded 32 MiB: {db_size}")
+
         usage = proc_info(proc.pid)
         check(usage["VmRSS"] <= 16 * 1024, "Auto process RSS exceeded 16 MiB")
         check(usage["fd"] <= 20, "Auto process leaked file descriptors")
@@ -1035,6 +1099,14 @@ auto:
         return {
             "passed": True, "wave": wave,
             "primary_attempts": primary, "fallback_successes": healthy,
+            "telemetry_written": telemetry_written,
+            "telemetry_dropped": telemetry_dropped,
+            "telemetry_write_failures": telemetry_write_failures,
+            "sqlite_request_rows": request_rows,
+            "sqlite_fallback_failure_rows": failed_candidates,
+            "sqlite_down_provider_hourly": {"attempts": down_hourly[0], "failures": down_hourly[1]},
+            "sqlite_down_provider_health": {"penalty": down_health[0], "consecutive_failures": down_health[1], "demoted": bool(down_health[2])},
+            "sqlite_bytes_with_wal": db_size,
             "rss_kib": usage["VmRSS"], "fds": usage["fd"],
             "threads": usage["Threads"]
         }

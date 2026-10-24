@@ -100,8 +100,10 @@ GUVNA_DATA_DIR/telemetry/requests.sqlite3 (or the selected -data directory).
 Rows contain timestamp, fixed endpoint category, configured provider/model labels
 (bounded and sanitized), downstream status, elapsed milliseconds, SSE-header
 state and a fixed failure category. Prompts, request/response bodies, credentials,
-URLs, request IDs, sensitive headers and client IPs are never stored. SSE records
-reflect header dispatch, not terminal stream success.
+URLs, request IDs, sensitive headers and client IPs are never stored. Each
+downstream request is recorded once; failed intermediate provider candidates are
+also retained in failure history and hourly attempt statistics. SSE terminal failure
+adds a failure row without counting the same attempt twice.
 
 A 512-item nonblocking sync queue feeds a single SQLite WAL worker (batches
 up to 64 rows, 250ms collection wait). Disk settings include a 32MiB main
@@ -113,8 +115,11 @@ block the gateway. New fixed-cardinality metrics:
 guvna_telemetry_written_total, guvna_telemetry_dropped_total, and
 guvna_telemetry_write_failures_total.
 
-Provider/model labels and failure categories are stored locally; learned Auto
-scoring and persistence/restoration of Auto health weights remain unfinished. The telemetry directory is local and limited to the service user.
+Provider/model labels and fixed failure categories are stored locally. With
+health_aware enabled, a provider-level health summary is restored from SQLite only
+when its last failure is within the 300-second freshness window. Per-model history
+remains available for analysis; live routing uses bounded provider-level scores,
+not a learned model. The telemetry directory is local and limited to the service user.
 ## Local runtime status (Unix only)
 
 On Linux, guvna serve creates GUVNA_DATA_DIR/control.sock. The containing

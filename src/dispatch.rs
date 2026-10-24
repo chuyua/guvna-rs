@@ -109,6 +109,55 @@ fn outcome_failure_type(outcome: Outcome) -> &'static str {
         Outcome::CallerRejected => "provider_4xx",
     }
 }
+fn telemetry_endpoint(endpoint: Endpoint) -> &'static str {
+    match endpoint {
+        Endpoint::Chat => "chat",
+        Endpoint::Embeddings => "embeddings",
+    }
+}
+
+fn fallback_failure_status(failure_type: &'static str) -> u16 {
+    match failure_type {
+        "rate_limited" => 429,
+        "credential_error" => 401,
+        "caller_error" | "provider_4xx" => 400,
+        "provider_5xx" | "upstream_unavailable" | "circuit_open" | "aggregation_busy" => 503,
+        "timeout" => 504,
+        "capability_mismatch" => 422,
+        "local_error" => 500,
+        _ => 502,
+    }
+}
+
+fn record_intermediate_candidate_failure(
+    state: &AppState,
+    endpoint: Endpoint,
+    context: TelemetryContext,
+    elapsed: Duration,
+    attempted_network: bool,
+) {
+    let failure_type = context.failure_type();
+    if matches!(failure_type, "success" | "stream_started") {
+        return;
+    }
+    if !attempted_network
+        && !matches!(
+            failure_type,
+            "circuit_open" | "capability_mismatch" | "credential_error" | "rate_limited"
+        )
+    {
+        return;
+    }
+    if let Some(telemetry) = &state.telemetry {
+        telemetry.observe_attempt(
+            telemetry_endpoint(endpoint),
+            fallback_failure_status(failure_type),
+            elapsed,
+            context,
+            &state.metrics,
+        );
+    }
+}
 fn walk_expired(deadline: Option<tokio::time::Instant>) -> bool {
     deadline.is_some_and(|until| tokio::time::Instant::now() >= until)
 }
@@ -261,12 +310,27 @@ async fn dispatch_inner(
     let mut all_candidates_rate_limited = true;
     let mut rate_limit_retry: Option<Duration> = None;
     let mut telemetry_context: Option<TelemetryContext> = None;
+    let mut candidate_started: Option<tokio::time::Instant> = None;
+    let mut candidate_attempted_network = false;
     // Exactly ONE candidate loop for chat + embedding. Key failover is confined to this loop.
     for step in steps {
+        if let Some(previous) = telemetry_context.take() {
+            let elapsed = candidate_started
+                .take()
+                .map_or(Duration::ZERO, |started| started.elapsed());
+            record_intermediate_candidate_failure(
+                &state,
+                endpoint,
+                previous,
+                elapsed,
+                candidate_attempted_network,
+            );
+        }
         if walk_expired(walk_deadline) {
             let mut context = telemetry_context.take();
             if let Some(context) = context.as_mut() {
                 context.set_failure_type("timeout");
+                context.set_health_observation(false);
             }
             return attach_telemetry_context(walk_timeout(&state.metrics), context);
         }
@@ -315,6 +379,7 @@ async fn dispatch_inner(
                         let mut context = telemetry_context.take();
                         if let Some(context) = context.as_mut() {
                             context.set_failure_type("timeout");
+                            context.set_health_observation(false);
                         }
                         return attach_telemetry_context(walk_timeout(&state.metrics), context);
                     }
@@ -332,6 +397,8 @@ async fn dispatch_inner(
             Metrics::inc(&state.metrics.candidate_fallbacks);
         }
         candidates_visited += 1;
+        candidate_started = Some(tokio::time::Instant::now());
+        candidate_attempted_network = false;
         telemetry_context = Some(TelemetryContext::new(
             &provider.name,
             &step.model,
@@ -369,6 +436,9 @@ async fn dispatch_inner(
         // otherwise valid multi-choice streams are rejected as malformed.
         let effective_n = payload.get("n").map_or(1, |v| v.as_u64().unwrap_or(0));
         if upstream_stream && ChatSse::new(effective_n).is_err() {
+            if let Some(context) = telemetry_context.as_mut() {
+                context.set_failure_type("capability_mismatch");
+            }
             all_candidates_rate_limited = false;
             continue;
         }
@@ -381,12 +451,17 @@ async fn dispatch_inner(
                 let mut context = telemetry_context.take();
                 if let Some(context) = context.as_mut() {
                     context.set_failure_type("timeout");
+                    context.set_health_observation(false);
                 }
                 return attach_telemetry_context(walk_timeout(&state.metrics), context);
             }
             tried.insert(lease.env.clone());
             let url = provider.endpoint(endpoint.path());
+            if let Some(context) = telemetry_context.as_mut() {
+                context.set_upstream_status(None);
+            }
             attempted_network = true;
+            candidate_attempted_network = true;
             Metrics::inc(&state.metrics.upstream_attempts);
             // A request-wide reqwest timeout would terminate a healthy SSE
             // generation after 90s despite regular progress. Time only the
@@ -408,6 +483,7 @@ async fn dispatch_inner(
                         let mut context = telemetry_context.take();
                         if let Some(context) = context.as_mut() {
                             context.set_failure_type("timeout");
+                            context.set_health_observation(false);
                         }
                         return attach_telemetry_context(walk_timeout(&state.metrics), context);
                     }
@@ -416,7 +492,7 @@ async fn dispatch_inner(
                     record_circuit_failure(&mut circuit_ticket, &state.metrics);
                     mark_auto_failure(&state, step.provider_index);
                     if let Some(context) = telemetry_context.as_mut() {
-                        context.set_failure_type("transport_error");
+                        context.set_failure_type("timeout");
                     }
                     break;
                 }
@@ -437,6 +513,7 @@ async fn dispatch_inner(
             let status = upstream.status().as_u16();
             let outcome = classify(Some(status));
             if let Some(context) = telemetry_context.as_mut() {
+                context.set_upstream_status(Some(status));
                 context.set_failure_type(outcome_failure_type(outcome));
             }
             if outcome.quarantine_credential() {
@@ -532,6 +609,7 @@ async fn dispatch_inner(
                     let mut context = telemetry_context.take();
                     if let Some(context) = context.as_mut() {
                         context.set_failure_type("timeout");
+                        context.set_health_observation(false);
                     }
                     return attach_telemetry_context(walk_timeout(&state.metrics), context);
                 }
@@ -589,7 +667,20 @@ async fn dispatch_inner(
             }
             break; // 4xx or 5xx: next chain step; no uncontrolled retries
         }
-        if let Some(delay) = state.pools[step.provider_index].all_keys_rate_limited_for() {
+        let rate_limit_delay = state.pools[step.provider_index].all_keys_rate_limited_for();
+        if !candidate_attempted_network {
+            if let Some(context) = telemetry_context.as_mut() {
+                if rate_limit_delay.is_some() {
+                    context.set_failure_type("rate_limited");
+                    context.set_upstream_status(Some(429));
+                } else {
+                    context.set_failure_type("credential_error");
+                    context.set_upstream_status(Some(401));
+                }
+                context.set_health_observation(false);
+            }
+        }
+        if let Some(delay) = rate_limit_delay {
             rate_limit_retry = Some(rate_limit_retry.map_or(delay, |previous| previous.min(delay)));
         } else {
             all_candidates_rate_limited = false;
@@ -599,6 +690,7 @@ async fn dispatch_inner(
         let mut context = telemetry_context.take();
         if let Some(context) = context.as_mut() {
             context.set_failure_type("timeout");
+            context.set_health_observation(false);
         }
         return attach_telemetry_context(walk_timeout(&state.metrics), context);
     }

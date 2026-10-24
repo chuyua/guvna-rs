@@ -32,6 +32,7 @@ pub struct TelemetryContext {
     model: String,
     failure_type: &'static str,
     is_upstream: bool,
+    upstream_status: Option<u16>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,11 +51,23 @@ impl TelemetryContext {
             model: safe_label(model),
             failure_type: allowed_failure_type(failure_type),
             is_upstream: true,
+            upstream_status: None,
         }
     }
 
     pub fn set_failure_type(&mut self, failure_type: &'static str) {
         self.failure_type = allowed_failure_type(failure_type);
+    }
+
+    pub fn failure_type(&self) -> &'static str {
+        self.failure_type
+    }
+
+    pub fn set_upstream_status(&mut self, status: Option<u16>) {
+        self.upstream_status = status;
+    }
+    pub fn set_health_observation(&mut self, enabled: bool) {
+        self.is_upstream = enabled;
     }
 
     fn local(status: u16, sse_headers: bool) -> Self {
@@ -128,6 +141,7 @@ struct Event {
     sse_headers: bool,
     failure_type: &'static str,
     record_request: bool,
+    count_attempt: bool,
     health_observation: bool,
 }
 
@@ -161,7 +175,7 @@ impl Telemetry {
         )
     }
 
-    /// Record a terminal stream outcome without duplicating its request row.
+    /// Record a terminal stream outcome without duplicating its request row or attempt count.
     pub fn observe_health(
         &self,
         endpoint: &'static str,
@@ -172,23 +186,48 @@ impl Telemetry {
         metrics: &Metrics,
     ) {
         let context = TelemetryContext::new(provider, model, failure_type);
+        let status = if failure_type == "success" { 200 } else { 502 };
+        self.enqueue_observation(endpoint, status, elapsed, context, false, metrics);
+    }
+
+    /// Persist a failed intermediate candidate attempt separately from the downstream request row.
+    pub fn observe_attempt(
+        &self,
+        endpoint: &'static str,
+        fallback_status: u16,
+        elapsed: Duration,
+        context: TelemetryContext,
+        metrics: &Metrics,
+    ) {
+        self.enqueue_observation(endpoint, fallback_status, elapsed, context, true, metrics);
+    }
+
+    fn enqueue_observation(
+        &self,
+        endpoint: &'static str,
+        fallback_status: u16,
+        elapsed: Duration,
+        context: TelemetryContext,
+        count_attempt: bool,
+        metrics: &Metrics,
+    ) {
         let event = Event {
             ts: now_secs(),
             endpoint,
             provider: context.provider,
             model: context.model,
-            status: if failure_type == "success" { 200 } else { 502 },
+            status: context.upstream_status.unwrap_or(fallback_status),
             elapsed_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
-            sse_headers: true,
+            sse_headers: false,
             failure_type: context.failure_type,
             record_request: false,
-            health_observation: true,
+            count_attempt,
+            health_observation: context.is_upstream,
         };
         if self.sender.try_send(event).is_err() {
             Metrics::inc(&metrics.telemetry_dropped);
         }
     }
-
     pub fn submit(
         &self,
         endpoint: &'static str,
@@ -213,6 +252,7 @@ impl Telemetry {
             sse_headers,
             failure_type: context.failure_type,
             record_request: true,
+            count_attempt: true,
             health_observation: context.is_upstream,
         };
         if self.sender.try_send(event).is_err() {
@@ -433,11 +473,11 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                     event.provider,
                     event.model,
                     event.failure_type,
-                    1_i64,
+                    i64::from(event.count_attempt),
                     i64::from(is_failure(event)),
                     event.elapsed_ms,
                 ])?;
-            } else if matches!(health_failure(event), Some(true)) {
+            } else if is_failure(event) {
                 // Streaming starts are counted once at response creation. Record the
                 // terminal failure separately without inflating request_count.
                 failure.execute(params![
@@ -456,7 +496,7 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                     event.provider,
                     event.model,
                     event.failure_type,
-                    0_i64,
+                    i64::from(event.count_attempt),
                     1_i64,
                     event.elapsed_ms,
                 ])?;
@@ -643,6 +683,7 @@ mod tests {
             sse_headers: false,
             failure_type: kind,
             record_request: true,
+            count_attempt: true,
             health_observation: true,
         }
     }
@@ -768,6 +809,7 @@ mod tests {
             "transport_error",
         );
         terminal.record_request = false;
+        terminal.count_attempt = false;
         terminal.sse_headers = true;
         write_batch(&mut conn, &[started, terminal]).unwrap();
 
