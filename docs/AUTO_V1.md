@@ -185,3 +185,14 @@ Local config.auto.capability_overrides can override context_tokens and
 supports_images by exact wire model name, without fetching external metadata.
 Overrides also work without enabling the embedded registry. The table is a
 conservative local hint and is not dynamically proven against upstream.
+
+
+### Streaming isolation
+
+Streaming Auto requests never wait for an external selector: the gateway
+uses a fresh cached ranking, a verified stale ranking (at most 120 seconds
+beyond TTL), or the original deterministic/health order. Cold or stale
+rankings trigger a bounded background refresh, with concurrent requests
+falling back instead of queuing behind the selector. The refresh does not
+alter an already-running SSE response or the shared candidate fallback walk.
+Nonstreaming requests retain the existing bounded synchronous selector.

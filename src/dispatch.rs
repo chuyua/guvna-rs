@@ -363,6 +363,31 @@ async fn dispatch_inner(
                     }
                 }
             });
+        } else if streaming {
+            // A selector can take up to 2s; never add that delay to SSE
+            // response headers or its first token. Cold/stale rankings are
+            // refreshed in the background, with one in-flight fetch per cache.
+            let baseline = steps.clone();
+            let (cached, refresh) =
+                decider.cached_rank(&baseline, input_bytes, context_estimate, requirements);
+            if let Some(ranked) = cached {
+                steps = ranked;
+            }
+            if refresh {
+                let owner = Arc::clone(&state);
+                let selector = Arc::clone(decider);
+                tokio::spawn(async move {
+                    let _ = selector
+                        .rank(
+                            &owner.config,
+                            &baseline,
+                            input_bytes,
+                            context_estimate,
+                            requirements,
+                        )
+                        .await;
+                });
+            }
         } else if let Some(ranked) = decider
             .rank(
                 &state.config,

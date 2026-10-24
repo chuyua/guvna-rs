@@ -70,6 +70,31 @@ impl AutoDecider {
         }))
     }
 
+    /// SSE must never wait for a remote selector. Return a verified fresh or
+    /// bounded stale ranking immediately, and signal whether background
+    /// refresh is needed. A busy cache lock means another refresh is running.
+    pub fn cached_rank(
+        &self,
+        steps: &[ResolvedStep],
+        input_bytes: usize,
+        estimated_tokens: usize,
+        requirements: AutoRequirements,
+    ) -> (Option<Vec<ResolvedStep>>, bool) {
+        if steps.len() < 2 {
+            return (None, false);
+        }
+        let Ok(mut cache) = self.cache.try_lock() else {
+            return (None, false);
+        };
+        let now = Instant::now();
+        cache.retain(|entry| entry.stale > now);
+        let key = ranking_key(steps, input_bytes, estimated_tokens, requirements);
+        match cache.iter().find(|entry| entry.key == key) {
+            Some(entry) => (apply_order(steps, &entry.order), entry.fresh <= now),
+            None => (None, true),
+        }
+    }
+
     pub async fn rank(
         &self,
         cfg: &Config,
@@ -296,6 +321,10 @@ auto:
                 params: Default::default(),
             },
         ];
+        let (cold, needs_refresh) =
+            decider.cached_rank(&steps, 123, 234, AutoRequirements::default());
+        assert!(cold.is_none());
+        assert!(needs_refresh);
         let reordered = decider
             .rank(&config, &steps, 123, 234, AutoRequirements::default())
             .await
@@ -307,6 +336,37 @@ auto:
             .unwrap();
         assert_eq!(cached[0].model, "two");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let (warm, needs_refresh) =
+            decider.cached_rank(&steps, 123, 234, AutoRequirements::default());
+        assert_eq!(warm.unwrap()[0].model, "two");
+        assert!(!needs_refresh);
+        let (different_capability, refresh) = decider.cached_rank(
+            &steps,
+            123,
+            234,
+            AutoRequirements::from_signals(false, true, false),
+        );
+        assert!(different_capability.is_none());
+        assert!(refresh);
+        {
+            let mut cache = decider.cache.lock().await;
+            let entry = cache.front_mut().unwrap();
+            entry.fresh = Instant::now() - Duration::from_millis(1);
+            let (blocked, refresh) =
+                decider.cached_rank(&steps, 123, 234, AutoRequirements::default());
+            assert!(blocked.is_none());
+            assert!(!refresh, "in-flight refresh must not create a convoy");
+        }
+        let (stale, refresh) = decider.cached_rank(&steps, 123, 234, AutoRequirements::default());
+        assert_eq!(stale.unwrap()[0].model, "two");
+        assert!(refresh, "stale ranking must schedule a background refresh");
+        {
+            let mut cache = decider.cache.lock().await;
+            cache.front_mut().unwrap().stale = Instant::now() - Duration::from_millis(1);
+        }
+        let (expired, refresh) = decider.cached_rank(&steps, 123, 234, AutoRequirements::default());
+        assert!(expired.is_none());
+        assert!(refresh);
         task.abort();
     }
 
