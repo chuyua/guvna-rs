@@ -13,11 +13,21 @@ const AUTO_CACHE_TTL: Duration = Duration::from_secs(30);
 const CONTEXT_SAFETY_MARGIN_PERCENT: usize = 20;
 
 /// Only well-known Chat request features are examined; no text or image bytes are retained.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AutoRequirements {
     tools: bool,
     images: bool,
     json_schema: bool,
+}
+
+impl AutoRequirements {
+    pub fn from_signals(tools: bool, images: bool, json_schema: bool) -> Self {
+        Self {
+            tools,
+            images,
+            json_schema,
+        }
+    }
 }
 
 pub fn auto_requirements(request: &Value) -> AutoRequirements {

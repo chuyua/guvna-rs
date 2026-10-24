@@ -291,7 +291,7 @@ async fn dispatch_inner(
     let auto_enabled = model == "auto" && state.config.auto.enabled;
     // Keep byte-range eligibility and context-window budgeting separate.
     // The context estimate includes the full request, output allowance and safety reserve.
-    let steps = match if auto_enabled {
+    let mut steps = match if auto_enabled {
         let input_bytes = routing::auto_input_bytes(request.get("messages"));
         let context_estimate = routing::auto_context_estimate(&request);
         let requirements = routing::auto_requirements(&request);
@@ -327,6 +327,24 @@ async fn dispatch_inner(
             "auto_no_eligible_candidate",
             "No configured Auto candidate satisfies input-size, context-window and model-capability constraints",
         );
+    }
+
+    if auto_enabled && let Some(decider) = &state.auto_decider {
+        let input_bytes = routing::auto_input_bytes(request.get("messages"));
+        let context_estimate = routing::auto_context_estimate(&request);
+        let requirements = routing::auto_requirements(&request);
+        if let Some(ranked) = decider
+            .rank(
+                &state.config,
+                &steps,
+                input_bytes,
+                context_estimate,
+                requirements,
+            )
+            .await
+        {
+            steps = ranked;
+        }
     }
 
     let mut permit = Some(admission);

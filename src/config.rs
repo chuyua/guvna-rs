@@ -69,6 +69,31 @@ pub struct AutoConfig {
     pub health_aware: bool,
     /// Opt-in discovery of additional candidates from validated named chains.
     pub discover_from_chains: bool,
+    /// External model selector, disabled by default and fail-open.
+    pub decider: AutoDeciderConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoDeciderConfig {
+    pub enabled: bool,
+    pub provider: String,
+    pub model: String,
+    /// Hard cap, including selector connect and response body.
+    pub timeout_ms: u64,
+    /// Cache a valid ranking, never a prompt or downstream response.
+    pub cache_ttl_secs: u64,
+}
+impl Default for AutoDeciderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: String::new(),
+            model: String::new(),
+            timeout_ms: 750,
+            cache_ttl_secs: 30,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -350,6 +375,18 @@ impl Config {
         {
             return Err("auto max_candidates must be 1..=32".into());
         }
+        if self.auto.decider.enabled {
+            let d = &self.auto.decider;
+            if !self.auto.enabled
+                || d.model.is_empty()
+                || d.model == "auto"
+                || !self.providers.iter().any(|p| p.name == d.provider)
+                || !(100..=2_000).contains(&d.timeout_ms)
+                || !(1..=120).contains(&d.cache_ttl_secs)
+            {
+                return Err("auto decider requires enabled Auto, a valid provider/model, timeout_ms 100..2000, cache_ttl_secs 1..120".into());
+            }
+        }
         if self.auto.health_aware && !self.auto.enabled {
             return Err("auto health_aware requires enabled: true".into());
         }
@@ -551,6 +588,43 @@ auto:
         cfg.discover_auto_candidates();
         assert_eq!(cfg.auto.candidates.len(), 3);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn decider_requires_explicit_auto_valid_provider_and_bounded_timeout() {
+        let base = r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://localhost:1234
+    key_env: K
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: alpha
+  decider:
+    enabled: true
+    provider: p
+    model: ranker
+"#;
+        let valid: Config = serde_yaml::from_str(base).unwrap();
+        assert!(valid.validate().is_ok());
+        for changed in [
+            base.replace(
+                "provider: p\n    model: ranker",
+                "provider: missing\n    model: ranker",
+            ),
+            base.replace("model: ranker", "model: auto"),
+            base.replace("model: ranker", "model: ranker\n    timeout_ms: 5"),
+            base.replace(
+                "enabled: true\n  candidates:",
+                "enabled: false\n  candidates:",
+            ),
+        ] {
+            let cfg: Config = serde_yaml::from_str(&changed).unwrap();
+            assert!(cfg.validate().is_err(), "{changed}");
+        }
     }
 
     #[test]

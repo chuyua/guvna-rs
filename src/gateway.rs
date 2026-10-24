@@ -18,6 +18,7 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
+    auto_decider::AutoDecider,
     auto_health::AutoHealth,
     circuit::{Circuit, Ticket},
     config::Config,
@@ -65,6 +66,7 @@ pub struct AppState {
     telemetry: Option<Telemetry>,
     auto_health: Option<AutoHealth>,
     auto_route_cache: AutoRouteCache,
+    auto_decider: Option<AutoDecider>,
     auto_generation: u64,
     started_at: Instant,
     model_catalog: Value,
@@ -160,6 +162,7 @@ impl AppState {
         let mut data: Vec<_> = model_details.values().cloned().collect();
         data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         let model_catalog = json!({"object":"list","data":data});
+        let auto_decider = AutoDecider::from_config(&config, &credentials, client.clone())?;
         let auto_generation = routing::config_generation(&config);
         let auto_route_cache = AutoRouteCache::new();
         let auto_health = config
@@ -181,6 +184,7 @@ impl AppState {
             telemetry: None,
             auto_health,
             auto_route_cache,
+            auto_decider,
             auto_generation,
             started_at: Instant::now(),
         })

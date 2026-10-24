@@ -134,3 +134,30 @@ missing from an explicitly declared provider model catalog are not silently
 coerced into Auto candidates. Missing candidates after discovery
 cause startup to fail safely. This discovery is a startup snapshot, not live
 reconfiguration; it does not enable remote management or a second scheduler.
+
+## Issue #129: bounded optional LLM Decider (experimental)
+
+Example under the Auto configuration (leave disabled by default):
+
+    auto:
+      enabled: true
+      decider:
+        enabled: true
+        provider: p
+        model: your-selector-model
+        timeout_ms: 750
+        cache_ttl_secs: 30
+
+The provider must already be declared and have a credential. The selector
+connects directly to that provider's OpenAI-compatible chat endpoint using
+the explicitly selected wire model, not the local /v1/auto endpoint.
+Only candidate labels, context-size estimates and capability flags are
+sent to the selector. Actual user prompts, messages, tool schemas, request
+bodies and keys are never part of the ranking prompt or persisted.
+Response must be a strict JSON permutation of eligible candidate indexes.
+Unavailable, slow or malformed selectors fall back immediately to existing
+priority/health ranking, with at most 120 seconds of previously verified stale
+ranking as a bounded exception. An in-flight selector does not serialize
+concurrent callers: they use deterministic fallback rather than wait. Cache
+has 32 entries and is keyed by ordered candidates, size buckets and required
+capabilities. This is not an upstream model response cache.
