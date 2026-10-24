@@ -113,6 +113,8 @@ pub struct Provider {
     #[serde(default)]
     pub prefixes: Vec<String>,
     #[serde(default)]
+    pub namespace_on_wire: bool,
+    #[serde(default)]
     pub stream_only: bool,
 }
 

@@ -14,7 +14,13 @@ duplicated routing state machines.
   `/v1/chat/completions`, `/v1/embeddings`.
 - Bearer auth, named fallback chains, direct provider-prefixed models. The
   matched prefix is gateway-local and is stripped before forwarding; nested
-  upstream namespaces such as `openai/gpt-4o` remain intact.
+  upstream namespaces such as `openai/gpt-4o` remain intact. Providers whose
+  real upstream IDs include the gateway namespace (e.g. NVIDIA NIM) can set
+  `namespace_on_wire: true` under that provider to forward the **full** client
+  model ID. The default is `false`; the flag does not change provider matching,
+  named-chain precedence or other providers. Use matching provider prefixes
+  (e.g. `nvidia`) and send the upstream's real model ID (e.g.
+  `nvidia/nemotron-3-embed-1b`).
 - Optional `default_chain: <configured-chain-name>` routes otherwise unknown
   model names to a configured named chain. Exact chain and provider-prefixed
   names take precedence; invalid default chains fail startup validation.
