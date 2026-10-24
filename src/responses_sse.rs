@@ -19,6 +19,7 @@ struct Tool {
     id: String,
     name: String,
     arguments: String,
+    arguments_seen: bool,
     output_index: usize,
 }
 
@@ -314,6 +315,7 @@ impl ResponsesSse {
                     id: id.into(),
                     name: name.into(),
                     arguments: String::new(),
+                    arguments_seen: false,
                     output_index,
                 });
                 pending.push_back(self.emit(
@@ -334,8 +336,8 @@ impl ResponsesSse {
             {
                 return Err(());
             }
-            let fragment = call
-                .pointer("/function/arguments")
+            let fragment_value = call.pointer("/function/arguments");
+            let fragment = fragment_value
                 .map(|v| v.as_str().ok_or(()))
                 .transpose()?
                 .unwrap_or("");
@@ -355,6 +357,7 @@ impl ResponsesSse {
                 return Err(());
             }
             self.tools[index].arguments.push_str(fragment);
+            self.tools[index].arguments_seen |= fragment_value.is_some();
             if !fragment.is_empty() {
                 let id = self.tools[index].id.clone();
                 let output_index = self.tools[index].output_index;
@@ -584,9 +587,10 @@ impl ResponsesSse {
             match reason {
                 "tool_calls" if !self.tools.is_empty() => {
                     if !self.tools.iter().all(|tool| {
-                        tool.arguments.is_empty()
-                            || serde_json::from_str::<Value>(&tool.arguments)
-                                .is_ok_and(|value| value.is_object())
+                        tool.arguments_seen
+                            && (tool.arguments.is_empty()
+                                || serde_json::from_str::<Value>(&tool.arguments)
+                                    .is_ok_and(|value| value.is_object()))
                     }) {
                         return Err(());
                     }
@@ -1128,7 +1132,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         assert!(all.contains("event: response.completed"));
-        assert!(all.contains("\\\"arguments\\\":\\\"{}\\\""), "{all}");
+        assert!(all.contains(r#""arguments":"{}""#), "{all}");
     }
 
     #[test]

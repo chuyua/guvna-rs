@@ -19,6 +19,7 @@ struct StreamToolCall {
     name: Option<String>,
     function_type: bool,
     arguments: String,
+    arguments_seen: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -253,6 +254,7 @@ impl ChatSse {
                         tool.id.is_none()
                             || tool.name.is_none()
                             || !tool.function_type
+                            || !tool.arguments_seen
                             || (!tool.arguments.is_empty()
                                 && !serde_json::from_str::<Value>(&tool.arguments)
                                     .is_ok_and(|value| value.is_object()))
@@ -328,6 +330,7 @@ impl ChatSse {
                     name: None,
                     function_type: false,
                     arguments: String::new(),
+                    arguments_seen: false,
                 });
                 self.tool_calls.len() - 1
             }
@@ -358,6 +361,7 @@ impl ChatSse {
         }
         tool.function_type |= call.get("type").and_then(Value::as_str) == Some("function");
         if let Some(part) = fragment {
+            tool.arguments_seen = true;
             tool.arguments.push_str(part);
             self.tool_argument_bytes += part.len();
         }
