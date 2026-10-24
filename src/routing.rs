@@ -31,6 +31,7 @@ struct CacheState {
 }
 
 /// Small process-local route cache. It stores route metadata only, never request content.
+#[derive(Default)]
 pub struct AutoRouteCache {
     state: Mutex<CacheState>,
 }
