@@ -17,6 +17,7 @@ const MAX_CHAIN_FILE_BYTES: usize = 1024 * 1024;
 
 pub enum Command {
     List,
+    Show(String),
     Validate,
     Set(PathBuf),
     Delete(String),
@@ -234,6 +235,21 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
             let listed = static_chains.chain(dynamic_chains).collect::<Vec<_>>();
             serde_json::to_string_pretty(&listed)
                 .map_err(|e| format!("encoding chain listing: {e}"))
+        }
+        Command::Show(name) => {
+            // Reuse the same size limit and validation as list; never access an
+            // unvalidated chain file or print any provider credentials.
+            let list = execute(config, data_dir, Command::List)?;
+            let values: Vec<serde_json::Value> = serde_json::from_str(&list)
+                .map_err(|_| "cannot decode local chain listing".to_string())?;
+            let chosen = values
+                .into_iter()
+                .find(|chain| {
+                    chain.get("name").and_then(serde_json::Value::as_str) == Some(name.as_str())
+                })
+                .ok_or_else(|| format!("unknown chain {name:?}"))?;
+            serde_json::to_string_pretty(&chosen)
+                .map_err(|_| "cannot format local chain".to_string())
         }
         Command::Validate => {
             let file = runtime_path(data_dir);

@@ -34,7 +34,7 @@ async fn run() -> Result<(), String> {
         args.next();
         chains_action = Some(
             args.next()
-                .ok_or("chains requires list|validate|set|delete|recover")?,
+                .ok_or("chains requires list|show|validate|set|delete|recover")?,
         );
     } else if args.peek().is_some_and(|s| s == "logs") {
         args.next();
@@ -81,7 +81,7 @@ async fn run() -> Result<(), String> {
             }
             "--help" | "-h" | "help" => {
                 println!(
-                    "guvna serve [-config config.yaml] [-data DIR]\nguvna status [-config config.yaml]\nguvna logs [--tail 100] [--system]\n  --healthcheck probes /healthz\nguvna chains list|validate [-config FILE] [-data DIR]\nguvna chains set -file CHAIN.yaml [-config FILE] [-data DIR]\nguvna chains delete -name NAME [-config FILE] [-data DIR]\nguvna chains recover [-from BACKUP] [-config FILE] [-data DIR]\n  --version"
+                    "guvna serve [-config config.yaml] [-data DIR]\nguvna status [-config config.yaml]\nguvna logs [--tail 100] [--system]\n  --healthcheck probes /healthz\nguvna chains show -name NAME\nguvna chains list|validate [-config FILE] [-data DIR]\nguvna chains set -file CHAIN.yaml [-config FILE] [-data DIR]\nguvna chains delete -name NAME [-config FILE] [-data DIR]\nguvna chains recover [-from BACKUP] [-config FILE] [-data DIR]\n  --version"
                 );
                 return Ok(());
             }
@@ -122,6 +122,9 @@ async fn run() -> Result<(), String> {
         let command = match action.as_str() {
             "list" if chains_file.is_none() && chains_name.is_none() && recover_from.is_none() => {
                 chain_store::Command::List
+            }
+            "show" if chains_file.is_none() && recover_from.is_none() => {
+                chain_store::Command::Show(chains_name.ok_or("chains show requires --name NAME")?)
             }
             "validate"
                 if chains_file.is_none() && chains_name.is_none() && recover_from.is_none() =>

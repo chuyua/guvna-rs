@@ -69,6 +69,19 @@ fn cli_set_replace_delete_and_corrupt_recovery_preserve_every_original_byte() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["name"], "immutable");
     assert_eq!(items[0]["source"], "config");
+    let shown: Value = serde_json::from_str(&success(&run(
+        &config,
+        &data,
+        &["show", "--name", "immutable"],
+    )))
+    .unwrap();
+    assert_eq!(shown["name"], "immutable");
+    assert_eq!(shown["source"], "config");
+    failure(
+        &run(&config, &data, &["show", "--name", "missing"]),
+        "unknown chain",
+    );
+    failure(&run(&config, &data, &["show"]), "requires --name");
     assert!(success(&run(&config, &data, &["validate"])).contains("0 runtime"));
     assert!(!data.exists(), "read-only CLI must not create a data dir");
 
