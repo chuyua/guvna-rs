@@ -368,10 +368,10 @@ fn drop_batch(batch: &[Event], metrics: &Metrics) {
 
 fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
     let mut conn = open_database(&path).ok();
-    if let Some(database) = conn.as_mut() {
-        if prune_expired(database, now_secs()).is_err() {
-            Metrics::inc(&metrics.telemetry_write_failures);
-        }
+    if let Some(database) = conn.as_mut()
+        && prune_expired(database, now_secs()).is_err()
+    {
+        Metrics::inc(&metrics.telemetry_write_failures);
     }
     let mut batches: usize = 0;
     let mut consecutive_failures: u32 = 0;
@@ -419,8 +419,9 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
             }
         }
         batches = batches.wrapping_add(1);
-        if batches.is_multiple_of(128) {
-            if let Some(database) = conn.as_mut() {
+        if batches.is_multiple_of(128)
+            && let Some(database) = conn.as_mut()
+        {
                 if prune_expired(database, now_secs()).is_err() {
                     Metrics::inc(&metrics.telemetry_write_failures);
                 }
