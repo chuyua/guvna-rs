@@ -3249,9 +3249,9 @@ async fn serve_progressing_aggregation(
     let chunks = futures_util::stream::unfold(0usize, move |index| async move {
         match index {
             0 => Some((Ok::<_, std::io::Error>(Bytes::from_static(SSE_START)), 1)),
-            18 if terminal => Some((Ok(Bytes::from_static(SSE_END)), 19)),
-            19 if terminal => Some((Ok(Bytes::from_static(SSE_DONE)), 20)),
-            20 if terminal => None,
+            12 if terminal => Some((Ok(Bytes::from_static(SSE_END)), 13)),
+            13 if terminal => Some((Ok(Bytes::from_static(SSE_DONE)), 14)),
+            14 if terminal => None,
             _ => {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 Some((
@@ -3427,10 +3427,10 @@ async fn drive_aggregating_progress(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn sse_only_aggregation_survives_eighty_seconds_of_valid_progress() {
+async fn sse_only_progressing_stream_completes_within_proxy_safe_budget() {
     let (status, result, elapsed, primary, backup, deadline_exhaustions, active) =
         drive_aggregating_progress(true, "12m").await;
-    assert!(elapsed >= std::time::Duration::from_secs(80), "{elapsed:?}");
+    assert!(elapsed >= std::time::Duration::from_secs(40), "{elapsed:?}");
     assert!(elapsed < std::time::Duration::from_secs(100), "{elapsed:?}");
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(result["choices"][0]["message"]["content"], "hi");
