@@ -125,12 +125,15 @@ fn validate_chat_with_params(
         }
         let finished_with_tools =
             choice.get("finish_reason").and_then(Value::as_str) == Some("tool_calls");
-        if finished_with_tools != calls.is_some_and(|calls| !calls.is_empty()) {
+        let reason = choice.get("finish_reason").and_then(Value::as_str);
+        let contains_tools = calls.is_some_and(|calls| !calls.is_empty());
+        if (finished_with_tools && !contains_tools) || (reason == Some("stop") && contains_tools) {
             return false;
         }
-        if (tool_choice.and_then(Value::as_str) == Some("none") && finished_with_tools)
+        if (tool_choice.and_then(Value::as_str) == Some("none") && contains_tools)
             || ((tool_choice.and_then(Value::as_str) == Some("required")
                 || required_name.is_some())
+                && reason == Some("stop")
                 && !finished_with_tools)
         {
             return false;
@@ -159,7 +162,10 @@ fn validate_chat_with_params(
                         .pointer("/function/arguments")
                         .and_then(Value::as_str)
                         .is_some_and(|s| {
-                            serde_json::from_str::<Value>(s).is_ok_and(|args| args.is_object())
+                            matches!(reason, Some("length" | "content_filter"))
+                                || s.is_empty()
+                                || serde_json::from_str::<Value>(s)
+                                    .is_ok_and(|args| args.is_object())
                         });
                 if !valid {
                     return false;
@@ -387,6 +393,35 @@ mod response_contract_tests {
                 "message":{"role":"assistant","tool_calls":[]},
                 "finish_reason":"tool_calls"
             }]})
+        ));
+    }
+
+    #[test]
+    fn truncated_required_tools_and_zero_argument_calls_remain_deliverable() {
+        let incomplete = json!({"choices":[{"index":0,
+            "message":{"role":"assistant","content":"partial"},
+            "finish_reason":"length"}]});
+        assert!(validate_chat(
+            &json!({"tool_choice":"required"}),
+            &incomplete
+        ));
+        let tool = json!({"choices":[{"index":0,
+            "message":{"role":"assistant","tool_calls":[{"id":"call_1",
+                "type":"function","function":{"name":"empty","arguments":""}}]},
+            "finish_reason":"tool_calls"}]});
+        assert!(validate_chat(&json!({"tool_choice":"required"}), &tool));
+        let mut truncated = tool.clone();
+        truncated["choices"][0]["finish_reason"] = json!("length");
+        truncated["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+            json!("{unfinished");
+        assert!(validate_chat(
+            &json!({"tool_choice":"required"}),
+            &truncated
+        ));
+        assert!(!validate_chat(&json!({"tool_choice":"none"}), &truncated));
+        assert!(!validate_chat(
+            &json!({"tool_choice":"required"}),
+            &json!({"choices":[assistant(0)]})
         ));
     }
 

@@ -337,8 +337,11 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
     if logical_model.is_empty() {
         return Err("missing model".into());
     }
-    if let Some(chain) = config.chains.iter().find(|c| c.name == logical_model) {
-        return chain
+    fn resolve_chain(
+        config: &Config,
+        chain: &crate::config::Chain,
+    ) -> Result<Vec<ResolvedStep>, String> {
+        chain
             .steps
             .iter()
             .map(|step: &Step| {
@@ -353,7 +356,10 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
                     params: step.params.clone(),
                 })
             })
-            .collect();
+            .collect()
+    }
+    if let Some(chain) = config.chains.iter().find(|c| c.name == logical_model) {
+        return resolve_chain(config, chain);
     }
     for (i, provider) in config.providers.iter().enumerate() {
         for prefix in provider.prefixes() {
@@ -377,6 +383,17 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
                 params: BTreeMap::new(),
             }]);
         }
+    }
+    // Only truly unknown names use the explicitly opted-in fallback. Exact
+    // chains and provider-prefixed direct models always take precedence.
+    if logical_model != "auto"
+        && !config.default_chain.is_empty()
+        && let Some(chain) = config
+            .chains
+            .iter()
+            .find(|c| c.name == config.default_chain)
+    {
+        return resolve_chain(config, chain);
     }
     Err(format!("unknown model or chain: {logical_model}"))
 }
@@ -801,5 +818,42 @@ chains:
             "openai/gpt-4o"
         );
         assert!(resolve(&cfg, "missing").is_err());
+    }
+
+    #[test]
+    fn default_chain_applies_only_to_unknown_names_and_never_shadows_explicit_routes() {
+        let cfg: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://p.example
+    key_env: P
+chains:
+  - name: first
+    steps:
+      - provider: p
+        model: first-physical
+  - name: backup
+    steps:
+      - provider: p
+        model: backup-physical
+default_chain: backup
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            resolve(&cfg, "unknown").unwrap()[0].model,
+            "backup-physical"
+        );
+        assert_eq!(resolve(&cfg, "first").unwrap()[0].model, "first-physical");
+        assert_eq!(resolve(&cfg, "p/direct").unwrap()[0].model, "direct");
+        assert!(
+            resolve(&cfg, "auto").is_err(),
+            "auto is reserved, not a fallback typo"
+        );
+        let no_default: Config = serde_yaml::from_str("providers: []").unwrap();
+        assert!(resolve(&no_default, "unknown").is_err());
     }
 }

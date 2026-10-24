@@ -115,6 +115,7 @@ struct ResponsesSse {
     created_at: Option<i64>,
     text: String,
     text_index: Option<usize>,
+    text_closed: bool,
     reasoning_text: String,
     reasoning_index: Option<usize>,
     next_output_index: usize,
@@ -137,6 +138,7 @@ impl ResponsesSse {
             created_at: None,
             text: String::new(),
             text_index: None,
+            text_closed: false,
             reasoning_text: String::new(),
             reasoning_index: None,
             next_output_index: 0,
@@ -196,7 +198,15 @@ impl ResponsesSse {
         self.id = Some(id.to_owned());
         self.created_at = event
             .get("created")
-            .and_then(Value::as_i64)
+            .and_then(|ts| {
+                ts.as_i64().or_else(|| {
+                    ts.as_f64()
+                        .filter(|n| {
+                            n.is_finite() && *n >= 0.0 && *n < i64::MAX as f64 && n.fract() == 0.0
+                        })
+                        .map(|n| n as i64)
+                })
+            })
             .filter(|ts| *ts >= 0);
         if self.created_at.is_none() && event.get("created").is_none() {
             // Timestamp the gateway Response if the upstream omits created.
@@ -274,6 +284,9 @@ impl ResponsesSse {
         if calls.is_empty() {
             return Err(());
         }
+        // An output item must close before a later function_call item opens.
+        // Do not delay a preceding message's .done events until [DONE].
+        self.close_text(pending, "completed");
         for call in calls {
             let index = call.get("index").and_then(Value::as_u64).ok_or(())? as usize;
             if index > self.tools.len() || index >= MAX_TOOLS {
@@ -472,7 +485,14 @@ impl ResponsesSse {
             self.begin(&event, pending)?;
         }
         let choice = &choices[0];
-        let delta = choice.get("delta").and_then(Value::as_object).ok_or(())?;
+        let empty_delta = serde_json::Map::new();
+        let delta = match choice.get("delta") {
+            Some(Value::Object(delta)) => delta,
+            Some(Value::Null) if choice.get("finish_reason").is_some_and(|v| !v.is_null()) => {
+                &empty_delta
+            }
+            _ => return Err(()),
+        };
         if delta.keys().any(|key| {
             ![
                 "role",
@@ -564,15 +584,21 @@ impl ResponsesSse {
             match reason {
                 "tool_calls" if !self.tools.is_empty() => {
                     if !self.tools.iter().all(|tool| {
-                        serde_json::from_str::<Value>(&tool.arguments)
-                            .is_ok_and(|value| value.is_object())
+                        tool.arguments.is_empty()
+                            || serde_json::from_str::<Value>(&tool.arguments)
+                                .is_ok_and(|value| value.is_object())
                     }) {
                         return Err(());
                     }
+                    for tool in &mut self.tools {
+                        if tool.arguments.is_empty() {
+                            tool.arguments.push_str("{}");
+                        }
+                    }
                 }
                 "stop" if self.tools.is_empty() => {}
-                "length" if self.tools.is_empty() => {}
-                "content_filter" if self.tools.is_empty() => {}
+                "length" => {}
+                "content_filter" => {}
                 _ => return Err(()),
             }
             self.finish_reason = Some(reason.to_owned());
@@ -615,32 +641,7 @@ impl ResponsesSse {
                 json!({"output_index":index,"item":item}),
             ));
         }
-        if let Some(index) = self.text_index {
-            let item_id = self.message_id();
-            pending.push_back(self.emit(
-                "response.output_text.done",
-                json!({
-                    "item_id":item_id,"output_index":index,"content_index":0,
-                    "text":self.text,"logprobs":[]
-                }),
-            ));
-            let item_id = self.message_id();
-            pending.push_back(self.emit(
-                "response.content_part.done",
-                json!({
-                    "item_id":item_id,"output_index":index,"content_index":0,
-                    "part":{"type":"output_text","text":self.text,"annotations":[]}
-                }),
-            ));
-            let item = json!({"id":self.message_id(),"type":"message","status":status,
-                "role":"assistant","content":[{"type":"output_text","text":self.text,"annotations":[]}]});
-            pending.push_back(self.emit(
-                "response.output_item.done",
-                json!({
-                    "output_index":index,"item":item
-                }),
-            ));
-        }
+        self.close_text(pending, status);
         for index in 0..self.tools.len() {
             let tool = &self.tools[index];
             let (id, name, arguments, output_index) = (
@@ -671,6 +672,39 @@ impl ResponsesSse {
         };
         let response = self.response(status);
         pending.push_back(self.emit(kind, json!({"response":response})));
+    }
+
+    fn close_text(&mut self, pending: &mut VecDeque<Bytes>, status: &str) {
+        if self.text_closed {
+            return;
+        }
+        if let Some(index) = self.text_index {
+            let item_id = self.message_id();
+            pending.push_back(self.emit(
+                "response.output_text.done",
+                json!({
+                    "item_id":item_id,"output_index":index,"content_index":0,
+                    "text":self.text,"logprobs":[]
+                }),
+            ));
+            let item_id = self.message_id();
+            pending.push_back(self.emit(
+                "response.content_part.done",
+                json!({
+                    "item_id":item_id,"output_index":index,"content_index":0,
+                    "part":{"type":"output_text","text":self.text,"annotations":[]}
+                }),
+            ));
+            let item = json!({"id":self.message_id(),"type":"message","status":status,
+                "role":"assistant","content":[{"type":"output_text","text":self.text,"annotations":[]}]});
+            pending.push_back(self.emit(
+                "response.output_item.done",
+                json!({
+                    "output_index":index,"item":item
+                }),
+            ));
+            self.text_closed = true;
+        }
     }
     fn failed(&mut self) -> Bytes {
         if self.id.is_some() {
@@ -992,6 +1026,111 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn mixed_text_message_closes_before_tool_item_opens_exactly_once() {
+        let mut translator = ResponsesSse::new("demo".into(), Value::Null);
+        let mut pending = VecDeque::new();
+        translator
+            .feed(
+                &frame(json!({
+                    "id":"chat","choices":[{"index":0,
+                        "delta":{"content":"hello"},"finish_reason":null}]
+                })),
+                &mut pending,
+            )
+            .unwrap();
+        translator
+            .feed(
+                &frame(json!({
+                    "id":"chat","choices":[{"index":0,
+                        "delta":{"tool_calls":[{"index":0,"id":"call_one","type":"function",
+                            "function":{"name":"lookup","arguments":"{}"}}]},
+                        "finish_reason":null}]
+                })),
+                &mut pending,
+            )
+            .unwrap();
+        let events = pending
+            .iter()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .collect::<Vec<_>>();
+        let text_done = events
+            .iter()
+            .position(|event| event.starts_with("event: response.output_text.done"))
+            .unwrap();
+        let message_done = events
+            .iter()
+            .position(|event| {
+                event.starts_with("event: response.output_item.done")
+                    && event.contains("\"type\":\"message\"")
+            })
+            .unwrap();
+        let tool_added = events
+            .iter()
+            .position(|event| {
+                event.starts_with("event: response.output_item.added")
+                    && event.contains("\"type\":\"function_call\"")
+            })
+            .unwrap();
+        assert!(text_done < message_done && message_done < tool_added);
+        translator
+            .feed(
+                &frame(json!({
+                    "id":"chat","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]
+                })),
+                &mut pending,
+            )
+            .unwrap();
+        translator.feed(b"data: [DONE]\n\n", &mut pending).unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|bytes| bytes.starts_with(b"event: response.output_text.done"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|bytes| bytes.starts_with(b"event: response.completed"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn integral_float_timestamp_and_empty_function_arguments_complete() {
+        let mut converter = ResponsesSse::new("demo".into(), Value::Null);
+        let mut pending = VecDeque::new();
+        converter
+            .feed(
+                &frame(json!({"id":"chat-1","created":1729600000.0,
+            "choices":[{"index":0,"delta":{"tool_calls":[{"index":0,
+                "id":"call_zero","type":"function",
+                "function":{"name":"no_params","arguments":""}}]},
+                "finish_reason":null}]})),
+                &mut pending,
+            )
+            .unwrap();
+        converter
+            .feed(
+                &frame(json!({"id":"chat-1","choices":[{"index":0,
+            "delta":null,"finish_reason":"tool_calls"}]})),
+                &mut pending,
+            )
+            .unwrap();
+        converter.feed(b"data: [DONE]\n\n", &mut pending).unwrap();
+        assert_eq!(converter.created_at, Some(1_729_600_000));
+        assert!(converter.done);
+        let all = pending
+            .iter()
+            .map(|e| String::from_utf8_lossy(e).into_owned())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(all.contains("event: response.completed"));
+        assert!(all.contains("\\\"arguments\\\":\\\"{}\\\""), "{all}");
+    }
+
     #[test]
     fn single_complete_frames_do_not_allocate_an_intermediate_frame_buffer() {
         let mut translator = ResponsesSse::new("demo".into(), Value::Null);

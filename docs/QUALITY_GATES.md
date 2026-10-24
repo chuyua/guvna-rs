@@ -110,7 +110,8 @@ An independent Linux --release gateway instance runs with Auto enabled,
 gate requires exactly 64 primary attempts and 64 successful fallback
 completions, reconciles metrics, and checks bounded RSS/FD/thread counts.
 Local warning JSON-line stderr events are restricted to fixed metadata
-fields, contain no API key values and are rate limited to ten lines.
+fields, contain no API key values and are sampled: first eight events per
+fixed category, then every 128th event (not a total cap of ten lines).
 
 ## SSE-only aggregation capability + failure classification
 

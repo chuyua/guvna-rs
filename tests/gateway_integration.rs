@@ -262,6 +262,36 @@ async fn candidate_payload_overrides_do_not_leak_to_fallback_steps() {
 }
 
 #[tokio::test]
+async fn default_chain_routes_unknown_model_but_not_named_or_prefixed_models() {
+    let (upstream_url, calls) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: bridge\n    type: openai\n    base_url: {upstream_url}\n    key_env: BRIDGE\nchains:\n  - name: fallback\n    steps:\n      - provider: bridge\n        model: physical-default\ndefault_chain: fallback\n"
+    )).unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("BRIDGE".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, result) = call(router.clone(), request("unknown-model", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["model"], "physical-default");
+    let (status, result) = call(
+        router.clone(),
+        request("bridge/physical-direct", "", "client"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["model"], "physical-direct");
+    let (status, result) = call(router.clone(), request("fallback", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["model"], "physical-default");
+    let (status, result) = call(router, request("auto", "", "client")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{result}");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
 async fn reject_bad_key_and_invalid_stream_n_without_calling_upstream() {
     let (a, calls) = start_upstream(StatusCode::OK).await;
     let router = make_app(&a, &a);
