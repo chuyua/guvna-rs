@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod ops_log;
 pub mod outcome;
 pub mod routing;
+pub mod scoring;
 pub mod sse;
 pub mod telemetry;
 

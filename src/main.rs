@@ -37,6 +37,8 @@ async fn run() -> Result<(), String> {
         .unwrap_or_else(|| PathBuf::from(".guvna"));
     let mut healthcheck = false;
     let mut status = false;
+    let mut status_scoring = false;
+    let mut scoring_hours: u32 = 24;
     let mut logs = false;
     let mut system_journal = false;
     let mut tail_specified = false;
@@ -69,6 +71,17 @@ async fn run() -> Result<(), String> {
             "-data" | "--data" => {
                 data_dir = PathBuf::from(args.next().ok_or("missing -data value")?);
             }
+            "--scoring" if status => status_scoring = true,
+            "--json" if status => {}
+            "--window" if status => {
+                scoring_hours = match args.next().as_deref() {
+                    Some("1h") => 1,
+                    Some("6h") => 6,
+                    Some("24h") => 24,
+                    Some("7d") => 168,
+                    _ => return Err("status --window requires 1h|6h|24h|7d".into()),
+                };
+            }
             "--system" if logs => system_journal = true,
             "--tail" if logs => {
                 tail_specified = true;
@@ -97,7 +110,7 @@ async fn run() -> Result<(), String> {
             }
             "--help" | "-h" | "help" => {
                 println!(
-                    "guvna serve [-config config.yaml] [-data DIR]\nguvna status [-config config.yaml]\nguvna logs [--tail 100] [--system]\n  --healthcheck probes /healthz\nguvna chains show -name NAME\nguvna chains list|validate [-config FILE] [-data DIR]\nguvna chains set -file CHAIN.yaml [-config FILE] [-data DIR]\nguvna chains delete -name NAME [-config FILE] [-data DIR]\nguvna chains recover [-from BACKUP] [-config FILE] [-data DIR]\n  --version"
+                    "guvna serve [-config config.yaml] [-data DIR]\nguvna status [--json] [--scoring] [--window 1h|6h|24h|7d] [-config config.yaml]\nguvna logs [--tail 100] [--system]\n  --healthcheck probes /healthz\nguvna chains show -name NAME\nguvna chains list|validate [-config FILE] [-data DIR]\nguvna chains set -file CHAIN.yaml [-config FILE] [-data DIR]\nguvna chains delete -name NAME [-config FILE] [-data DIR]\nguvna chains recover [-from BACKUP] [-config FILE] [-data DIR]\n  --version"
                 );
                 return Ok(());
             }
@@ -131,9 +144,19 @@ async fn run() -> Result<(), String> {
     }
     if status {
         #[cfg(unix)]
-        if let Some(snapshot) = control_socket::query(&data_dir).await? {
-            println!("{snapshot}");
-            return Ok(());
+        {
+            let snapshot = if status_scoring {
+                control_socket::query_scoring(&data_dir, scoring_hours).await?
+            } else {
+                control_socket::query(&data_dir).await?
+            };
+            if let Some(snapshot) = snapshot {
+                println!("{snapshot}");
+                return Ok(());
+            }
+        }
+        if status_scoring {
+            return Err("status --scoring requires a running local Unix control socket".into());
         }
     }
     let real_path = std::fs::canonicalize(&config_path)

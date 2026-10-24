@@ -22,12 +22,14 @@ use tokio::{
 
 const SOCKET_NAME: &str = "control.sock";
 const MAX_CONTROL_LINE: usize = 4096;
+const MAX_CONTROL_RESPONSE_LINE: usize = 32768;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CLIENTS: usize = 4;
 
 struct ControlSocket {
     listener: UnixListener,
     path: PathBuf,
+    directory: PathBuf,
     state: Arc<AppState>,
 }
 
@@ -56,6 +58,7 @@ impl ControlSocket {
         Ok(Self {
             listener,
             path,
+            directory: data_dir.to_path_buf(),
             state,
         })
     }
@@ -72,9 +75,10 @@ impl ControlSocket {
                 Err(_) => break,
             };
             let state = Arc::clone(&self.state);
+            let directory = self.directory.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = handle_client(stream, state).await;
+                let _ = handle_client(stream, state, directory).await;
             });
         }
     }
@@ -131,7 +135,10 @@ pub async fn spawn(data_dir: &Path, state: Arc<AppState>) -> Result<JoinHandle<(
     Ok(tokio::spawn(server.run()))
 }
 
-async fn read_line_bounded<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, &'static str> {
+async fn read_line_bounded<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<Vec<u8>, &'static str> {
     let mut bytes = Vec::with_capacity(128);
     loop {
         let mut byte = [0_u8; 1];
@@ -146,14 +153,18 @@ async fn read_line_bounded<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u
         if byte[0] == b'\n' {
             return Ok(bytes);
         }
-        if bytes.len() >= MAX_CONTROL_LINE {
+        if bytes.len() >= limit {
             return Err("request_too_large");
         }
         bytes.push(byte[0]);
     }
 }
 
-async fn handle_client(mut stream: UnixStream, state: Arc<AppState>) -> Result<(), String> {
+async fn handle_client(
+    mut stream: UnixStream,
+    state: Arc<AppState>,
+    directory: PathBuf,
+) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     if stream
         .peer_cred()
@@ -163,17 +174,37 @@ async fn handle_client(mut stream: UnixStream, state: Arc<AppState>) -> Result<(
     {
         return Err("control peer uid mismatch".into());
     }
-    let bytes = timeout(CONTROL_TIMEOUT, read_line_bounded(&mut stream))
-        .await
-        .map_err(|_| "control request timed out")?
-        .map_err(str::to_string)?;
+    let bytes = timeout(
+        CONTROL_TIMEOUT,
+        read_line_bounded(&mut stream, MAX_CONTROL_LINE),
+    )
+    .await
+    .map_err(|_| "control request timed out")?
+    .map_err(str::to_string)?;
     let request: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid control JSON")?;
-    let response = if request.get("command").and_then(Value::as_str) == Some("status") {
-        state.runtime_status()
-    } else {
-        json!({"error":"unsupported_command"})
+    let response = match request.get("command").and_then(Value::as_str) {
+        Some("status") => state.runtime_status(),
+        Some("scoring") => {
+            let hours = request.get("hours").and_then(Value::as_u64).unwrap_or(24);
+            if ![1, 6, 24, 168].contains(&hours) {
+                json!({"error":"invalid_scoring_window"})
+            } else {
+                let work = tokio::task::spawn_blocking(move || {
+                    guvna::scoring::read_scoring(&directory, hours as u32)
+                });
+                match timeout(Duration::from_millis(800), work).await {
+                    Ok(Ok(Ok(report))) => report,
+                    _ => json!({"error":"scoring_unavailable"}),
+                }
+            }
+        }
+        _ => json!({"error":"unsupported_command"}),
     };
     let mut output = serde_json::to_vec(&response).map_err(|_| "encode control response")?;
+    if output.len() >= MAX_CONTROL_RESPONSE_LINE {
+        output = serde_json::to_vec(&json!({"error":"control_response_too_large"}))
+            .map_err(|_| "encode bounded control response")?;
+    }
     output.push(b'\n');
     timeout(CONTROL_TIMEOUT, stream.write_all(&output))
         .await
@@ -184,6 +215,16 @@ async fn handle_client(mut stream: UnixStream, state: Arc<AppState>) -> Result<(
 
 /// Returns None only when no socket is installed (legacy HTTP health probe fallback).
 pub async fn query(data_dir: &Path) -> Result<Option<String>, String> {
+    query_command(data_dir, "status", 24).await
+}
+pub async fn query_scoring(data_dir: &Path, hours: u32) -> Result<Option<String>, String> {
+    query_command(data_dir, "scoring", hours).await
+}
+async fn query_command(
+    data_dir: &Path,
+    command: &str,
+    hours: u32,
+) -> Result<Option<String>, String> {
     let path = socket_path(data_dir)?;
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -202,17 +243,20 @@ pub async fn query(data_dir: &Path) -> Result<Option<String>, String> {
         Ok(Err(error)) => return Err(format!("connect local control socket: {error}")),
         Err(_) => return Err("timed out connecting to local control socket".into()),
     };
-    timeout(
+    let mut request = serde_json::to_vec(&json!({"command":command,"hours":hours}))
+        .map_err(|_| "cannot serialize control request")?;
+    request.push(b'\n');
+    timeout(CONTROL_TIMEOUT, stream.write_all(&request))
+        .await
+        .map_err(|_| "local status request timed out")?
+        .map_err(|_| "write local status request")?;
+    let bytes = timeout(
         CONTROL_TIMEOUT,
-        stream.write_all(b"{\"command\":\"status\"}\n"),
+        read_line_bounded(&mut stream, MAX_CONTROL_RESPONSE_LINE),
     )
     .await
-    .map_err(|_| "local status request timed out")?
-    .map_err(|_| "write local status request")?;
-    let bytes = timeout(CONTROL_TIMEOUT, read_line_bounded(&mut stream))
-        .await
-        .map_err(|_| "local status response timed out")?
-        .map_err(str::to_string)?;
+    .map_err(|_| "local status response timed out")?
+    .map_err(str::to_string)?;
     let response: Value =
         serde_json::from_slice(&bytes).map_err(|_| "invalid local status response")?;
     if let Some(error) = response.get("error").and_then(Value::as_str) {
@@ -268,6 +312,12 @@ mod tests {
         assert!(!response.contains("private-provider"));
         assert!(!response.contains("UPSTREAM_SECRET_ENV"));
 
+        let scoring = query_scoring(dir.path(), 1).await.unwrap().unwrap();
+        let scoring_data: Value = serde_json::from_str(&scoring).unwrap();
+        assert_eq!(scoring_data["enabled"], false);
+        assert_eq!(scoring_data["window_hours"], 1);
+        assert!(query_scoring(dir.path(), 2).await.is_err());
+
         server.abort();
         let _ = server.await;
         assert!(!socket.exists());
@@ -280,7 +330,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            read_line_bounded(&mut reader).await,
+            read_line_bounded(&mut reader, MAX_CONTROL_LINE).await,
             Err("request_too_large")
         );
     }

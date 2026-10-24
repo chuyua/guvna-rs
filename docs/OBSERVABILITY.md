@@ -163,3 +163,15 @@ An unavailable or stale control socket causes `guvna status` to use the
 loopback health probe. Existing user-supplied data directories retain their
 permissions; newly created ones are secured at 0700. The control socket is
 secured at 0600 and peer credentials are verified on Linux.
+## Issue #129: local historical scoring inspection
+
+Use guvna status --scoring --window 1h|6h|24h|7d --data DIR on Linux.
+The request uses only the same-UID, permission-restricted Unix control socket;
+the service opens a separate read-only SQLite connection with a short busy
+timeout and bounded response size. It never queries SQLite on the public
+HTTP request path. Summaries include actual candidate attempt/failure counts,
+mean attempt time and up to 512 samples per candidate of downstream-completion
+p95. The totals come from hour buckets (window start is rounded down);
+the downstream p95 is not an upstream attempt p95. Results are advisory only
+and only qualify candidates after at least 20 attempts. This does not
+silently activate telemetry-based model ordering or expose another TCP port.
