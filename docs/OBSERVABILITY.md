@@ -88,7 +88,27 @@ attempt count matches the mock providers across 2,000 normal requests,
 It also checks that expected success, fallback and stream counters reconcile,
 and that the active request gauge returns to zero.
 
-The metrics endpoint is deliberately small and stateless: there is no disk
-database, no background exporter task and no added third-party telemetry
-dependency. For external monitoring, use an authenticated scrape over a
+The metrics endpoint is deliberately small and stateless: optional local SQLite metadata is available only when explicitly enabled. For external monitoring, use an authenticated scrape over a
 trusted loopback/tunnel; do not put tokens in query strings.
+
+## Optional local SQLite request metadata (Issue #69)
+
+Set GUVNA_TELEMETRY_SQLITE=1 to enable persistent local request metadata.
+Without this setting the database writer is not started. Data is written to
+GUVNA_DATA_DIR/telemetry/requests.sqlite3 (or the selected -data directory).
+
+Rows contain a timestamp, fixed endpoint category (chat or embeddings),
+downstream HTTP status, bounded elapsed milliseconds and an SSE-headers flag.
+No prompts, credentials, client IPs, provider/model names or request bodies are
+written. SSE records reflect header dispatch, not terminal stream success.
+
+A 512-item nonblocking sync queue feeds a single SQLite WAL worker (batches
+up to 64 rows, 250ms collection wait). Disk settings include a 32MiB main
+database page cap and a 1MiB journal target, not an absolute filesystem quota.
+Rows older than seven days are pruned on startup and periodically. A full or
+locked database cannot block the gateway. New fixed-cardinality metrics:
+guvna_telemetry_written_total, guvna_telemetry_dropped_total, and
+guvna_telemetry_write_failures_total.
+
+Provider/model history and Auto V2 health scoring are separate unfinished
+features. The telemetry directory is local and limited to the service user.

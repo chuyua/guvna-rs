@@ -8,11 +8,13 @@ Example in config.yaml:
 
     auto:
       enabled: true
+      max_candidates: 2
       candidates:
         - provider: fast
           model: fast-model
           priority: 1
           max_input_bytes: 1024
+          max_context_tokens: 1024
         - provider: reliable
           model: big-context-model
           priority: 3
@@ -64,7 +66,8 @@ aggregation_failed. Informational event: aggregation_completed. All
 events are local-only and sampled; no per-user or per-provider data is logged.
 
 The pre-existing authenticated /metrics endpoint still works but this
-feature adds no endpoints or telemetry databases. systemd/journald can
+feature adds no remote endpoints; separately opt in to local SQLite request
+metadata using GUVNA_TELEMETRY_SQLITE=1. systemd/journald can
 collect these lines locally using the OS's existing access controls.
 
 ## Deferred scope

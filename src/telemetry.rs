@@ -125,6 +125,18 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
     tx.commit()
 }
 
+/// Delete expired metadata at startup and periodically, without reading request bodies.
+fn prune_expired(conn: &Connection) -> rusqlite::Result<usize> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64;
+    conn.execute(
+        "DELETE FROM request_events WHERE ts < ?1",
+        [now - RETENTION_SECS],
+    )
+}
 fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
     let mut conn = match open_database(&path) {
         Ok(db) => db,
@@ -136,6 +148,9 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
             return;
         }
     };
+    if prune_expired(&conn).is_err() {
+        Metrics::inc(&metrics.telemetry_write_failures);
+    }
     let mut batches: usize = 0;
     while let Ok(first) = receiver.recv() {
         let mut batch = Vec::with_capacity(BATCH_CAPACITY);
@@ -162,16 +177,7 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
         }
         batches = batches.wrapping_add(1);
         if batches.is_multiple_of(128) {
-            let cutoff = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                .min(i64::MAX as u64) as i64
-                - RETENTION_SECS;
-            if conn
-                .execute("DELETE FROM request_events WHERE ts < ?1", [cutoff])
-                .is_err()
-            {
+            if prune_expired(&conn).is_err() {
                 Metrics::inc(&metrics.telemetry_write_failures);
             }
         }
@@ -238,6 +244,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn expired_rows_are_pruned_but_recent_rows_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_database(&dir.path().join("test.sqlite3")).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let events = [
+            Event {
+                ts: now - RETENTION_SECS - 1,
+                endpoint: "chat",
+                status: 200,
+                elapsed_ms: 1,
+                sse_headers: false,
+            },
+            Event {
+                ts: now,
+                endpoint: "embeddings",
+                status: 500,
+                elapsed_ms: 2,
+                sse_headers: false,
+            },
+        ];
+        write_batch(&mut conn, &events).unwrap();
+        assert_eq!(prune_expired(&conn).unwrap(), 1);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
     #[test]
     fn locked_database_rejects_batch_without_leaking_partial_rows() {
         let dir = tempfile::tempdir().unwrap();

@@ -72,7 +72,7 @@ Mixed upstream 5xx, connection, invalid-result, auth and circuit failures
 retain the conservative failover/error behavior. Fixed-cardinality
 guvna_rate_limit_exhaustions_total and the opt-in rate_limit_exhausted
 local stderr event expose this condition without prompts, credentials
-or provider identifiers. No remote management endpoint or telemetry DB.
+or provider identifiers. No remote management endpoint. Local SQLite telemetry is separately opt-in.
 
 An opt-in Auto V1 selects model candidates using configured priority
 and a bounded encoded-input-length filter. POST /v1/auto or Chat model
@@ -81,8 +81,9 @@ auto delegates to existing failover and circuit logic; Auto is off by default.
 Set GUVNA_LOG_EVENTS=1 for sparse local stderr JSON-lines, including
 sampled SSE aggregation successes and failures, without prompt, provider URL,
 client IP or API key. Logs can be collected by the host journal for soak
-testing. No remote management endpoint, control socket, telemetry database
-or additional externally exposed interface is created. See docs/AUTO_V1.md.
+testing. Auto itself creates no remote management endpoint or control socket.
+For optional local SQLite metadata, set GUVNA_TELEMETRY_SQLITE=1 and see
+docs/OBSERVABILITY.md. See docs/AUTO_V1.md for routing.
 
 ## Non-streaming whole-chain timeout
 
