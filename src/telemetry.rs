@@ -876,6 +876,27 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_database_drops_telemetry_without_blocking_or_rewriting_corrupt_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.sqlite3");
+        let original = b"not a valid sqlite database";
+        std::fs::write(&path, original).unwrap();
+
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let metrics = Arc::new(Metrics::default());
+        let worker_metrics = Arc::clone(&metrics);
+        let handle = thread::spawn(move || worker(receiver, path, worker_metrics));
+        sender
+            .try_send(event(123, "provider", "model", 503, 1, "provider_5xx"))
+            .unwrap();
+        drop(sender);
+        handle.join().unwrap();
+
+        assert_eq!(metrics.telemetry_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.telemetry_write_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+    #[test]
     fn locked_database_rejects_batch_without_leaking_partial_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.sqlite3");
