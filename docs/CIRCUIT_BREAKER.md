@@ -50,6 +50,15 @@ fall back successfully, and metrics/RSS/FD/thread limits are verified.
 Do not mistake the provider breaker for key-level 429/auth quarantine or
 the global request admission limiter.
 
+## Optional per-credential transient cooldown
+
+An explicit `quarantine.transient: 30s` under a provider enables per-key
+isolation after an upstream HTTP 5xx or transport timeout/failure. Without
+this setting transient key quarantine stays **disabled** for compatibility,
+and provider circuit-breaking behavior is unchanged. A zero duration disables
+the per-key isolation. A stale overlapping request cannot extend cooldown.
+A healthy alternate key or downstream provider remains eligible to run.
+
 ## Per-credential HTTP 429 Retry-After
 
 HTTP 429 never counts against the provider circuit breaker. Instead, only the
