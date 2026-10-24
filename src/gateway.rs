@@ -136,7 +136,28 @@ impl AppState {
 
     /// Optional local-only telemetry. Main enables this explicitly; test AppStates stay off.
     pub fn enable_telemetry(&mut self, data_dir: &std::path::Path) -> Result<(), String> {
-        self.telemetry = Some(Telemetry::start(data_dir, Arc::clone(&self.metrics))?);
+        let restored = if self.auto_health.is_some() {
+            Telemetry::load_provider_health(data_dir)
+        } else {
+            Vec::new()
+        };
+        let telemetry = Telemetry::start(data_dir, Arc::clone(&self.metrics))?;
+        if let Some(health) = &self.auto_health {
+            for (index, provider) in self.config.providers.iter().enumerate() {
+                let provider_label = Telemetry::normalize_label(&provider.name);
+                if let Some(snapshot) = restored.iter().find(|item| item.provider == provider_label)
+                {
+                    health.restore(
+                        index,
+                        snapshot.penalty,
+                        snapshot.consecutive_failures,
+                        snapshot.demoted,
+                        snapshot.last_failure_secs,
+                    );
+                }
+            }
+        }
+        self.telemetry = Some(telemetry);
         Ok(())
     }
     pub fn runtime_status(&self) -> Value {

@@ -461,6 +461,7 @@ async fn dispatch_inner(
                             .with_tool_choice(payload.get("tool_choice")),
                         state.clone(),
                         step.provider_index,
+                        step.model.clone(),
                         lease.clone(),
                         &mut permit,
                         &mut circuit_ticket,

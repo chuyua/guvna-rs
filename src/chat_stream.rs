@@ -16,6 +16,7 @@ const MAX_STREAM_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 struct ChatStreamState {
     owner: Arc<AppState>,
     provider_index: usize,
+    model: String,
     lease: Lease,
     upstream: reqwest::Response,
     parser: ChatSse,
@@ -43,6 +44,7 @@ pub(super) async fn start(
     parser: ChatSse,
     owner: Arc<AppState>,
     provider_index: usize,
+    model: String,
     lease: Lease,
     permit: &mut Option<OwnedSemaphorePermit>,
     circuit_ticket: &mut Option<Ticket>,
@@ -62,6 +64,7 @@ pub(super) async fn start(
     let mut state = ChatStreamState {
         owner,
         provider_index,
+        model,
         lease,
         upstream,
         parser,
@@ -106,6 +109,16 @@ fn stream_response(state: ChatStreamState) -> Response {
                     if let Some(health) = &state.owner.auto_health {
                         health.mark_success(state.provider_index);
                     }
+                    if let Some(telemetry) = &state.owner.telemetry {
+                        let provider = &state.owner.config.providers[state.provider_index].name;
+                        telemetry.observe_health(
+                            "chat",
+                            provider,
+                            &state.model,
+                            "success",
+                            &state.owner.metrics,
+                        );
+                    }
                     Metrics::inc(&state.owner.metrics.chat_stream_completed);
                     state.terminal_reported = true;
                 }
@@ -133,6 +146,19 @@ fn stream_response(state: ChatStreamState) -> Response {
             }
             if state.terminated {
                 Metrics::inc(&state.owner.metrics.chat_stream_failed);
+                if let Some(health) = &state.owner.auto_health {
+                    health.mark_failure(state.provider_index);
+                }
+                if let Some(telemetry) = &state.owner.telemetry {
+                    let provider = &state.owner.config.providers[state.provider_index].name;
+                    telemetry.observe_health(
+                        "chat",
+                        provider,
+                        &state.model,
+                        "transport_error",
+                        &state.owner.metrics,
+                    );
+                }
                 record_circuit_failure(&mut state.circuit_ticket, &state.owner.metrics);
                 state.terminal_reported = true;
                 return Some((Ok(stream_error()), state));

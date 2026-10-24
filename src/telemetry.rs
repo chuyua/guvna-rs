@@ -31,6 +31,16 @@ pub struct TelemetryContext {
     provider: String,
     model: String,
     failure_type: &'static str,
+    is_upstream: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderHealthSnapshot {
+    pub provider: String,
+    pub penalty: u8,
+    pub consecutive_failures: u16,
+    pub demoted: bool,
+    pub last_failure_secs: u64,
 }
 
 impl TelemetryContext {
@@ -39,6 +49,7 @@ impl TelemetryContext {
             provider: safe_label(provider),
             model: safe_label(model),
             failure_type: allowed_failure_type(failure_type),
+            is_upstream: true,
         }
     }
 
@@ -63,7 +74,9 @@ impl TelemetryContext {
                 _ => "unknown",
             }
         };
-        Self::new("unknown", "unknown", failure_type)
+        let mut context = Self::new("unknown", "unknown", failure_type);
+        context.is_upstream = false;
+        context
     }
 }
 
@@ -114,6 +127,8 @@ struct Event {
     elapsed_ms: u32,
     sse_headers: bool,
     failure_type: &'static str,
+    record_request: bool,
+    health_observation: bool,
 }
 
 impl Telemetry {
@@ -134,6 +149,43 @@ impl Telemetry {
             .spawn(move || worker(receiver, directory.join("requests.sqlite3"), metrics))
             .map_err(|_| "cannot start telemetry writer".to_string())?;
         Ok(Self { sender })
+    }
+    pub fn normalize_label(value: &str) -> String {
+        safe_label(value)
+    }
+
+    pub fn load_provider_health(data_dir: &Path) -> Vec<ProviderHealthSnapshot> {
+        load_provider_health_from_path(
+            &data_dir.join("telemetry").join("requests.sqlite3"),
+            now_secs(),
+        )
+    }
+
+    /// Record a terminal stream outcome without duplicating its request row.
+    pub fn observe_health(
+        &self,
+        endpoint: &'static str,
+        provider: &str,
+        model: &str,
+        failure_type: &'static str,
+        metrics: &Metrics,
+    ) {
+        let context = TelemetryContext::new(provider, model, failure_type);
+        let event = Event {
+            ts: now_secs(),
+            endpoint,
+            provider: context.provider,
+            model: context.model,
+            status: if failure_type == "success" { 200 } else { 502 },
+            elapsed_ms: 0,
+            sse_headers: true,
+            failure_type: context.failure_type,
+            record_request: false,
+            health_observation: true,
+        };
+        if self.sender.try_send(event).is_err() {
+            Metrics::inc(&metrics.telemetry_dropped);
+        }
     }
 
     pub fn submit(
@@ -159,6 +211,8 @@ impl Telemetry {
             elapsed_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
             sse_headers,
             failure_type: context.failure_type,
+            record_request: true,
+            health_observation: context.is_upstream,
         };
         if self.sender.try_send(event).is_err() {
             Metrics::inc(&metrics.telemetry_dropped);
@@ -258,6 +312,18 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
             PRIMARY KEY (hour_ts, endpoint, provider, model, failure_type)
         );
         CREATE INDEX IF NOT EXISTS hourly_stats_ts ON hourly_stats(hour_ts);
+        CREATE TABLE IF NOT EXISTS provider_health (
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            penalty INTEGER NOT NULL CHECK (penalty BETWEEN 0 AND 100),
+            consecutive_failures INTEGER NOT NULL,
+            demoted INTEGER NOT NULL CHECK (demoted IN (0,1)),
+            last_failure_ts INTEGER NOT NULL,
+            last_success_ts INTEGER NOT NULL,
+            updated_ts INTEGER NOT NULL,
+            PRIMARY KEY (provider, model)
+        );
+        CREATE INDEX IF NOT EXISTS provider_health_updated_ts ON provider_health(updated_ts);
     ",
     )?;
     #[cfg(unix)]
@@ -271,6 +337,24 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
 
 fn is_failure(event: &Event) -> bool {
     !matches!(event.failure_type, "success" | "stream_started")
+}
+
+fn health_failure(event: &Event) -> Option<bool> {
+    if !event.health_observation {
+        return None;
+    }
+    match event.failure_type {
+        "success" => Some(false),
+        "rate_limited"
+        | "provider_5xx"
+        | "transport_error"
+        | "invalid_response"
+        | "timeout"
+        | "upstream_unavailable" => Some(true),
+        // Credential errors, caller/model 4xx and local capacity failures do not
+        // poison provider health, though they remain visible in request telemetry.
+        _ => None,
+    }
 }
 
 fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
@@ -296,43 +380,74 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
              total_elapsed_ms=total_elapsed_ms+excluded.total_elapsed_ms,
              max_elapsed_ms=MAX(max_elapsed_ms,excluded.max_elapsed_ms)",
         )?;
+        let mut health = tx.prepare_cached(
+            "INSERT INTO provider_health
+             (provider,model,penalty,consecutive_failures,demoted,last_failure_ts,last_success_ts,updated_ts)
+             VALUES (?1,?2,CASE WHEN ?3=1 THEN 35 ELSE 0 END,
+                     CASE WHEN ?3=1 THEN 1 ELSE 0 END,0,
+                     CASE WHEN ?3=1 THEN ?4 ELSE 0 END,
+                     CASE WHEN ?3=0 THEN ?4 ELSE 0 END,?4)
+             ON CONFLICT(provider,model) DO UPDATE SET
+             penalty=CASE WHEN ?3=1 THEN MIN(provider_health.penalty+35,100)
+                          ELSE MAX(provider_health.penalty-20,0) END,
+             consecutive_failures=CASE WHEN ?3=1
+                          THEN MIN(provider_health.consecutive_failures+1,65535) ELSE 0 END,
+             demoted=CASE WHEN ?3=1 THEN
+                          CASE WHEN provider_health.consecutive_failures+1>=3
+                                    AND MIN(provider_health.penalty+35,100)>=70
+                               THEN 1 ELSE provider_health.demoted END
+                          ELSE CASE WHEN MAX(provider_health.penalty-20,0)<=30
+                                    THEN 0 ELSE provider_health.demoted END END,
+             last_failure_ts=CASE WHEN ?3=1 THEN ?4 ELSE provider_health.last_failure_ts END,
+             last_success_ts=CASE WHEN ?3=0 THEN ?4 ELSE provider_health.last_success_ts END,
+             updated_ts=?4",
+        )?;
         for event in batch {
-            request.execute(params![
-                event.ts,
-                event.endpoint,
-                event.provider,
-                event.model,
-                event.status,
-                event.elapsed_ms,
-                i64::from(event.sse_headers),
-                event.failure_type,
-            ])?;
-            if is_failure(event) {
-                failure.execute(params![
+            if event.record_request {
+                request.execute(params![
                     event.ts,
                     event.endpoint,
                     event.provider,
                     event.model,
                     event.status,
                     event.elapsed_ms,
+                    i64::from(event.sse_headers),
                     event.failure_type,
                 ])?;
+                if is_failure(event) {
+                    failure.execute(params![
+                        event.ts,
+                        event.endpoint,
+                        event.provider,
+                        event.model,
+                        event.status,
+                        event.elapsed_ms,
+                        event.failure_type,
+                    ])?;
+                }
+                let hour = event.ts - event.ts.rem_euclid(3600);
+                hourly.execute(params![
+                    hour,
+                    event.endpoint,
+                    event.provider,
+                    event.model,
+                    event.failure_type,
+                    i64::from(is_failure(event)),
+                    event.elapsed_ms,
+                ])?;
             }
-            let hour = event.ts - event.ts.rem_euclid(3600);
-            hourly.execute(params![
-                hour,
-                event.endpoint,
-                event.provider,
-                event.model,
-                event.failure_type,
-                i64::from(is_failure(event)),
-                event.elapsed_ms,
-            ])?;
+            if let Some(failed) = health_failure(event) {
+                let failed = i64::from(failed);
+                // Per-model score plus a provider-wide aggregate used by the
+                // existing conservative candidate ranking after restart.
+                for model in [event.model.as_str(), "*"] {
+                    health.execute(params![event.provider, model, failed, event.ts])?;
+                }
+            }
         }
     }
     tx.commit()
 }
-
 /// Delete request details after seven days and failure/hourly history after 30 days.
 fn prune_expired(conn: &mut Connection, now: i64) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
@@ -348,6 +463,10 @@ fn prune_expired(conn: &mut Connection, now: i64) -> rusqlite::Result<()> {
         "DELETE FROM hourly_stats WHERE hour_ts < ?1",
         [now - HISTORY_RETENTION_SECS],
     )?;
+    tx.execute(
+        "DELETE FROM provider_health WHERE updated_ts < ?1",
+        [now - HISTORY_RETENTION_SECS],
+    )?;
     tx.commit()
 }
 
@@ -359,6 +478,47 @@ fn now_secs() -> i64 {
         .min(i64::MAX as u64) as i64
 }
 
+fn load_provider_health_from_path(path: &Path, now: i64) -> Vec<ProviderHealthSnapshot> {
+    if !path.is_file() {
+        return Vec::new();
+    }
+    let Ok(conn) = Connection::open(path) else {
+        return Vec::new();
+    };
+    if conn.busy_timeout(Duration::from_millis(100)).is_err() {
+        return Vec::new();
+    }
+    let exists: rusqlite::Result<bool> = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_health')",
+        [],
+        |row| row.get(0),
+    );
+    if !matches!(exists, Ok(true)) {
+        return Vec::new();
+    }
+    let Ok(mut statement) = conn.prepare(
+        "SELECT provider,penalty,consecutive_failures,demoted,last_failure_ts
+         FROM provider_health WHERE model='*' AND updated_ts >= ?1",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map([now - HISTORY_RETENTION_SECS], |row| {
+        let penalty: i64 = row.get(1)?;
+        let failures: i64 = row.get(2)?;
+        let demoted: i64 = row.get(3)?;
+        let last_failure: i64 = row.get(4)?;
+        Ok(ProviderHealthSnapshot {
+            provider: row.get(0)?,
+            penalty: penalty.clamp(0, 100) as u8,
+            consecutive_failures: failures.clamp(0, u16::MAX as i64) as u16,
+            demoted: demoted != 0,
+            last_failure_secs: last_failure.max(0) as u64,
+        })
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(Result::ok).collect()
+}
 fn drop_batch(batch: &[Event], metrics: &Metrics) {
     metrics
         .telemetry_dropped
@@ -457,6 +617,8 @@ mod tests {
             elapsed_ms: elapsed,
             sse_headers: false,
             failure_type: kind,
+            record_request: true,
+            health_observation: true,
         }
     }
 
@@ -560,8 +722,40 @@ mod tests {
             [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
         ).unwrap();
         assert_eq!(hourly, (1, 1, 51, 51));
+        let health: (i64, i64, i64) = db.query_row(
+            "SELECT penalty,consecutive_failures,demoted FROM provider_health WHERE provider='provider_A' AND model='*'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(health, (35, 1, 0));
     }
 
+    #[test]
+    fn provider_health_snapshot_restores_only_recent_provider_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health.sqlite3");
+        let mut conn = open_database(&path).unwrap();
+        write_batch(
+            &mut conn,
+            &[
+                event(7200, "provider A", "model/alpha", 503, 1, "provider_5xx"),
+                event(7201, "provider A", "model/alpha", 503, 1, "provider_5xx"),
+                event(7202, "provider A", "model/alpha", 503, 1, "provider_5xx"),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let snapshots = load_provider_health_from_path(&path, 7203);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].provider, "provider_A");
+        assert_eq!(snapshots[0].penalty, 100);
+        assert_eq!(snapshots[0].consecutive_failures, 3);
+        assert!(snapshots[0].demoted);
+        assert_eq!(snapshots[0].last_failure_secs, 7202);
+
+        let stale = load_provider_health_from_path(&path, 7202 + HISTORY_RETENTION_SECS + 1);
+        assert!(stale.is_empty());
+    }
     #[test]
     fn retention_is_seven_days_for_requests_and_thirty_for_failure_history() {
         let dir = tempfile::tempdir().unwrap();
