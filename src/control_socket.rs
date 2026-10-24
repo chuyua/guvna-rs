@@ -15,7 +15,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    sync::Semaphore,
+    sync::{Mutex, Semaphore},
     task::JoinHandle,
     time::timeout,
 };
@@ -71,6 +71,7 @@ impl ControlSocket {
 
     async fn run(self) {
         let permits = Arc::new(Semaphore::new(MAX_CLIENTS));
+        let mutation_gate = Arc::new(Mutex::new(()));
         loop {
             let (stream, _) = match self.listener.accept().await {
                 Ok(connection) => connection,
@@ -83,9 +84,10 @@ impl ControlSocket {
             let state = Arc::clone(&self.state);
             let directory = self.directory.clone();
             let base_config = Arc::clone(&self.base_config);
+            let gate = Arc::clone(&mutation_gate);
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = handle_client(stream, state, directory, base_config).await;
+                let _ = handle_client(stream, state, directory, base_config, gate).await;
             });
         }
     }
@@ -176,6 +178,7 @@ async fn handle_client(
     state: Arc<AppState>,
     directory: PathBuf,
     base_config: Arc<Config>,
+    mutation_gate: Arc<Mutex<()>>,
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     if stream
@@ -214,19 +217,21 @@ async fn handle_client(
                 } else {
                     chain_store::Command::Delete(value.to_owned())
                 };
+                // The original write and subsequent in-memory publish must
+                // be serialized. Dropping a timeout around spawn_blocking is
+                // essential: orphaned filesystem writes cannot race a newer
+                // snapshot into the older in-memory state.
+                let _serial = mutation_gate.lock().await;
                 let base = Arc::clone(&base_config);
                 let local_dir = directory.clone();
-                let result = timeout(
-                    Duration::from_secs(3),
-                    tokio::task::spawn_blocking(move || {
-                        let output = chain_store::execute(&base, &local_dir, cmd)?;
-                        let routes = base.as_ref().clone().with_runtime_chains(&local_dir)?;
-                        Ok::<_, String>((output, routes))
-                    }),
-                )
+                let result = tokio::task::spawn_blocking(move || {
+                    let output = chain_store::execute(&base, &local_dir, cmd)?;
+                    let routes = base.as_ref().clone().with_runtime_chains(&local_dir)?;
+                    Ok::<_, String>((output, routes))
+                })
                 .await;
                 match result {
-                    Ok(Ok(Ok((output, routes)))) => match state.replace_route_snapshot(routes) {
+                    Ok(Ok((output, routes))) => match state.replace_route_snapshot(routes) {
                         Ok(()) => json!({"ok":true,"online":true,"result":output}),
                         Err(_) => json!({"error":"route_reload_failed"}),
                     },
@@ -449,6 +454,72 @@ mod tests {
             .unwrap_err();
         assert!(forbidden.contains("chain_update_failed"));
         assert!(routing::resolve(&state.route_snapshot(), "immutable").is_ok());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_online_mutations_keep_disk_and_live_snapshot_in_sync() {
+        use guvna::config::Config;
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: http://127.0.0.1:1\n    key_env: K\nchains:\n  - name: static\n    steps:\n      - provider: p\n        model: fixed\n"
+        ).unwrap();
+        let state = Arc::new(
+            AppState::new(
+                config.clone(),
+                HashMap::from([("K".to_owned(), "test-key".to_owned())]),
+                vec!["client-key".to_owned()],
+            )
+            .unwrap(),
+        );
+        let server = spawn(dir.path(), state.clone(), Arc::new(config.clone()))
+            .await
+            .unwrap();
+        let first = dir.path().join("first.yaml");
+        let second = dir.path().join("second.yaml");
+        fs::write(
+            &first,
+            "name: first\nsteps:\n  - provider: p\n    model: one\n",
+        )
+        .unwrap();
+        fs::write(
+            &second,
+            "name: second\nsteps:\n  - provider: p\n    model: two\n",
+        )
+        .unwrap();
+        let a = query_chain_mutation(dir.path(), "chains_set", first.to_str().unwrap());
+        let b = query_chain_mutation(dir.path(), "chains_set", second.to_str().unwrap());
+        let (a, b) = tokio::join!(a, b);
+        for output in [a.unwrap().unwrap(), b.unwrap().unwrap()] {
+            assert!(
+                output.contains("\"online\": true") || output.contains("\"online\":true"),
+                "{output}"
+            );
+        }
+        let current = state.route_snapshot();
+        let on_disk = config.with_runtime_chains(dir.path()).unwrap();
+        for name in ["static", "first", "second"] {
+            assert_eq!(
+                current
+                    .chains
+                    .iter()
+                    .find(|chain| chain.name == name)
+                    .unwrap()
+                    .steps[0]
+                    .model,
+                on_disk
+                    .chains
+                    .iter()
+                    .find(|chain| chain.name == name)
+                    .unwrap()
+                    .steps[0]
+                    .model,
+                "{name}",
+            );
+        }
         server.abort();
         let _ = server.await;
     }
