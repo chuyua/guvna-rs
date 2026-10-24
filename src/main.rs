@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod control_socket;
 use guvna::{chain_store, config::Config, gateway};
 use std::{collections::HashMap, env, path::PathBuf};
 
@@ -113,6 +115,13 @@ async fn run() -> Result<(), String> {
     if system_journal || tail_specified {
         return Err("journal options require logs subcommand".into());
     }
+    if status {
+        #[cfg(unix)]
+        if let Some(snapshot) = control_socket::query(&data_dir).await? {
+            println!("{snapshot}");
+            return Ok(());
+        }
+    }
     let real_path = std::fs::canonicalize(&config_path)
         .map_err(|e| format!("config path {}: {e}", config_path.display()))?;
     if let Some(action) = chains_action {
@@ -201,7 +210,12 @@ async fn run() -> Result<(), String> {
         "guvna-rs starting; config={}; listening={bind}:{port}",
         real_path.display()
     );
-    axum::serve(listener, gateway::app(state))
+    let (app, runtime_state) = gateway::app_with_state(state);
+    #[cfg(unix)]
+    let _control_server = control_socket::spawn(&data_dir, runtime_state).await?;
+    #[cfg(not(unix))]
+    let _ = runtime_state;
+    axum::serve(listener, app)
         .await
         .map_err(|e| format!("serving: {e}"))?;
     Ok(())

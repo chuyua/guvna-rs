@@ -115,3 +115,16 @@ guvna_telemetry_write_failures_total.
 
 Provider/model labels and failure categories are stored locally; learned Auto
 scoring and persistence/restoration of Auto health weights remain unfinished. The telemetry directory is local and limited to the service user.
+## Local runtime status (Unix only)
+
+On Linux, guvna serve creates GUVNA_DATA_DIR/control.sock. The containing
+directory is set to mode 0700 and the socket to 0600. guvna status sends one
+bounded JSON-line status command and prints a runtime snapshot containing
+uptime, in-flight count, open-circuit count, provider count, Auto/SQLite flags
+and fixed request/telemetry counters. No provider names, model names, secrets,
+credentials or request bodies are returned. Only the read-only status command
+is supported; there is no mutation protocol and no additional TCP listener.
+If the socket is absent, status retains the legacy loopback HTTP health probe.
+Stale sockets are cleaned on startup only after confirming the path is a Unix
+socket and a connection is refused; non-socket files and active sockets are
+never replaced.

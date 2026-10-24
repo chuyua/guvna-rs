@@ -83,7 +83,10 @@ unhealthy providers without replacing configured priorities or fallback.
 Set GUVNA_LOG_EVENTS=1 for sparse local stderr JSON-lines, including
 sampled SSE aggregation successes and failures, without prompt, provider URL,
 client IP or API key. Logs can be collected by the host journal for soak
-testing. Auto itself creates no remote management endpoint or control socket.
+testing. guvna status reads runtime counters from a read-only Unix domain
+socket under the data directory (directory mode 0700, socket mode 0600).
+It exposes no mutating command or new TCP port; HTTP health probing remains
+a fallback only when the socket is absent.
 For optional local SQLite metadata, set GUVNA_TELEMETRY_SQLITE=1 and see
 docs/OBSERVABILITY.md. See docs/AUTO_V1.md for routing.
 

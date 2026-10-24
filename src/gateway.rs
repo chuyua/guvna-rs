@@ -12,8 +12,8 @@ use axum::{
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::Arc,
-    time::{Duration, SystemTime},
+    sync::{Arc, atomic::Ordering},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -56,6 +56,7 @@ pub struct AppState {
     metrics: Arc<Metrics>,
     telemetry: Option<Telemetry>,
     auto_health: Option<AutoHealth>,
+    started_at: Instant,
     model_catalog: Value,
     model_details: HashMap<String, Value>,
 }
@@ -129,6 +130,7 @@ impl AppState {
             metrics: Arc::new(Metrics::default()),
             telemetry: None,
             auto_health,
+            started_at: Instant::now(),
         })
     }
 
@@ -136,6 +138,34 @@ impl AppState {
     pub fn enable_telemetry(&mut self, data_dir: &std::path::Path) -> Result<(), String> {
         self.telemetry = Some(Telemetry::start(data_dir, Arc::clone(&self.metrics))?);
         Ok(())
+    }
+    pub fn runtime_status(&self) -> Value {
+        let active = MAX_INFLIGHT_REQUESTS - self.inflight.available_permits();
+        let open_circuits = self
+            .circuits
+            .iter()
+            .filter_map(Option::as_ref)
+            .filter(|c| c.is_open())
+            .count();
+        json!({
+            "status": "running",
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_seconds": self.started_at.elapsed().as_secs(),
+            "providers_configured": self.config.providers.len(),
+            "active_requests": active,
+            "circuit_open_providers": open_circuits,
+            "auto_enabled": self.config.auto.enabled,
+            "auto_health_aware": self.config.auto.health_aware,
+            "sqlite_telemetry_enabled": self.telemetry.is_some(),
+            "requests_dispatched": self.metrics.requests_dispatched.load(Ordering::Relaxed),
+            "upstream_attempts": self.metrics.upstream_attempts.load(Ordering::Relaxed),
+            "upstream_success": self.metrics.upstream_success.load(Ordering::Relaxed),
+            "upstream_http_failures": self.metrics.upstream_http_failures.load(Ordering::Relaxed),
+            "upstream_transport_failures": self.metrics.upstream_transport_failures.load(Ordering::Relaxed),
+            "telemetry_written": self.metrics.telemetry_written.load(Ordering::Relaxed),
+            "telemetry_dropped": self.metrics.telemetry_dropped.load(Ordering::Relaxed),
+            "telemetry_write_failures": self.metrics.telemetry_write_failures.load(Ordering::Relaxed)
+        })
     }
     fn allowed(&self, headers: &HeaderMap) -> bool {
         let Some(header) = headers
@@ -271,7 +301,12 @@ fn record_circuit_success(ticket: &mut Option<Ticket>, metrics: &Metrics) {
 }
 
 pub fn app(state: AppState) -> Router {
-    Router::new()
+    app_with_state(state).0
+}
+
+pub fn app_with_state(state: AppState) -> (Router, Arc<AppState>) {
+    let state = Arc::new(state);
+    let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_endpoint))
         .route("/v1/models", get(models))
@@ -281,7 +316,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/responses", post(responses::handle))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(Arc::new(state))
+        .with_state(Arc::clone(&state));
+    (app, state)
 }
 
 async fn healthz() -> &'static str {
