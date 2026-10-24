@@ -382,6 +382,7 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
         Bytes::from(value.to_string()),
         Endpoint::Chat,
         permit,
+        None,
     )
     .await;
     if response.status() != StatusCode::OK {

@@ -495,7 +495,7 @@ async fn chat(State(state): State<Arc<AppState>>, request: Request<Body>) -> Res
         body,
         dispatch::Endpoint::Chat,
         permit,
-        payload_permit,
+        Some(payload_permit),
     )
     .await
 }
@@ -539,7 +539,7 @@ async fn auto(State(state): State<Arc<AppState>>, request: Request<Body>) -> Res
         Bytes::from(value.to_string()),
         dispatch::Endpoint::Chat,
         permit,
-        payload_permit,
+        Some(payload_permit),
     )
     .await
 }
@@ -554,7 +554,7 @@ async fn embeddings(State(state): State<Arc<AppState>>, request: Request<Body>) 
         body,
         dispatch::Endpoint::Embeddings,
         permit,
-        payload_permit,
+        Some(payload_permit),
     )
     .await
 }

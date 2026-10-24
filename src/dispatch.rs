@@ -47,7 +47,7 @@ pub(super) async fn dispatch(
     body: Bytes,
     endpoint: Endpoint,
     admission: OwnedSemaphorePermit,
-    payload_permit: OwnedSemaphorePermit,
+    payload_permit: Option<OwnedSemaphorePermit>,
 ) -> Response {
     let started = tokio::time::Instant::now();
     let id = ops_log::next_request_id();
@@ -170,7 +170,7 @@ async fn dispatch_inner(
     body: Bytes,
     endpoint: Endpoint,
     admission: OwnedSemaphorePermit,
-    payload_permit: OwnedSemaphorePermit,
+    payload_permit: Option<OwnedSemaphorePermit>,
     started: tokio::time::Instant,
 ) -> Response {
     let mut request: Value = match serde_json::from_slice(&body) {
