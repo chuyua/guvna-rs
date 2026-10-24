@@ -368,24 +368,6 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
         return resolve_chain(config, chain);
     }
     let mut longest: Option<(usize, usize, String)> = None;
-    // Issue #132: a provider whose upstream model ids genuinely carry the same
-    // namespace as the gateway prefix (e.g. NVIDIA NIM ids are "nvidia/...")
-    // opts out of namespace stripping with an explicit `prefixes: []`. For such
-    // providers the whole logical model id is the upstream wire name.
-    if let Some((i, _)) = config
-        .providers
-        .iter()
-        .enumerate()
-        .find(|(_, p)| p.namespace_on_wire)
-    {
-        {
-            return Ok(vec![ResolvedStep {
-                provider_index: i,
-                model: logical_model.to_owned(),
-                params: BTreeMap::new(),
-            }]);
-        }
-    }
     for (i, provider) in config.providers.iter().enumerate() {
         for prefix in provider.prefixes() {
             let Some(suffix) = logical_model
@@ -397,15 +379,21 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
             if suffix.is_empty() {
                 return Err("empty passthrough model".into());
             }
-            // The matched prefix is a gateway-local namespace, not part of the
-            // upstream model name. Strip exactly one prefix while preserving
-            // nested upstream namespaces (e.g. alias/openai/gpt-4o -> openai/gpt-4o).
-            // Explicit chain steps remain untouched and can still name the exact wire model.
+            // Select the provider by the longest matching namespace FIRST.
+            // The opt-in controls only the model sent to that provider, never
+            // provider selection. Default behavior strips one gateway prefix;
+            // namespaced upstreams (e.g. NVIDIA NIM) can forward the full ID.
+            // Explicit chain steps remain untouched.
             if longest
                 .as_ref()
                 .is_none_or(|(size, _, _)| prefix.len() > *size)
             {
-                longest = Some((prefix.len(), i, suffix.to_owned()));
+                let wire_model = if provider.namespace_on_wire {
+                    logical_model.to_owned()
+                } else {
+                    suffix.to_owned()
+                };
+                longest = Some((prefix.len(), i, wire_model));
             }
         }
     }
@@ -835,6 +823,52 @@ providers:
             resolve(&cfg, "nvidia/nemotron-3.5-embed-1b").unwrap()[0].model,
             "nvidia/nemotron-3.5-embed-1b"
         );
+    }
+
+    #[test]
+    fn namespace_on_wire_never_hijacks_other_providers_or_unknown_models_issue_132() {
+        let cfg: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: nvidia
+    type: openai
+    base_url: https://nvidia.example
+    key_env: NVIDIA_KEY
+    namespace_on_wire: true
+    prefixes: [nvidia, nim]
+  - name: other
+    type: openai
+    base_url: https://other.example
+    key_env: OTHER_KEY
+    prefixes: [other, nvidia/nemotron]
+chains:
+  - name: exact
+    steps:
+      - provider: other
+        model: physical-model
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        for (requested, index, wire) in [
+            (
+                "nvidia/nemotron-3-embed-1b",
+                0,
+                "nvidia/nemotron-3-embed-1b",
+            ),
+            ("nim/a-new-model", 0, "nim/a-new-model"),
+            ("other/chat", 1, "chat"),
+            ("nvidia/nemotron/nested", 1, "nested"),
+            ("exact", 1, "physical-model"),
+        ] {
+            let steps = resolve(&cfg, requested).unwrap();
+            assert_eq!(steps.len(), 1, "{requested}");
+            assert_eq!(steps[0].provider_index, index, "{requested}");
+            assert_eq!(steps[0].model, wire, "{requested}");
+        }
+        for unknown in ["nvidiax/model", "unconfigured/model", "other/", "auto"] {
+            assert!(resolve(&cfg, unknown).is_err(), "{unknown}");
+        }
     }
 
     #[test]
