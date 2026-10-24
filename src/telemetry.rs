@@ -161,7 +161,7 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
             }
         }
         batches = batches.wrapping_add(1);
-        if batches % 128 == 0 {
+        if batches.is_multiple_of(128) {
             let cutoff = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
