@@ -349,7 +349,7 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
                     .providers
                     .iter()
                     .position(|p| p.name == step.provider)
-                    .ok_or_else(|| format!("missing provider for chain {logical_model}"))?;
+                    .ok_or_else(|| format!("missing provider for chain {}", chain.name))?;
                 Ok(ResolvedStep {
                     provider_index,
                     model: step.model.clone(),
