@@ -31,14 +31,18 @@ use tokio::sync::OwnedSemaphorePermit;
 #[derive(Clone, Copy)]
 pub(super) enum Endpoint {
     Chat,
+    Responses,
     Embeddings,
 }
 impl Endpoint {
     fn path(self) -> &'static str {
         match self {
-            Self::Chat => "/chat/completions",
+            Self::Chat | Self::Responses => "/chat/completions",
             Self::Embeddings => "/embeddings",
         }
+    }
+    fn is_chat(self) -> bool {
+        matches!(self, Self::Chat | Self::Responses)
     }
 }
 
@@ -68,6 +72,7 @@ pub(super) async fn dispatch(
     if let Some(telemetry) = telemetry {
         let label = match endpoint {
             Endpoint::Chat => "chat",
+            Endpoint::Responses => "responses",
             Endpoint::Embeddings => "embeddings",
         };
         telemetry.submit(
@@ -102,6 +107,7 @@ fn outcome_failure_type(outcome: Outcome) -> &'static str {
 fn telemetry_endpoint(endpoint: Endpoint) -> &'static str {
     match endpoint {
         Endpoint::Chat => "chat",
+        Endpoint::Responses => "responses",
         Endpoint::Embeddings => "embeddings",
     }
 }
@@ -261,7 +267,7 @@ async fn dispatch_inner(
                     .expect("config validated"),
             )
     });
-    if streaming && !matches!(endpoint, Endpoint::Chat) {
+    if streaming && !endpoint.is_chat() {
         return error(
             StatusCode::NOT_IMPLEMENTED,
             "migration_pending",
@@ -279,9 +285,7 @@ async fn dispatch_inner(
     // Reject malformed n for both JSON and SSE requests locally. The 64
     // choice bound is specific to the streaming parser; a JSON-only provider
     // may legitimately support larger positive n values.
-    if matches!(endpoint, Endpoint::Chat)
-        && (expected == 0 || (streaming && ChatSse::new(expected).is_err()))
-    {
+    if endpoint.is_chat() && (expected == 0 || (streaming && ChatSse::new(expected).is_err())) {
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_n",
@@ -375,14 +379,14 @@ async fn dispatch_inner(
         }
         let provider = &state.config.providers[step.provider_index];
         if !streaming
-            && matches!(endpoint, Endpoint::Chat)
+            && endpoint.is_chat()
             && provider.stream_only
             && failed_aggregation_routes.contains(&(step.provider_index, step.model.clone()))
         {
             all_candidates_rate_limited = false;
             continue;
         }
-        if provider.stream_only && !streaming && !matches!(endpoint, Endpoint::Chat) {
+        if provider.stream_only && !streaming && !endpoint.is_chat() {
             all_candidates_rate_limited = false;
             continue; // Only Chat has a validated SSE-to-JSON adapter.
         }
@@ -466,8 +470,7 @@ async fn dispatch_inner(
             },
             None => None, // Preserve existing routing behavior by default.
         };
-        let upstream_stream =
-            streaming || (provider.stream_only && matches!(endpoint, Endpoint::Chat));
+        let upstream_stream = streaming || (provider.stream_only && endpoint.is_chat());
         // Chain defaults are applied per candidate. An injected n must drive
         // the SSE parser and SSE-to-JSON aggregator just like a caller n;
         // otherwise valid multi-choice streams are rejected as malformed.
