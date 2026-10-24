@@ -3233,8 +3233,8 @@ timeout:
 }
 
 // The stream-only Chat -> JSON bridge must not inherit the non-stream
-// 90-second JSON read deadline. Use virtual time and real network sockets,
-// rather than imposing a 10-minute wall-clock delay on every CI build.
+// 90-second JSON read deadline. Use virtual time and real network sockets
+// while respecting the 100-second front-proxy-safe total walk budget.
 #[derive(Clone)]
 struct ProgressingAggregation {
     hits: Arc<AtomicUsize>,
@@ -3249,9 +3249,9 @@ async fn serve_progressing_aggregation(
     let chunks = futures_util::stream::unfold(0usize, move |index| async move {
         match index {
             0 => Some((Ok::<_, std::io::Error>(Bytes::from_static(SSE_START)), 1)),
-            21 if terminal => Some((Ok(Bytes::from_static(SSE_END)), 22)),
-            22 if terminal => Some((Ok(Bytes::from_static(SSE_DONE)), 23)),
-            23 if terminal => None,
+            18 if terminal => Some((Ok(Bytes::from_static(SSE_END)), 19)),
+            19 if terminal => Some((Ok(Bytes::from_static(SSE_DONE)), 20)),
+            20 if terminal => None,
             _ => {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 Some((
@@ -3427,11 +3427,11 @@ async fn drive_aggregating_progress(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn sse_only_aggregation_survives_ninety_seconds_of_valid_progress() {
+async fn sse_only_aggregation_survives_eighty_seconds_of_valid_progress() {
     let (status, result, elapsed, primary, backup, deadline_exhaustions, active) =
         drive_aggregating_progress(true, "12m").await;
-    assert!(elapsed > std::time::Duration::from_secs(90), "{elapsed:?}");
-    assert!(elapsed < std::time::Duration::from_secs(10 * 60));
+    assert!(elapsed >= std::time::Duration::from_secs(80), "{elapsed:?}");
+    assert!(elapsed < std::time::Duration::from_secs(100), "{elapsed:?}");
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(result["choices"][0]["message"]["content"], "hi");
     assert_eq!(result["choices"][0]["finish_reason"], "stop");
@@ -3442,22 +3442,25 @@ async fn sse_only_aggregation_survives_ninety_seconds_of_valid_progress() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn sse_only_infinite_heartbeat_expires_and_uses_healthy_json_backup() {
+async fn sse_only_infinite_heartbeat_ends_before_front_proxy_hard_timeout() {
     let (status, result, elapsed, primary, backup, deadline_exhaustions, active) =
         drive_aggregating_progress(false, "12m").await;
+    assert!(elapsed >= std::time::Duration::from_secs(95), "{elapsed:?}");
     assert!(
-        elapsed >= std::time::Duration::from_secs(9 * 60),
+        elapsed <= std::time::Duration::from_secs(105),
         "{elapsed:?}"
     );
-    assert!(
-        elapsed <= std::time::Duration::from_secs(11 * 60),
-        "{elapsed:?}"
-    );
-    assert_eq!(status, StatusCode::OK, "{result}");
-    assert_eq!(result["choices"][0]["message"]["content"], "success");
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{result}");
+    assert_eq!(result["error"]["code"], "upstream_walk_timeout");
     assert_eq!(primary, 1, "no repeated attempts on a drip-fed primary");
-    assert_eq!(backup, 1, "hard deadline must allow exactly one fallback");
-    assert_eq!(deadline_exhaustions, 0, "wrong total-walk deadline outcome");
+    assert_eq!(
+        backup, 0,
+        "the exhausted budget must not start a late fallback"
+    );
+    assert_eq!(
+        deadline_exhaustions, 1,
+        "expected local 504 before front-proxy expiry"
+    );
     assert_eq!(active, 0, "aggregation admission permit was not released");
 }
 
