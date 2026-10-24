@@ -250,11 +250,28 @@ mod tests {
         );
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config: Config = serde_yaml::from_str(&format!(
-            "providers:\n  - name: p\n    type: openai\n    base_url: http://{address}\n    key_env: K\n\
-             auto:\n  enabled: true\n  candidates:\n    - provider: p\n      model: one\n\
-                 - provider: p\n      model: two\n  decider:\n    enabled: true\n\
-                   provider: p\n    model: ranker\n    timeout_ms: 500\n    cache_ttl_secs: 30"
-        )).unwrap();
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{address}
+    key_env: K
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: one
+    - provider: p
+      model: two
+  decider:
+    enabled: true
+    provider: p
+    model: ranker
+    timeout_ms: 500
+    cache_ttl_secs: 30
+"#
+        ))
+        .unwrap();
         config.validate().unwrap();
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
