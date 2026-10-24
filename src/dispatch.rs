@@ -23,7 +23,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime},
 };
 use tokio::sync::OwnedSemaphorePermit;
