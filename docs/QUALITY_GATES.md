@@ -111,7 +111,8 @@ gate requires exactly 64 primary attempts and 64 successful fallback
 completions, reconciles metrics, and checks bounded RSS/FD/thread counts.
 Local warning JSON-line stderr events are restricted to fixed metadata
 fields, contain no API key values and are sampled: first eight events per
-fixed category, then every 128th event (not a total cap of ten lines).
+separately tracked aggregation category and every 128th thereafter.
+Other event categories share a bounded global sequence counter.
 
 ## SSE-only aggregation capability + failure classification
 

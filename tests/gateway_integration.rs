@@ -929,7 +929,7 @@ async fn malformed_tool_arguments_cannot_complete_chat_stream() {
 }
 
 #[tokio::test]
-async fn truncated_tool_stream_cannot_claim_success_or_retry_after_partial_output() {
+async fn truncated_tool_stream_preserves_length_finish_without_replaying_partial_output() {
     let tool = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"key\\\":\"}}]},\"finish_reason\":null}]}\n\n";
     let finish =
         b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n";
@@ -942,8 +942,13 @@ async fn truncated_tool_stream_cannot_claim_success_or_retry_after_partial_outpu
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
     let text = String::from_utf8(bytes.to_vec()).unwrap();
-    assert!(text.contains("upstream_stream_incomplete"), "{text}");
-    assert!(!text.contains("data: [DONE]"), "{text}");
+    // The upstream's explicit "length" means the tool invocation was
+    // truncated, not successfully executable. Forward that truthful terminal
+    // outcome instead of replacing a valid incomplete response with an error.
+    assert!(text.contains(r#""finish_reason":"length""#), "{text}");
+    assert!(text.contains("data: [DONE]"), "{text}");
+    assert!(!text.contains(r#""finish_reason":"tool_calls""#), "{text}");
+    assert!(!text.contains("upstream_stream_incomplete"), "{text}");
     assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
 }
