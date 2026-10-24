@@ -175,3 +175,21 @@ p95. The totals come from hour buckets (window start is rounded down);
 the downstream p95 is not an upstream attempt p95. Results are advisory only
 and only qualify candidates after at least 20 attempts. This does not
 silently activate telemetry-based model ordering or expose another TCP port.
+
+
+### Conservative provider attribution (Issue #129)
+
+Local scoring keeps the original raw attempts, failures and success_rate for
+compatibility, but these raw figures include caller/local errors and stream
+header starts. They must not be used as a model quality ranking. New
+observed_success_rate counts confirmed nonstream upstream successes and
+actual upstream provider failures (5xx, transport, invalid response, timeout,
+unavailable); excludes caller errors, local capacity failures, credential
+errors, 429 cooldown and stream starts. The qualified gate requires at least
+20 such observed samples; zero samples return null, not a fabricated 100%.
+Stream terminal failures with no additional upstream attempt are excluded
+from this conservative score, pending request-correlated outcome telemetry.
+downstream_p95_ms now measures nonstream downstream completions only.
+stream_header_p95_ms reports SSE response-header time separately, not full
+stream duration. Both derive from a bounded latest-512-row combined sample.
+Shadow comparisons remain advisory and never claim counterfactual success.
