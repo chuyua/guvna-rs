@@ -176,6 +176,86 @@ chains:
 }
 
 #[tokio::test]
+async fn failed_first_candidate_is_correlated_with_one_terminal_request_and_scoring() {
+    use guvna::gateway::app_with_state;
+    use rusqlite::{Connection, params};
+    let dir = tempfile::tempdir().unwrap();
+    let (bad, bad_calls) = start_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let (good, good_calls) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: broken\n    type: openai\n    base_url: {bad}\n    key_env: FIRST\n\
+         - name: healthy\n    type: openai\n    base_url: {good}\n    key_env: SECOND\n\
+         chains:\n  - name: demo\n    steps:\n      - provider: broken\n        model: one\n\
+               - provider: healthy\n        model: two\n"
+    ))
+    .unwrap();
+    let mut state = AppState::new(
+        config,
+        HashMap::from([
+            ("FIRST".into(), "secret-one".into()),
+            ("SECOND".into(), "secret-two".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, shared) = app_with_state(state);
+    let (status, result) = call(router, request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(bad_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(good_calls.load(Ordering::SeqCst), 1);
+    assert!(shared.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let (request_id, attempt, stream): (String, i64, i64) = db
+        .query_row(
+            "SELECT request_id,attempt_index,stream_requested FROM request_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(!request_id.is_empty());
+    assert_eq!((attempt, stream), (2, 0));
+    let (fail_id, fail_attempt, fail_stream): (String, i64, i64) = db
+        .query_row(
+            "SELECT request_id,attempt_index,stream_requested FROM failure_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (fail_id, fail_attempt, fail_stream),
+        (request_id.clone(), 1, 0)
+    );
+    let requests: i64 = db
+        .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(requests, 1);
+    let scoring = guvna::scoring::read_scoring(dir.path(), 1).unwrap();
+    assert_eq!(scoring["request_metrics"]["traced_requests"], 1);
+    assert_eq!(scoring["request_metrics"]["requests_with_fallback"], 1);
+    assert_eq!(scoring["request_metrics"]["fallback_rate"], 1.0);
+    assert_eq!(scoring["request_metrics"]["first_attempt_nonstream"], 1);
+    assert_eq!(
+        scoring["request_metrics"]["first_attempt_successes_nonstream"],
+        0
+    );
+    assert_eq!(
+        scoring["request_metrics"]["first_attempt_success_rate_nonstream"],
+        0.0
+    );
+    // A trace is operational metadata, never a source for credentials or prompts.
+    assert!(!request_id.contains("secret"));
+    let unknown: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM request_events WHERE request_id=?1",
+            params![request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unknown, 1);
+}
+
+#[tokio::test]
 async fn uncatalogued_prefixed_model_strips_only_the_gateway_namespace_on_wire() {
     let (upstream_url, calls) = start_upstream(StatusCode::OK).await;
     let config: Config = serde_yaml::from_str(&format!(

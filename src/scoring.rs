@@ -149,6 +149,39 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
             break;
         }
     }
+    // Legacy databases are still readable before the writer migrates them.
+    // Only terminal request rows enter the denominator: failed intermediate
+    // candidates are recorded separately and cannot inflate request counts.
+    let request_metrics = if conn
+        .prepare("SELECT request_id,attempt_index,stream_requested FROM request_events LIMIT 0")
+        .is_ok()
+    {
+        let (traced, fallback, first_nonstream, first_success): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN attempt_index > 1 THEN 1 ELSE 0 END),0),
+                        COALESCE(SUM(CASE WHEN stream_requested = 0 THEN 1 ELSE 0 END),0),
+                        COALESCE(SUM(CASE WHEN attempt_index = 1 AND stream_requested = 0
+                                            AND failure_type = 'success' THEN 1 ELSE 0 END),0)
+                 FROM request_events
+                 WHERE ts >= ?1 AND request_id IS NOT NULL AND attempt_index IS NOT NULL",
+                params![since],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|_| "cannot read request-level scoring")?;
+        Some(json!({
+            "traced_requests":traced,
+            "requests_with_fallback":fallback,
+            "fallback_rate":if traced > 0 {Some(fallback as f64 / traced as f64)} else {None},
+            "first_attempt_nonstream":first_nonstream,
+            "first_attempt_successes_nonstream":first_success,
+            "first_attempt_success_rate_nonstream":if first_nonstream > 0 {
+                Some(first_success as f64 / first_nonstream as f64)
+            } else {None},
+        }))
+    } else {
+        None
+    };
     Ok(json!({
         "enabled":true,"source":"local_sqlite_read_only",
         "window_hours":hours,
@@ -157,6 +190,8 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
         "advisory_only":true,
         "candidate_count":candidates.len(),
         "candidates":candidates,
+        "request_metrics":request_metrics,
+         "request_metrics_notes":"Only traced terminal request rows count toward fallback rate; the first-attempt success rate is restricted to nonstream completions, not unverified SSE headers. Old SQLite databases report null until migrated.",
          "notes":"raw success_rate includes all failure classes; observed_success_rate counts only confirmed nonstream successes and attempted upstream provider failures, excluding caller/local/credential errors and unverified stream starts. Qualification requires 20 observed samples. p95 separates nonstream completion from SSE response-header latency, sampled from up to 512 recent downstream rows per candidate; neither is a counterfactual outcome or complete SSE duration.",
     }))
 }

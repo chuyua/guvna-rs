@@ -196,3 +196,22 @@ rankings trigger a bounded background refresh, with concurrent requests
 falling back instead of queuing behind the selector. The refresh does not
 alter an already-running SSE response or the shared candidate fallback walk.
 Nonstreaming requests retain the existing bounded synchronous selector.
+
+## Request-level correlation and fallback evidence (Issue #129)
+
+When SQLite telemetry is explicitly enabled, the writer migrates
+request_events and failure_events in place with nullable request_id,
+attempt_index (1-based) and stream_requested fields. A random-free,
+restart-distinct timestamp/counter trace ID associates one terminal
+downstream request row with intermediate candidate failures and terminal
+stream failures; no client identity, prompt or credentials are recorded.
+Old rows remain readable with NULL trace columns.
+
+The local read-only status --scoring output includes request_metrics with
+traced_requests, requests_with_fallback, fallback_rate, and
+first_attempt_success_rate_nonstream. These are actual downstream outcomes,
+not counterfactual Shadow predictions. A stream that only emitted HTTP
+headers does not count as a completed first-attempt success; cancelled SSE
+streams are not yet a complete outcome dataset. An old, unmigrated SQLite
+database returns null request_metrics until the telemetry writer migrates
+it. All existing aggregate scoring fields remain compatible.

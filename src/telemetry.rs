@@ -38,6 +38,9 @@ pub struct TelemetryContext {
     failure_type: &'static str,
     is_upstream: bool,
     upstream_status: Option<u16>,
+    request_id: Option<String>,
+    attempt_index: Option<u16>,
+    stream_requested: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -58,7 +61,16 @@ impl TelemetryContext {
             failure_type: allowed_failure_type(failure_type),
             is_upstream: true,
             upstream_status: None,
+            request_id: None,
+            attempt_index: None,
+            stream_requested: false,
         }
+    }
+
+    pub fn set_trace(&mut self, request_id: &str, attempt_index: u16, stream: bool) {
+        self.request_id = Some(request_id.to_owned());
+        self.attempt_index = Some(attempt_index);
+        self.stream_requested = stream;
     }
 
     pub fn set_failure_type(&mut self, failure_type: &'static str) {
@@ -149,6 +161,9 @@ struct Event {
     record_request: bool,
     count_attempt: bool,
     health_observation: bool,
+    request_id: Option<String>,
+    attempt_index: Option<u16>,
+    stream_requested: bool,
 }
 
 impl Telemetry {
@@ -214,9 +229,12 @@ impl Telemetry {
         model: &str,
         failure_type: &'static str,
         elapsed: Duration,
+        request_id: &str,
+        attempt_index: u16,
         metrics: &Metrics,
     ) {
-        let context = TelemetryContext::new(provider, model, failure_type);
+        let mut context = TelemetryContext::new(provider, model, failure_type);
+        context.set_trace(request_id, attempt_index, true);
         let status = if failure_type == "success" { 200 } else { 502 };
         self.enqueue_observation(endpoint, status, elapsed, context, false, metrics);
     }
@@ -254,6 +272,9 @@ impl Telemetry {
             record_request: false,
             count_attempt,
             health_observation: context.is_upstream,
+            request_id: context.request_id,
+            attempt_index: context.attempt_index,
+            stream_requested: context.stream_requested,
         };
         if self
             .sender
@@ -272,7 +293,30 @@ impl Telemetry {
         context: Option<TelemetryContext>,
         metrics: &Metrics,
     ) {
+        self.submit_traced(
+            endpoint,
+            status,
+            elapsed,
+            sse_headers,
+            context,
+            None,
+            metrics,
+        );
+    }
+
+    pub fn submit_traced(
+        &self,
+        endpoint: &'static str,
+        status: u16,
+        elapsed: Duration,
+        sse_headers: bool,
+        context: Option<TelemetryContext>,
+        request_id: Option<&str>,
+        metrics: &Metrics,
+    ) {
         let context = context.unwrap_or_else(|| TelemetryContext::local(status, sse_headers));
+        let stream_requested = context.stream_requested || sse_headers;
+        let request_id = request_id.map(str::to_owned).or(context.request_id.clone());
         let event = Event {
             ts: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -289,6 +333,9 @@ impl Telemetry {
             record_request: true,
             count_attempt: true,
             health_observation: context.is_upstream,
+            request_id,
+            attempt_index: context.attempt_index,
+            stream_requested,
         };
         if self
             .sender
@@ -300,8 +347,9 @@ impl Telemetry {
     }
 }
 
-fn has_column(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
-    let mut statement = conn.prepare("PRAGMA table_info(request_events)")?;
+fn has_column(conn: &Connection, table: &str, name: &str) -> rusqlite::Result<bool> {
+    // Table names are internal fixed constants, not user input.
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
     for column in columns {
         if column? == name {
@@ -335,7 +383,7 @@ fn migrate_legacy_request_events(conn: &Connection) -> rusqlite::Result<()> {
             "ALTER TABLE request_events ADD COLUMN failure_type TEXT NOT NULL DEFAULT 'unknown'",
         ),
     ] {
-        if !has_column(conn, name)? {
+        if !has_column(conn, "request_events", name)? {
             conn.execute_batch(definition)?;
         }
     }
@@ -411,6 +459,19 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
         CREATE INDEX IF NOT EXISTS provider_health_updated_ts ON provider_health(updated_ts);
     ",
     )?;
+    for table in ["request_events", "failure_events"] {
+        for (column, definition) in [
+            ("request_id", "TEXT"),
+            ("attempt_index", "INTEGER"),
+            ("stream_requested", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !has_column(&conn, table, column)? {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                ))?;
+            }
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -468,13 +529,13 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
     {
         let mut request = tx.prepare_cached(
             "INSERT INTO request_events
-             (ts,endpoint,provider,model,status,elapsed_ms,sse_headers,failure_type)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+             (ts,endpoint,provider,model,status,elapsed_ms,sse_headers,failure_type,request_id,attempt_index,stream_requested)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         )?;
         let mut failure = tx.prepare_cached(
             "INSERT INTO failure_events
-             (ts,endpoint,provider,model,status,elapsed_ms,failure_type)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+             (ts,endpoint,provider,model,status,elapsed_ms,failure_type,request_id,attempt_index,stream_requested)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         )?;
         let mut hourly = tx.prepare_cached(
             "INSERT INTO hourly_stats
@@ -526,6 +587,9 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                     event.elapsed_ms,
                     i64::from(event.sse_headers),
                     event.failure_type,
+                    event.request_id,
+                    event.attempt_index,
+                    i64::from(event.stream_requested),
                 ])?;
                 if is_failure(event) {
                     failure.execute(params![
@@ -536,6 +600,9 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                         event.status,
                         event.elapsed_ms,
                         event.failure_type,
+                        event.request_id,
+                        event.attempt_index,
+                        i64::from(event.stream_requested),
                     ])?;
                 }
                 let hour = event.ts - event.ts.rem_euclid(3600);
@@ -560,6 +627,9 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                     event.status,
                     event.elapsed_ms,
                     event.failure_type,
+                    event.request_id,
+                    event.attempt_index,
+                    i64::from(event.stream_requested),
                 ])?;
                 let hour = event.ts - event.ts.rem_euclid(3600);
                 hourly.execute(params![
@@ -850,6 +920,9 @@ mod tests {
             record_request: true,
             count_attempt: true,
             health_observation: true,
+            request_id: None,
+            attempt_index: None,
+            stream_requested: false,
         }
     }
 
@@ -926,6 +999,19 @@ mod tests {
             row,
             ("unknown".into(), "unknown".into(), "unknown".into(), 200)
         );
+        for table in ["request_events", "failure_events"] {
+            for column in ["request_id", "attempt_index", "stream_requested"] {
+                assert!(has_column(&migrated, table, column).unwrap());
+            }
+        }
+        let legacy_trace: (Option<String>, Option<i64>, i64) = migrated
+            .query_row(
+                "SELECT request_id,attempt_index,stream_requested FROM request_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy_trace, (None, None, 0));
         let tables: i64 = migrated.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('failure_events','hourly_stats')",
             [], |row| row.get(0),

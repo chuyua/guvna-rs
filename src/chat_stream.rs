@@ -16,11 +16,15 @@ const MAX_STREAM_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 pub(super) struct StreamRoute {
     pub(super) provider_index: usize,
     pub(super) model: String,
+    pub(super) request_id: String,
+    pub(super) attempt_index: u16,
 }
 struct ChatStreamState {
     owner: Arc<AppState>,
     provider_index: usize,
     model: String,
+    request_id: String,
+    attempt_index: u16,
     started_at: tokio::time::Instant,
     lease: Lease,
     upstream: reqwest::Response,
@@ -69,6 +73,8 @@ pub(super) async fn start(
         owner,
         provider_index: route.provider_index,
         model: route.model,
+        request_id: route.request_id,
+        attempt_index: route.attempt_index,
         started_at: tokio::time::Instant::now(),
         lease,
         upstream,
@@ -125,6 +131,8 @@ fn stream_response(state: ChatStreamState) -> Response {
                                 .telemetry_model_name(state.provider_index, &state.model),
                             "success",
                             state.started_at.elapsed(),
+                            &state.request_id,
+                            state.attempt_index,
                             &state.owner.metrics,
                         );
                     }
@@ -176,6 +184,8 @@ fn stream_response(state: ChatStreamState) -> Response {
                             .telemetry_model_name(state.provider_index, &state.model),
                         "transport_error",
                         state.started_at.elapsed(),
+                        &state.request_id,
+                        state.attempt_index,
                         &state.owner.metrics,
                     );
                 }

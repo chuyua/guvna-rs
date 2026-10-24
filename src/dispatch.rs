@@ -51,9 +51,29 @@ pub(super) async fn dispatch(
 ) -> Response {
     let started = tokio::time::Instant::now();
     let id = ops_log::next_request_id();
+    // Correlation survives process restarts without deriving an id from user data.
     let telemetry = state.telemetry.clone();
+    let request_id = telemetry.as_ref().map(|_| {
+        format!(
+            "{:x}-{:x}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            id
+        )
+    });
     let metrics = Arc::clone(&state.metrics);
-    let response = dispatch_inner(state, body, endpoint, admission, payload_permit, started).await;
+    let response = dispatch_inner(
+        state,
+        body,
+        endpoint,
+        admission,
+        payload_permit,
+        started,
+        request_id.as_deref().unwrap_or(""),
+    )
+    .await;
     let telemetry_context = response.extensions().get::<TelemetryContext>().cloned();
     let sse_headers = response
         .headers()
@@ -70,12 +90,13 @@ pub(super) async fn dispatch(
             Endpoint::Chat => "chat",
             Endpoint::Embeddings => "embeddings",
         };
-        telemetry.submit(
+        telemetry.submit_traced(
             label,
             response.status().as_u16(),
             started.elapsed(),
             sse_headers,
             telemetry_context,
+            request_id.as_deref(),
             &metrics,
         );
     }
@@ -175,6 +196,7 @@ async fn dispatch_inner(
     admission: OwnedSemaphorePermit,
     payload_permit: Option<OwnedSemaphorePermit>,
     started: tokio::time::Instant,
+    request_id: &str,
 ) -> Response {
     let mut request: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -519,11 +541,19 @@ async fn dispatch_inner(
         candidates_visited += 1;
         candidate_started = Some(tokio::time::Instant::now());
         candidate_attempted_network = false;
-        telemetry_context = Some(TelemetryContext::new(
+        let mut context = TelemetryContext::new(
             &provider.name,
             state.telemetry_model_name(step.provider_index, &step.model),
             "upstream_unavailable",
-        ));
+        );
+        if !request_id.is_empty() {
+            context.set_trace(
+                request_id,
+                u16::try_from(candidates_visited).unwrap_or(u16::MAX),
+                streaming,
+            );
+        }
+        telemetry_context = Some(context);
         let mut circuit_ticket = match &state.circuits[step.provider_index] {
             Some(circuit) => match circuit.admit() {
                 Some(ticket) => Some(ticket),
@@ -722,6 +752,8 @@ async fn dispatch_inner(
                         chat_stream::StreamRoute {
                             provider_index: step.provider_index,
                             model: step.model.clone(),
+                            request_id: request_id.to_owned(),
+                            attempt_index: u16::try_from(candidates_visited).unwrap_or(u16::MAX),
                         },
                         lease.clone(),
                         &mut permit,
