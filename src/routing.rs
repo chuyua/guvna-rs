@@ -228,13 +228,7 @@ pub fn resolve_auto_with_estimate(
     // model selection on restart or across concurrent requests.
     ranked.sort_by_key(|(position, candidate)| {
         let penalty = if config.auto.health_aware {
-            config
-                .providers
-                .iter()
-                .position(|provider| provider.name == candidate.provider)
-                .and_then(|index| penalties.get(index))
-                .copied()
-                .unwrap_or(0)
+            penalties.get(*position).copied().unwrap_or(0)
         } else {
             0
         };
@@ -459,6 +453,39 @@ auto:
             cache.resolve(&cfg, 50, 60, &[100, 0], 7).unwrap()[0].model,
             "beta"
         );
+    }
+    #[test]
+    fn auto_health_isolates_models_sharing_one_provider() {
+        let cfg: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: shared
+    type: openai
+    base_url: https://shared.example
+    key_env: SHARED
+    models: [unhealthy-model, healthy-model]
+auto:
+  enabled: true
+  health_aware: true
+  max_candidates: 1
+  candidates:
+    - provider: shared
+      model: unhealthy-model
+      priority: 1
+    - provider: shared
+      model: healthy-model
+      priority: 2
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let baseline = resolve_auto_with_health(&cfg, 42, &[0, 0]).unwrap();
+        assert_eq!(baseline[0].model, "unhealthy-model");
+        let demoted = resolve_auto_with_health(&cfg, 42, &[100, 0]).unwrap();
+        assert_eq!(demoted[0].provider_index, 0);
+        assert_eq!(demoted[0].model, "healthy-model");
+        let recovered = resolve_auto_with_health(&cfg, 42, &[0, 0]).unwrap();
+        assert_eq!(recovered[0].model, "unhealthy-model");
     }
     #[test]
     fn auto_route_cache_is_bounded_ttl_limited_and_generation_fenced() {

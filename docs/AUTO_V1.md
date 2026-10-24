@@ -91,9 +91,9 @@ hint. The default is false and leaves the original V1 priority order intact.
 The same config candidates, context budget, max_candidates limit and single
 upstream failover loop still apply.
 
-When enabled, each configured provider uses only a few in-memory atomic
-counters. Three recent transport/provider failures can demote an unhealthy
-provider behind a healthy fallback before max_candidates is applied. HTTP
+When enabled, each configured Auto provider/model candidate uses only a few
+in-memory atomic counters. Three recent transport/provider failures can demote
+the affected model candidate behind a healthy fallback before max_candidates is applied. HTTP
 429 can also contribute; caller-side 4xx and credential auth errors do not.
 Each successful validated response reduces the penalty. Recovery hysteresis
 requires enough successes to reset demotion, and a 300-second freshness limit
@@ -101,7 +101,7 @@ expires old health penalties without a background timer. No remote scorer,
 prompts, keys, provider labels, extra HTTP calls or request-path SQL reads.
 
 This remains a conservative V2 foundation, not a learned model capability engine.
-When SQLite telemetry is enabled, a bounded provider-level health summary is
+When SQLite telemetry is enabled, a bounded per-provider/model health summary is
 restored at startup only if the last failure is within the 300-second freshness
 window. Failed intermediate candidates are recorded separately from the single
 downstream request row, so fallback failures survive restart without double-counting

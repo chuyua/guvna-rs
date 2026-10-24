@@ -1,4 +1,4 @@
-//! Bounded opt-in provider health hints, no network requests, user data or timers.
+//! Bounded opt-in Auto candidate health hints, no network requests, user data or timers.
 use std::{
     sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -70,7 +70,7 @@ impl AutoHealth {
         }
     }
 
-    /// Restore only the bounded provider summary persisted by SQLite at startup.
+    /// Restore only a bounded provider/model candidate summary from SQLite at startup.
     pub fn restore(
         &self,
         index: usize,
@@ -122,9 +122,17 @@ impl AutoHealth {
 
     fn failure_at(&self, index: usize, now_secs: u64) {
         if let Some(score) = self.providers.get(index) {
+            let previous = score.last_failure_secs.swap(now_secs, Ordering::Relaxed);
+            if now_secs.saturating_sub(previous) > FRESH_SECS || now_secs < previous {
+                // A stale outage is not fresh evidence. Reset the sampling
+                // window before considering a new failure; concurrent resets
+                // can at worst delay demotion, never create false demotion.
+                score.penalty.store(0, Ordering::Relaxed);
+                score.consecutive_failures.store(0, Ordering::Relaxed);
+                score.demoted.store(false, Ordering::Relaxed);
+            }
             let updated = update_penalty(&score.penalty, |value| value.saturating_add(35).min(100));
             let failures = count_observation(&score.consecutive_failures);
-            score.last_failure_secs.store(now_secs, Ordering::Relaxed);
             if failures >= MIN_SAMPLES && updated >= DEMOTE_AT {
                 score.demoted.store(true, Ordering::Relaxed);
             }
@@ -192,6 +200,21 @@ mod tests {
         assert_eq!(health.penalties_at(303), vec![0]);
     }
 
+    #[test]
+    fn stale_failure_streak_does_not_immediately_demote_on_new_outage() {
+        let health = AutoHealth::new(1);
+        for time in [1, 2, 3] {
+            health.failure_at(0, time);
+        }
+        assert_eq!(health.penalties_at(3), vec![100]);
+        assert_eq!(health.penalties_at(304), vec![0]);
+        health.failure_at(0, 400);
+        assert_eq!(health.penalties_at(400), vec![0]);
+        health.failure_at(0, 401);
+        assert_eq!(health.penalties_at(401), vec![0]);
+        health.failure_at(0, 402);
+        assert_eq!(health.penalties_at(402), vec![100]);
+    }
     #[test]
     fn restores_recent_health_but_ignores_stale_history() {
         let health = AutoHealth::new(2);

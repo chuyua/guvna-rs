@@ -38,6 +38,7 @@ pub struct TelemetryContext {
 #[derive(Clone, Debug)]
 pub struct ProviderHealthSnapshot {
     pub provider: String,
+    pub model: String,
     pub penalty: u8,
     pub consecutive_failures: u16,
     pub demoted: bool,
@@ -562,18 +563,20 @@ fn load_provider_health_from_path(path: &Path, now: i64) -> Vec<ProviderHealthSn
         return Vec::new();
     }
     let Ok(mut statement) = conn.prepare(
-        "SELECT provider,penalty,consecutive_failures,demoted,last_failure_ts
-         FROM provider_health WHERE model='*' AND updated_ts >= ?1",
+        "SELECT provider,model,penalty,consecutive_failures,demoted,last_failure_ts
+         FROM provider_health WHERE model!='*' AND updated_ts >= ?1
+         ORDER BY updated_ts DESC LIMIT 256",
     ) else {
         return Vec::new();
     };
     let Ok(rows) = statement.query_map([now - HISTORY_RETENTION_SECS], |row| {
-        let penalty: i64 = row.get(1)?;
-        let failures: i64 = row.get(2)?;
-        let demoted: i64 = row.get(3)?;
-        let last_failure: i64 = row.get(4)?;
+        let penalty: i64 = row.get(2)?;
+        let failures: i64 = row.get(3)?;
+        let demoted: i64 = row.get(4)?;
+        let last_failure: i64 = row.get(5)?;
         Ok(ProviderHealthSnapshot {
             provider: row.get(0)?,
+            model: row.get(1)?,
             penalty: penalty.clamp(0, 100) as u8,
             consecutive_failures: failures.clamp(0, u16::MAX as i64) as u16,
             demoted: demoted != 0,
@@ -876,6 +879,7 @@ mod tests {
         let snapshots = load_provider_health_from_path(&path, 7203);
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].provider, "provider_A");
+        assert_eq!(snapshots[0].model, "model/alpha");
         assert_eq!(snapshots[0].penalty, 100);
         assert_eq!(snapshots[0].consecutive_failures, 3);
         assert!(snapshots[0].demoted);

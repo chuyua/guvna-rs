@@ -117,9 +117,9 @@ guvna_telemetry_written_total, guvna_telemetry_dropped_total, and
 guvna_telemetry_write_failures_total.
 
 Provider/model labels and fixed failure categories are stored locally. With
-health_aware enabled, a provider-level health summary is restored from SQLite only
-when its last failure is within the 300-second freshness window. Per-model history
-remains available for analysis; live routing uses bounded provider-level scores,
+health_aware enabled, per-provider/model health summaries are restored from SQLite only
+when the last failure is within the 300-second freshness window. Live routing
+uses bounded candidate-level scores,
 not a learned model. The telemetry directory is local and limited to the service user.
 ## Local runtime status (Unix only)
 

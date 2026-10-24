@@ -111,9 +111,10 @@ fn stream_response(state: ChatStreamState) -> Response {
                     state.owner.pools[state.provider_index].record_success(&state.lease);
                     record_circuit_success(&mut state.circuit_ticket, &state.owner.metrics);
                     Metrics::inc(&state.owner.metrics.upstream_success);
-                    if let Some(health) = &state.owner.auto_health {
-                        health.mark_success(state.provider_index);
-                    }
+                    state
+                        .owner
+                        .mark_auto_success(state.provider_index, &state.model);
+
                     if let Some(telemetry) = &state.owner.telemetry {
                         let provider = &state.owner.config.providers[state.provider_index].name;
                         telemetry.observe_health(
@@ -152,9 +153,10 @@ fn stream_response(state: ChatStreamState) -> Response {
             }
             if state.terminated {
                 Metrics::inc(&state.owner.metrics.chat_stream_failed);
-                if let Some(health) = &state.owner.auto_health {
-                    health.mark_failure(state.provider_index);
-                }
+                state
+                    .owner
+                    .mark_auto_failure(state.provider_index, &state.model);
+
                 if let Some(telemetry) = &state.owner.telemetry {
                     let provider = &state.owner.config.providers[state.provider_index].name;
                     telemetry.observe_health(

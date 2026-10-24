@@ -81,17 +81,6 @@ pub(super) async fn dispatch(
     response
 }
 
-fn mark_auto_failure(state: &AppState, provider_index: usize) {
-    if let Some(health) = &state.auto_health {
-        health.mark_failure(provider_index);
-    }
-}
-
-fn mark_auto_success(state: &AppState, provider_index: usize) {
-    if let Some(health) = &state.auto_health {
-        health.mark_success(provider_index);
-    }
-}
 fn attach_telemetry_context(mut response: Response, context: Option<TelemetryContext>) -> Response {
     if let Some(context) = context {
         response.extensions_mut().insert(context);
@@ -500,7 +489,7 @@ async fn dispatch_inner(
                         Metrics::inc(&state.metrics.credential_quarantines);
                     }
                     record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                    mark_auto_failure(&state, step.provider_index);
+                    state.mark_auto_failure(step.provider_index, &step.model);
                     if let Some(context) = telemetry_context.as_mut() {
                         context.set_failure_type("timeout");
                     }
@@ -516,7 +505,7 @@ async fn dispatch_inner(
                         Metrics::inc(&state.metrics.credential_quarantines);
                     }
                     record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                    mark_auto_failure(&state, step.provider_index);
+                    state.mark_auto_failure(step.provider_index, &step.model);
                     if let Some(context) = telemetry_context.as_mut() {
                         context.set_failure_type("transport_error");
                     }
@@ -545,7 +534,7 @@ async fn dispatch_inner(
                     Metrics::inc(&state.metrics.credential_quarantines);
                 }
                 if outcome == Outcome::RateLimited {
-                    mark_auto_failure(&state, step.provider_index);
+                    state.mark_auto_failure(step.provider_index, &step.model);
                 }
                 continue; // try a different key; each key is attempted once
             }
@@ -580,7 +569,7 @@ async fn dispatch_inner(
                             Metrics::inc(&state.metrics.upstream_invalid_responses);
                             ops_log::warn("stream_preflight_failure");
                             record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                            mark_auto_failure(&state, step.provider_index);
+                            state.mark_auto_failure(step.provider_index, &step.model);
                             if let Some(context) = telemetry_context.as_mut() {
                                 context.set_failure_type("invalid_response");
                             }
@@ -641,7 +630,7 @@ async fn dispatch_inner(
                     {
                         state.pools[step.provider_index].record_success(&lease);
                         record_circuit_success(&mut circuit_ticket, &state.metrics);
-                        mark_auto_success(&state, step.provider_index);
+                        state.mark_auto_success(step.provider_index, &step.model);
                         Metrics::inc(&state.metrics.upstream_success);
                         if upstream_stream && !streaming {
                             Metrics::inc(&state.metrics.aggregation_completed);
@@ -670,7 +659,7 @@ async fn dispatch_inner(
                             Metrics::inc(&state.metrics.credential_quarantines);
                         }
                         record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                        mark_auto_failure(&state, step.provider_index);
+                        state.mark_auto_failure(step.provider_index, &step.model);
                         if let Some(context) = telemetry_context.as_mut() {
                             context.set_failure_type("timeout");
                         }
@@ -696,7 +685,7 @@ async fn dispatch_inner(
                             ops_log::warn("upstream_invalid");
                         }
                         record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                        mark_auto_failure(&state, step.provider_index);
+                        state.mark_auto_failure(step.provider_index, &step.model);
                         if let Some(context) = telemetry_context.as_mut() {
                             context.set_failure_type(if aggregation_transient_failure {
                                 "timeout"
@@ -714,7 +703,7 @@ async fn dispatch_inner(
                 if state.pools[step.provider_index].record(&lease, outcome) {
                     Metrics::inc(&state.metrics.credential_quarantines);
                 }
-                mark_auto_failure(&state, step.provider_index);
+                state.mark_auto_failure(step.provider_index, &step.model);
             }
             if outcome == Outcome::ProviderTransient
                 && let Some(ticket) = &mut circuit_ticket
