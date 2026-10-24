@@ -214,6 +214,45 @@ fn request(model: &str, extra: &str, key: &str) -> Request<Body> {
 }
 
 #[tokio::test]
+async fn last_upstream_caller_rejection_preserves_client_status_without_key_leak() {
+    let (upstream, hits) = start_upstream(StatusCode::UNPROCESSABLE_ENTITY).await;
+    let router = make_app(&upstream, &upstream);
+    let (status, body) = call(router, request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "upstream_rejected");
+    assert!(!body.to_string().contains("Bearer"));
+    assert!(hits.load(Ordering::SeqCst) >= 1);
+}
+
+#[tokio::test]
+async fn upstream_4xx_error_messages_never_reflect_secret_or_prompt_content() {
+    async fn secret_bearing_error() -> impl IntoResponse {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(json!({
+                "error": {
+                    "code": "invalid_request_error",
+                    "message": "Bearer provider-secret: confidential prompt content"
+                }
+            })),
+        )
+    }
+    let routes = Router::new().route("/v1/chat/completions", post(secret_bearing_error));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+    let url = format!("http://{addr}");
+    let (status, body) = call(make_app(&url, &url), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        body["error"]["message"],
+        "Upstream rejected request parameters"
+    );
+    assert!(!body.to_string().contains("provider-secret"));
+    assert!(!body.to_string().contains("confidential prompt"));
+}
+
+#[tokio::test]
 async fn failover_skips_bad_provider_and_key_and_preserves_large_integers() {
     let (a, first_calls) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
     let (b, next_calls) = start_upstream(StatusCode::OK).await;
@@ -2005,7 +2044,8 @@ async fn metrics_auth_privacy_retry_fallback_and_credential_quarantine() {
     assert_eq!(metric_value(&after, "upstream_invalid_responses_total"), 0);
     assert!(!after.contains("secret"));
     assert!(!after.contains("BAD"));
-    assert_eq!(after.matches("# TYPE guvna_").count(), 29);
+    assert_eq!(after.matches("# TYPE guvna_").count(), 30);
+    assert_eq!(metric_value(&after, "aggregation_failures_total"), 0);
     assert_eq!(metric_value(&after, "walk_deadline_exhaustions_total"), 0);
     assert_eq!(metric_value(&after, "circuit_open_providers"), 0);
     assert_eq!(metric_value(&after, "circuit_bypasses_total"), 0);
@@ -3781,14 +3821,14 @@ async fn sse_only_aggregate_preserves_reasoning_and_refusal_without_replaying_to
 }
 
 #[tokio::test]
-async fn failed_stream_only_aggregation_is_not_retried_for_duplicate_chain_steps() {
+async fn failed_stream_only_aggregation_does_not_repeat_same_model_with_param_variation() {
     let bad = aggregate_chat_frame(json!({"choices":[{"index":0,
         "delta":{"audio":{"data":"unsupported"}},"finish_reason":null}]}));
     let (primary, primary_hits, _) =
         start_strict_stream_only(vec![bad, b"data: [DONE]\n\n".to_vec()]).await;
     let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
     let yaml = format!(
-        "providers:\n  - name: streaming\n    type: openai\n    base_url: {primary}\n    key_env: STREAM_KEY\n    stream_only: true\n  - name: backup\n    type: openai\n    base_url: {backup}\n    key_env: BACKUP_KEY\nchains:\n  - name: ordered\n    steps:\n      - provider: streaming\n        model: first-model\n      - provider: streaming\n        model: first-model\n      - provider: backup\n        model: backup-model\n"
+        "providers:\n  - name: streaming\n    type: openai\n    base_url: {primary}\n    key_env: STREAM_KEY\n    stream_only: true\n  - name: backup\n    type: openai\n    base_url: {backup}\n    key_env: BACKUP_KEY\nchains:\n  - name: ordered\n    steps:\n      - provider: streaming\n        model: first-model\n      - provider: streaming\n        model: first-model\n        params:\n          temperature: 0.7\n      - provider: backup\n        model: backup-model\n"
     );
     let config: Config = serde_yaml::from_str(&yaml).unwrap();
     let router = app(AppState::new(
@@ -3804,6 +3844,67 @@ async fn failed_stream_only_aggregation_is_not_retried_for_duplicate_chain_steps
     assert_eq!(status, StatusCode::OK, "{output}");
     assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn local_aggregation_failures_do_not_cascade_open_provider_circuit() {
+    let invalid = aggregate_chat_frame(json!({"choices":[{"index":0,
+        "delta":{"audio":{"data":"unsupported"}},"finish_reason":null}]}));
+    let (primary, attempts, _) =
+        start_strict_stream_only(vec![invalid, b"data: [DONE]\n\n".to_vec()]).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: streaming
+    type: openai
+    base_url: {primary}
+    key_env: STREAM_KEY
+    stream_only: true
+    circuit_breaker:
+      enabled: true
+      failure_threshold: 1
+      cooldown: 500ms
+      max_cooldown: 1s
+  - name: backup
+    type: openai
+    base_url: {backup}
+    key_env: BACKUP_KEY
+chains:
+  - name: ordered
+    steps:
+      - provider: streaming
+        model: stream-model
+      - provider: backup
+        model: backup-model
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("STREAM_KEY".into(), "stream-secret".into()),
+            ("BACKUP_KEY".into(), "backup-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let runs = futures_util::future::join_all(
+        (0..8).map(|_| call(router.clone(), request("ordered", "", "client"))),
+    )
+    .await;
+    for (status, output) in &runs {
+        assert_eq!(*status, StatusCode::OK, "{output}");
+    }
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        8,
+        "local aggregation failures incorrectly opened the shared breaker"
+    );
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 8);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "circuit_openings_total"), 0);
+    assert_eq!(metric_value(&metrics, "aggregation_failures_total"), 8);
 }
 
 #[tokio::test]

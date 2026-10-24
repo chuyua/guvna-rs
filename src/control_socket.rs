@@ -34,6 +34,7 @@ struct ControlSocket {
 impl ControlSocket {
     async fn bind(data_dir: &Path, state: Arc<AppState>) -> Result<Self, String> {
         let path = socket_path(data_dir)?;
+        let newly_created = !data_dir.exists();
         fs::create_dir_all(data_dir)
             .map_err(|error| format!("create local control directory: {error}"))?;
         let directory_metadata = fs::symlink_metadata(data_dir)
@@ -41,8 +42,10 @@ impl ControlSocket {
         if !directory_metadata.file_type().is_dir() {
             return Err("GUVNA_DATA_DIR must be a real directory, not a symlink".into());
         }
-        fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("secure local control directory: {error}"))?;
+        if newly_created {
+            fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("secure local control directory: {error}"))?;
+        }
         ensure_socket_available(&path).await?;
         let listener = UnixListener::bind(&path)
             .map_err(|error| format!("bind local control socket {}: {error}", path.display()))?;
@@ -151,6 +154,15 @@ async fn read_line_bounded<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u
 }
 
 async fn handle_client(mut stream: UnixStream, state: Arc<AppState>) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if stream
+        .peer_cred()
+        .map_err(|_| "control peer credentials unavailable")?
+        .uid()
+        != unsafe { libc::geteuid() }
+    {
+        return Err("control peer uid mismatch".into());
+    }
     let bytes = timeout(CONTROL_TIMEOUT, read_line_bounded(&mut stream))
         .await
         .map_err(|_| "control request timed out")?
@@ -184,7 +196,8 @@ pub async fn query(data_dir: &Path) -> Result<Option<String>, String> {
     let mut stream = match timeout(CONTROL_TIMEOUT, UnixStream::connect(&path)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => {
-            return Err("local control socket is stale; restart guvna to recover it".into());
+            // A stale socket is equivalent to absence for status probing.
+            return Ok(None);
         }
         Ok(Err(error)) => return Err(format!("connect local control socket: {error}")),
         Err(_) => return Err("timed out connecting to local control socket".into()),
@@ -219,6 +232,8 @@ mod tests {
         use std::collections::HashMap;
 
         let dir = tempfile::tempdir().unwrap();
+        let original_directory_mode =
+            fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
         let config: Config = serde_yaml::from_str(
             "providers:\n  - name: private-provider\n    type: openai\n    base_url: http://127.0.0.1:1\n    key_env: UPSTREAM_SECRET_ENV\n    models: [test-model]\n"
         ).unwrap();
@@ -238,7 +253,10 @@ mod tests {
         let mode = fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let directory_mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
-        assert_eq!(directory_mode, 0o700);
+        assert_eq!(
+            directory_mode, original_directory_mode,
+            "existing user-supplied directory permissions must be preserved"
+        );
 
         let response = query(dir.path()).await.unwrap().unwrap();
         let value: Value = serde_json::from_str(&response).unwrap();

@@ -13,6 +13,7 @@ struct State {
     generation: u64,
     open_until: Option<Instant>,
     probing: bool,
+    probe_deadline: Option<Instant>,
     next_cooldown: Duration,
 }
 
@@ -42,6 +43,7 @@ impl Circuit {
                 generation: 0,
                 open_until: None,
                 probing: false,
+                probe_deadline: None,
                 next_cooldown: base,
             }),
             threshold: config.failure_threshold,
@@ -56,11 +58,20 @@ impl Circuit {
 
     pub fn admit_at(self: &Arc<Self>, now: Instant) -> Option<Ticket> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.probing && state.probe_deadline.is_some_and(|until| now >= until) {
+            // Fence off the outstanding long-lived SSE probe result.
+            state.probing = false;
+            state.probe_deadline = None;
+            state.generation = state.generation.wrapping_add(1);
+            state.open_until = now.checked_add(self.base);
+            return None;
+        }
         let probe = if let Some(until) = state.open_until {
             if now < until || state.probing {
                 return None;
             }
             state.probing = true;
+            state.probe_deadline = now.checked_add(Duration::from_secs(10));
             true
         } else {
             false
@@ -75,7 +86,7 @@ impl Circuit {
 
     pub fn is_open(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.open_until.is_some() || state.probing
+        state.open_until.is_some_and(|until| Instant::now() < until)
     }
 
     fn report(&self, ticket: &Ticket, failure: bool, now: Instant) -> bool {
@@ -86,6 +97,7 @@ impl Circuit {
         if !failure {
             state.failures = 0;
             state.probing = false;
+            state.probe_deadline = None;
             state.open_until = None;
             state.next_cooldown = self.base;
             return false;
@@ -98,6 +110,7 @@ impl Circuit {
         state.open_until = now.checked_add(delay);
         state.next_cooldown = delay.saturating_mul(2).min(self.max);
         state.probing = false;
+        state.probe_deadline = None;
         state.generation = state.generation.wrapping_add(1);
         state.failures = 0;
         true
@@ -110,6 +123,7 @@ impl Circuit {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.generation == ticket.generation && state.probing {
             state.probing = false;
+            state.probe_deadline = None;
             // Client cancellation is neutral, not a provider failure. Delay
             // another probe briefly instead of unleashing a stampede.
             state.open_until = Instant::now().checked_add(self.base);
@@ -243,6 +257,27 @@ mod tests {
         // Artificial-time tests may simulate expiry without sleeping.
         let recovered = breaker.admit_at(Instant::now() + Duration::from_millis(100));
         assert!(recovered.is_some());
+    }
+
+    #[test]
+    fn stale_ten_second_probe_cannot_block_other_clients_forever() {
+        let breaker = circuit();
+        let start = Instant::now();
+        for _ in 0..3 {
+            let mut ticket = breaker.admit_at(start).unwrap();
+            ticket.failure_at(start);
+        }
+        let mut stalled = breaker
+            .admit_at(start + Duration::from_millis(100))
+            .unwrap();
+        assert!(stalled.is_probe());
+        // The first arrival after expiry fences the stalled probe and
+        // starts a short neutral backoff before another probe is permitted.
+        assert!(breaker.admit_at(start + Duration::from_secs(11)).is_none());
+        let retried = breaker.admit_at(start + Duration::from_secs(12));
+        assert!(retried.is_some(), "expired probe did not unlock recovery");
+        stalled.success_at(start + Duration::from_secs(12));
+        assert!(breaker.admit_at(start + Duration::from_secs(12)).is_none());
     }
 
     #[test]

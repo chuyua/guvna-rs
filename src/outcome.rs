@@ -28,10 +28,6 @@ impl Outcome {
     pub fn blame_provider(self) -> bool {
         matches!(self, Self::ProviderTransient)
     }
-
-    pub fn may_fallback(self) -> bool {
-        !matches!(self, Self::Success)
-    }
 }
 
 #[cfg(test)]

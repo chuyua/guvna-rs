@@ -72,6 +72,39 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn telemetry_model_name<'a>(
+        &self,
+        provider_index: usize,
+        model: &'a str,
+    ) -> &'a str {
+        let provider = &self.config.providers[provider_index];
+        if provider.models.iter().any(|name| name == model)
+            || self
+                .config
+                .chains
+                .iter()
+                .flat_map(|chain| &chain.steps)
+                .any(|step| step.provider == provider.name && step.model == model)
+            || self
+                .config
+                .auto
+                .candidates
+                .iter()
+                .any(|step| step.provider == provider.name && step.model == model)
+        {
+            model
+        } else {
+            "passthrough"
+        }
+    }
+    pub fn record_telemetry_start_failure(&self) {
+        Metrics::inc(&self.metrics.telemetry_write_failures);
+    }
+    pub fn flush_telemetry(&self, deadline: Duration) -> bool {
+        self.telemetry
+            .as_ref()
+            .is_none_or(|telemetry| telemetry.flush(deadline))
+    }
     pub fn new(
         config: Config,
         credentials: HashMap<String, String>,
@@ -278,7 +311,9 @@ fn retry_after_delay(headers: &reqwest::header::HeaderMap, now: SystemTime) -> O
         .ok()?
         .trim();
     let delay = if !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()) {
-        Duration::from_secs(raw.parse::<u64>().unwrap_or(u64::MAX))
+        // Reject unrepresentable decimal hints as malformed. Never turn an
+        // invalid attacker-controlled value into a full 24h quarantine.
+        Duration::from_secs(raw.parse::<u64>().ok()?)
     } else {
         httpdate::parse_http_date(raw)
             .ok()?
@@ -458,16 +493,23 @@ async fn model_detail(
 }
 
 async fn chat(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    let (body, permit, _payload_permit) = match authenticated_body(&state, request).await {
+    let (body, permit, payload_permit) = match authenticated_body(&state, request).await {
         Ok(result) => result,
         Err(error) => return error.into_response(),
     };
-    dispatch::dispatch(state, body, dispatch::Endpoint::Chat, permit).await
+    dispatch::dispatch(
+        state,
+        body,
+        dispatch::Endpoint::Chat,
+        permit,
+        Some(payload_permit),
+    )
+    .await
 }
 /// Optional Auto Chat alias. It rewrites only the logical model name and
 /// then invokes the exact same dispatch loop as ordinary Chat completions.
 async fn auto(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    let (body, permit, _payload_permit) = match authenticated_body(&state, request).await {
+    let (body, permit, payload_permit) = match authenticated_body(&state, request).await {
         Ok(result) => result,
         Err(error) => return error.into_response(),
     };
@@ -504,16 +546,24 @@ async fn auto(State(state): State<Arc<AppState>>, request: Request<Body>) -> Res
         Bytes::from(value.to_string()),
         dispatch::Endpoint::Chat,
         permit,
+        Some(payload_permit),
     )
     .await
 }
 
 async fn embeddings(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    let (body, permit, _payload_permit) = match authenticated_body(&state, request).await {
+    let (body, permit, payload_permit) = match authenticated_body(&state, request).await {
         Ok(result) => result,
         Err(error) => return error.into_response(),
     };
-    dispatch::dispatch(state, body, dispatch::Endpoint::Embeddings, permit).await
+    dispatch::dispatch(
+        state,
+        body,
+        dispatch::Endpoint::Embeddings,
+        permit,
+        Some(payload_permit),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -564,7 +614,7 @@ auto:
         assert_eq!(health.penalties(), vec![80, 0]);
     }
     #[test]
-    fn retry_after_parser_accepts_delta_and_date_with_saturating_bounds() {
+    fn retry_after_parser_caps_valid_hints_but_rejects_overflow() {
         let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let make_headers = |value: &str| {
             reqwest::header::HeaderMap::from_iter([(
@@ -578,6 +628,10 @@ auto:
         );
         assert_eq!(
             retry_after_delay(&make_headers("999999999999999999999999999999"), now),
+            None
+        );
+        assert_eq!(
+            retry_after_delay(&make_headers("86401"), now),
             Some(Duration::from_secs(86400))
         );
         assert_eq!(

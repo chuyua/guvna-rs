@@ -87,6 +87,31 @@ fn validate_chat_with_params(
         {
             return false;
         }
+        let end_reason = choice.get("finish_reason").and_then(Value::as_str);
+        if matches!(end_reason, Some("stop" | "length"))
+            && !message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+            && !message
+                .get("refusal")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+            && !message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|c| !c.is_empty())
+            && !message
+                .get("reasoning")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+            && !message
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        {
+            return false;
+        }
         // Logprobs are a requested output, not optional metadata that can
         // disappear silently when the upstream ignores the flag. A native
         // JSON fallback must also honor it before becoming a valid success.
@@ -189,7 +214,13 @@ fn validate_embeddings_with_params(
 ) -> bool {
     let expected = match request_value(request, params, "input") {
         Some(Value::String(_)) => 1,
-        Some(Value::Array(items)) if !items.is_empty() => items.len(),
+        Some(Value::Array(items)) if !items.is_empty() => {
+            if items.iter().all(Value::is_number) {
+                1
+            } else {
+                items.len()
+            }
+        }
         _ => return false,
     };
     let Some(data) = response.get("data").and_then(Value::as_array) else {
@@ -477,6 +508,19 @@ mod response_contract_tests {
         assert!(!validate_chat(&request, &item("null")));
         assert!(!validate_chat(&request, &item("[]")));
         assert!(!validate_chat(&request, &item("42")));
+    }
+
+    #[test]
+    fn refuse_semantically_empty_chat_and_accept_one_tokenized_embedding() {
+        let empty = json!({"choices":[{"index":0,"message":{"role":"assistant","content":null},
+            "finish_reason":"stop"}]});
+        assert!(!validate_chat(&json!({}), &empty));
+        let refused = json!({"choices":[{"index":0,"message":{"role":"assistant",
+            "content":null,"refusal":"Not allowed"},"finish_reason":"stop"}]});
+        assert!(validate_chat(&json!({}), &refused));
+        let embedding = json!({"data":[{"index":0,"embedding":[0.3,0.5]}]});
+        assert!(validate_embeddings(&json!({"input":[1,2,3]}), &embedding));
+        assert!(!validate_embeddings(&json!({"input":42}), &embedding));
     }
 
     #[test]

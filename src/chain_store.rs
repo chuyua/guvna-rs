@@ -29,6 +29,16 @@ fn runtime_path(data_dir: &Path) -> PathBuf {
 }
 
 fn read_limited(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    // An existing FIFO can block forever in open(2). Reject non-regular
+    // nodes before opening, then recheck the opened inode as below.
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(format!("{} is not a regular file", path.display()));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("stat {}: {err}", path.display())),
+        _ => {}
+    }
     // Open the checked inode, not the pathname after a separate metadata
     // check. Linux O_NOFOLLOW closes the symlink swap race between stat/open.
     let mut options = OpenOptions::new();
@@ -217,6 +227,15 @@ fn preserve_original(dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|e| format!("writing preserved original {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    File::open(dir)
+        .and_then(|parent| parent.sync_all())
+        .map_err(|e| {
+            format!(
+                "syncing preserved original directory {}: {e}",
+                dir.display()
+            )
+        })?;
     Ok(path)
 }
 

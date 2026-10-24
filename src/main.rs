@@ -6,6 +6,7 @@ use std::{
     env,
     future::{Future, IntoFuture},
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 
@@ -18,6 +19,13 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
+    // Set before starting the SQLite worker or binding a Unix control
+    // socket. The socket's bind->chmod interval and lazily created WAL/SHM
+    // must never inherit permissive service-manager umask settings.
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(0o077);
+    }
     let mut config_path = PathBuf::from("config.yaml");
     let mut data_dir = env::var_os("GUVNA_DATA_DIR")
         .map(PathBuf::from)
@@ -202,26 +210,35 @@ async fn run() -> Result<(), String> {
         .collect();
     let port = config.port;
     let mut state = gateway::AppState::new(config, credentials, client_keys)?;
-    if matches!(
-        env::var("GUVNA_TELEMETRY_SQLITE").as_deref(),
-        Ok("1" | "true")
-    ) {
-        state.enable_telemetry(&data_dir)?;
+    let telemetry_enabled = env::var("GUVNA_TELEMETRY_SQLITE")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+    if telemetry_enabled && state.enable_telemetry(&data_dir).is_err() {
+        // Optional local telemetry must never prevent the gateway booting.
+        guvna::ops_log::warn("telemetry_init_failed");
+        state.record_telemetry_start_failure();
     }
     let bind = env::var("GUVNA_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
     let listener = tokio::net::TcpListener::bind((bind.as_str(), port))
         .await
         .map_err(|e| format!("binding {bind}:{port}: {e}"))?;
     eprintln!(
-        "guvna-rs starting; config={}; listening={bind}:{port}",
-        real_path.display()
+        "guvna-rs starting; config={}; listening={}",
+        real_path.display(),
+        listener.local_addr().map_err(|e| e.to_string())?
     );
     let (app, runtime_state) = gateway::app_with_state(state);
     #[cfg(unix)]
-    let _control_server = control_socket::spawn(&data_dir, runtime_state).await?;
-    #[cfg(not(unix))]
-    let _ = runtime_state;
+    let _control_server = control_socket::spawn(&data_dir, Arc::clone(&runtime_state)).await?;
     serve_until_shutdown(listener, app, shutdown_signal(), Duration::from_secs(30)).await?;
+    if !runtime_state.flush_telemetry(Duration::from_secs(3)) {
+        guvna::ops_log::warn("telemetry_shutdown_flush_failed");
+    }
     Ok(())
 }
 

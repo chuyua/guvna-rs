@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 // Strict stateless Responses compatibility adapter; unsupported modes fail closed.
 pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    let (body, permit, _payload_permit) = match authenticated_body(&state, request).await {
+    let (body, permit, payload_permit) = match authenticated_body(&state, request).await {
         Ok(result) => result,
         Err(error) => return error.into_response(),
     };
@@ -34,6 +34,7 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     // The translated Value owns its data; do not retain the original body
     // buffer while validating and dispatching the translated request.
     drop(body);
+    drop(payload_permit);
     let streaming = value.get("stream") == Some(&Value::Bool(true));
 
     if value.get("stream").is_some_and(|v| !v.is_boolean()) {
@@ -157,7 +158,6 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
         "prompt_cache_key",
         "messages",
         "max_tokens",
-        "n",
     ] {
         if object.contains_key(key) {
             return error(
@@ -171,6 +171,7 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     for key in object.keys() {
         if ![
             "model",
+            "n",
             "input",
             "stream",
             "text",
@@ -381,6 +382,7 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
         Bytes::from(value.to_string()),
         Endpoint::Chat,
         permit,
+        None,
     )
     .await;
     if response.status() != StatusCode::OK {
@@ -670,11 +672,18 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
 // Convert one fully buffered Chat Completion into a non-streaming Responses
 // document. This function performs no I/O, routing or retry decisions.
 fn reasoning_text(message: &Value) -> Result<Option<String>, ()> {
+    if let Some(ordered) = message.get("reasoning_ordered") {
+        return Ok(ordered
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned));
+    }
     let reasoning = message.get("reasoning").filter(|value| !value.is_null());
     let reasoning_content = message
         .get("reasoning_content")
         .filter(|value| !value.is_null());
     let text = match (reasoning, reasoning_content) {
+        (Some(left), Some(right)) if left == right => Some(left.as_str().ok_or(())?.to_owned()),
         (Some(left), Some(right)) => Some(format!(
             "{}{}",
             left.as_str().ok_or(())?,
@@ -862,7 +871,12 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
     let content_value = &message["content"];
     let content = match content_value.as_str() {
         Some(content) => content,
-        None if content_value.is_null() && reasoning.is_some() => "",
+        None if content_value.is_null() && reasoning.is_some() => {
+            message["refusal"].as_str().unwrap_or("")
+        }
+        None if content_value.is_null() && message["refusal"].as_str().is_some() => {
+            message["refusal"].as_str().unwrap_or("")
+        }
         _ => {
             return error(
                 StatusCode::BAD_GATEWAY,
@@ -905,6 +919,19 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
 #[cfg(test)]
 mod reasoning_tests {
     use super::*;
+
+    #[test]
+    fn nonstream_reasoning_prefers_arrival_order_and_deduplicates_mirrors() {
+        let ordered = json!({"reasoning":"continues",
+            "reasoning_content":"thinking ",
+            "reasoning_ordered":"thinking continues"});
+        assert_eq!(
+            reasoning_text(&ordered).unwrap(),
+            Some("thinking continues".into())
+        );
+        let mirrored = json!({"reasoning":"I think","reasoning_content":"I think"});
+        assert_eq!(reasoning_text(&mirrored).unwrap(), Some("I think".into()));
+    }
 
     #[tokio::test]
     async fn nonstream_reasoning_fields_are_preserved_in_responses_output() {

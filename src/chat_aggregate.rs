@@ -15,8 +15,9 @@ const MAX_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TOTAL_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AGGREGATED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 // Reasoning models may emit one SSE event per reasoning token. Keep this
-// count high enough for long generations while the independent byte budgets
-// below remain the primary memory bound.
+// count high enough for long generations while the 8 MiB input-byte ceiling
+// makes this event limit a secondary defensive bound, not a promised number
+// of accepted frames.
 const MAX_EVENTS: usize = 262_144;
 // A long prompt can leave a reasoning model silent for more than 15 seconds.
 // The separate 10-minute absolute lifetime and shared walk budget still bound
@@ -72,6 +73,7 @@ struct Choice {
     refusal: Option<String>,
     reasoning: Option<String>,
     reasoning_content: Option<String>,
+    reasoning_ordered: String,
     tools: BTreeMap<u64, Tool>,
     finish_reason: Option<String>,
 }
@@ -187,7 +189,15 @@ fn apply_event(
         ] {
             if let Some(fragment) = delta.get(field).filter(|value| !value.is_null()) {
                 let fragment = fragment.as_str().ok_or(())?;
+                // Mirrored aliases in one frame contain the same content,
+                // not two different thoughts. Keep first occurrence.
+                if field == "reasoning_content" && delta.get("reasoning") == delta.get(field) {
+                    continue;
+                }
                 append_bounded(slot.get_or_insert_with(String::new), fragment, used)?;
+                if matches!(field, "reasoning" | "reasoning_content") {
+                    choice.reasoning_ordered.push_str(fragment);
+                }
             }
         }
         // Unknown non-null deltas (legacy function_call, images, audio, etc.)
@@ -291,7 +301,7 @@ pub(super) async fn aggregate(
     }
     // Apply the same named/required/none tool contract as direct Chat SSE.
     // Reject an incompatible first tool delta immediately rather than
-    // holding the aggregation semaphore until the 15-second idle timeout.
+    // holding the aggregation semaphore until the 60-second idle timeout.
     let mut parser = ChatSse::new(expected)
         .map_err(|_| ())?
         .with_tool_choice(tool_choice);
@@ -367,6 +377,9 @@ pub(super) async fn aggregate(
         if let Some(reasoning_content) = choice.reasoning_content {
             message["reasoning_content"] = Value::String(reasoning_content);
         }
+        if !choice.reasoning_ordered.is_empty() {
+            message["reasoning_ordered"] = Value::String(choice.reasoning_ordered);
+        }
         if let Some(calls) = calls {
             message["tool_calls"] = json!(calls);
         }
@@ -400,6 +413,33 @@ mod output_budget_tests {
             &mut created,
             &mut model,
         )
+    }
+
+    #[test]
+    fn reasoning_fragments_follow_arrival_order_and_mirrors_count_once() {
+        let mut choices = vec![Choice::default()];
+        let mut used = 0;
+        let mut usage = Value::Null;
+        let mut id = None;
+        let mut created = None;
+        let mut model = None;
+        for event in [
+            json!({"choices":[{"index":0,"delta":{"reasoning_content":"thinking "},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{"reasoning":"continues"},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{"reasoning":" mirror","reasoning_content":" mirror"},"finish_reason":null}]}),
+        ] {
+            apply_event(
+                &event,
+                &mut choices,
+                &mut used,
+                &mut usage,
+                &mut id,
+                &mut created,
+                &mut model,
+            )
+            .unwrap();
+        }
+        assert_eq!(choices[0].reasoning_ordered, "thinking continues mirror");
     }
 
     #[test]

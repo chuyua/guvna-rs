@@ -1,5 +1,6 @@
 //! Bounded opt-in Auto candidate health hints, no network requests, user data or timers.
 use std::{
+    sync::Mutex,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,6 +12,10 @@ const FRESH_SECS: u64 = 300;
 
 #[derive(Default)]
 struct ProviderScore {
+    // Mutations to the failure window and the demotion latch must be atomic
+    // as one transition; independent relaxed atomics allow stale resets to
+    // undo a concurrent demotion.
+    transition: Mutex<()>,
     penalty: AtomicU8,
     consecutive_failures: AtomicU16,
     demoted: AtomicBool,
@@ -62,6 +67,7 @@ impl AutoHealth {
 
     pub fn mark_success(&self, index: usize) {
         if let Some(score) = self.providers.get(index) {
+            let _transition = score.transition.lock().unwrap_or_else(|e| e.into_inner());
             let updated = update_penalty(&score.penalty, |value| value.saturating_sub(20));
             if updated <= RECOVER_AT {
                 score.demoted.store(false, Ordering::Relaxed);
@@ -99,7 +105,9 @@ impl AutoHealth {
         now_secs: u64,
     ) {
         if let Some(score) = self.providers.get(index) {
-            let fresh = now_secs.saturating_sub(last_failure_secs) <= FRESH_SECS;
+            let _transition = score.transition.lock().unwrap_or_else(|e| e.into_inner());
+            let fresh = last_failure_secs <= now_secs
+                && now_secs.saturating_sub(last_failure_secs) <= FRESH_SECS;
             score
                 .penalty
                 .store(if fresh { penalty.min(100) } else { 0 }, Ordering::Relaxed);
@@ -107,10 +115,9 @@ impl AutoHealth {
                 if fresh { consecutive_failures } else { 0 },
                 Ordering::Relaxed,
             );
-            score.demoted.store(
-                fresh && demoted && consecutive_failures >= MIN_SAMPLES && penalty >= DEMOTE_AT,
-                Ordering::Relaxed,
-            );
+            score
+                .demoted
+                .store(fresh && demoted && penalty > RECOVER_AT, Ordering::Relaxed);
             score
                 .last_failure_secs
                 .store(last_failure_secs, Ordering::Relaxed);
@@ -122,11 +129,11 @@ impl AutoHealth {
 
     fn failure_at(&self, index: usize, now_secs: u64) {
         if let Some(score) = self.providers.get(index) {
+            let _transition = score.transition.lock().unwrap_or_else(|e| e.into_inner());
             let previous = score.last_failure_secs.swap(now_secs, Ordering::Relaxed);
             if now_secs.saturating_sub(previous) > FRESH_SECS || now_secs < previous {
-                // A stale outage is not fresh evidence. Reset the sampling
-                // window before considering a new failure; concurrent resets
-                // can at worst delay demotion, never create false demotion.
+                // A stale outage is not fresh evidence. Serialize window
+                // rollover with the full demotion transition.
                 score.penalty.store(0, Ordering::Relaxed);
                 score.consecutive_failures.store(0, Ordering::Relaxed);
                 score.demoted.store(false, Ordering::Relaxed);
@@ -145,6 +152,7 @@ impl AutoHealth {
             .map(|score| {
                 let last_failure = score.last_failure_secs.load(Ordering::Relaxed);
                 if score.demoted.load(Ordering::Relaxed)
+                    && now_secs >= last_failure
                     && now_secs.saturating_sub(last_failure) <= FRESH_SECS
                 {
                     score.penalty.load(Ordering::Relaxed)
@@ -229,6 +237,32 @@ mod tests {
         health.mark_failure(usize::MAX);
         health.mark_success(usize::MAX);
         assert_eq!(health.penalties(), vec![0]);
+    }
+
+    #[test]
+    fn concurrent_failure_window_resets_do_not_erase_new_demotion() {
+        use std::sync::{Arc, Barrier};
+        let health = Arc::new(AutoHealth::new(1));
+        for time in [1, 2, 3] {
+            health.failure_at(0, time);
+        }
+        // New failures after a stale window must serialize the complete
+        // reset-plus-penalty transition under contention.
+        health.failure_at(0, 1000);
+        let barrier = Arc::new(Barrier::new(17));
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let health = Arc::clone(&health);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    health.failure_at(0, 1001);
+                });
+            }
+            barrier.wait();
+        });
+        assert_eq!(health.penalties_at(1001), vec![100]);
+        assert!(health.providers[0].demoted.load(Ordering::Relaxed));
     }
 
     #[test]

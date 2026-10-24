@@ -503,6 +503,7 @@ impl ResponsesSse {
                 "tool_calls",
                 "reasoning",
                 "reasoning_content",
+                "refusal",
             ]
             .contains(&key.as_str())
         }) || delta.get("role").is_some_and(|role| role != "assistant")
@@ -515,6 +516,9 @@ impl ResponsesSse {
             let Some(part) = delta.get(field).filter(|value| !value.is_null()) else {
                 continue;
             };
+            if field == "reasoning_content" && delta.get("reasoning") == delta.get(field) {
+                continue;
+            }
             let part = part.as_str().ok_or(())?;
             if part.is_empty() {
                 continue;
@@ -546,39 +550,44 @@ impl ResponsesSse {
                 }),
             ));
         }
-        if let Some(content) = delta.get("content").filter(|part| !part.is_null()) {
-            let part = content.as_str().ok_or(())?;
-            if !part.is_empty() {
-                if !self.tools.is_empty() {
-                    return Err(());
+        for field in ["content", "refusal"] {
+            if let Some(content) = delta.get(field).filter(|part| !part.is_null()) {
+                if field == "refusal" && delta.get("content") == Some(content) {
+                    continue; // Do not duplicate mirrored text.
                 }
-                let used = self
-                    .tools
-                    .iter()
-                    .map(|tool| tool.arguments.len())
-                    .sum::<usize>();
-                if part.len()
-                    > MAX_TEXT.saturating_sub(
-                        self.text
-                            .len()
-                            .saturating_add(self.reasoning_text.len())
-                            .saturating_add(used),
-                    )
-                {
-                    return Err(());
+                let part = content.as_str().ok_or(())?;
+                if !part.is_empty() {
+                    if !self.tools.is_empty() {
+                        return Err(());
+                    }
+                    let used = self
+                        .tools
+                        .iter()
+                        .map(|tool| tool.arguments.len())
+                        .sum::<usize>();
+                    if part.len()
+                        > MAX_TEXT.saturating_sub(
+                            self.text
+                                .len()
+                                .saturating_add(self.reasoning_text.len())
+                                .saturating_add(used),
+                        )
+                    {
+                        return Err(());
+                    }
+                    self.begin_text(pending);
+                    self.text.push_str(part);
+                    let item_id = self.message_id();
+                    pending.push_back(self.emit(
+                        "response.output_text.delta",
+                        json!({
+                            "item_id":item_id,"output_index":self.text_index,"content_index":0,
+                            "delta":part,"logprobs":[]
+                        }),
+                    ));
                 }
-                self.begin_text(pending);
-                self.text.push_str(part);
-                let item_id = self.message_id();
-                pending.push_back(self.emit(
-                    "response.output_text.delta",
-                    json!({
-                        "item_id":item_id,"output_index":self.text_index,"content_index":0,
-                        "delta":part,"logprobs":[]
-                    }),
-                ));
             }
-        }
+        } // content/refusal parts
         if let Some(calls) = delta.get("tool_calls") {
             self.tool_delta(calls, pending)?;
         }
@@ -621,53 +630,64 @@ impl ResponsesSse {
         if self.text_index.is_none() && self.tools.is_empty() && self.reasoning_index.is_none() {
             self.begin_text(pending);
         }
-        if let Some(index) = self.reasoning_index {
-            let item_id = self.reasoning_id();
-            pending.push_back(self.emit(
-                "response.reasoning_text.done",
-                json!({
-                    "item_id":item_id,"output_index":index,"content_index":0,
-                    "text":self.reasoning_text
-                }),
-            ));
-            let item_id = self.reasoning_id();
-            pending.push_back(self.emit(
-                "response.content_part.done",
-                json!({
-                    "item_id":item_id,"output_index":index,"content_index":0,
-                    "part":{"type":"reasoning_text","text":self.reasoning_text}
-                }),
-            ));
-            let item = json!({"id":self.reasoning_id(),"type":"reasoning","status":status,
+        // Output-item terminal events must follow their assigned indices,
+        // not a hard-coded reasoning/text/tool category order.
+        for output_index in 0..self.next_output_index {
+            if self.reasoning_index == Some(output_index) {
+                let index = output_index;
+                let item_id = self.reasoning_id();
+                pending.push_back(self.emit(
+                    "response.reasoning_text.done",
+                    json!({
+                        "item_id":item_id,"output_index":index,"content_index":0,
+                        "text":self.reasoning_text
+                    }),
+                ));
+                let item_id = self.reasoning_id();
+                pending.push_back(self.emit(
+                    "response.content_part.done",
+                    json!({
+                        "item_id":item_id,"output_index":index,"content_index":0,
+                        "part":{"type":"reasoning_text","text":self.reasoning_text}
+                    }),
+                ));
+                let item = json!({"id":self.reasoning_id(),"type":"reasoning","status":status,
                 "summary":[],"content":[{"type":"reasoning_text","text":self.reasoning_text}]});
-            pending.push_back(self.emit(
-                "response.output_item.done",
-                json!({"output_index":index,"item":item}),
-            ));
-        }
-        self.close_text(pending, status);
-        for index in 0..self.tools.len() {
-            let tool = &self.tools[index];
-            let (id, name, arguments, output_index) = (
-                tool.id.clone(),
-                tool.name.clone(),
-                tool.arguments.clone(),
-                tool.output_index,
-            );
-            pending.push_back(self.emit(
-                "response.function_call_arguments.done",
-                json!({
-                    "item_id":id,"output_index":output_index,"arguments":arguments
-                }),
-            ));
-            pending.push_back(self.emit(
-                "response.output_item.done",
-                json!({
-                    "output_index":output_index,
-                    "item":{"id":id,"call_id":id,"name":name,"arguments":arguments,
-                        "type":"function_call","status":"completed"}
-                }),
-            ));
+                pending.push_back(self.emit(
+                    "response.output_item.done",
+                    json!({"output_index":index,"item":item}),
+                ));
+            }
+            if self.text_index == Some(output_index) {
+                self.close_text(pending, status);
+            }
+            if let Some(index) = self
+                .tools
+                .iter()
+                .position(|tool| tool.output_index == output_index)
+            {
+                let tool = &self.tools[index];
+                let (id, name, arguments, output_index) = (
+                    tool.id.clone(),
+                    tool.name.clone(),
+                    tool.arguments.clone(),
+                    tool.output_index,
+                );
+                pending.push_back(self.emit(
+                    "response.function_call_arguments.done",
+                    json!({
+                        "item_id":id,"output_index":output_index,"arguments":arguments
+                    }),
+                ));
+                pending.push_back(self.emit(
+                    "response.output_item.done",
+                    json!({
+                        "output_index":output_index,
+                        "item":{"id":id,"call_id":id,"name":name,"arguments":arguments,
+                            "type":"function_call","status":"completed"}
+                    }),
+                ));
+            }
         }
         let kind = if status == "incomplete" {
             "response.incomplete"
@@ -731,6 +751,43 @@ mod tests {
     fn frame(event: Value) -> Bytes {
         Bytes::from(format!("data: {event}\n\n"))
     }
+    #[test]
+    fn mixed_text_then_reasoning_completes_in_output_index_order() {
+        let mut translator = ResponsesSse::new("logical".into(), Value::Null);
+        let mut events = VecDeque::new();
+        translator
+            .feed(
+                &frame(json!({"id":"mixed","created":123,
+            "choices":[{"index":0,"delta":{"content":"answer"},
+                "finish_reason":null}]})),
+                &mut events,
+            )
+            .unwrap();
+        translator
+            .feed(
+                &frame(json!({"id":"mixed",
+            "choices":[{"index":0,"delta":{"reasoning":"thought"},
+                "finish_reason":"stop"}]})),
+                &mut events,
+            )
+            .unwrap();
+        translator.feed(b"data: [DONE]\n\n", &mut events).unwrap();
+        let done: Vec<usize> = events
+            .iter()
+            .filter_map(|frame| {
+                let text = std::str::from_utf8(frame).ok()?;
+                if !text.starts_with("event: response.output_item.done\n") {
+                    return None;
+                }
+                let data = text.lines().find_map(|line| line.strip_prefix("data: "))?;
+                serde_json::from_str::<Value>(data).ok()?["output_index"]
+                    .as_u64()
+                    .and_then(|index| usize::try_from(index).ok())
+            })
+            .collect();
+        assert_eq!(done, vec![0, 1], "out-of-order terminal output items");
+    }
+
     #[test]
     fn fragments_usage_and_success() {
         let mut t = ResponsesSse::new("logical".into(), json!({"trace":"x"}));

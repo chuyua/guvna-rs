@@ -81,6 +81,13 @@ aggregation failure categories (such as aggregation_invalid_sse and
 aggregation_idle_timeout) are also emitted. Informational event:
 aggregation_completed. All
 events are local-only and sampled; no per-user or per-provider data is logged.
+The numeric request_id is monotonic only **within one process lifetime**;
+it restarts from 1 on each daemon restart. For long-term journald correlation
+combine the event timestamp with the process/systemd invocation identity.
+The warning list above is illustrative, not an exhaustive enum; additional
+fixed local events include telemetry_open_failed, telemetry_write_failed,
+telemetry_prune_failed, telemetry_checkpoint_failed and
+telemetry_shutdown_flush_failed.
 
 The pre-existing authenticated /metrics endpoint still works but this
 feature adds no remote endpoints; separately opt in to local SQLite request
