@@ -46,8 +46,9 @@ arguments. SSE event data includes a monotonically increasing sequence number.
   name and ID on their first delta and final JSON-object arguments.
   Empty zero-argument function strings are normalized to `{}` in final
   Responses output; interrupted tool arguments remain incomplete.
-- Unsupported provider-specific deltas, reasoning/multimodal data and
-  stateful sessions are rejected or result in explicit failure events.
+- Supported reasoning deltas are translated into reasoning items and
+  supported refusal text is preserved. Unsupported provider-specific
+  multimodal deltas and stateful sessions still fail explicitly.
 
 These limits protect a low-memory, single-user VPS. They do not imply full
 OpenAI Responses protocol or Go-legacy feature parity. Linux CI and

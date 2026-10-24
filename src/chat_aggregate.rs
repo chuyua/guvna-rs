@@ -291,7 +291,7 @@ pub(super) async fn aggregate(
     }
     // Apply the same named/required/none tool contract as direct Chat SSE.
     // Reject an incompatible first tool delta immediately rather than
-    // holding the aggregation semaphore until the 15-second idle timeout.
+    // holding the aggregation semaphore until the 60-second idle timeout.
     let mut parser = ChatSse::new(expected)
         .map_err(|_| ())?
         .with_tool_choice(tool_choice);

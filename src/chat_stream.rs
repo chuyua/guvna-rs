@@ -120,7 +120,9 @@ fn stream_response(state: ChatStreamState) -> Response {
                         telemetry.observe_health(
                             "chat",
                             provider,
-                            &state.model,
+                            state
+                                .owner
+                                .telemetry_model_name(state.provider_index, &state.model),
                             "success",
                             state.started_at.elapsed(),
                             &state.owner.metrics,
@@ -149,7 +151,14 @@ fn stream_response(state: ChatStreamState) -> Response {
                         }
                     }
                 }
-                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => state.terminated = true,
+                Ok(Ok(None)) => {
+                    if let Some(done) = state.parser.finalize_on_eof() {
+                        state.pending.push_back(done);
+                    } else {
+                        state.terminated = true;
+                    }
+                }
+                Ok(Err(_)) | Err(_) => state.terminated = true,
             }
             if state.terminated {
                 Metrics::inc(&state.owner.metrics.chat_stream_failed);
@@ -162,7 +171,9 @@ fn stream_response(state: ChatStreamState) -> Response {
                     telemetry.observe_health(
                         "chat",
                         provider,
-                        &state.model,
+                        state
+                            .owner
+                            .telemetry_model_name(state.provider_index, &state.model),
                         "transport_error",
                         state.started_at.elapsed(),
                         &state.owner.metrics,

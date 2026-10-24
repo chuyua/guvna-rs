@@ -35,6 +35,9 @@ Long-running SSE streams retain their permits until completion/cancellation.
 - guvna_upstream_http_failures_total: upstream non-2xx HTTP statuses.
 - guvna_upstream_invalid_responses_total: malformed non-streaming 2xx payloads
   or streams that failed initial SSE validation before relay.
+- guvna_aggregation_busy_total: SSE-to-JSON aggregation capacity rejections.
+- guvna_aggregation_completed_total: validated SSE-only upstream responses
+  converted into ordinary JSON.
 - guvna_credential_quarantines_total: credential isolation decisions actually
   applied; stale concurrent failures cannot increase this counter.
 - guvna_candidate_fallbacks_total: transitions to the next chain step, not
@@ -100,19 +103,23 @@ GUVNA_DATA_DIR/telemetry/requests.sqlite3 (or the selected -data directory).
 Rows contain timestamp, fixed endpoint category, configured provider/model labels
 (bounded and sanitized), downstream status, elapsed milliseconds, SSE-header
 state and a fixed failure category. Prompts, request/response bodies, credentials,
-URLs, request IDs, sensitive headers and client IPs are never stored. Each
+URLs, request IDs, sensitive headers and client IPs are never stored. Unconfigured
+caller-controlled passthrough model suffixes are labeled `passthrough` instead. Each
 downstream request is recorded once; failed intermediate provider candidates are
 also retained in failure history and hourly attempt statistics. hourly_stats.request_count
 counts provider attempts and failure_count counts failed outcomes. SSE terminal failure
 adds a failure row without counting the same attempt twice.
 
 A 512-item nonblocking sync queue feeds a single SQLite WAL worker (batches
-up to 64 rows, 250ms collection wait). Disk settings include a 32MiB main
-database page cap and a 1MiB journal target, not an absolute filesystem quota.
+up to 64 rows, 250ms collection wait). The SQLite worker attempts to limit its
+own main database growth to 32MiB and targets a 1MiB journal. These are
+connection-local settings, not global database or filesystem quotas; external
+writers may exceed them. Use a filesystem quota for a hard storage ceiling.
 Request details are retained for seven days; failure details and hourly aggregates
 for 30 days. Legacy request tables are migrated without discarding existing rows.
-Write failures trigger bounded reconnect backoff; a full or locked database cannot
-block the gateway. New fixed-cardinality metrics:
+Write failures trigger bounded reconnect backoff and privacy-safe sampled local
+warning events. Optional telemetry startup failures are nonfatal; a full or locked
+database cannot block the gateway. New fixed-cardinality metrics:
 guvna_telemetry_written_total, guvna_telemetry_dropped_total, and
 guvna_telemetry_write_failures_total.
 
@@ -134,3 +141,8 @@ If the socket is absent, status retains the legacy loopback HTTP health probe.
 Stale sockets are cleaned on startup only after confirming the path is a Unix
 socket and a connection is refused; non-socket files and active sockets are
 never replaced.
+
+An unavailable or stale control socket causes `guvna status` to use the
+loopback health probe. Existing user-supplied data directories retain their
+permissions; newly created ones are secured at 0700. The control socket is
+secured at 0600 and peer credentials are verified on Linux.

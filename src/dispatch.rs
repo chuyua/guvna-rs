@@ -20,7 +20,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     collections::HashSet,
     sync::Arc,
@@ -47,12 +47,13 @@ pub(super) async fn dispatch(
     body: Bytes,
     endpoint: Endpoint,
     admission: OwnedSemaphorePermit,
+    payload_permit: OwnedSemaphorePermit,
 ) -> Response {
     let started = tokio::time::Instant::now();
     let id = ops_log::next_request_id();
     let telemetry = state.telemetry.clone();
     let metrics = Arc::clone(&state.metrics);
-    let response = dispatch_inner(state, body, endpoint, admission, started).await;
+    let response = dispatch_inner(state, body, endpoint, admission, payload_permit, started).await;
     let telemetry_context = response.extensions().get::<TelemetryContext>().cloned();
     let sse_headers = response
         .headers()
@@ -169,6 +170,7 @@ async fn dispatch_inner(
     body: Bytes,
     endpoint: Endpoint,
     admission: OwnedSemaphorePermit,
+    payload_permit: OwnedSemaphorePermit,
     started: tokio::time::Instant,
 ) -> Response {
     let mut request: Value = match serde_json::from_slice(&body) {
@@ -184,12 +186,38 @@ async fn dispatch_inner(
     // The parsed Value owns its strings; release the raw body buffer before
     // routing and candidate serialization to reduce the per-request peak.
     drop(body);
+    // Payload slots cover only receiving and parsing JSON, not upstream waits.
+    drop(payload_permit);
     if !request.is_object() {
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "Expected JSON object",
         );
+    }
+    if matches!(endpoint, Endpoint::Embeddings) {
+        let input_valid = match request.get("input") {
+            Some(Value::String(s)) => !s.is_empty(),
+            Some(Value::Array(items)) if !items.is_empty() => {
+                items
+                    .iter()
+                    .all(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                    || items.iter().all(|v| v.as_u64().is_some())
+                    || items.iter().all(|v| {
+                        v.as_array().is_some_and(|a| {
+                            !a.is_empty() && a.iter().all(|n| n.as_u64().is_some())
+                        })
+                    })
+            }
+            _ => false,
+        };
+        if !input_valid {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+                "Embeddings input must contain text or nonempty token arrays",
+            );
+        }
     }
     if request
         .get("model")
@@ -298,6 +326,7 @@ async fn dispatch_inner(
     // Count actual candidate transitions, not provider-key retries.
     let mut candidates_visited = 0usize;
     let mut attempted_network = false;
+    let mut last_upstream_client_error: Option<(StatusCode, Value)> = None;
     let mut bypassed_circuit = false;
     let mut aggregation_busy = false;
     let mut unsupported_aggregate_logprobs = false;
@@ -411,7 +440,7 @@ async fn dispatch_inner(
         candidate_attempted_network = false;
         telemetry_context = Some(TelemetryContext::new(
             &provider.name,
-            &step.model,
+            state.telemetry_model_name(step.provider_index, &step.model),
             "upstream_unavailable",
         ));
         let mut circuit_ticket = match &state.circuits[step.provider_index] {
@@ -457,6 +486,17 @@ async fn dispatch_inner(
         } else {
             None
         };
+        let original_stream_options = if override_stream {
+            let mut options = object
+                .get("stream_options")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            options.insert("include_usage".into(), Value::Bool(true));
+            object.insert("stream_options".into(), Value::Object(options))
+        } else {
+            None
+        };
         let mut injected_params = Vec::new();
         for (name, value) in &step.params {
             if !object.contains_key(name) {
@@ -470,6 +510,11 @@ async fn dispatch_inner(
             object.remove(&name);
         }
         if override_stream {
+            if let Some(original) = original_stream_options {
+                object.insert("stream_options".into(), original);
+            } else {
+                object.remove("stream_options");
+            }
             if let Some(original) = original_stream {
                 object.insert("stream".into(), original);
             } else {
@@ -746,6 +791,28 @@ async fn dispatch_inner(
                     } // next step
                 }
             }
+            if (400..500).contains(&status) && !matches!(status, 401 | 403 | 429) {
+                let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
+                // Do not reflect arbitrary provider JSON or secret-bearing
+                // error text. Only allow a short, structured diagnosis.
+                let detail =
+                    tokio::time::timeout(Duration::from_secs(2), bounded_error_json(upstream))
+                        .await
+                        .ok()
+                        .flatten();
+                let message = detail
+                    .as_ref()
+                    .and_then(|body| body.pointer("/error/message").and_then(Value::as_str))
+                    .filter(|text| text.len() <= 512)
+                    .unwrap_or("Upstream rejected the request");
+                last_upstream_client_error = Some((
+                    status_code,
+                    json!({
+                        "error":{"type":"upstream_client_error",
+                            "code":"upstream_rejected","message":message}
+                    }),
+                ));
+            }
             Metrics::inc(&state.metrics.upstream_http_failures);
             ops_log::warn("provider_http_failure");
             if outcome == Outcome::ProviderTransient {
@@ -870,6 +937,12 @@ async fn dispatch_inner(
         }
         return attach_telemetry_context(response, context);
     }
+    if let Some((status, value)) = last_upstream_client_error {
+        return attach_telemetry_context(
+            (status, Json(value)).into_response(),
+            telemetry_context.take(),
+        );
+    }
     let context = telemetry_context.take();
     attach_telemetry_context(
         error(
@@ -879,6 +952,17 @@ async fn dispatch_inner(
         ),
         context,
     )
+}
+
+async fn bounded_error_json(mut upstream: reqwest::Response) -> Option<Value> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = upstream.chunk().await.ok()? {
+        if chunk.len() > 8192usize.saturating_sub(bytes.len()) {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).ok()
 }
 
 async fn bounded_json(response: reqwest::Response) -> Result<Value, ()> {

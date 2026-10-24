@@ -202,19 +202,30 @@ async fn run() -> Result<(), String> {
         .collect();
     let port = config.port;
     let mut state = gateway::AppState::new(config, credentials, client_keys)?;
-    if matches!(
-        env::var("GUVNA_TELEMETRY_SQLITE").as_deref(),
-        Ok("1" | "true")
-    ) {
-        state.enable_telemetry(&data_dir)?;
+    if env::var("GUVNA_TELEMETRY_SQLITE")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    {
+        if let Err(_error) = state.enable_telemetry(&data_dir) {
+            // Optional local telemetry must never prevent the gateway booting.
+            // Log only a fixed event name, never filesystem details or secrets.
+            guvna::ops_log::warn("telemetry_init_failed");
+            state.record_telemetry_start_failure();
+        }
     }
     let bind = env::var("GUVNA_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
     let listener = tokio::net::TcpListener::bind((bind.as_str(), port))
         .await
         .map_err(|e| format!("binding {bind}:{port}: {e}"))?;
     eprintln!(
-        "guvna-rs starting; config={}; listening={bind}:{port}",
-        real_path.display()
+        "guvna-rs starting; config={}; listening={}",
+        real_path.display(),
+        listener.local_addr().map_err(|e| e.to_string())?
     );
     let (app, runtime_state) = gateway::app_with_state(state);
     #[cfg(unix)]

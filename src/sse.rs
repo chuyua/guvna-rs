@@ -60,6 +60,20 @@ impl ChatSse {
     pub fn is_done(&self) -> bool {
         self.done
     }
+    /// Some OpenAI-compatible SSE providers close at EOF after every choice's
+    /// finish_reason without sending the optional [DONE] sentinel. Only
+    /// synthesize the terminal marker for a fully parsed, complete stream.
+    pub fn finalize_on_eof(&mut self) -> Option<Bytes> {
+        if self.done
+            || !self.line.is_empty()
+            || !self.data.is_empty()
+            || self.finished_mask.count_ones() as u64 != self.expected
+        {
+            return None;
+        }
+        self.done = true;
+        Some(Bytes::from_static(b"data: [DONE]\n\n"))
+    }
 
     /// Preserve the caller's tool constraint through SSE validation. An
     /// upstream 200 cannot silently override a required or forbidden tool.
@@ -589,6 +603,30 @@ mod tests {
         parser.push(b"data: [DONE]\n\n").unwrap();
         assert_eq!(parser.tool_calls.len(), 130);
         parser.finish().unwrap();
+    }
+
+    #[test]
+    fn completed_choices_at_eof_gain_one_valid_terminal_marker() {
+        let mut parser = ChatSse::new(1).unwrap();
+        parser
+            .push(
+                br#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}
+
+"#,
+            )
+            .unwrap();
+        assert_eq!(
+            parser.finalize_on_eof().unwrap(),
+            Bytes::from_static(b"data: [DONE]\n\n")
+        );
+        assert!(parser.finalize_on_eof().is_none());
+        parser.finish().unwrap();
+
+        let mut incomplete = ChatSse::new(1).unwrap();
+        incomplete.push(br#"data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}
+
+"#).unwrap();
+        assert!(incomplete.finalize_on_eof().is_none());
     }
 
     #[test]

@@ -99,7 +99,8 @@ impl AutoHealth {
         now_secs: u64,
     ) {
         if let Some(score) = self.providers.get(index) {
-            let fresh = now_secs.saturating_sub(last_failure_secs) <= FRESH_SECS;
+            let fresh = last_failure_secs <= now_secs
+                && now_secs.saturating_sub(last_failure_secs) <= FRESH_SECS;
             score
                 .penalty
                 .store(if fresh { penalty.min(100) } else { 0 }, Ordering::Relaxed);
@@ -107,10 +108,9 @@ impl AutoHealth {
                 if fresh { consecutive_failures } else { 0 },
                 Ordering::Relaxed,
             );
-            score.demoted.store(
-                fresh && demoted && consecutive_failures >= MIN_SAMPLES && penalty >= DEMOTE_AT,
-                Ordering::Relaxed,
-            );
+            score
+                .demoted
+                .store(fresh && demoted && penalty > RECOVER_AT, Ordering::Relaxed);
             score
                 .last_failure_secs
                 .store(last_failure_secs, Ordering::Relaxed);
@@ -145,6 +145,7 @@ impl AutoHealth {
             .map(|score| {
                 let last_failure = score.last_failure_secs.load(Ordering::Relaxed);
                 if score.demoted.load(Ordering::Relaxed)
+                    && now_secs >= last_failure
                     && now_secs.saturating_sub(last_failure) <= FRESH_SECS
                 {
                     score.penalty.load(Ordering::Relaxed)

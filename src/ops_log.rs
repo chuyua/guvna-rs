@@ -1,6 +1,7 @@
 //! Optional low-cardinality local stderr failure events. This is NOT remote
 //! management or durable telemetry. Never render prompts, API keys, model
 //! names, provider endpoints, request bodies or client addresses here.
+use std::io::Write;
 use std::sync::{
     OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -41,7 +42,11 @@ fn request_summary_line(id: u64, elapsed: Duration, status: u16, sse_headers: bo
 /// Emit no unbounded/user-controlled fields and expose no remote log API.
 pub fn request_finished(id: u64, elapsed: Duration, status: u16, sse_headers: bool) {
     if request_log_enabled() {
-        eprintln!("{}", request_summary_line(id, elapsed, status, sse_headers));
+        let _ = writeln!(
+            std::io::stderr(),
+            "{}",
+            request_summary_line(id, elapsed, status, sse_headers)
+        );
     }
 }
 
@@ -108,7 +113,8 @@ fn emit(level: &'static str, event: &'static str) {
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis());
-    eprintln!(
+    let _ = writeln!(
+        std::io::stderr(),
         "{{\"ts_unix_ms\":{timestamp_ms},\"level\":\"{level}\",\"event\":\"{event}\",\"sequence\":{sequence}}}"
     );
 }

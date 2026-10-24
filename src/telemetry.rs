@@ -149,13 +149,18 @@ struct Event {
 impl Telemetry {
     pub fn start(data_dir: &Path, metrics: Arc<Metrics>) -> Result<Self, String> {
         let directory = data_dir.join("telemetry");
+        if let Ok(meta) = std::fs::symlink_metadata(&directory) {
+            if !meta.file_type().is_dir() {
+                return Err("telemetry directory must be a real directory".into());
+            }
+        }
         std::fs::create_dir_all(&directory)
-            .map_err(|_| "cannot create telemetry data directory".to_string())?;
+            .map_err(|e| format!("cannot create telemetry data directory: {e}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-                .map_err(|_| "cannot secure telemetry directory".to_string())?;
+                .map_err(|e| format!("cannot secure telemetry directory: {e}"))?;
         }
         let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
         std::thread::Builder::new()
@@ -305,7 +310,7 @@ fn migrate_legacy_request_events(conn: &Connection) -> rusqlite::Result<()> {
 }
 fn open_database(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.busy_timeout(Duration::from_millis(100))?;
+    conn.busy_timeout(Duration::from_secs(1))?;
     migrate_legacy_request_events(&conn)?;
     conn.execute_batch(
         "
@@ -377,6 +382,28 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+// SQLite creates WAL and SHM lazily. Protect each new sidecar as soon as the
+// writer has created it, not only the main database file.
+#[cfg(unix)]
+fn secure_sidecars(path: &Path) {
+    use std::{ffi::OsString, os::unix::fs::PermissionsExt};
+    for suffix in ["-wal", "-shm"] {
+        let mut name = OsString::from(path.as_os_str());
+        name.push(suffix);
+        let sidecar = PathBuf::from(name);
+        if let Err(error) =
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600))
+        {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                crate::ops_log::warn("telemetry_permissions_failed");
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn secure_sidecars(_path: &Path) {}
+
 fn is_failure(event: &Event) -> bool {
     !matches!(event.failure_type, "success" | "stream_started")
 }
@@ -430,11 +457,18 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                      CASE WHEN ?3=1 THEN ?4 ELSE 0 END,
                      CASE WHEN ?3=0 THEN ?4 ELSE 0 END,?4)
              ON CONFLICT(provider,model) DO UPDATE SET
-             penalty=CASE WHEN ?3=1 THEN MIN(provider_health.penalty+35,100)
+             penalty=CASE WHEN ?4 < provider_health.last_failure_ts
+                               OR ?4-provider_health.last_failure_ts>300
+                          THEN CASE WHEN ?3=1 THEN 35 ELSE 0 END
+                          WHEN ?3=1 THEN MIN(provider_health.penalty+35,100)
                           ELSE MAX(provider_health.penalty-20,0) END,
-             consecutive_failures=CASE WHEN ?3=1
-                          THEN MIN(provider_health.consecutive_failures+1,65535) ELSE 0 END,
-             demoted=CASE WHEN ?3=1 THEN
+             consecutive_failures=CASE WHEN ?3=0 THEN 0
+                          WHEN ?4 < provider_health.last_failure_ts
+                               OR ?4-provider_health.last_failure_ts>300 THEN 1
+                          ELSE MIN(provider_health.consecutive_failures+1,65535) END,
+             demoted=CASE WHEN ?4 < provider_health.last_failure_ts
+                               OR ?4-provider_health.last_failure_ts>300 THEN 0
+                          WHEN ?3=1 THEN
                           CASE WHEN provider_health.consecutive_failures+1>=3
                                     AND MIN(provider_health.penalty+35,100)>=70
                                THEN 1 ELSE provider_health.demoted END
@@ -504,11 +538,9 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
             }
             if let Some(failed) = health_failure(event) {
                 let failed = i64::from(failed);
-                // Per-model score plus a provider-wide aggregate used by the
-                // existing conservative candidate ranking after restart.
-                for model in [event.model.as_str(), "*"] {
-                    health.execute(params![event.provider, model, failed, event.ts])?;
-                }
+                // Only per-model rows are consumed on restart. Do not write a
+                // redundant provider-wide '*' row for every single event.
+                health.execute(params![event.provider, event.model, failed, event.ts])?;
             }
         }
     }
@@ -595,11 +627,19 @@ fn drop_batch(batch: &[Event], metrics: &Metrics) {
 }
 
 fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
-    let mut conn = open_database(&path).ok();
+    let mut conn = match open_database(&path) {
+        Ok(database) => Some(database),
+        Err(_) => {
+            Metrics::inc(&metrics.telemetry_write_failures);
+            crate::ops_log::warn("telemetry_open_failed");
+            None
+        }
+    };
     if let Some(database) = conn.as_mut()
         && prune_expired(database, now_secs()).is_err()
     {
         Metrics::inc(&metrics.telemetry_write_failures);
+        crate::ops_log::warn("telemetry_prune_failed");
     }
     let mut batches: usize = 0;
     let mut consecutive_failures: u32 = 0;
@@ -619,6 +659,9 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
                 Err(_) => {
                     drop_batch(&batch, &metrics);
                     consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures.is_power_of_two() {
+                        crate::ops_log::warn("telemetry_open_failed");
+                    }
                     let delay_ms = 50_u64
                         .saturating_mul(1_u64 << consecutive_failures.min(7))
                         .min(5000);
@@ -630,6 +673,7 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
         let write_result = write_batch(conn.as_mut().expect("opened above"), &batch);
         match write_result {
             Ok(()) => {
+                secure_sidecars(&path);
                 consecutive_failures = 0;
                 metrics
                     .telemetry_written
@@ -637,8 +681,16 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
             }
             Err(_) => {
                 drop_batch(&batch, &metrics);
+                if let Some(database) = conn.as_mut() {
+                    if prune_expired(database, now_secs()).is_err() {
+                        crate::ops_log::warn("telemetry_prune_failed");
+                    }
+                }
                 conn = None; // Reopen after busy, readonly, full-disk or corruption errors.
                 consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures.is_power_of_two() {
+                    crate::ops_log::warn("telemetry_write_failed");
+                }
                 let delay_ms = 50_u64
                     .saturating_mul(1_u64 << consecutive_failures.min(7))
                     .min(5000);
@@ -652,6 +704,7 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
         {
             if prune_expired(database, now_secs()).is_err() {
                 Metrics::inc(&metrics.telemetry_write_failures);
+                crate::ops_log::warn("telemetry_prune_failed");
             }
             // Checkpoint and truncate WAL from the single writer, never on the request path.
             if database
@@ -659,6 +712,7 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
                 .is_err()
             {
                 Metrics::inc(&metrics.telemetry_write_failures);
+                crate::ops_log::warn("telemetry_checkpoint_failed");
             }
         }
     }

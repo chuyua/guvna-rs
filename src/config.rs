@@ -164,14 +164,21 @@ impl CircuitBreakerConfig {
     }
 }
 impl QuarantineConfig {
+    fn checked_duration(value: &str) -> Result<Duration, String> {
+        let duration = parse_duration(value)?;
+        if !(Duration::from_secs(1)..=Duration::from_secs(30 * 24 * 3600)).contains(&duration) {
+            return Err("quarantine duration must be between 1s and 30d".into());
+        }
+        Ok(duration)
+    }
     pub fn auth(&self) -> Result<Duration, String> {
-        parse_duration(self.auth.as_deref().unwrap_or("24h"))
+        Self::checked_duration(self.auth.as_deref().unwrap_or("24h"))
     }
     pub fn rate_limit(&self) -> Result<Duration, String> {
-        parse_duration(self.rate_limit.as_deref().unwrap_or("60s"))
+        Self::checked_duration(self.rate_limit.as_deref().unwrap_or("60s"))
     }
     pub fn transient(&self) -> Result<Duration, String> {
-        parse_duration(self.transient.as_deref().unwrap_or("60s"))
+        Self::checked_duration(self.transient.as_deref().unwrap_or("60s"))
     }
 }
 
@@ -281,6 +288,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.port == 0 {
+            return Err("port must be between 1 and 65535".into());
+        }
         self.timeout.walk_duration()?;
         let mut providers = HashSet::new();
         let mut prefixes = HashSet::new();
@@ -390,7 +400,19 @@ impl Config {
         if chain.steps.is_empty() {
             return Err(format!("chain {} has no steps", chain.name));
         }
+        let mut seen_steps = HashSet::new();
         for step in &chain.steps {
+            let key = (
+                step.provider.clone(),
+                step.model.clone(),
+                serde_json::to_string(&step.params).map_err(|e| e.to_string())?,
+            );
+            if !seen_steps.insert(key) {
+                return Err(format!(
+                    "chain {} contains a duplicate candidate step",
+                    chain.name
+                ));
+            }
             if !self.providers.iter().any(|p| p.name == step.provider) || step.model.is_empty() {
                 return Err(format!(
                     "chain {} references missing provider or empty model",
@@ -422,6 +444,43 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fail_closed_invalid_ports_quarantine_and_duplicate_chain_steps() {
+        let invalid_port: Config = serde_yaml::from_str("port: 0").unwrap();
+        assert!(invalid_port.validate().is_err());
+        let bad_quarantine: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://test.invalid
+    key_env: K
+    quarantine:
+      auth: 0s
+"#,
+        )
+        .unwrap();
+        assert!(bad_quarantine.validate().is_err());
+        let duplicates: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://test.invalid
+    key_env: K
+chains:
+  - name: fallback
+    steps:
+      - provider: p
+        model: m
+      - provider: p
+        model: m
+"#,
+        )
+        .unwrap();
+        assert!(duplicates.validate().is_err());
+    }
 
     #[test]
     fn walk_budget_defaults_and_bounds_are_fail_closed() {

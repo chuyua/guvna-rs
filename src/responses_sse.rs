@@ -451,7 +451,9 @@ impl ResponsesSse {
         let event: Value = serde_json::from_slice(data).map_err(|_| ())?;
         let choices = event.get("choices").and_then(Value::as_array).ok_or(())?;
         let mut usage_on_frame = false;
-        if let Some(usage) = event.get("usage").filter(|value| !value.is_null()) {
+        if choices.is_empty()
+            && let Some(usage) = event.get("usage").filter(|value| !value.is_null())
+        {
             if self.usage_seen {
                 return Err(());
             }
@@ -503,6 +505,7 @@ impl ResponsesSse {
                 "tool_calls",
                 "reasoning",
                 "reasoning_content",
+                "refusal",
             ]
             .contains(&key.as_str())
         }) || delta.get("role").is_some_and(|role| role != "assistant")
@@ -546,39 +549,44 @@ impl ResponsesSse {
                 }),
             ));
         }
-        if let Some(content) = delta.get("content").filter(|part| !part.is_null()) {
-            let part = content.as_str().ok_or(())?;
-            if !part.is_empty() {
-                if !self.tools.is_empty() {
-                    return Err(());
+        for field in ["content", "refusal"] {
+            if let Some(content) = delta.get(field).filter(|part| !part.is_null()) {
+                if field == "refusal" && delta.get("content") == Some(content) {
+                    continue; // Do not duplicate mirrored text.
                 }
-                let used = self
-                    .tools
-                    .iter()
-                    .map(|tool| tool.arguments.len())
-                    .sum::<usize>();
-                if part.len()
-                    > MAX_TEXT.saturating_sub(
-                        self.text
-                            .len()
-                            .saturating_add(self.reasoning_text.len())
-                            .saturating_add(used),
-                    )
-                {
-                    return Err(());
+                let part = content.as_str().ok_or(())?;
+                if !part.is_empty() {
+                    if !self.tools.is_empty() {
+                        return Err(());
+                    }
+                    let used = self
+                        .tools
+                        .iter()
+                        .map(|tool| tool.arguments.len())
+                        .sum::<usize>();
+                    if part.len()
+                        > MAX_TEXT.saturating_sub(
+                            self.text
+                                .len()
+                                .saturating_add(self.reasoning_text.len())
+                                .saturating_add(used),
+                        )
+                    {
+                        return Err(());
+                    }
+                    self.begin_text(pending);
+                    self.text.push_str(part);
+                    let item_id = self.message_id();
+                    pending.push_back(self.emit(
+                        "response.output_text.delta",
+                        json!({
+                            "item_id":item_id,"output_index":self.text_index,"content_index":0,
+                            "delta":part,"logprobs":[]
+                        }),
+                    ));
                 }
-                self.begin_text(pending);
-                self.text.push_str(part);
-                let item_id = self.message_id();
-                pending.push_back(self.emit(
-                    "response.output_text.delta",
-                    json!({
-                        "item_id":item_id,"output_index":self.text_index,"content_index":0,
-                        "delta":part,"logprobs":[]
-                    }),
-                ));
             }
-        }
+        } // content/refusal parts
         if let Some(calls) = delta.get("tool_calls") {
             self.tool_delta(calls, pending)?;
         }

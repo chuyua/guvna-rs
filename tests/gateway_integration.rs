@@ -214,6 +214,17 @@ fn request(model: &str, extra: &str, key: &str) -> Request<Body> {
 }
 
 #[tokio::test]
+async fn last_upstream_caller_rejection_preserves_client_status_without_key_leak() {
+    let (upstream, hits) = start_upstream(StatusCode::UNPROCESSABLE_ENTITY).await;
+    let router = make_app(&upstream, &upstream);
+    let (status, body) = call(router, request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "upstream_rejected");
+    assert!(!body.to_string().contains("Bearer"));
+    assert!(hits.load(Ordering::SeqCst) >= 1);
+}
+
+#[tokio::test]
 async fn failover_skips_bad_provider_and_key_and_preserves_large_integers() {
     let (a, first_calls) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
     let (b, next_calls) = start_upstream(StatusCode::OK).await;

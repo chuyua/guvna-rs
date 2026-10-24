@@ -46,7 +46,7 @@ pub fn auto_requirements(request: &Value) -> AutoRequirements {
                         parts.iter().any(|part| {
                             matches!(
                                 part.get("type").and_then(Value::as_str),
-                                Some("image_url" | "image")
+                                Some("image_url" | "image" | "input_image")
                             )
                         })
                     })
@@ -151,6 +151,12 @@ impl AutoRouteCache {
         state
             .entries
             .retain(|entry| entry.expires_at > Instant::now());
+        // Concurrent cold misses for the same key must not evict other entries.
+        if let Some(index) = state.entries.iter().position(|entry| entry.key == key) {
+            let entry = state.entries.remove(index).expect("located cache entry");
+            state.entries.push_back(entry);
+            return Ok(steps);
+        }
         if state.entries.len() >= AUTO_CACHE_CAPACITY {
             state.entries.pop_front();
         }
@@ -361,6 +367,7 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
     if let Some(chain) = config.chains.iter().find(|c| c.name == logical_model) {
         return resolve_chain(config, chain);
     }
+    let mut longest: Option<(usize, usize, String)> = None;
     for (i, provider) in config.providers.iter().enumerate() {
         for prefix in provider.prefixes() {
             let Some(suffix) = logical_model
@@ -376,13 +383,20 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
             // upstream model name. Strip exactly one prefix while preserving
             // nested upstream namespaces (e.g. alias/openai/gpt-4o -> openai/gpt-4o).
             // Explicit chain steps remain untouched and can still name the exact wire model.
-            let wire_model = suffix.to_owned();
-            return Ok(vec![ResolvedStep {
-                provider_index: i,
-                model: wire_model,
-                params: BTreeMap::new(),
-            }]);
+            if longest
+                .as_ref()
+                .is_none_or(|(size, _, _)| prefix.len() > *size)
+            {
+                longest = Some((prefix.len(), i, suffix.to_owned()));
+            }
         }
+    }
+    if let Some((_, provider_index, model)) = longest {
+        return Ok(vec![ResolvedStep {
+            provider_index,
+            model,
+            params: BTreeMap::new(),
+        }]);
     }
     // Only truly unknown names use the explicitly opted-in fallback. Exact
     // chains and provider-prefixed direct models always take precedence.
@@ -778,6 +792,30 @@ auto:
             "alpha",
         );
     }
+    #[test]
+    fn longest_provider_namespace_wins_independent_of_yaml_order() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: broad
+    type: openai
+    base_url: https://first.example
+    key_env: KEY1
+    prefixes: [openai]
+  - name: narrow
+    type: openai
+    base_url: https://second.example
+    key_env: KEY2
+    prefixes: [openai/gpt]
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let routed = resolve(&config, "openai/gpt/4o").unwrap();
+        assert_eq!(routed[0].provider_index, 1);
+        assert_eq!(routed[0].model, "4o");
+    }
+
     #[test]
     fn chain_and_namespaced_passthrough() {
         let cfg: Config = serde_yaml::from_str(
