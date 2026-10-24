@@ -824,11 +824,23 @@ async fn dispatch_inner(
                 // Never reflect arbitrary upstream messages: some providers
                 // include credential fragments or request text in them. Map
                 // only recognized machine-readable error codes to fixed text.
-                let detail =
-                    tokio::time::timeout(Duration::from_secs(2), bounded_error_json(upstream))
-                        .await
-                        .ok()
-                        .flatten();
+                let error_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                let error_deadline =
+                    walk_deadline.map_or(error_deadline, |until| until.min(error_deadline));
+                let detail = tokio::time::timeout_at(error_deadline, bounded_error_json(upstream))
+                    .await
+                    .ok()
+                    .flatten();
+                if walk_expired(walk_deadline) {
+                    if let Some(context) = telemetry_context.as_mut() {
+                        context.set_failure_type("timeout");
+                        context.set_health_observation(false);
+                    }
+                    return attach_telemetry_context(
+                        walk_timeout(&state.metrics),
+                        telemetry_context.take(),
+                    );
+                }
                 let message = match detail
                     .as_ref()
                     .and_then(|body| body.pointer("/error/code").and_then(Value::as_str))
