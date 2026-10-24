@@ -97,18 +97,21 @@ Set GUVNA_TELEMETRY_SQLITE=1 to enable persistent local request metadata.
 Without this setting the database writer is not started. Data is written to
 GUVNA_DATA_DIR/telemetry/requests.sqlite3 (or the selected -data directory).
 
-Rows contain a timestamp, fixed endpoint category (chat or embeddings),
-downstream HTTP status, bounded elapsed milliseconds and an SSE-headers flag.
-No prompts, credentials, client IPs, provider/model names or request bodies are
-written. SSE records reflect header dispatch, not terminal stream success.
+Rows contain timestamp, fixed endpoint category, configured provider/model labels
+(bounded and sanitized), downstream status, elapsed milliseconds, SSE-header
+state and a fixed failure category. Prompts, request/response bodies, credentials,
+URLs, request IDs, sensitive headers and client IPs are never stored. SSE records
+reflect header dispatch, not terminal stream success.
 
 A 512-item nonblocking sync queue feeds a single SQLite WAL worker (batches
 up to 64 rows, 250ms collection wait). Disk settings include a 32MiB main
 database page cap and a 1MiB journal target, not an absolute filesystem quota.
-Rows older than seven days are pruned on startup and periodically. A full or
-locked database cannot block the gateway. New fixed-cardinality metrics:
+Request details are retained for seven days; failure details and hourly aggregates
+for 30 days. Legacy request tables are migrated without discarding existing rows.
+Write failures trigger bounded reconnect backoff; a full or locked database cannot
+block the gateway. New fixed-cardinality metrics:
 guvna_telemetry_written_total, guvna_telemetry_dropped_total, and
 guvna_telemetry_write_failures_total.
 
-Provider/model history and learned Auto scoring remain unfinished; the
-optional bounded in-memory health-aware Auto ranking is separate from SQLite. The telemetry directory is local and limited to the service user.
+Provider/model labels and failure categories are stored locally; learned Auto
+scoring and persistence/restoration of Auto health weights remain unfinished. The telemetry directory is local and limited to the service user.

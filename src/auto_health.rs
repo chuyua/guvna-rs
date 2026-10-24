@@ -12,7 +12,7 @@ const FRESH_SECS: u64 = 300;
 #[derive(Default)]
 struct ProviderScore {
     penalty: AtomicU8,
-    samples: AtomicU16,
+    consecutive_failures: AtomicU16,
     demoted: AtomicBool,
     last_failure_secs: AtomicU64,
 }
@@ -62,7 +62,7 @@ impl AutoHealth {
             if updated <= RECOVER_AT {
                 score.demoted.store(false, Ordering::Relaxed);
             }
-            count_observation(&score.samples);
+            score.consecutive_failures.store(0, Ordering::Relaxed);
         }
     }
 
@@ -73,9 +73,9 @@ impl AutoHealth {
     fn failure_at(&self, index: usize, now_secs: u64) {
         if let Some(score) = self.providers.get(index) {
             let updated = update_penalty(&score.penalty, |value| value.saturating_add(35).min(100));
-            let samples = count_observation(&score.samples);
+            let failures = count_observation(&score.consecutive_failures);
             score.last_failure_secs.store(now_secs, Ordering::Relaxed);
-            if samples >= MIN_SAMPLES && updated >= DEMOTE_AT {
+            if failures >= MIN_SAMPLES && updated >= DEMOTE_AT {
                 score.demoted.store(true, Ordering::Relaxed);
             }
         }
@@ -121,6 +121,18 @@ mod tests {
     }
 
     #[test]
+    fn successful_request_resets_failure_streak_before_demoting() {
+        let health = AutoHealth::new(1);
+        health.failure_at(0, 1);
+        health.failure_at(0, 2);
+        health.mark_success(0);
+        health.failure_at(0, 3);
+        health.failure_at(0, 4);
+        assert_eq!(health.penalties_at(4), vec![0]);
+        health.failure_at(0, 5);
+        assert_eq!(health.penalties_at(5), vec![100]);
+    }
+    #[test]
     fn stale_failures_age_out_without_timers_or_disk() {
         let health = AutoHealth::new(1);
         for _ in 0..3 {
@@ -139,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn observation_counter_never_wraps() {
+    fn failure_streak_counter_never_wraps() {
         let counter = AtomicU16::new(u16::MAX);
         assert_eq!(count_observation(&counter), u16::MAX);
         assert_eq!(counter.load(Ordering::Relaxed), u16::MAX);
