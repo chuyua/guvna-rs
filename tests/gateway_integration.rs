@@ -194,6 +194,69 @@ async fn uncatalogued_prefixed_model_strips_only_the_gateway_namespace_on_wire()
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn issue_132_namespaced_embedding_reaches_correct_upstream_without_hijacking_chat() {
+    async fn echo_embedding_model(request: Request<Body>) -> impl IntoResponse {
+        let body = to_bytes(request.into_body(), 1 << 20).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        (
+            StatusCode::OK,
+            axum::Json(json!({
+                "object": "list",
+                "model": payload["model"],
+                "data": [{"object":"embedding","index":0,"embedding":[0.25,0.5]}]
+            })),
+        )
+    }
+    let (other_url, other_hits) = start_upstream(StatusCode::OK).await;
+    let nvidia_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let nvidia_url = format!("http://{}", nvidia_listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            nvidia_listener,
+            Router::new().route("/v1/embeddings", post(echo_embedding_model)),
+        )
+        .await
+        .unwrap();
+    });
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: nvidia\n    type: openai\n    base_url: {nvidia_url}\n    key_env: NVIDIA\n    namespace_on_wire: true\n  - name: other\n    type: openai\n    base_url: {other_url}\n    key_env: OTHER\n"
+    ))
+    .unwrap();
+    cfg.validate().unwrap();
+    let gateway = app(AppState::new(
+        cfg,
+        HashMap::from([
+            ("NVIDIA".into(), "nvidia-secret".into()),
+            ("OTHER".into(), "other-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let embeddings = Request::builder()
+        .method("POST")
+        .uri("/v1/embeddings")
+        .header("authorization", "Bearer client")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model":"nvidia/nemotron-3-embed-1b","input":"hello"}).to_string(),
+        ))
+        .unwrap();
+    let (status, body) = call(gateway.clone(), embeddings).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "nvidia/nemotron-3-embed-1b");
+    assert_eq!(body["data"][0]["embedding"], json!([0.25, 0.5]));
+
+    let (status, chat) = call(gateway.clone(), request("other/a-model", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{chat}");
+    assert_eq!(chat["model"], "a-model");
+    assert_eq!(other_hits.load(Ordering::SeqCst), 1);
+
+    let (status, unknown) = call(gateway, request("unconfigured/model", "", "client")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
+    assert_eq!(other_hits.load(Ordering::SeqCst), 1);
+}
+
 async fn call(router: Router, request: Request<Body>) -> (StatusCode, Value) {
     let response = router.oneshot(request).await.unwrap();
     let status = response.status();
