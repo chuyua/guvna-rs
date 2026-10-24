@@ -3796,8 +3796,15 @@ async fn sse_only_aggregate_declines_unsupported_n_before_network_but_keeps_json
             request("streaming/model", &format!(",\"n\":{n}"), "client"),
         )
         .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{output}");
-        assert_eq!(output["error"]["code"], "aggregate_n_unsupported");
+        if n == 0 {
+            // Invalid client input is rejected before any provider/aggregation
+            // work; this protects provider health state from local 400s.
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{output}");
+            assert_eq!(output["error"]["code"], "invalid_n");
+        } else {
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{output}");
+            assert_eq!(output["error"]["code"], "aggregate_n_unsupported");
+        }
         assert_eq!(streaming_hits.load(Ordering::SeqCst), 0);
 
         // The fallback JSON provider may support n > 64; do not reject the
