@@ -19,6 +19,13 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
+    // Set before starting the SQLite worker or binding a Unix control
+    // socket. The socket's bind->chmod interval and lazily created WAL/SHM
+    // must never inherit permissive service-manager umask settings.
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(0o077);
+    }
     let mut config_path = PathBuf::from("config.yaml");
     let mut data_dir = env::var_os("GUVNA_DATA_DIR")
         .map(PathBuf::from)

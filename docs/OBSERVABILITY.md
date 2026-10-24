@@ -137,6 +137,9 @@ health_aware enabled, per-provider/model health summaries are restored from SQLi
 when the last failure is within the 300-second freshness window. Live routing
 uses bounded candidate-level scores,
 not a learned model. The telemetry directory is local and limited to the service user.
+The daemon sets umask 0077 before creating SQLite or binding its control
+socket; main DB, WAL and SHM are owner-only (0600) and an existing database
+symlink is rejected to avoid opening an unexpected target.
 ## Local runtime status (Unix only)
 
 On Linux, guvna serve creates GUVNA_DATA_DIR/control.sock. The containing

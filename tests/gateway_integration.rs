@@ -3819,6 +3819,67 @@ async fn failed_stream_only_aggregation_does_not_repeat_same_model_with_param_va
 }
 
 #[tokio::test]
+async fn local_aggregation_failures_do_not_cascade_open_provider_circuit() {
+    let invalid = aggregate_chat_frame(json!({"choices":[{"index":0,
+        "delta":{"audio":{"data":"unsupported"}},"finish_reason":null}]}));
+    let (primary, attempts, _) =
+        start_strict_stream_only(vec![invalid, b"data: [DONE]\n\n".to_vec()]).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: streaming
+    type: openai
+    base_url: {primary}
+    key_env: STREAM_KEY
+    stream_only: true
+    circuit_breaker:
+      enabled: true
+      failure_threshold: 1
+      cooldown: 500ms
+      max_cooldown: 1s
+  - name: backup
+    type: openai
+    base_url: {backup}
+    key_env: BACKUP_KEY
+chains:
+  - name: ordered
+    steps:
+      - provider: streaming
+        model: stream-model
+      - provider: backup
+        model: backup-model
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("STREAM_KEY".into(), "stream-secret".into()),
+            ("BACKUP_KEY".into(), "backup-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let runs = futures_util::future::join_all(
+        (0..8).map(|_| call(router.clone(), request("ordered", "", "client"))),
+    )
+    .await;
+    for (status, output) in &runs {
+        assert_eq!(*status, StatusCode::OK, "{output}");
+    }
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        8,
+        "local aggregation failures incorrectly opened the shared breaker"
+    );
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 8);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "circuit_openings_total"), 0);
+    assert_eq!(metric_value(&metrics, "aggregation_failures_total"), 8);
+}
+
+#[tokio::test]
 async fn sse_only_aggregate_fails_over_for_unrepresentable_and_invalid_deltas() {
     let failures = vec![
         // Unsupported but syntactically valid extensions must never be

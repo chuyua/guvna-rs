@@ -342,6 +342,11 @@ fn migrate_legacy_request_events(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 fn open_database(path: &Path) -> rusqlite::Result<Connection> {
+    // Avoid opening a pre-existing symlink or special file in the service
+    // data directory. The normal path is owned by this local daemon.
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.file_type().is_file()) {
+        return Err(rusqlite::Error::InvalidPath(path.to_path_buf()));
+    }
     let conn = Connection::open(path)?;
     conn.busy_timeout(Duration::from_secs(1))?;
     migrate_legacy_request_events(&conn)?;
@@ -412,6 +417,7 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
     }
+    secure_sidecars(path);
     Ok(conn)
 }
 
@@ -864,6 +870,21 @@ mod tests {
             .unwrap();
         assert_eq!(written, 40);
         assert_eq!(metrics.telemetry_dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_sqlite_symlink_is_rejected_without_touching_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside");
+        let link = dir.path().join("telemetry.sqlite3");
+        std::fs::write(&target, b"keep external bytes").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(matches!(
+            open_database(&link),
+            Err(rusqlite::Error::InvalidPath(_))
+        ));
+        assert_eq!(std::fs::read(target).unwrap(), b"keep external bytes");
     }
 
     #[test]
