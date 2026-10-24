@@ -1321,7 +1321,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        for secret in [
+        // Names of columns/values that must never appear in the persisted
+        // schema. These are field names from the public request format, not
+        // credentials; the assertion reports only that a forbidden column was
+        // found, never the value itself.
+        for forbidden_column in [
             "prompt",
             "token",
             "api_key",
@@ -1331,7 +1335,10 @@ mod tests {
             "response_body",
             "base_url",
         ] {
-            assert!(!schema.contains(secret), "{secret}");
+            assert!(
+                !schema.contains(forbidden_column),
+                "telemetry schema must not persist request payload fields"
+            );
         }
     }
 }
