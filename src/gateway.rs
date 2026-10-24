@@ -311,13 +311,9 @@ fn retry_after_delay(headers: &reqwest::header::HeaderMap, now: SystemTime) -> O
         .ok()?
         .trim();
     let delay = if !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()) {
-        // A huge decimal Retry-After should saturate to the one-day policy
-        // instead of failing to parse and silently bypassing the cooldown.
-        Duration::from_secs(if raw.len() > 5 {
-            86400
-        } else {
-            raw.parse::<u64>().ok()?.min(86400)
-        })
+        // Reject unrepresentable decimal hints as malformed. Never turn an
+        // invalid attacker-controlled value into a full 24h quarantine.
+        Duration::from_secs(raw.parse::<u64>().ok()?)
     } else {
         httpdate::parse_http_date(raw)
             .ok()?
@@ -618,7 +614,7 @@ auto:
         assert_eq!(health.penalties(), vec![80, 0]);
     }
     #[test]
-    fn retry_after_parser_accepts_delta_and_date_with_saturating_bounds() {
+    fn retry_after_parser_caps_valid_hints_but_rejects_overflow() {
         let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let make_headers = |value: &str| {
             reqwest::header::HeaderMap::from_iter([(
@@ -632,6 +628,10 @@ auto:
         );
         assert_eq!(
             retry_after_delay(&make_headers("999999999999999999999999999999"), now),
+            None
+        );
+        assert_eq!(
+            retry_after_delay(&make_headers("86401"), now),
             Some(Duration::from_secs(86400))
         );
         assert_eq!(

@@ -2016,7 +2016,8 @@ async fn metrics_auth_privacy_retry_fallback_and_credential_quarantine() {
     assert_eq!(metric_value(&after, "upstream_invalid_responses_total"), 0);
     assert!(!after.contains("secret"));
     assert!(!after.contains("BAD"));
-    assert_eq!(after.matches("# TYPE guvna_").count(), 29);
+    assert_eq!(after.matches("# TYPE guvna_").count(), 30);
+    assert_eq!(metric_value(&after, "aggregation_failures_total"), 0);
     assert_eq!(metric_value(&after, "walk_deadline_exhaustions_total"), 0);
     assert_eq!(metric_value(&after, "circuit_open_providers"), 0);
     assert_eq!(metric_value(&after, "circuit_bypasses_total"), 0);
@@ -3792,14 +3793,14 @@ async fn sse_only_aggregate_preserves_reasoning_and_refusal_without_replaying_to
 }
 
 #[tokio::test]
-async fn failed_stream_only_aggregation_is_not_retried_for_duplicate_chain_steps() {
+async fn failed_stream_only_aggregation_does_not_repeat_same_model_with_param_variation() {
     let bad = aggregate_chat_frame(json!({"choices":[{"index":0,
         "delta":{"audio":{"data":"unsupported"}},"finish_reason":null}]}));
     let (primary, primary_hits, _) =
         start_strict_stream_only(vec![bad, b"data: [DONE]\n\n".to_vec()]).await;
     let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
     let yaml = format!(
-        "providers:\n  - name: streaming\n    type: openai\n    base_url: {primary}\n    key_env: STREAM_KEY\n    stream_only: true\n  - name: backup\n    type: openai\n    base_url: {backup}\n    key_env: BACKUP_KEY\nchains:\n  - name: ordered\n    steps:\n      - provider: streaming\n        model: first-model\n      - provider: streaming\n        model: first-model\n      - provider: backup\n        model: backup-model\n"
+        "providers:\n  - name: streaming\n    type: openai\n    base_url: {primary}\n    key_env: STREAM_KEY\n    stream_only: true\n  - name: backup\n    type: openai\n    base_url: {backup}\n    key_env: BACKUP_KEY\nchains:\n  - name: ordered\n    steps:\n      - provider: streaming\n        model: first-model\n      - provider: streaming\n        model: first-model\n        params:\n          temperature: 0.7\n      - provider: backup\n        model: backup-model\n"
     );
     let config: Config = serde_yaml::from_str(&yaml).unwrap();
     let router = app(AppState::new(
