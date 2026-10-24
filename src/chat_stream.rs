@@ -13,6 +13,10 @@ use tokio::sync::OwnedSemaphorePermit;
 // Bound a single upstream read: even valid tiny events must not create an unbounded queue.
 const MAX_STREAM_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 
+pub(super) struct StreamRoute {
+    pub(super) provider_index: usize,
+    pub(super) model: String,
+}
 struct ChatStreamState {
     owner: Arc<AppState>,
     provider_index: usize,
@@ -43,8 +47,7 @@ pub(super) async fn start(
     upstream: reqwest::Response,
     parser: ChatSse,
     owner: Arc<AppState>,
-    provider_index: usize,
-    model: String,
+    route: StreamRoute,
     lease: Lease,
     permit: &mut Option<OwnedSemaphorePermit>,
     circuit_ticket: &mut Option<Ticket>,
@@ -63,8 +66,8 @@ pub(super) async fn start(
     }
     let mut state = ChatStreamState {
         owner,
-        provider_index,
-        model,
+        provider_index: route.provider_index,
+        model: route.model,
         lease,
         upstream,
         parser,

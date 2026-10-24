@@ -460,8 +460,10 @@ async fn dispatch_inner(
                             .expect("validated candidate stream n")
                             .with_tool_choice(payload.get("tool_choice")),
                         state.clone(),
-                        step.provider_index,
-                        step.model.clone(),
+                        chat_stream::StreamRoute {
+                            provider_index: step.provider_index,
+                            model: step.model.clone(),
+                        },
                         lease.clone(),
                         &mut permit,
                         &mut circuit_ticket,
