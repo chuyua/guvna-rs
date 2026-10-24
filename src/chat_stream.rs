@@ -21,6 +21,7 @@ struct ChatStreamState {
     owner: Arc<AppState>,
     provider_index: usize,
     model: String,
+    started_at: tokio::time::Instant,
     lease: Lease,
     upstream: reqwest::Response,
     parser: ChatSse,
@@ -68,6 +69,7 @@ pub(super) async fn start(
         owner,
         provider_index: route.provider_index,
         model: route.model,
+        started_at: tokio::time::Instant::now(),
         lease,
         upstream,
         parser,
@@ -119,6 +121,7 @@ fn stream_response(state: ChatStreamState) -> Response {
                             provider,
                             &state.model,
                             "success",
+                            state.started_at.elapsed(),
                             &state.owner.metrics,
                         );
                     }
@@ -159,6 +162,7 @@ fn stream_response(state: ChatStreamState) -> Response {
                         provider,
                         &state.model,
                         "transport_error",
+                        state.started_at.elapsed(),
                         &state.owner.metrics,
                     );
                 }

@@ -168,6 +168,7 @@ impl Telemetry {
         provider: &str,
         model: &str,
         failure_type: &'static str,
+        elapsed: Duration,
         metrics: &Metrics,
     ) {
         let context = TelemetryContext::new(provider, model, failure_type);
@@ -177,7 +178,7 @@ impl Telemetry {
             provider: context.provider,
             model: context.model,
             status: if failure_type == "success" { 200 } else { 502 },
-            elapsed_ms: 0,
+            elapsed_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
             sse_headers: true,
             failure_type: context.failure_type,
             record_request: false,
@@ -373,9 +374,9 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
         let mut hourly = tx.prepare_cached(
             "INSERT INTO hourly_stats
              (hour_ts,endpoint,provider,model,failure_type,request_count,failure_count,total_elapsed_ms,max_elapsed_ms)
-             VALUES (?1,?2,?3,?4,?5,1,?6,?7,?7)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)
              ON CONFLICT(hour_ts,endpoint,provider,model,failure_type) DO UPDATE SET
-             request_count=request_count+1,
+             request_count=request_count+excluded.request_count,
              failure_count=failure_count+excluded.failure_count,
              total_elapsed_ms=total_elapsed_ms+excluded.total_elapsed_ms,
              max_elapsed_ms=MAX(max_elapsed_ms,excluded.max_elapsed_ms)",
@@ -432,7 +433,31 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                     event.provider,
                     event.model,
                     event.failure_type,
+                    1_i64,
                     i64::from(is_failure(event)),
+                    event.elapsed_ms,
+                ])?;
+            } else if matches!(health_failure(event), Some(true)) {
+                // Streaming starts are counted once at response creation. Record the
+                // terminal failure separately without inflating request_count.
+                failure.execute(params![
+                    event.ts,
+                    event.endpoint,
+                    event.provider,
+                    event.model,
+                    event.status,
+                    event.elapsed_ms,
+                    event.failure_type,
+                ])?;
+                let hour = event.ts - event.ts.rem_euclid(3600);
+                hourly.execute(params![
+                    hour,
+                    event.endpoint,
+                    event.provider,
+                    event.model,
+                    event.failure_type,
+                    0_i64,
+                    1_i64,
                     event.elapsed_ms,
                 ])?;
             }
@@ -729,6 +754,37 @@ mod tests {
         assert_eq!(health, (35, 1, 0));
     }
 
+    #[test]
+    fn terminal_stream_failure_is_recorded_without_counting_a_second_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_database(&dir.path().join("stream.sqlite3")).unwrap();
+        let started = event(7200, "provider A", "model/alpha", 200, 12, "stream_started");
+        let mut terminal = event(
+            7202,
+            "provider A",
+            "model/alpha",
+            502,
+            2000,
+            "transport_error",
+        );
+        terminal.record_request = false;
+        terminal.sse_headers = true;
+        write_batch(&mut conn, &[started, terminal]).unwrap();
+
+        let requests: i64 = conn
+            .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
+            .unwrap();
+        let failures: i64 = conn
+            .query_row("SELECT COUNT(*) FROM failure_events", [], |row| row.get(0))
+            .unwrap();
+        let aggregate: (i64, i64, i64) = conn.query_row(
+            "SELECT request_count,failure_count,max_elapsed_ms FROM hourly_stats WHERE failure_type='transport_error'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(requests, 1);
+        assert_eq!(failures, 1);
+        assert_eq!(aggregate, (0, 1, 2000));
+    }
     #[test]
     fn provider_health_snapshot_restores_only_recent_provider_summary() {
         let dir = tempfile::tempdir().unwrap();
