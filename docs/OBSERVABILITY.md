@@ -102,7 +102,8 @@ Rows contain timestamp, fixed endpoint category, configured provider/model label
 state and a fixed failure category. Prompts, request/response bodies, credentials,
 URLs, request IDs, sensitive headers and client IPs are never stored. Each
 downstream request is recorded once; failed intermediate provider candidates are
-also retained in failure history and hourly attempt statistics. SSE terminal failure
+also retained in failure history and hourly attempt statistics. hourly_stats.request_count
+counts provider attempts and failure_count counts failed outcomes. SSE terminal failure
 adds a failure row without counting the same attempt twice.
 
 A 512-item nonblocking sync queue feeds a single SQLite WAL worker (batches

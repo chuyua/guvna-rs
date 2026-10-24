@@ -796,6 +796,36 @@ mod tests {
     }
 
     #[test]
+    fn intermediate_fallback_failure_is_retained_without_a_duplicate_downstream_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_database(&dir.path().join("fallback.sqlite3")).unwrap();
+        let mut failure = event(7200, "down", "down", 503, 50, "provider_5xx");
+        failure.record_request = false;
+        failure.count_attempt = true;
+        let success = event(7201, "live", "fast", 200, 70, "success");
+        write_batch(&mut conn, &[failure, success]).unwrap();
+
+        let requests: i64 = conn
+            .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
+            .unwrap();
+        let failures: i64 = conn
+            .query_row("SELECT COUNT(*) FROM failure_events", [], |row| row.get(0))
+            .unwrap();
+        let fallback: (i64,i64) = conn.query_row(
+            "SELECT request_count,failure_count FROM hourly_stats WHERE provider='down' AND failure_type='provider_5xx'",
+            [], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        let success_attempts: i64 = conn.query_row(
+            "SELECT request_count FROM hourly_stats WHERE provider='live' AND failure_type='success'",
+            [], |row| row.get(0),
+        ).unwrap();
+
+        assert_eq!(requests, 1);
+        assert_eq!(failures, 1);
+        assert_eq!(fallback, (1, 1));
+        assert_eq!(success_attempts, 1);
+    }
+    #[test]
     fn terminal_stream_failure_is_recorded_without_counting_a_second_request() {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = open_database(&dir.path().join("stream.sqlite3")).unwrap();

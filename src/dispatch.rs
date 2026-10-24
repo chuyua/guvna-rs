@@ -668,17 +668,15 @@ async fn dispatch_inner(
             break; // 4xx or 5xx: next chain step; no uncontrolled retries
         }
         let rate_limit_delay = state.pools[step.provider_index].all_keys_rate_limited_for();
-        if !candidate_attempted_network {
-            if let Some(context) = telemetry_context.as_mut() {
-                if rate_limit_delay.is_some() {
-                    context.set_failure_type("rate_limited");
-                    context.set_upstream_status(Some(429));
-                } else {
-                    context.set_failure_type("credential_error");
-                    context.set_upstream_status(Some(401));
-                }
-                context.set_health_observation(false);
+        if !candidate_attempted_network && let Some(context) = telemetry_context.as_mut() {
+            if rate_limit_delay.is_some() {
+                context.set_failure_type("rate_limited");
+                context.set_upstream_status(Some(429));
+            } else {
+                context.set_failure_type("credential_error");
+                context.set_upstream_status(Some(401));
             }
+            context.set_health_observation(false);
         }
         if let Some(delay) = rate_limit_delay {
             rate_limit_retry = Some(rate_limit_retry.map_or(delay, |previous| previous.min(delay)));
