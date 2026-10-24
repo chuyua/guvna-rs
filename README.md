@@ -48,8 +48,8 @@ Unsupported reasoning, image, audio, stateful continuation, and other
 advanced Responses modes remain explicitly unsupported. The gateway must not
 be treated as full OpenAI Responses parity or a production drop-in replacement.
 
-Not yet shipped: advanced Auto learning/cache,
-complete Go protocol parity and full multi-modal streaming.
+Not yet shipped: learned Auto scoring, complete Go protocol parity and full multi-modal streaming.
+The current Auto cache stores only route metadata (128 entries, 30s TTL); it does not learn from or retain prompts.
 
 POST /v1/chat/completions, /v1/embeddings and /v1/responses authenticate
 request headers **before** buffering the request body. The existing 32 MiB
@@ -72,17 +72,25 @@ Mixed upstream 5xx, connection, invalid-result, auth and circuit failures
 retain the conservative failover/error behavior. Fixed-cardinality
 guvna_rate_limit_exhaustions_total and the opt-in rate_limit_exhausted
 local stderr event expose this condition without prompts, credentials
-or provider identifiers. No remote management endpoint or telemetry DB.
+or provider identifiers. No remote management endpoint. Local SQLite telemetry is separately opt-in.
 
-An opt-in Auto V1 selects model candidates using configured priority
-and a bounded encoded-input-length filter. POST /v1/auto or Chat model
-auto delegates to existing failover and circuit logic; Auto is off by default.
+An opt-in Auto route selects model candidates using configured priority,
+message byte limits, a full-request context estimate with requested/default output
+allowance and a 20% safety reserve,
+and an exact model-catalog filter when a provider declares models. POST /v1/auto
+or Chat model auto delegates to existing failover and circuit logic; Auto is off by default.
+With auto.health_aware: true, in-memory failure hints can temporarily demote
+unhealthy providers without replacing configured priorities or fallback.
 
 Set GUVNA_LOG_EVENTS=1 for sparse local stderr JSON-lines, including
 sampled SSE aggregation successes and failures, without prompt, provider URL,
 client IP or API key. Logs can be collected by the host journal for soak
-testing. No remote management endpoint, control socket, telemetry database
-or additional externally exposed interface is created. See docs/AUTO_V1.md.
+testing. guvna status reads runtime counters from a read-only Unix domain
+socket under the data directory (directory mode 0700, socket mode 0600).
+It exposes no mutating command or new TCP port; HTTP health probing remains
+a fallback only when the socket is absent.
+For optional local SQLite metadata, set GUVNA_TELEMETRY_SQLITE=1 and see
+docs/OBSERVABILITY.md. See docs/AUTO_V1.md for routing.
 
 ## Non-streaming whole-chain timeout
 

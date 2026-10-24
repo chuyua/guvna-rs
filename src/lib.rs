@@ -1,4 +1,5 @@
 //! Guvna Rust core. Keep request policy in one place; never clone handler walks.
+pub mod auto_health;
 pub mod chain_store;
 pub mod circuit;
 pub mod config;
@@ -9,5 +10,6 @@ pub mod ops_log;
 pub mod outcome;
 pub mod routing;
 pub mod sse;
+pub mod telemetry;
 
 pub(crate) mod responses_sse;

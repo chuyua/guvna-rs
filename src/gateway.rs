@@ -12,16 +12,19 @@ use axum::{
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::Arc,
-    time::{Duration, SystemTime},
+    sync::{Arc, atomic::Ordering},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
+    auto_health::AutoHealth,
     circuit::{Circuit, Ticket},
     config::Config,
     keypool::KeyPool,
     metrics::Metrics,
+    routing::{self, AutoRouteCache},
+    telemetry::Telemetry,
 };
 
 // Keep these children private to the gateway: only the route handlers and
@@ -52,6 +55,11 @@ pub struct AppState {
     inflight: Arc<Semaphore>,
     aggregation_slots: Arc<Semaphore>,
     metrics: Arc<Metrics>,
+    telemetry: Option<Telemetry>,
+    auto_health: Option<AutoHealth>,
+    auto_route_cache: AutoRouteCache,
+    auto_generation: u64,
+    started_at: Instant,
     model_catalog: Value,
     model_details: HashMap<String, Value>,
 }
@@ -108,6 +116,12 @@ impl AppState {
         let mut data: Vec<_> = model_details.values().cloned().collect();
         data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         let model_catalog = json!({"object":"list","data":data});
+        let auto_generation = routing::config_generation(&config);
+        let auto_route_cache = AutoRouteCache::new();
+        let auto_health = config
+            .auto
+            .health_aware
+            .then(|| AutoHealth::new(config.auto.candidates.len()));
         Ok(Self {
             model_catalog,
             model_details,
@@ -119,9 +133,95 @@ impl AppState {
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             aggregation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_AGGREGATIONS)),
             metrics: Arc::new(Metrics::default()),
+            telemetry: None,
+            auto_health,
+            auto_route_cache,
+            auto_generation,
+            started_at: Instant::now(),
         })
     }
 
+    fn auto_candidate_index(&self, provider_index: usize, model: &str) -> Option<usize> {
+        let provider = self.config.providers.get(provider_index)?;
+        self.config
+            .auto
+            .candidates
+            .iter()
+            .position(|candidate| candidate.provider == provider.name && candidate.model == model)
+    }
+
+    fn mark_auto_failure(&self, provider_index: usize, model: &str) {
+        if let Some(health) = &self.auto_health
+            && let Some(index) = self.auto_candidate_index(provider_index, model)
+        {
+            health.mark_failure(index);
+        }
+    }
+
+    fn mark_auto_success(&self, provider_index: usize, model: &str) {
+        if let Some(health) = &self.auto_health
+            && let Some(index) = self.auto_candidate_index(provider_index, model)
+        {
+            health.mark_success(index);
+        }
+    }
+    /// Optional local-only telemetry. Main enables this explicitly; test AppStates stay off.
+    pub fn enable_telemetry(&mut self, data_dir: &std::path::Path) -> Result<(), String> {
+        let restored = if self.auto_health.is_some() {
+            Telemetry::load_provider_health(data_dir)
+        } else {
+            Vec::new()
+        };
+        let telemetry = Telemetry::start(data_dir, Arc::clone(&self.metrics))?;
+        if let Some(health) = &self.auto_health {
+            for (index, candidate) in self.config.auto.candidates.iter().enumerate() {
+                let provider_label = Telemetry::normalize_label(&candidate.provider);
+                let model_label = Telemetry::normalize_label(&candidate.model);
+                if let Some(snapshot) = restored
+                    .iter()
+                    .find(|item| item.provider == provider_label && item.model == model_label)
+                {
+                    health.restore(
+                        index,
+                        snapshot.penalty,
+                        snapshot.consecutive_failures,
+                        snapshot.demoted,
+                        snapshot.last_failure_secs,
+                    );
+                }
+            }
+        }
+        self.telemetry = Some(telemetry);
+        Ok(())
+    }
+    pub fn runtime_status(&self) -> Value {
+        let active = MAX_INFLIGHT_REQUESTS - self.inflight.available_permits();
+        let open_circuits = self
+            .circuits
+            .iter()
+            .filter_map(Option::as_ref)
+            .filter(|c| c.is_open())
+            .count();
+        json!({
+            "status": "running",
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_seconds": self.started_at.elapsed().as_secs(),
+            "providers_configured": self.config.providers.len(),
+            "active_requests": active,
+            "circuit_open_providers": open_circuits,
+            "auto_enabled": self.config.auto.enabled,
+            "auto_health_aware": self.config.auto.health_aware,
+            "sqlite_telemetry_enabled": self.telemetry.is_some(),
+            "requests_dispatched": self.metrics.requests_dispatched.load(Ordering::Relaxed),
+            "upstream_attempts": self.metrics.upstream_attempts.load(Ordering::Relaxed),
+            "upstream_success": self.metrics.upstream_success.load(Ordering::Relaxed),
+            "upstream_http_failures": self.metrics.upstream_http_failures.load(Ordering::Relaxed),
+            "upstream_transport_failures": self.metrics.upstream_transport_failures.load(Ordering::Relaxed),
+            "telemetry_written": self.metrics.telemetry_written.load(Ordering::Relaxed),
+            "telemetry_dropped": self.metrics.telemetry_dropped.load(Ordering::Relaxed),
+            "telemetry_write_failures": self.metrics.telemetry_write_failures.load(Ordering::Relaxed)
+        })
+    }
     fn allowed(&self, headers: &HeaderMap) -> bool {
         let Some(header) = headers
             .get(axum::http::header::AUTHORIZATION)
@@ -256,7 +356,12 @@ fn record_circuit_success(ticket: &mut Option<Ticket>, metrics: &Metrics) {
 }
 
 pub fn app(state: AppState) -> Router {
-    Router::new()
+    app_with_state(state).0
+}
+
+pub fn app_with_state(state: AppState) -> (Router, Arc<AppState>) {
+    let state = Arc::new(state);
+    let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_endpoint))
         .route("/v1/models", get(models))
@@ -266,7 +371,8 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/responses", post(responses::handle))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(Arc::new(state))
+        .with_state(Arc::clone(&state));
+    (app, state)
 }
 
 async fn healthz() -> &'static str {
@@ -381,6 +487,48 @@ async fn embeddings(State(state): State<Arc<AppState>>, request: Request<Body>) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn auto_model_health_isolated_within_shared_provider() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: shared
+    type: openai
+    base_url: https://shared.example
+    key_env: SHARED
+    models: [unstable, stable]
+auto:
+  enabled: true
+  health_aware: true
+  candidates:
+    - provider: shared
+      model: unstable
+      priority: 1
+    - provider: shared
+      model: stable
+      priority: 2
+"#,
+        )
+        .unwrap();
+        let state = AppState::new(
+            config,
+            HashMap::from([("SHARED".to_owned(), "placeholder".to_owned())]),
+            vec!["local-client".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(state.auto_candidate_index(0, "unstable"), Some(0));
+        assert_eq!(state.auto_candidate_index(0, "stable"), Some(1));
+        assert_eq!(state.auto_candidate_index(0, "other"), None);
+        for _ in 0..3 {
+            state.mark_auto_failure(0, "unstable");
+        }
+        let health = state.auto_health.as_ref().unwrap();
+        assert_eq!(health.penalties(), vec![100, 0]);
+        state.mark_auto_success(0, "stable");
+        assert_eq!(health.penalties(), vec![100, 0]);
+        state.mark_auto_success(0, "unstable");
+        assert_eq!(health.penalties(), vec![80, 0]);
+    }
     #[test]
     fn retry_after_parser_accepts_delta_and_date_with_saturating_bounds() {
         let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);

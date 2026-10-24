@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Default)]
 pub struct Metrics {
+    pub telemetry_written: AtomicU64,
+    pub telemetry_dropped: AtomicU64,
+    pub telemetry_write_failures: AtomicU64,
     pub requests_dispatched: AtomicU64,
     pub upstream_attempts: AtomicU64,
     pub upstream_success: AtomicU64,
@@ -45,6 +48,12 @@ impl Metrics {
                 result.push('\n');
             }};
         }
+        emit!("telemetry_written_total", self.telemetry_written);
+        emit!("telemetry_dropped_total", self.telemetry_dropped);
+        emit!(
+            "telemetry_write_failures_total",
+            self.telemetry_write_failures
+        );
         emit!("requests_dispatched_total", self.requests_dispatched);
         emit!("upstream_attempts_total", self.upstream_attempts);
         emit!("upstream_success_total", self.upstream_success);
@@ -120,6 +129,9 @@ mod tests {
         );
         assert!(rendered.contains("guvna_circuit_open_providers 2\n"));
         assert!(rendered.contains("guvna_walk_deadline_exhaustions_total 0\n"));
-        assert_eq!(rendered.matches("# TYPE guvna_").count(), 26);
+        assert!(rendered.contains("guvna_telemetry_written_total 0\n"));
+        assert!(rendered.contains("guvna_telemetry_dropped_total 0\n"));
+        assert!(rendered.contains("guvna_telemetry_write_failures_total 0\n"));
+        assert_eq!(rendered.matches("# TYPE guvna_").count(), 29);
     }
 }

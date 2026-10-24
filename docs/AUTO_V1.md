@@ -8,11 +8,13 @@ Example in config.yaml:
 
     auto:
       enabled: true
+      max_candidates: 2
       candidates:
         - provider: fast
           model: fast-model
           priority: 1
           max_input_bytes: 1024
+          max_context_tokens: 8192
         - provider: reliable
           model: big-context-model
           priority: 3
@@ -25,8 +27,22 @@ The provider names must exist. Auto has 1..32 candidates when enabled.
 Candidates are sorted by ascending priority, with stable configuration
 order for ties. Eligibility is based on the encoded JSON message size
 between optional min_input_bytes (default 0) and max_input_bytes
-(default unlimited). It is a rough size heuristic, NOT tokenizer output.
-Routing stores no user-specific cache entry, prompt or learned model score.
+(default unlimited). It is a rough size heuristic, NOT tokenizer output. max_context_tokens
+uses the full serialized request size plus a 20% reserve and the requested
+max_completion_tokens/max_tokens (or 1024 tokens by default). This intentionally
+overestimates tokens and includes tool/schema payloads, without a remote tokenizer.
+If provider.models is non-empty, a candidate model must match that catalog exactly;
+an empty catalog means capability is unknown and does not hard-reject candidates.
+A candidate may also declare supports_tools, supports_images, or
+supports_json_schema as false to hard-exclude incompatible Chat requests.
+When omitted, capability is unknown and old configurations remain eligible;
+true is an explicit local assertion, not runtime verification of the model.
+Capability requirements derive only from Chat tool declarations/history, image
+content-part types, and response_format.type=json_schema. The cache key
+includes these capability requirements to prevent cross-request misrouting.
+The process-local cache stores route metadata only (max 128 entries, 30s TTL),
+keys results by request-size estimates and live health scores, and clears on a
+route-config generation change. It never stores prompts or request bodies.
 
 Interfaces:
 - POST /v1/auto accepts a Chat Completion body with model omitted or auto.
@@ -64,13 +80,36 @@ aggregation_failed. Informational event: aggregation_completed. All
 events are local-only and sampled; no per-user or per-provider data is logged.
 
 The pre-existing authenticated /metrics endpoint still works but this
-feature adds no endpoints or telemetry databases. systemd/journald can
+feature adds no remote endpoints; separately opt in to local SQLite request
+metadata using GUVNA_TELEMETRY_SQLITE=1. systemd/journald can
 collect these lines locally using the OS's existing access controls.
 
 ## Deferred scope
 
-This is Auto V1, NOT full Go Auto parity: no dynamic learned scoring,
-response caching, tokenizer-based context classification, cross-request
-model reliability weighting, or semantic prompt profiling. Existing
-credential quarantine and provider circuit breaking handle known failures.
-Further Auto intelligence should follow deterministic real-world tests.
+This is not full Go Auto parity: no dynamic learned scoring, response caching,
+tokenizer-based context classification, or semantic prompt profiling. The route
+cache is not a response cache and never retains prompt content. Existing credential
+quarantine and provider circuit breaking continue to handle known failures.
+
+## Auto V2: optional in-process health-aware ordering
+
+Add health_aware: true under auto to enable a bounded failure-weighted health
+hint. The default is false and leaves the original V1 priority order intact.
+The same config candidates, context budget, max_candidates limit and single
+upstream failover loop still apply.
+
+When enabled, each configured Auto provider/model candidate uses only a few
+in-memory atomic counters. Three recent transport/provider failures can demote
+the affected model candidate behind a healthy fallback before max_candidates is applied. HTTP
+429 can also contribute; caller-side 4xx and credential auth errors do not.
+Each successful validated response reduces the penalty. Recovery hysteresis
+requires enough successes to reset demotion, and a 300-second freshness limit
+expires old health penalties without a background timer. No remote scorer,
+prompts, keys, provider labels, extra HTTP calls or request-path SQL reads.
+
+This remains a conservative V2 foundation, not a learned model capability engine.
+When SQLite telemetry is enabled, a bounded per-provider/model health summary is
+restored at startup only if the last failure is within the 300-second freshness
+window. Failed intermediate candidates are recorded separately from the single
+downstream request row, so fallback failures survive restart without double-counting
+the request. If SQLite is disabled or unreadable, routing falls back to in-memory hints.

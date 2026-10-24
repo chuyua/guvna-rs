@@ -17,6 +17,7 @@ const MAX_CHAIN_FILE_BYTES: usize = 1024 * 1024;
 
 pub enum Command {
     List,
+    Show(String),
     Validate,
     Set(PathBuf),
     Delete(String),
@@ -93,6 +94,11 @@ fn validate_data(bytes: Option<&[u8]>, config: &Config) -> Result<RuntimeChains,
                 "runtime chain {:?} shadows config.yaml (preserved)",
                 chain.name
             ));
+        }
+        if config.auto.enabled && chain.name == "auto" {
+            return Err(
+                "runtime chain name auto is reserved when Auto is enabled (preserved)".into(),
+            );
         }
         config.validate_chain(chain)?;
     }
@@ -235,6 +241,21 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
             serde_json::to_string_pretty(&listed)
                 .map_err(|e| format!("encoding chain listing: {e}"))
         }
+        Command::Show(name) => {
+            // Reuse the same size limit and validation as list; never access an
+            // unvalidated chain file or print any provider credentials.
+            let list = execute(config, data_dir, Command::List)?;
+            let values: Vec<serde_json::Value> = serde_json::from_str(&list)
+                .map_err(|_| "cannot decode local chain listing".to_string())?;
+            let chosen = values
+                .into_iter()
+                .find(|chain| {
+                    chain.get("name").and_then(serde_json::Value::as_str) == Some(name.as_str())
+                })
+                .ok_or_else(|| format!("unknown chain {name:?}"))?;
+            serde_json::to_string_pretty(&chosen)
+                .map_err(|_| "cannot format local chain".to_string())
+        }
         Command::Validate => {
             let file = runtime_path(data_dir);
             let current = read_limited(&file)?;
@@ -253,6 +274,9 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
                 .map_err(|e| format!("invalid chain definition {}: {e}", source.display()))?;
             if chain.name.is_empty() || config.chains.iter().any(|c| c.name == chain.name) {
                 return Err("chain name is empty or owned by config.yaml".into());
+            }
+            if config.auto.enabled && chain.name == "auto" {
+                return Err("chain name auto is reserved when Auto is enabled".into());
             }
             config.validate_chain(&chain)?;
             let (directory, _lock) = lock_directory(data_dir)?;

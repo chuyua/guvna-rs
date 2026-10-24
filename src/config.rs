@@ -56,13 +56,17 @@ impl TimeoutConfig {
     }
 }
 
-/// Deterministic, opt-in Auto routing. No remote control, external cache,
-/// provider identifiers in metrics, or mutable cross-request rankings.
+/// Deterministic, opt-in Auto routing. Its bounded cache stores route metadata only;
+/// health hints remain explicit and never depend on request-path database reads.
 #[derive(Clone, Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutoConfig {
     pub enabled: bool,
     pub candidates: Vec<AutoCandidate>,
+    /// Bound the number of upstream candidates attempted per Auto request.
+    pub max_candidates: Option<usize>,
+    /// Opt-in live failure-weighted priority (defaults to V1 deterministic order).
+    pub health_aware: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -75,6 +79,12 @@ pub struct AutoCandidate {
     #[serde(default)]
     pub min_input_bytes: usize,
     pub max_input_bytes: Option<usize>,
+    pub max_context_tokens: Option<usize>,
+    /// Explicit negative declarations make incompatible requests ineligible.
+    /// None means unknown and preserves legacy routing behavior.
+    pub supports_tools: Option<bool>,
+    pub supports_images: Option<bool>,
+    pub supports_json_schema: Option<bool>,
 }
 
 fn default_auto_priority() -> u16 {
@@ -321,6 +331,16 @@ impl Config {
                 }
             }
         }
+        if self
+            .auto
+            .max_candidates
+            .is_some_and(|limit| !(1..=32).contains(&limit))
+        {
+            return Err("auto max_candidates must be 1..=32".into());
+        }
+        if self.auto.health_aware && !self.auto.enabled {
+            return Err("auto health_aware requires enabled: true".into());
+        }
         if self.auto.enabled {
             if self.auto.candidates.is_empty() || self.auto.candidates.len() > 32 {
                 return Err("auto enabled requires 1..32 configured candidates".into());
@@ -342,6 +362,7 @@ impl Config {
                 .max_input_bytes
                 .is_some_and(|v| v < candidate.min_input_bytes)
                 || candidate.max_input_bytes == Some(0)
+                || candidate.max_context_tokens == Some(0)
             {
                 return Err("auto candidate invalid input length range".into());
             }

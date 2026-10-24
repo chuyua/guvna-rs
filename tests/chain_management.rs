@@ -69,6 +69,19 @@ fn cli_set_replace_delete_and_corrupt_recovery_preserve_every_original_byte() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["name"], "immutable");
     assert_eq!(items[0]["source"], "config");
+    let shown: Value = serde_json::from_str(&success(&run(
+        &config,
+        &data,
+        &["show", "--name", "immutable"],
+    )))
+    .unwrap();
+    assert_eq!(shown["name"], "immutable");
+    assert_eq!(shown["source"], "config");
+    failure(
+        &run(&config, &data, &["show", "--name", "missing"]),
+        "unknown chain",
+    );
+    failure(&run(&config, &data, &["show"]), "requires --name");
     assert!(success(&run(&config, &data, &["validate"])).contains("0 runtime"));
     assert!(!data.exists(), "read-only CLI must not create a data dir");
 
@@ -301,6 +314,51 @@ fn file_persistence_preserves_large_integer_parameters_without_float_rounding() 
     assert_eq!(params["response_format"]["type"], "json_object");
     let persisted = fs::read_to_string(data.join("chains.yaml")).unwrap();
     assert!(persisted.contains("12345678901234567890"), "{persisted}");
+}
+
+#[test]
+fn auto_reserved_runtime_chain_name_is_rejected_before_write_and_on_load() {
+    let (dir, config, data) = setup();
+    fs::write(
+        &config,
+        "providers:\n  - name: p\n    type: openai\n    base_url: https://example.org\n    key_env: KEY\nchains:\n  - name: immutable\n    steps:\n      - provider: p\n        model: static\nauto:\n  enabled: true\n  candidates:\n    - provider: p\n      model: static\n",
+    )
+    .unwrap();
+    let definition_file = dir.path().join("chain.yaml");
+    definition(&definition_file, "auto", "shadow");
+    failure(
+        &run(
+            &config,
+            &data,
+            &["set", "--file", definition_file.to_str().unwrap()],
+        ),
+        "reserved when Auto is enabled",
+    );
+    assert!(
+        !data.join("chains.yaml").exists(),
+        "rejected writes must not create runtime chain state"
+    );
+
+    fs::create_dir_all(&data).unwrap();
+    let invalid =
+        "version: 1\nchains:\n  - name: auto\n    steps: [{provider: p, model: shadow}]\n";
+    fs::write(data.join("chains.yaml"), invalid).unwrap();
+    let config_value = Config::load(&config).unwrap();
+    assert!(
+        config_value
+            .clone()
+            .with_runtime_chains(&data)
+            .unwrap_err()
+            .contains("reserved when Auto is enabled")
+    );
+    failure(
+        &run(&config, &data, &["validate"]),
+        "reserved when Auto is enabled",
+    );
+    assert_eq!(
+        fs::read_to_string(data.join("chains.yaml")).unwrap(),
+        invalid
+    );
 }
 
 #[test]

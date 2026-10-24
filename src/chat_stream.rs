@@ -13,9 +13,15 @@ use tokio::sync::OwnedSemaphorePermit;
 // Bound a single upstream read: even valid tiny events must not create an unbounded queue.
 const MAX_STREAM_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 
+pub(super) struct StreamRoute {
+    pub(super) provider_index: usize,
+    pub(super) model: String,
+}
 struct ChatStreamState {
     owner: Arc<AppState>,
     provider_index: usize,
+    model: String,
+    started_at: tokio::time::Instant,
     lease: Lease,
     upstream: reqwest::Response,
     parser: ChatSse,
@@ -42,7 +48,7 @@ pub(super) async fn start(
     upstream: reqwest::Response,
     parser: ChatSse,
     owner: Arc<AppState>,
-    provider_index: usize,
+    route: StreamRoute,
     lease: Lease,
     permit: &mut Option<OwnedSemaphorePermit>,
     circuit_ticket: &mut Option<Ticket>,
@@ -61,7 +67,9 @@ pub(super) async fn start(
     }
     let mut state = ChatStreamState {
         owner,
-        provider_index,
+        provider_index: route.provider_index,
+        model: route.model,
+        started_at: tokio::time::Instant::now(),
         lease,
         upstream,
         parser,
@@ -103,6 +111,21 @@ fn stream_response(state: ChatStreamState) -> Response {
                     state.owner.pools[state.provider_index].record_success(&state.lease);
                     record_circuit_success(&mut state.circuit_ticket, &state.owner.metrics);
                     Metrics::inc(&state.owner.metrics.upstream_success);
+                    state
+                        .owner
+                        .mark_auto_success(state.provider_index, &state.model);
+
+                    if let Some(telemetry) = &state.owner.telemetry {
+                        let provider = &state.owner.config.providers[state.provider_index].name;
+                        telemetry.observe_health(
+                            "chat",
+                            provider,
+                            &state.model,
+                            "success",
+                            state.started_at.elapsed(),
+                            &state.owner.metrics,
+                        );
+                    }
                     Metrics::inc(&state.owner.metrics.chat_stream_completed);
                     state.terminal_reported = true;
                 }
@@ -130,6 +153,21 @@ fn stream_response(state: ChatStreamState) -> Response {
             }
             if state.terminated {
                 Metrics::inc(&state.owner.metrics.chat_stream_failed);
+                state
+                    .owner
+                    .mark_auto_failure(state.provider_index, &state.model);
+
+                if let Some(telemetry) = &state.owner.telemetry {
+                    let provider = &state.owner.config.providers[state.provider_index].name;
+                    telemetry.observe_health(
+                        "chat",
+                        provider,
+                        &state.model,
+                        "transport_error",
+                        state.started_at.elapsed(),
+                        &state.owner.metrics,
+                    );
+                }
                 record_circuit_failure(&mut state.circuit_ticket, &state.owner.metrics);
                 state.terminal_reported = true;
                 return Some((Ok(stream_error()), state));

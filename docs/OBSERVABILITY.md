@@ -88,7 +88,49 @@ attempt count matches the mock providers across 2,000 normal requests,
 It also checks that expected success, fallback and stream counters reconcile,
 and that the active request gauge returns to zero.
 
-The metrics endpoint is deliberately small and stateless: there is no disk
-database, no background exporter task and no added third-party telemetry
-dependency. For external monitoring, use an authenticated scrape over a
+The metrics endpoint is deliberately small and stateless: optional local SQLite metadata is available only when explicitly enabled. For external monitoring, use an authenticated scrape over a
 trusted loopback/tunnel; do not put tokens in query strings.
+
+## Optional local SQLite request metadata (Issue #69)
+
+Set GUVNA_TELEMETRY_SQLITE=1 to enable persistent local request metadata.
+Without this setting the database writer is not started. Data is written to
+GUVNA_DATA_DIR/telemetry/requests.sqlite3 (or the selected -data directory).
+
+Rows contain timestamp, fixed endpoint category, configured provider/model labels
+(bounded and sanitized), downstream status, elapsed milliseconds, SSE-header
+state and a fixed failure category. Prompts, request/response bodies, credentials,
+URLs, request IDs, sensitive headers and client IPs are never stored. Each
+downstream request is recorded once; failed intermediate provider candidates are
+also retained in failure history and hourly attempt statistics. hourly_stats.request_count
+counts provider attempts and failure_count counts failed outcomes. SSE terminal failure
+adds a failure row without counting the same attempt twice.
+
+A 512-item nonblocking sync queue feeds a single SQLite WAL worker (batches
+up to 64 rows, 250ms collection wait). Disk settings include a 32MiB main
+database page cap and a 1MiB journal target, not an absolute filesystem quota.
+Request details are retained for seven days; failure details and hourly aggregates
+for 30 days. Legacy request tables are migrated without discarding existing rows.
+Write failures trigger bounded reconnect backoff; a full or locked database cannot
+block the gateway. New fixed-cardinality metrics:
+guvna_telemetry_written_total, guvna_telemetry_dropped_total, and
+guvna_telemetry_write_failures_total.
+
+Provider/model labels and fixed failure categories are stored locally. With
+health_aware enabled, per-provider/model health summaries are restored from SQLite only
+when the last failure is within the 300-second freshness window. Live routing
+uses bounded candidate-level scores,
+not a learned model. The telemetry directory is local and limited to the service user.
+## Local runtime status (Unix only)
+
+On Linux, guvna serve creates GUVNA_DATA_DIR/control.sock. The containing
+directory is set to mode 0700 and the socket to 0600. guvna status sends one
+bounded JSON-line status command and prints a runtime snapshot containing
+uptime, in-flight count, open-circuit count, provider count, Auto/SQLite flags
+and fixed request/telemetry counters. No provider names, model names, secrets,
+credentials or request bodies are returned. Only the read-only status command
+is supported; there is no mutation protocol and no additional TCP listener.
+If the socket is absent, status retains the legacy loopback HTTP health probe.
+Stale sockets are cleaned on startup only after confirming the path is a Unix
+socket and a connection is refused; non-socket files and active sockets are
+never replaced.

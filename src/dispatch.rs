@@ -11,6 +11,7 @@ use crate::{
     outcome::{Outcome, classify},
     routing,
     sse::ChatSse,
+    telemetry::TelemetryContext,
 };
 use axum::{
     Json,
@@ -49,7 +50,10 @@ pub(super) async fn dispatch(
 ) -> Response {
     let started = tokio::time::Instant::now();
     let id = ops_log::next_request_id();
+    let telemetry = state.telemetry.clone();
+    let metrics = Arc::clone(&state.metrics);
     let response = dispatch_inner(state, body, endpoint, admission, started).await;
+    let telemetry_context = response.extensions().get::<TelemetryContext>().cloned();
     let sse_headers = response
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -60,9 +64,89 @@ pub(super) async fn dispatch(
         response.status().as_u16(),
         sse_headers,
     );
+    if let Some(telemetry) = telemetry {
+        let label = match endpoint {
+            Endpoint::Chat => "chat",
+            Endpoint::Embeddings => "embeddings",
+        };
+        telemetry.submit(
+            label,
+            response.status().as_u16(),
+            started.elapsed(),
+            sse_headers,
+            telemetry_context,
+            &metrics,
+        );
+    }
     response
 }
 
+fn attach_telemetry_context(mut response: Response, context: Option<TelemetryContext>) -> Response {
+    if let Some(context) = context {
+        response.extensions_mut().insert(context);
+    }
+    response
+}
+
+fn outcome_failure_type(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Success => "success",
+        Outcome::CredentialAuth => "credential_error",
+        Outcome::RateLimited => "rate_limited",
+        Outcome::ProviderTransient => "provider_5xx",
+        Outcome::TransportFailure => "transport_error",
+        Outcome::CallerRejected => "provider_4xx",
+    }
+}
+fn telemetry_endpoint(endpoint: Endpoint) -> &'static str {
+    match endpoint {
+        Endpoint::Chat => "chat",
+        Endpoint::Embeddings => "embeddings",
+    }
+}
+
+fn fallback_failure_status(failure_type: &'static str) -> u16 {
+    match failure_type {
+        "rate_limited" => 429,
+        "credential_error" => 401,
+        "caller_error" | "provider_4xx" => 400,
+        "provider_5xx" | "upstream_unavailable" | "circuit_open" | "aggregation_busy" => 503,
+        "timeout" => 504,
+        "capability_mismatch" => 422,
+        "local_error" => 500,
+        _ => 502,
+    }
+}
+
+fn record_intermediate_candidate_failure(
+    state: &AppState,
+    endpoint: Endpoint,
+    context: TelemetryContext,
+    elapsed: Duration,
+    attempted_network: bool,
+) {
+    let failure_type = context.failure_type();
+    if matches!(failure_type, "success" | "stream_started") {
+        return;
+    }
+    if !attempted_network
+        && !matches!(
+            failure_type,
+            "circuit_open" | "capability_mismatch" | "credential_error" | "rate_limited"
+        )
+    {
+        return;
+    }
+    if let Some(telemetry) = &state.telemetry {
+        telemetry.observe_attempt(
+            telemetry_endpoint(endpoint),
+            fallback_failure_status(failure_type),
+            elapsed,
+            context,
+            &state.metrics,
+        );
+    }
+}
 fn walk_expired(deadline: Option<tokio::time::Instant>) -> bool {
     deadline.is_some_and(|until| tokio::time::Instant::now() >= until)
 }
@@ -153,19 +237,38 @@ async fn dispatch_inner(
         );
     };
     let expected = request.get("n").map_or(1, |v| v.as_u64().unwrap_or(0));
-    if streaming && ChatSse::new(expected).is_err() {
+    // Reject malformed n for both JSON and SSE requests locally. The 64
+    // choice bound is specific to the streaming parser; a JSON-only provider
+    // may legitimately support larger positive n values.
+    if matches!(endpoint, Endpoint::Chat)
+        && (expected == 0 || (streaming && ChatSse::new(expected).is_err()))
+    {
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_n",
-            "stream n must be 1..64",
+            "n must be a positive integer (stream n must be 1..64)",
         );
     }
     let auto_enabled = model == "auto" && state.config.auto.enabled;
-    // Bytes of encoded message content are a deterministic bounded proxy
-    // for context size; no remote tokenizer or prompt logging is involved.
+    // Keep byte-range eligibility and context-window budgeting separate.
+    // The context estimate includes the full request, output allowance and safety reserve.
     let steps = match if auto_enabled {
         let input_bytes = routing::auto_input_bytes(request.get("messages"));
-        routing::resolve_auto(&state.config, input_bytes)
+        let context_estimate = routing::auto_context_estimate(&request);
+        let requirements = routing::auto_requirements(&request);
+        let penalties = state
+            .auto_health
+            .as_ref()
+            .map(|health| health.penalties())
+            .unwrap_or_default();
+        state.auto_route_cache.resolve(
+            &state.config,
+            input_bytes,
+            context_estimate,
+            requirements,
+            &penalties,
+            state.auto_generation,
+        )
     } else {
         routing::resolve(&state.config, model)
     } {
@@ -183,7 +286,7 @@ async fn dispatch_inner(
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "auto_no_eligible_candidate",
-            "No configured Auto candidate accepts this input size",
+            "No configured Auto candidate satisfies input-size, context-window and model-capability constraints",
         );
     }
 
@@ -202,12 +305,43 @@ async fn dispatch_inner(
     // key, or capability-mismatched candidate must not masquerade as 429.
     let mut all_candidates_rate_limited = true;
     let mut rate_limit_retry: Option<Duration> = None;
+    let mut telemetry_context: Option<TelemetryContext> = None;
+    let mut candidate_started: Option<tokio::time::Instant> = None;
+    let mut candidate_attempted_network = false;
+    // Retry distinct models on the same provider, but never reattempt the
+    // exact failed SSE-only provider/model during a single candidate walk.
+    let mut failed_aggregation_routes = HashSet::new();
     // Exactly ONE candidate loop for chat + embedding. Key failover is confined to this loop.
     for step in steps {
+        if let Some(previous) = telemetry_context.take() {
+            let elapsed = candidate_started
+                .take()
+                .map_or(Duration::ZERO, |started| started.elapsed());
+            record_intermediate_candidate_failure(
+                &state,
+                endpoint,
+                previous,
+                elapsed,
+                candidate_attempted_network,
+            );
+        }
         if walk_expired(walk_deadline) {
-            return walk_timeout(&state.metrics);
+            let mut context = telemetry_context.take();
+            if let Some(context) = context.as_mut() {
+                context.set_failure_type("timeout");
+                context.set_health_observation(false);
+            }
+            return attach_telemetry_context(walk_timeout(&state.metrics), context);
         }
         let provider = &state.config.providers[step.provider_index];
+        if !streaming
+            && matches!(endpoint, Endpoint::Chat)
+            && provider.stream_only
+            && failed_aggregation_routes.contains(&(step.provider_index, step.model.clone()))
+        {
+            all_candidates_rate_limited = false;
+            continue;
+        }
         if provider.stream_only && !streaming && !matches!(endpoint, Endpoint::Chat) {
             all_candidates_rate_limited = false;
             continue; // Only Chat has a validated SSE-to-JSON adapter.
@@ -249,7 +383,12 @@ async fn dispatch_inner(
                 Ok(Ok(permit)) => Some(permit),
                 _ => {
                     if walk_expired(walk_deadline) {
-                        return walk_timeout(&state.metrics);
+                        let mut context = telemetry_context.take();
+                        if let Some(context) = context.as_mut() {
+                            context.set_failure_type("timeout");
+                            context.set_health_observation(false);
+                        }
+                        return attach_telemetry_context(walk_timeout(&state.metrics), context);
                     }
                     Metrics::inc(&state.metrics.aggregation_busy);
                     crate::ops_log::warn("aggregate_capacity");
@@ -265,12 +404,22 @@ async fn dispatch_inner(
             Metrics::inc(&state.metrics.candidate_fallbacks);
         }
         candidates_visited += 1;
+        candidate_started = Some(tokio::time::Instant::now());
+        candidate_attempted_network = false;
+        telemetry_context = Some(TelemetryContext::new(
+            &provider.name,
+            &step.model,
+            "upstream_unavailable",
+        ));
         let mut circuit_ticket = match &state.circuits[step.provider_index] {
             Some(circuit) => match circuit.admit() {
                 Some(ticket) => Some(ticket),
                 None => {
                     Metrics::inc(&state.metrics.circuit_bypasses);
                     bypassed_circuit = true;
+                    if let Some(context) = telemetry_context.as_mut() {
+                        context.set_failure_type("circuit_open");
+                    }
                     all_candidates_rate_limited = false;
                     continue; // No HTTP calls while open or a recovery probe runs.
                 }
@@ -294,6 +443,9 @@ async fn dispatch_inner(
         // otherwise valid multi-choice streams are rejected as malformed.
         let effective_n = payload.get("n").map_or(1, |v| v.as_u64().unwrap_or(0));
         if upstream_stream && ChatSse::new(effective_n).is_err() {
+            if let Some(context) = telemetry_context.as_mut() {
+                context.set_failure_type("capability_mismatch");
+            }
             all_candidates_rate_limited = false;
             continue;
         }
@@ -303,11 +455,20 @@ async fn dispatch_inner(
         let mut tried = HashSet::new();
         while let Some(lease) = state.pools[step.provider_index].acquire(&tried) {
             if walk_expired(walk_deadline) {
-                return walk_timeout(&state.metrics);
+                let mut context = telemetry_context.take();
+                if let Some(context) = context.as_mut() {
+                    context.set_failure_type("timeout");
+                    context.set_health_observation(false);
+                }
+                return attach_telemetry_context(walk_timeout(&state.metrics), context);
             }
             tried.insert(lease.env.clone());
             let url = provider.endpoint(endpoint.path());
+            if let Some(context) = telemetry_context.as_mut() {
+                context.set_upstream_status(None);
+            }
             attempted_network = true;
+            candidate_attempted_network = true;
             Metrics::inc(&state.metrics.upstream_attempts);
             // A request-wide reqwest timeout would terminate a healthy SSE
             // generation after 90s despite regular progress. Time only the
@@ -326,11 +487,23 @@ async fn dispatch_inner(
                 Ok(result) => result,
                 Err(_) => {
                     if walk_expired(walk_deadline) {
-                        return walk_timeout(&state.metrics);
+                        let mut context = telemetry_context.take();
+                        if let Some(context) = context.as_mut() {
+                            context.set_failure_type("timeout");
+                            context.set_health_observation(false);
+                        }
+                        return attach_telemetry_context(walk_timeout(&state.metrics), context);
                     }
                     Metrics::inc(&state.metrics.upstream_transport_failures);
                     ops_log::warn("transport_failure");
+                    if state.pools[step.provider_index].record(&lease, Outcome::TransportFailure) {
+                        Metrics::inc(&state.metrics.credential_quarantines);
+                    }
                     record_circuit_failure(&mut circuit_ticket, &state.metrics);
+                    state.mark_auto_failure(step.provider_index, &step.model);
+                    if let Some(context) = telemetry_context.as_mut() {
+                        context.set_failure_type("timeout");
+                    }
                     break;
                 }
             };
@@ -339,12 +512,23 @@ async fn dispatch_inner(
                 Err(_) => {
                     Metrics::inc(&state.metrics.upstream_transport_failures);
                     ops_log::warn("transport_failure");
+                    if state.pools[step.provider_index].record(&lease, Outcome::TransportFailure) {
+                        Metrics::inc(&state.metrics.credential_quarantines);
+                    }
                     record_circuit_failure(&mut circuit_ticket, &state.metrics);
+                    state.mark_auto_failure(step.provider_index, &step.model);
+                    if let Some(context) = telemetry_context.as_mut() {
+                        context.set_failure_type("transport_error");
+                    }
                     break;
                 } // key-neutral
             };
             let status = upstream.status().as_u16();
             let outcome = classify(Some(status));
+            if let Some(context) = telemetry_context.as_mut() {
+                context.set_upstream_status(Some(status));
+                context.set_failure_type(outcome_failure_type(outcome));
+            }
             if outcome.quarantine_credential() {
                 Metrics::inc(&state.metrics.upstream_http_failures);
                 ops_log::warn("provider_http_failure");
@@ -360,6 +544,9 @@ async fn dispatch_inner(
                 ) {
                     Metrics::inc(&state.metrics.credential_quarantines);
                 }
+                if outcome == Outcome::RateLimited {
+                    state.mark_auto_failure(step.provider_index, &step.model);
+                }
                 continue; // try a different key; each key is attempted once
             }
             if outcome == Outcome::Success {
@@ -370,25 +557,41 @@ async fn dispatch_inner(
                             .expect("validated candidate stream n")
                             .with_tool_choice(payload.get("tool_choice")),
                         state.clone(),
-                        step.provider_index,
+                        chat_stream::StreamRoute {
+                            provider_index: step.provider_index,
+                            model: step.model.clone(),
+                        },
                         lease.clone(),
                         &mut permit,
                         &mut circuit_ticket,
                     )
                     .await
                     {
-                        Ok(stream_response) => return stream_response,
+                        Ok(stream_response) => {
+                            if let Some(context) = telemetry_context.as_mut() {
+                                context.set_failure_type("stream_started");
+                            }
+                            return attach_telemetry_context(
+                                stream_response,
+                                telemetry_context.take(),
+                            );
+                        }
                         Err(_) => {
                             Metrics::inc(&state.metrics.upstream_invalid_responses);
                             ops_log::warn("stream_preflight_failure");
                             record_circuit_failure(&mut circuit_ticket, &state.metrics);
+                            state.mark_auto_failure(step.provider_index, &step.model);
+                            if let Some(context) = telemetry_context.as_mut() {
+                                context.set_failure_type("invalid_response");
+                            }
                             break;
                         } // preflight rejected
                     }
                 }
+                let mut aggregation_transient_failure = false;
                 let result = if upstream_stream && !streaming {
                     // JSON-capable providers retain a bounded body read.
-                    // SSE-only generations have both a 15s idle limit and a
+                    // SSE-only generations have both a 60s idle limit and a
                     // 10min absolute cap. The shared non-streaming walk
                     // budget still wins if shorter, preventing indefinite
                     // retries or heartbeats across multiple candidates.
@@ -406,10 +609,18 @@ async fn dispatch_inner(
                     )
                     .await;
                     if aggregated.is_err() {
+                        aggregation_transient_failure = true;
                         ops_log::warn("aggregation_lifetime_timeout");
                     }
                     aggregated.map(|value| {
                         value.map_err(|error| {
+                            if matches!(
+                                error,
+                                chat_aggregate::AggregateError::IdleTimeout
+                                    | chat_aggregate::AggregateError::UpstreamTransport
+                            ) {
+                                aggregation_transient_failure = true;
+                            }
                             ops_log::warn(error.log_event());
                         })
                     })
@@ -417,7 +628,12 @@ async fn dispatch_inner(
                     tokio::time::timeout_at(deadline, bounded_json(upstream)).await
                 };
                 if walk_expired(walk_deadline) {
-                    return walk_timeout(&state.metrics);
+                    let mut context = telemetry_context.take();
+                    if let Some(context) = context.as_mut() {
+                        context.set_failure_type("timeout");
+                        context.set_health_observation(false);
+                    }
+                    return attach_telemetry_context(walk_timeout(&state.metrics), context);
                 }
                 match result {
                     Ok(Ok(value))
@@ -425,27 +641,81 @@ async fn dispatch_inner(
                     {
                         state.pools[step.provider_index].record_success(&lease);
                         record_circuit_success(&mut circuit_ticket, &state.metrics);
+                        state.mark_auto_success(step.provider_index, &step.model);
                         Metrics::inc(&state.metrics.upstream_success);
                         if upstream_stream && !streaming {
                             Metrics::inc(&state.metrics.aggregation_completed);
                             ops_log::info("aggregation_completed");
                         }
-                        return (StatusCode::OK, Json(value)).into_response();
+                        if let Some(context) = telemetry_context.as_mut() {
+                            context.set_failure_type("success");
+                        }
+                        return attach_telemetry_context(
+                            (StatusCode::OK, Json(value)).into_response(),
+                            telemetry_context.take(),
+                        );
                     }
-                    _ => {
-                        Metrics::inc(&state.metrics.upstream_invalid_responses);
+                    Err(_) => {
                         if upstream_stream && !streaming {
+                            failed_aggregation_routes
+                                .insert((step.provider_index, step.model.clone()));
                             ops_log::warn("aggregation_failed");
                         } else {
+                            ops_log::warn("upstream_body_timeout");
+                        }
+                        Metrics::inc(&state.metrics.upstream_transport_failures);
+                        if state.pools[step.provider_index]
+                            .record(&lease, Outcome::TransportFailure)
+                        {
+                            Metrics::inc(&state.metrics.credential_quarantines);
+                        }
+                        record_circuit_failure(&mut circuit_ticket, &state.metrics);
+                        state.mark_auto_failure(step.provider_index, &step.model);
+                        if let Some(context) = telemetry_context.as_mut() {
+                            context.set_failure_type("timeout");
+                        }
+                        break;
+                    }
+                    _ => {
+                        if upstream_stream && !streaming {
+                            failed_aggregation_routes
+                                .insert((step.provider_index, step.model.clone()));
+                            if aggregation_transient_failure {
+                                Metrics::inc(&state.metrics.upstream_transport_failures);
+                                if state.pools[step.provider_index]
+                                    .record(&lease, Outcome::TransportFailure)
+                                {
+                                    Metrics::inc(&state.metrics.credential_quarantines);
+                                }
+                            } else {
+                                Metrics::inc(&state.metrics.upstream_invalid_responses);
+                            }
+                            ops_log::warn("aggregation_failed");
+                        } else {
+                            Metrics::inc(&state.metrics.upstream_invalid_responses);
                             ops_log::warn("upstream_invalid");
                         }
                         record_circuit_failure(&mut circuit_ticket, &state.metrics);
+                        state.mark_auto_failure(step.provider_index, &step.model);
+                        if let Some(context) = telemetry_context.as_mut() {
+                            context.set_failure_type(if aggregation_transient_failure {
+                                "timeout"
+                            } else {
+                                "invalid_response"
+                            });
+                        }
                         break;
                     } // next step
                 }
             }
             Metrics::inc(&state.metrics.upstream_http_failures);
             ops_log::warn("provider_http_failure");
+            if outcome == Outcome::ProviderTransient {
+                if state.pools[step.provider_index].record(&lease, outcome) {
+                    Metrics::inc(&state.metrics.credential_quarantines);
+                }
+                state.mark_auto_failure(step.provider_index, &step.model);
+            }
             if outcome == Outcome::ProviderTransient
                 && let Some(ticket) = &mut circuit_ticket
             {
@@ -459,14 +729,30 @@ async fn dispatch_inner(
             }
             break; // 4xx or 5xx: next chain step; no uncontrolled retries
         }
-        if let Some(delay) = state.pools[step.provider_index].all_keys_rate_limited_for() {
+        let rate_limit_delay = state.pools[step.provider_index].all_keys_rate_limited_for();
+        if !candidate_attempted_network && let Some(context) = telemetry_context.as_mut() {
+            if rate_limit_delay.is_some() {
+                context.set_failure_type("rate_limited");
+                context.set_upstream_status(Some(429));
+            } else {
+                context.set_failure_type("credential_error");
+                context.set_upstream_status(Some(401));
+            }
+            context.set_health_observation(false);
+        }
+        if let Some(delay) = rate_limit_delay {
             rate_limit_retry = Some(rate_limit_retry.map_or(delay, |previous| previous.min(delay)));
         } else {
             all_candidates_rate_limited = false;
         }
     }
     if walk_expired(walk_deadline) {
-        return walk_timeout(&state.metrics);
+        let mut context = telemetry_context.take();
+        if let Some(context) = context.as_mut() {
+            context.set_failure_type("timeout");
+            context.set_health_observation(false);
+        }
+        return attach_telemetry_context(walk_timeout(&state.metrics), context);
     }
     if all_candidates_rate_limited && let Some(delay) = rate_limit_retry {
         // A *bounded* delta-seconds retry hint, rounded up so fast retries do
@@ -486,21 +772,31 @@ async fn dispatch_inner(
         );
         Metrics::inc(&state.metrics.rate_limit_exhaustions);
         ops_log::warn("rate_limit_exhausted");
-        return response;
+        return attach_telemetry_context(response, telemetry_context.take());
     }
     if unsupported_aggregate_n && !attempted_network {
-        return error(
+        let response = error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "aggregate_n_unsupported",
             "SSE-only Chat aggregation supports n in the range 1..64; configure a JSON-capable fallback",
         );
+        let mut context = telemetry_context.take();
+        if let Some(context) = context.as_mut() {
+            context.set_failure_type("capability_mismatch");
+        }
+        return attach_telemetry_context(response, context);
     }
     if unsupported_aggregate_logprobs && !attempted_network {
-        return error(
+        let response = error(
             StatusCode::NOT_IMPLEMENTED,
             "aggregate_logprobs_unsupported",
             "SSE-only Chat aggregation cannot preserve token logprobs; use a JSON-capable provider",
         );
+        let mut context = telemetry_context.take();
+        if let Some(context) = context.as_mut() {
+            context.set_failure_type("capability_mismatch");
+        }
+        return attach_telemetry_context(response, context);
     }
     if aggregation_busy && !attempted_network {
         crate::ops_log::warn("aggregate_capacity");
@@ -513,7 +809,11 @@ async fn dispatch_inner(
             axum::http::header::RETRY_AFTER,
             axum::http::HeaderValue::from_static("1"),
         );
-        return response;
+        let mut context = telemetry_context.take();
+        if let Some(context) = context.as_mut() {
+            context.set_failure_type("aggregation_busy");
+        }
+        return attach_telemetry_context(response, context);
     }
     if bypassed_circuit && !attempted_network {
         ops_log::warn("provider_circuit_open");
@@ -526,12 +826,20 @@ async fn dispatch_inner(
             axum::http::header::RETRY_AFTER,
             axum::http::HeaderValue::from_static("1"),
         );
-        return response;
+        let mut context = telemetry_context.take();
+        if let Some(context) = context.as_mut() {
+            context.set_failure_type("circuit_open");
+        }
+        return attach_telemetry_context(response, context);
     }
-    error(
-        StatusCode::BAD_GATEWAY,
-        "upstream_unavailable",
-        "No upstream returned a valid response",
+    let context = telemetry_context.take();
+    attach_telemetry_context(
+        error(
+            StatusCode::BAD_GATEWAY,
+            "upstream_unavailable",
+            "No upstream returned a valid response",
+        ),
+        context,
     )
 }
 

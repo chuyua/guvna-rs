@@ -53,6 +53,9 @@ static AGGREGATION_INVALID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static AGGREGATION_TIMEOUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static AGGREGATION_TRANSPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static AGGREGATION_LIMIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static AGGREGATION_EVENT_LIMIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static AGGREGATION_INPUT_LIMIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static AGGREGATION_OUTPUT_LIMIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static AGGREGATION_LIFETIME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn enabled() -> bool {
@@ -92,6 +95,9 @@ fn emit(level: &'static str, event: &'static str) {
         "aggregation_idle_timeout" => &AGGREGATION_TIMEOUT_SEQUENCE,
         "aggregation_transport_failure" => &AGGREGATION_TRANSPORT_SEQUENCE,
         "aggregation_resource_limit" => &AGGREGATION_LIMIT_SEQUENCE,
+        "aggregation_event_limit" => &AGGREGATION_EVENT_LIMIT_SEQUENCE,
+        "aggregation_input_limit" => &AGGREGATION_INPUT_LIMIT_SEQUENCE,
+        "aggregation_output_limit" => &AGGREGATION_OUTPUT_LIMIT_SEQUENCE,
         "aggregation_lifetime_timeout" => &AGGREGATION_LIFETIME_SEQUENCE,
         _ => &SEQUENCE,
     };
@@ -156,6 +162,9 @@ mod tests {
             "aggregation_idle_timeout",
             "aggregation_transport_failure",
             "aggregation_resource_limit",
+            "aggregation_event_limit",
+            "aggregation_input_limit",
+            "aggregation_output_limit",
             "aggregation_lifetime_timeout",
         ] {
             assert!(category.starts_with("aggregation_"));

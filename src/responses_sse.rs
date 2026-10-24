@@ -115,6 +115,8 @@ struct ResponsesSse {
     created_at: Option<i64>,
     text: String,
     text_index: Option<usize>,
+    reasoning_text: String,
+    reasoning_index: Option<usize>,
     next_output_index: usize,
     tools: Vec<Tool>,
     finish_reason: Option<String>,
@@ -135,6 +137,8 @@ impl ResponsesSse {
             created_at: None,
             text: String::new(),
             text_index: None,
+            reasoning_text: String::new(),
+            reasoning_index: None,
             next_output_index: 0,
             tools: Vec::new(),
             finish_reason: None,
@@ -153,11 +157,18 @@ impl ResponsesSse {
     fn message_id(&self) -> String {
         format!("msg_{}", self.id.as_deref().unwrap_or_default())
     }
+    fn reasoning_id(&self) -> String {
+        format!("rs_{}", self.id.as_deref().unwrap_or_default())
+    }
     fn response(&self, status: &str) -> Value {
         let mut output = vec![Value::Null; self.next_output_index];
         if let Some(index) = self.text_index {
             output[index] = json!({"id":self.message_id(),"type":"message","status":status,
                 "role":"assistant","content":[{"type":"output_text","text":self.text,"annotations":[]}]});
+        }
+        if let Some(index) = self.reasoning_index {
+            output[index] = json!({"id":self.reasoning_id(),"type":"reasoning","status":status,
+                "summary":[],"content":[{"type":"reasoning_text","text":self.reasoning_text}]});
         }
         for tool in &self.tools {
             output[tool.output_index] = json!({"id":tool.id,"call_id":tool.id,
@@ -233,6 +244,31 @@ impl ResponsesSse {
         ));
     }
 
+    fn begin_reasoning(&mut self, pending: &mut VecDeque<Bytes>) {
+        if self.reasoning_index.is_some() {
+            return;
+        }
+        let index = self.next_output_index;
+        self.next_output_index += 1;
+        self.reasoning_index = Some(index);
+        let item_id = self.reasoning_id();
+        pending.push_back(self.emit(
+            "response.output_item.added",
+            json!({
+                "output_index":index,
+                "item":{"id":item_id,"type":"reasoning","status":"in_progress",
+                    "summary":[],"content":[]}
+            }),
+        ));
+        pending.push_back(self.emit(
+            "response.content_part.added",
+            json!({
+                "item_id":item_id,"output_index":index,"content_index":0,
+                "part":{"type":"reasoning_text","text":""}
+            }),
+        ));
+    }
+
     fn tool_delta(&mut self, calls: &Value, pending: &mut VecDeque<Bytes>) -> Result<(), ()> {
         let calls = calls.as_array().ok_or(())?;
         if calls.is_empty() {
@@ -296,7 +332,12 @@ impl ResponsesSse {
                 .map(|tool| tool.arguments.len())
                 .sum::<usize>();
             if fragment.len() > MAX_TOOL_ARGUMENTS.saturating_sub(self.tools[index].arguments.len())
-                || fragment.len() > MAX_TEXT.saturating_sub(total.saturating_add(self.text.len()))
+                || fragment.len()
+                    > MAX_TEXT.saturating_sub(
+                        total
+                            .saturating_add(self.text.len())
+                            .saturating_add(self.reasoning_text.len()),
+                    )
             {
                 return Err(());
             }
@@ -393,11 +434,11 @@ impl ResponsesSse {
         }
         let event: Value = serde_json::from_slice(data).map_err(|_| ())?;
         let choices = event.get("choices").and_then(Value::as_array).ok_or(())?;
-        if choices.is_empty() {
-            if self.finish_reason.is_none() || self.usage_seen {
+        let mut usage_on_frame = false;
+        if let Some(usage) = event.get("usage").filter(|value| !value.is_null()) {
+            if self.usage_seen {
                 return Err(());
             }
-            let usage = event.get("usage").ok_or(())?;
             let (Some(input), Some(output), Some(total)) = (
                 usage["prompt_tokens"].as_u64(),
                 usage["completion_tokens"].as_u64(),
@@ -410,6 +451,12 @@ impl ResponsesSse {
             }
             self.usage = json!({"input_tokens":input,"output_tokens":output,"total_tokens":total});
             self.usage_seen = true;
+            usage_on_frame = true;
+        }
+        if choices.is_empty() {
+            if self.finish_reason.is_none() || !usage_on_frame {
+                return Err(());
+            }
             return Ok(());
         }
         if choices.len() != 1 || choices[0]["index"] != 0 || self.finish_reason.is_some() {
@@ -426,12 +473,55 @@ impl ResponsesSse {
         }
         let choice = &choices[0];
         let delta = choice.get("delta").and_then(Value::as_object).ok_or(())?;
-        if delta
-            .keys()
-            .any(|key| !["role", "content", "tool_calls"].contains(&key.as_str()))
-            || delta.get("role").is_some_and(|role| role != "assistant")
+        if delta.keys().any(|key| {
+            ![
+                "role",
+                "content",
+                "tool_calls",
+                "reasoning",
+                "reasoning_content",
+            ]
+            .contains(&key.as_str())
+        }) || delta.get("role").is_some_and(|role| role != "assistant")
         {
             return Err(());
+        }
+        // Some compatible providers emit both fields in the same delta.
+        // Preserve both fragments in order instead of failing a valid stream.
+        for field in ["reasoning", "reasoning_content"] {
+            let Some(part) = delta.get(field).filter(|value| !value.is_null()) else {
+                continue;
+            };
+            let part = part.as_str().ok_or(())?;
+            if part.is_empty() {
+                continue;
+            }
+            let used = self
+                .tools
+                .iter()
+                .map(|tool| tool.arguments.len())
+                .sum::<usize>();
+            if part.len()
+                > MAX_TEXT.saturating_sub(
+                    self.text
+                        .len()
+                        .saturating_add(self.reasoning_text.len())
+                        .saturating_add(used),
+                )
+            {
+                return Err(());
+            }
+            self.begin_reasoning(pending);
+            self.reasoning_text.push_str(part);
+            let item_id = self.reasoning_id();
+            let output_index = self.reasoning_index.ok_or(())?;
+            pending.push_back(self.emit(
+                "response.reasoning_text.delta",
+                json!({
+                    "item_id":item_id,"output_index":output_index,"content_index":0,
+                    "delta":part
+                }),
+            ));
         }
         if let Some(content) = delta.get("content").filter(|part| !part.is_null()) {
             let part = content.as_str().ok_or(())?;
@@ -444,7 +534,14 @@ impl ResponsesSse {
                     .iter()
                     .map(|tool| tool.arguments.len())
                     .sum::<usize>();
-                if part.len() > MAX_TEXT.saturating_sub(self.text.len().saturating_add(used)) {
+                if part.len()
+                    > MAX_TEXT.saturating_sub(
+                        self.text
+                            .len()
+                            .saturating_add(self.reasoning_text.len())
+                            .saturating_add(used),
+                    )
+                {
                     return Err(());
                 }
                 self.begin_text(pending);
@@ -491,8 +588,32 @@ impl ResponsesSse {
         } else {
             "completed"
         };
-        if self.text_index.is_none() && self.tools.is_empty() {
+        if self.text_index.is_none() && self.tools.is_empty() && self.reasoning_index.is_none() {
             self.begin_text(pending);
+        }
+        if let Some(index) = self.reasoning_index {
+            let item_id = self.reasoning_id();
+            pending.push_back(self.emit(
+                "response.reasoning_text.done",
+                json!({
+                    "item_id":item_id,"output_index":index,"content_index":0,
+                    "text":self.reasoning_text
+                }),
+            ));
+            let item_id = self.reasoning_id();
+            pending.push_back(self.emit(
+                "response.content_part.done",
+                json!({
+                    "item_id":item_id,"output_index":index,"content_index":0,
+                    "part":{"type":"reasoning_text","text":self.reasoning_text}
+                }),
+            ));
+            let item = json!({"id":self.reasoning_id(),"type":"reasoning","status":status,
+                "summary":[],"content":[{"type":"reasoning_text","text":self.reasoning_text}]});
+            pending.push_back(self.emit(
+                "response.output_item.done",
+                json!({"output_index":index,"item":item}),
+            ));
         }
         if let Some(index) = self.text_index {
             let item_id = self.message_id();
@@ -592,6 +713,108 @@ mod tests {
         assert!(completed.contains("input_tokens"));
         assert!(completed.contains("trace"));
     }
+    #[test]
+    fn reasoning_and_reasoning_content_are_translated_as_reasoning_items() {
+        let mut translator = ResponsesSse::new("logical".into(), Value::Null);
+        let mut output = VecDeque::new();
+        translator
+            .feed(
+                &frame(json!({"id":"reasoning1","created":123,
+                    "choices":[{"index":0,"delta":{"reasoning_content":"thinking "},"finish_reason":null}]})),
+                &mut output,
+            )
+            .unwrap();
+        translator
+            .feed(
+                &frame(json!({"id":"reasoning1",
+                    "choices":[{"index":0,"delta":{"reasoning":"continues"},"finish_reason":null}]})),
+                &mut output,
+            )
+            .unwrap();
+        translator
+            .feed(
+                &frame(json!({"id":"reasoning1",
+                    "choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]})),
+                &mut output,
+            )
+            .unwrap();
+        translator.feed(b"data: [DONE]\n\n", &mut output).unwrap();
+        assert!(translator.done);
+        assert_eq!(translator.reasoning_text, "thinking continues");
+        let events = output
+            .iter()
+            .map(|event| String::from_utf8_lossy(event).into_owned())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(events.contains("response.reasoning_text.delta"));
+        assert!(events.contains("response.reasoning_text.done"));
+        assert!(events.contains("\"type\":\"reasoning\""));
+        assert!(events.contains("\"type\":\"reasoning_text\""));
+        assert!(events.contains("response.completed"));
+
+        let mut ambiguous = ResponsesSse::new("logical".into(), Value::Null);
+        let mut output = VecDeque::new();
+        ambiguous
+            .feed(
+                &frame(json!({"id":"ambiguous",
+                    "choices":[{"index":0,"delta":{"reasoning":"a","reasoning_content":"b"},"finish_reason":null}]})),
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(ambiguous.reasoning_text, "ab");
+    }
+
+    #[test]
+    fn usage_on_a_content_frame_is_preserved_and_duplicate_usage_fails_closed() {
+        let usage = json!({"prompt_tokens":2,"completion_tokens":3,"total_tokens":5});
+        let mut translator = ResponsesSse::new("logical".into(), Value::Null);
+        let mut output = VecDeque::new();
+        translator
+            .feed(
+                &frame(json!({"id":"usage1","created":123,
+                    "choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}],
+                    "usage":usage.clone()})),
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(
+            translator.usage,
+            json!({"input_tokens":2,"output_tokens":3,"total_tokens":5})
+        );
+        assert!(
+            translator
+                .feed(&frame(json!({"choices":[],"usage":usage})), &mut output)
+                .is_err()
+        );
+        assert!(!translator.done);
+        assert!(
+            !output
+                .iter()
+                .any(|event| event.starts_with(b"event: response.completed"))
+        );
+    }
+
+    #[test]
+    fn reasoning_text_shares_the_existing_bounded_output_budget() {
+        let mut translator = ResponsesSse::new("logical".into(), Value::Null);
+        let mut output = VecDeque::new();
+        translator
+            .feed(
+                &frame(json!({"id":"bounded-reasoning",
+                    "choices":[{"index":0,"delta":{"reasoning_content":"r".repeat(MAX_TEXT)},"finish_reason":null}]})),
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(translator.reasoning_text.len(), MAX_TEXT);
+        assert!(translator
+            .feed(
+                &frame(json!({"id":"bounded-reasoning",
+                    "choices":[{"index":0,"delta":{"content":"one extra byte"},"finish_reason":null}]})),
+                &mut output,
+            )
+            .is_err());
+    }
+
     #[test]
     fn json_output_mode_must_not_complete_unparseable_upstream_text() {
         for (fragment, object_only, accepted) in [
