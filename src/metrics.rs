@@ -129,6 +129,9 @@ mod tests {
         );
         assert!(rendered.contains("guvna_circuit_open_providers 2\n"));
         assert!(rendered.contains("guvna_walk_deadline_exhaustions_total 0\n"));
-        assert_eq!(rendered.matches("# TYPE guvna_").count(), 26);
+        assert!(rendered.contains("guvna_telemetry_written_total 0\n"));
+        assert!(rendered.contains("guvna_telemetry_dropped_total 0\n"));
+        assert!(rendered.contains("guvna_telemetry_write_failures_total 0\n"));
+        assert_eq!(rendered.matches("# TYPE guvna_").count(), 29);
     }
 }
