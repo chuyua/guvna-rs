@@ -179,7 +179,7 @@ struct Event {
     request_id: Option<String>,
     attempt_index: Option<u16>,
     stream_requested: bool,
-    shadow: Option<ShadowRecord>,
+    shadow: Option<Box<ShadowRecord>>,
 }
 
 impl Telemetry {
@@ -287,7 +287,7 @@ impl Telemetry {
             request_id: Some(request_id.to_owned()),
             attempt_index: None,
             stream_requested: false,
-            shadow: Some(record),
+            shadow: Some(Box::new(record)),
         };
         if self
             .sender
@@ -757,23 +757,23 @@ fn recover_page_capacity(conn: &mut Connection, now: i64) -> rusqlite::Result<bo
         return Ok(false);
     }
     let tx = conn.transaction()?;
-    let removed = tx.execute(
+    let removed_requests = tx.execute(
         "DELETE FROM request_events WHERE rowid IN
          (SELECT rowid FROM request_events ORDER BY ts LIMIT 8192)",
         [],
     )?;
-    tx.execute(
+    let removed_failures = tx.execute(
         "DELETE FROM failure_events WHERE rowid IN
          (SELECT rowid FROM failure_events ORDER BY ts LIMIT 2048)",
         [],
     )?;
-    tx.execute(
+    let removed_shadows = tx.execute(
         "DELETE FROM shadow_events WHERE rowid IN
          (SELECT rowid FROM shadow_events ORDER BY ts LIMIT 2048)",
         [],
     )?;
     tx.commit()?;
-    Ok(removed > 0)
+    Ok(removed_requests + removed_failures + removed_shadows > 0)
 }
 
 fn now_secs() -> i64 {
@@ -1034,6 +1034,32 @@ mod tests {
         assert_eq!(summary["shadow_metrics"]["top_candidate_disagreements"], 1);
         assert_eq!(summary["shadow_metrics"]["disagreement_rate"], 1.0);
         assert_eq!(summary["request_metrics"]["traced_requests"], 0);
+    }
+
+    #[test]
+    fn full_disk_recovery_counts_shadow_only_rows_as_reclaimed_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shadow-capacity.sqlite3");
+        let mut conn = open_database(&path).unwrap();
+        conn.execute(
+            "INSERT INTO shadow_events VALUES (?1,'trace','base','one','other','two',1,1)",
+            [now_secs()],
+        )
+        .unwrap();
+        let pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        let ceiling: i64 = conn
+            .query_row(&format!("PRAGMA max_page_count={}", pages + 8), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(ceiling, pages + 8);
+        assert!(recover_page_capacity(&mut conn, now_secs()).unwrap());
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM shadow_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]
