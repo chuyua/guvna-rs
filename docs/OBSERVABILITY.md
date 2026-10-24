@@ -208,3 +208,13 @@ The completion rate excludes client cancellations from its denominator;
 it does not infer completion from SSE headers. Old SQLite databases without
 this table report null until the writer upgrades them. Terminal details
 expire after seven days and participate in bounded full-disk recovery.
+
+
+### Local credential health counters
+
+The existing Unix Socket status command reports key_health as aggregate
+configured/available/auth_quarantined/rate_limited/transient_quarantined
+counts plus total_uses. Expired cooldowns are counted as available. The
+snapshot never includes key values, key environment variable names, provider
+names, timestamps or other credential-identifying labels. Missing keys are
+not counted as configured. No extra TCP management route is added.

@@ -28,6 +28,30 @@ pub struct Lease {
     epoch: u64,
 }
 
+/// Aggregate counters only: no key names, values, providers or cooldown timestamps.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, PartialEq, Eq)]
+pub struct KeyHealthSnapshot {
+    pub configured: usize,
+    pub available: usize,
+    pub auth_quarantined: usize,
+    pub rate_limited: usize,
+    pub transient_quarantined: usize,
+    pub total_uses: u64,
+}
+
+impl std::ops::AddAssign for KeyHealthSnapshot {
+    fn add_assign(&mut self, other: Self) {
+        self.configured = self.configured.saturating_add(other.configured);
+        self.available = self.available.saturating_add(other.available);
+        self.auth_quarantined = self.auth_quarantined.saturating_add(other.auth_quarantined);
+        self.rate_limited = self.rate_limited.saturating_add(other.rate_limited);
+        self.transient_quarantined = self
+            .transient_quarantined
+            .saturating_add(other.transient_quarantined);
+        self.total_uses = self.total_uses.saturating_add(other.total_uses);
+    }
+}
+
 pub struct KeyPool {
     inner: Mutex<Inner>,
     rotation: String,
@@ -73,6 +97,30 @@ impl KeyPool {
                 .map(|_| provider.quarantine.transient())
                 .transpose()?,
         })
+    }
+
+    /// Local CLI status snapshot; a brief mutex read, never acquire a lease.
+    /// Expired cooldowns are counted as available even before their next use.
+    pub fn health_snapshot(&self) -> KeyHealthSnapshot {
+        let now = Instant::now();
+        let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        let mut result = KeyHealthSnapshot {
+            configured: inner.credentials.len(),
+            ..KeyHealthSnapshot::default()
+        };
+        for key in &inner.credentials {
+            result.total_uses = result.total_uses.saturating_add(key.uses);
+            if key.blocked_until.is_none_or(|until| until <= now) {
+                result.available += 1;
+            } else {
+                match key.blocked_for {
+                    Some(Outcome::CredentialAuth) => result.auth_quarantined += 1,
+                    Some(Outcome::RateLimited) => result.rate_limited += 1,
+                    _ => result.transient_quarantined += 1,
+                }
+            }
+        }
+        result
     }
 
     pub fn acquire(&self, excluded: &HashSet<String>) -> Option<Lease> {
@@ -219,6 +267,47 @@ quarantine:
 "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn local_health_snapshot_is_aggregate_and_respects_fenced_cooldowns() {
+        let pool = KeyPool::new(
+            &provider(),
+            &HashMap::from([
+                ("A".into(), "sensitive-alpha".into()),
+                ("B".into(), "sensitive-beta".into()),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(pool.health_snapshot().configured, 2);
+        assert_eq!(pool.health_snapshot().available, 2);
+        let first = pool.acquire(&HashSet::new()).unwrap();
+        assert!(pool.record(&first, Outcome::CredentialAuth));
+        let second = pool.acquire(&HashSet::new()).unwrap();
+        assert!(pool.record(&second, Outcome::RateLimited));
+        let snapshot = pool.health_snapshot();
+        assert_eq!(snapshot.configured, 2);
+        assert_eq!(snapshot.available, 0);
+        assert_eq!(snapshot.auth_quarantined, 1);
+        assert_eq!(snapshot.rate_limited, 1);
+        assert_eq!(snapshot.transient_quarantined, 0);
+        assert_eq!(snapshot.total_uses, 2);
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        for secret in ["sensitive-alpha", "sensitive-beta", "A", "B"] {
+            assert!(!serialized.contains(secret), "key metadata leaked");
+        }
+        // Stale successful callbacks cannot remove quarantine or skew status.
+        pool.record_success(&first);
+        assert_eq!(pool.health_snapshot(), snapshot);
+    }
+
+    #[test]
+    fn local_health_snapshot_does_not_report_missing_keys_as_available() {
+        let pool = KeyPool::new(&provider(), &HashMap::new()).unwrap();
+        let snapshot = pool.health_snapshot();
+        assert_eq!(snapshot.configured, 0);
+        assert_eq!(snapshot.available, 0);
+        assert_eq!(snapshot.total_uses, 0);
     }
 
     #[test]

@@ -381,6 +381,10 @@ mod tests {
         let value: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["status"], "running");
         assert_eq!(value["providers_configured"], 1);
+        assert_eq!(value["key_health"]["configured"], 1);
+        assert_eq!(value["key_health"]["available"], 1);
+        assert_eq!(value["key_health"]["auth_quarantined"], 0);
+        assert_eq!(value["key_health"]["total_uses"], 0);
         assert_eq!(value["requests_dispatched"], 0);
         assert!(!response.contains("provider-secret"));
         assert!(!response.contains("client-secret"));

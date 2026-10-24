@@ -25,7 +25,7 @@ use crate::{
     auto_health::AutoHealth,
     circuit::{Circuit, Ticket},
     config::Config,
-    keypool::KeyPool,
+    keypool::{KeyHealthSnapshot, KeyPool},
     metrics::Metrics,
     routing::{self, AutoRouteCache},
     telemetry::Telemetry,
@@ -289,11 +289,16 @@ impl AppState {
             .filter_map(Option::as_ref)
             .filter(|c| c.is_open())
             .count();
+        let mut key_health = KeyHealthSnapshot::default();
+        for pool in &self.pools {
+            key_health += pool.health_snapshot();
+        }
         json!({
             "status": "running",
             "version": env!("CARGO_PKG_VERSION"),
             "uptime_seconds": self.started_at.elapsed().as_secs(),
             "providers_configured": self.config.providers.len(),
+            "key_health": key_health,
             "active_requests": active,
             "circuit_open_providers": open_circuits,
             "auto_enabled": self.config.auto.enabled,
