@@ -582,7 +582,11 @@ async fn dispatch_inner(
                         upstream,
                         ChatSse::new(effective_n)
                             .expect("validated candidate stream n")
-                            .with_tool_choice(payload.get("tool_choice")),
+                            .with_tool_choice(
+                                request
+                                    .get("tool_choice")
+                                    .or_else(|| step.params.get("tool_choice")),
+                            ),
                         state.clone(),
                         chat_stream::StreamRoute {
                             provider_index: step.provider_index,
@@ -631,7 +635,9 @@ async fn dispatch_inner(
                             upstream,
                             effective_n,
                             &step.model,
-                            payload.get("tool_choice"),
+                            request
+                                .get("tool_choice")
+                                .or_else(|| step.params.get("tool_choice")),
                         ),
                     )
                     .await;
@@ -664,7 +670,12 @@ async fn dispatch_inner(
                 }
                 match result {
                     Ok(Ok(value))
-                        if response_validation::valid_result(endpoint, &payload, &value) =>
+                        if response_validation::valid_result_with_params(
+                            endpoint,
+                            &request,
+                            &step.params,
+                            &value,
+                        ) =>
                     {
                         state.pools[step.provider_index].record_success(&lease);
                         record_circuit_success(&mut circuit_ticket, &state.metrics);

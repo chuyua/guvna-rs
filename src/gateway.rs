@@ -290,6 +290,7 @@ fn retry_after_delay(headers: &reqwest::header::HeaderMap, now: SystemTime) -> O
 
 // Authenticate before invoking Bytes::from_request: the normal Bytes handler
 // extractor buffers the body before handler-level authorization can run.
+#[derive(Debug)]
 enum RequestBodyError {
     Unauthorized,
     Overloaded,
@@ -518,6 +519,7 @@ async fn embeddings(State(state): State<Arc<AppState>>, request: Request<Body>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn auto_model_health_isolated_within_shared_provider() {
