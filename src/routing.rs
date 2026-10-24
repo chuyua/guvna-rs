@@ -368,6 +368,24 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
         return resolve_chain(config, chain);
     }
     let mut longest: Option<(usize, usize, String)> = None;
+    // Issue #132: a provider whose upstream model ids genuinely carry the same
+    // namespace as the gateway prefix (e.g. NVIDIA NIM ids are "nvidia/...")
+    // opts out of namespace stripping with an explicit `prefixes: []`. For such
+    // providers the whole logical model id is the upstream wire name.
+    if let Some((i, _)) = config
+        .providers
+        .iter()
+        .enumerate()
+        .find(|(_, p)| p.namespace_on_wire)
+    {
+        {
+            return Ok(vec![ResolvedStep {
+                provider_index: i,
+                model: logical_model.to_owned(),
+                params: BTreeMap::new(),
+            }]);
+        }
+    }
     for (i, provider) in config.providers.iter().enumerate() {
         for prefix in provider.prefixes() {
             let Some(suffix) = logical_model
@@ -792,6 +810,33 @@ auto:
             "alpha",
         );
     }
+    #[test]
+    fn namespace_on_wire_provider_forwards_full_id_issue_132() {
+        // NVIDIA NIM ids carry the same namespace as the gateway prefix;
+        // namespace_on_wire forwards the whole logical id verbatim (issue #132).
+        let cfg: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: nvidia
+    type: openai
+    base_url: https://integrate.api.nvidia.com
+    key_env: KEY
+    models: [nvidia/nemotron-3-embed-1b, nvidia/nemotron-3.5-embed-1b]
+    namespace_on_wire: true
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            resolve(&cfg, "nvidia/nemotron-3-embed-1b").unwrap()[0].model,
+            "nvidia/nemotron-3-embed-1b"
+        );
+        assert_eq!(
+            resolve(&cfg, "nvidia/nemotron-3.5-embed-1b").unwrap()[0].model,
+            "nvidia/nemotron-3.5-embed-1b"
+        );
+    }
+
     #[test]
     fn longest_provider_namespace_wins_independent_of_yaml_order() {
         let config: Config = serde_yaml::from_str(
