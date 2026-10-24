@@ -14,7 +14,7 @@ Example in config.yaml:
           model: fast-model
           priority: 1
           max_input_bytes: 1024
-          max_context_tokens: 1024
+          max_context_tokens: 8192
         - provider: reliable
           model: big-context-model
           priority: 3
@@ -27,8 +27,15 @@ The provider names must exist. Auto has 1..32 candidates when enabled.
 Candidates are sorted by ascending priority, with stable configuration
 order for ties. Eligibility is based on the encoded JSON message size
 between optional min_input_bytes (default 0) and max_input_bytes
-(default unlimited). It is a rough size heuristic, NOT tokenizer output.
-Routing stores no user-specific cache entry, prompt or learned model score.
+(default unlimited). It is a rough size heuristic, NOT tokenizer output. max_context_tokens
+uses the full serialized request size plus a 20% reserve and the requested
+max_completion_tokens/max_tokens (or 1024 tokens by default). This intentionally
+overestimates tokens and includes tool/schema payloads, without a remote tokenizer.
+If provider.models is non-empty, a candidate model must match that catalog exactly;
+an empty catalog means capability is unknown and does not hard-reject candidates.
+The process-local cache stores route metadata only (max 128 entries, 30s TTL),
+keys results by request-size estimates and live health scores, and clears on a
+route-config generation change. It never stores prompts or request bodies.
 
 Interfaces:
 - POST /v1/auto accepts a Chat Completion body with model omitted or auto.
@@ -72,11 +79,10 @@ collect these lines locally using the OS's existing access controls.
 
 ## Deferred scope
 
-This is Auto V1, NOT full Go Auto parity: no dynamic learned scoring,
-response caching, tokenizer-based context classification, cross-request
-model reliability weighting, or semantic prompt profiling. Existing
-credential quarantine and provider circuit breaking handle known failures.
-Further Auto intelligence should follow deterministic real-world tests.
+This is not full Go Auto parity: no dynamic learned scoring, response caching,
+tokenizer-based context classification, or semantic prompt profiling. The route
+cache is not a response cache and never retains prompt content. Existing credential
+quarantine and provider circuit breaking continue to handle known failures.
 
 ## Auto V2: optional in-process health-aware ordering
 
@@ -94,5 +100,7 @@ requires enough successes to reset demotion, and a 300-second freshness limit
 expires old health penalties without a background timer. No remote scorer,
 prompts, keys, provider labels, extra HTTP calls or request-path SQL reads.
 
-This is deliberately a small V2 foundation, not a learned model capability
-engine or durable per-provider scoring history. Scores reset on restart.
+This remains a conservative V2 foundation, not a learned model capability engine.
+When SQLite telemetry is enabled, a bounded provider-level health summary is
+restored at startup only if the last failure is within the 300-second freshness
+window. If SQLite is disabled or unreadable, routing falls back to in-memory hints.

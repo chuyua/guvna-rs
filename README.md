@@ -48,8 +48,8 @@ Unsupported reasoning, image, audio, stateful continuation, and other
 advanced Responses modes remain explicitly unsupported. The gateway must not
 be treated as full OpenAI Responses parity or a production drop-in replacement.
 
-Not yet shipped: advanced Auto learning/cache,
-complete Go protocol parity and full multi-modal streaming.
+Not yet shipped: learned Auto scoring, complete Go protocol parity and full multi-modal streaming.
+The current Auto cache stores only route metadata (128 entries, 30s TTL); it does not learn from or retain prompts.
 
 POST /v1/chat/completions, /v1/embeddings and /v1/responses authenticate
 request headers **before** buffering the request body. The existing 32 MiB
@@ -74,9 +74,11 @@ guvna_rate_limit_exhaustions_total and the opt-in rate_limit_exhausted
 local stderr event expose this condition without prompts, credentials
 or provider identifiers. No remote management endpoint. Local SQLite telemetry is separately opt-in.
 
-An opt-in Auto V1 selects model candidates using configured priority
-and a bounded encoded-input-length filter. POST /v1/auto or Chat model
-auto delegates to existing failover and circuit logic; Auto is off by default.
+An opt-in Auto route selects model candidates using configured priority,
+message byte limits, a full-request context estimate with requested/default output
+allowance and a 20% safety reserve,
+and an exact model-catalog filter when a provider declares models. POST /v1/auto
+or Chat model auto delegates to existing failover and circuit logic; Auto is off by default.
 With auto.health_aware: true, in-memory failure hints can temporarily demote
 unhealthy providers without replacing configured priorities or fallback.
 

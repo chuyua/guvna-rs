@@ -23,6 +23,7 @@ use crate::{
     config::Config,
     keypool::KeyPool,
     metrics::Metrics,
+    routing::{self, AutoRouteCache},
     telemetry::Telemetry,
 };
 
@@ -56,6 +57,8 @@ pub struct AppState {
     metrics: Arc<Metrics>,
     telemetry: Option<Telemetry>,
     auto_health: Option<AutoHealth>,
+    auto_route_cache: AutoRouteCache,
+    auto_generation: u64,
     started_at: Instant,
     model_catalog: Value,
     model_details: HashMap<String, Value>,
@@ -113,6 +116,8 @@ impl AppState {
         let mut data: Vec<_> = model_details.values().cloned().collect();
         data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         let model_catalog = json!({"object":"list","data":data});
+        let auto_generation = routing::config_generation(&config);
+        let auto_route_cache = AutoRouteCache::new();
         let auto_health = config
             .auto
             .health_aware
@@ -130,6 +135,8 @@ impl AppState {
             metrics: Arc::new(Metrics::default()),
             telemetry: None,
             auto_health,
+            auto_route_cache,
+            auto_generation,
             started_at: Instant::now(),
         })
     }

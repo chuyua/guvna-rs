@@ -207,16 +207,23 @@ async fn dispatch_inner(
         );
     }
     let auto_enabled = model == "auto" && state.config.auto.enabled;
-    // Bytes of encoded message content are a deterministic bounded proxy
-    // for context size; no remote tokenizer or prompt logging is involved.
+    // Keep byte-range eligibility and context-window budgeting separate.
+    // The context estimate includes the full request, output allowance and safety reserve.
     let steps = match if auto_enabled {
         let input_bytes = routing::auto_input_bytes(request.get("messages"));
+        let context_estimate = routing::auto_context_estimate(&request);
         let penalties = state
             .auto_health
             .as_ref()
             .map(|health| health.penalties())
             .unwrap_or_default();
-        routing::resolve_auto_with_health(&state.config, input_bytes, &penalties)
+        state.auto_route_cache.resolve(
+            &state.config,
+            input_bytes,
+            context_estimate,
+            &penalties,
+            state.auto_generation,
+        )
     } else {
         routing::resolve(&state.config, model)
     } {
@@ -234,7 +241,7 @@ async fn dispatch_inner(
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "auto_no_eligible_candidate",
-            "No configured Auto candidate accepts this input size",
+            "No configured Auto candidate satisfies input-size, context-window and model-capability constraints",
         );
     }
 

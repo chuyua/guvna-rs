@@ -56,8 +56,8 @@ impl TimeoutConfig {
     }
 }
 
-/// Deterministic, opt-in Auto routing. No remote control, external cache,
-/// provider identifiers in metrics, or mutable cross-request rankings.
+/// Deterministic, opt-in Auto routing. Its bounded cache stores route metadata only;
+/// health hints remain explicit and never depend on request-path database reads.
 #[derive(Clone, Debug, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutoConfig {
