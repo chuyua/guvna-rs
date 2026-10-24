@@ -190,11 +190,32 @@ async fn run() -> Result<(), String> {
             }
             _ => return Err("invalid chains subcommand or incompatible flags".into()),
         };
+        #[cfg(unix)]
+        {
+            let online = match &command {
+                chain_store::Command::Set(file) => {
+                    let absolute = std::fs::canonicalize(file)
+                        .map_err(|e| format!("chain source file: {e}"))?;
+                    Some(("chains_set", absolute.to_string_lossy().into_owned()))
+                }
+                chain_store::Command::Delete(name) => Some(("chains_delete", name.clone())),
+                _ => None,
+            };
+            if let Some((action, argument)) = online
+                && let Some(result) =
+                    control_socket::query_chain_mutation(&data_dir, action, &argument).await?
+            {
+                println!("{result}");
+                return Ok(());
+            }
+        }
         let config = Config::load(&real_path)?;
         println!("{}", chain_store::execute(&config, &data_dir, command)?);
+        eprintln!("guvna: offline chain update; restart daemon to apply runtime routing changes");
         return Ok(());
     }
-    let config = Config::load(&real_path)?.with_runtime_chains(&data_dir)?;
+    let base_config = Config::load(&real_path)?;
+    let config = base_config.clone().with_runtime_chains(&data_dir)?;
     if healthcheck || status {
         let bind = env::var("GUVNA_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
         let probe_host = local_probe_host(&bind)?;
@@ -257,7 +278,8 @@ async fn run() -> Result<(), String> {
     );
     let (app, runtime_state) = gateway::app_with_state(state);
     #[cfg(unix)]
-    let _control_server = control_socket::spawn(&data_dir, Arc::clone(&runtime_state)).await?;
+    let _control_server =
+        control_socket::spawn(&data_dir, Arc::clone(&runtime_state), Arc::new(base_config)).await?;
     serve_until_shutdown(listener, app, shutdown_signal(), Duration::from_secs(30)).await?;
     if !runtime_state.flush_telemetry(Duration::from_secs(3)) {
         guvna::ops_log::warn("telemetry_shutdown_flush_failed");

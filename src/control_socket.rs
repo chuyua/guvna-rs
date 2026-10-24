@@ -1,6 +1,6 @@
 //! Permission-restricted, read-only local runtime status over a Unix domain socket.
-//! No TCP management listener and no mutating command is exposed.
-use guvna::gateway::AppState;
+//! Same-UID Unix socket supports limited runtime chain edits. No TCP admin.
+use guvna::{chain_store, config::Config, gateway::AppState};
 use serde_json::{Value, json};
 use std::{
     fs, io,
@@ -31,10 +31,15 @@ struct ControlSocket {
     path: PathBuf,
     directory: PathBuf,
     state: Arc<AppState>,
+    base_config: Arc<Config>,
 }
 
 impl ControlSocket {
-    async fn bind(data_dir: &Path, state: Arc<AppState>) -> Result<Self, String> {
+    async fn bind(
+        data_dir: &Path,
+        state: Arc<AppState>,
+        base_config: Arc<Config>,
+    ) -> Result<Self, String> {
         let path = socket_path(data_dir)?;
         let newly_created = !data_dir.exists();
         fs::create_dir_all(data_dir)
@@ -60,6 +65,7 @@ impl ControlSocket {
             path,
             directory: data_dir.to_path_buf(),
             state,
+            base_config,
         })
     }
 
@@ -76,9 +82,10 @@ impl ControlSocket {
             };
             let state = Arc::clone(&self.state);
             let directory = self.directory.clone();
+            let base_config = Arc::clone(&self.base_config);
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = handle_client(stream, state, directory).await;
+                let _ = handle_client(stream, state, directory, base_config).await;
             });
         }
     }
@@ -130,8 +137,12 @@ async fn ensure_socket_available(path: &Path) -> Result<(), String> {
     }
 }
 
-pub async fn spawn(data_dir: &Path, state: Arc<AppState>) -> Result<JoinHandle<()>, String> {
-    let server = ControlSocket::bind(data_dir, state).await?;
+pub async fn spawn(
+    data_dir: &Path,
+    state: Arc<AppState>,
+    base_config: Arc<Config>,
+) -> Result<JoinHandle<()>, String> {
+    let server = ControlSocket::bind(data_dir, state, base_config).await?;
     Ok(tokio::spawn(server.run()))
 }
 
@@ -164,6 +175,7 @@ async fn handle_client(
     mut stream: UnixStream,
     state: Arc<AppState>,
     directory: PathBuf,
+    base_config: Arc<Config>,
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     if stream
@@ -184,6 +196,44 @@ async fn handle_client(
     let request: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid control JSON")?;
     let response = match request.get("command").and_then(Value::as_str) {
         Some("status") => state.runtime_status(),
+        Some("chains_list") => {
+            let snapshot = state.route_snapshot();
+            json!({"chains":snapshot.chains.iter().map(|c| &c.name).collect::<Vec<_>>()})
+        }
+        Some("chains_set" | "chains_delete") => {
+            let action = request.get("command").and_then(Value::as_str).unwrap_or("");
+            let value = request
+                .get("argument")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if value.is_empty() || value.len() > 2048 {
+                json!({"error":"invalid_chain_argument"})
+            } else {
+                let cmd = if action == "chains_set" {
+                    chain_store::Command::Set(PathBuf::from(value))
+                } else {
+                    chain_store::Command::Delete(value.to_owned())
+                };
+                let base = Arc::clone(&base_config);
+                let local_dir = directory.clone();
+                let result = timeout(
+                    Duration::from_secs(3),
+                    tokio::task::spawn_blocking(move || {
+                        let output = chain_store::execute(&base, &local_dir, cmd)?;
+                        let routes = base.as_ref().clone().with_runtime_chains(&local_dir)?;
+                        Ok::<_, String>((output, routes))
+                    }),
+                )
+                .await;
+                match result {
+                    Ok(Ok(Ok((output, routes)))) => match state.replace_route_snapshot(routes) {
+                        Ok(()) => json!({"ok":true,"online":true,"result":output}),
+                        Err(_) => json!({"error":"route_reload_failed"}),
+                    },
+                    _ => json!({"error":"chain_update_failed"}),
+                }
+            }
+        }
         Some("scoring") => {
             let hours = request.get("hours").and_then(Value::as_u64).unwrap_or(24);
             if ![1, 6, 24, 168].contains(&hours) {
@@ -215,15 +265,35 @@ async fn handle_client(
 
 /// Returns None only when no socket is installed (legacy HTTP health probe fallback).
 pub async fn query(data_dir: &Path) -> Result<Option<String>, String> {
-    query_command(data_dir, "status", 24).await
+    query_request(data_dir, json!({"command":"status"}), CONTROL_TIMEOUT).await
 }
 pub async fn query_scoring(data_dir: &Path, hours: u32) -> Result<Option<String>, String> {
-    query_command(data_dir, "scoring", hours).await
+    query_request(
+        data_dir,
+        json!({"command":"scoring","hours":hours}),
+        CONTROL_TIMEOUT,
+    )
+    .await
 }
-async fn query_command(
+pub async fn query_chain_mutation(
     data_dir: &Path,
-    command: &str,
-    hours: u32,
+    action: &str,
+    argument: &str,
+) -> Result<Option<String>, String> {
+    if !["chains_set", "chains_delete"].contains(&action) {
+        return Err("unsupported local chain operation".into());
+    }
+    query_request(
+        data_dir,
+        json!({"command":action,"argument":argument}),
+        Duration::from_secs(5),
+    )
+    .await
+}
+async fn query_request(
+    data_dir: &Path,
+    request: Value,
+    reply_timeout: Duration,
 ) -> Result<Option<String>, String> {
     let path = socket_path(data_dir)?;
     match fs::symlink_metadata(&path) {
@@ -243,15 +313,15 @@ async fn query_command(
         Ok(Err(error)) => return Err(format!("connect local control socket: {error}")),
         Err(_) => return Err("timed out connecting to local control socket".into()),
     };
-    let mut request = serde_json::to_vec(&json!({"command":command,"hours":hours}))
-        .map_err(|_| "cannot serialize control request")?;
+    let mut request =
+        serde_json::to_vec(&request).map_err(|_| "cannot serialize control request")?;
     request.push(b'\n');
     timeout(CONTROL_TIMEOUT, stream.write_all(&request))
         .await
         .map_err(|_| "local status request timed out")?
         .map_err(|_| "write local status request")?;
     let bytes = timeout(
-        CONTROL_TIMEOUT,
+        reply_timeout,
         read_line_bounded(&mut stream, MAX_CONTROL_RESPONSE_LINE),
     )
     .await
@@ -283,7 +353,7 @@ mod tests {
         ).unwrap();
         let state = Arc::new(
             AppState::new(
-                config,
+                config.clone(),
                 HashMap::from([(
                     "UPSTREAM_SECRET_ENV".to_string(),
                     "provider-secret".to_string(),
@@ -292,7 +362,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let server = spawn(dir.path(), state).await.unwrap();
+        let server = spawn(dir.path(), state, Arc::new(config)).await.unwrap();
         let socket = dir.path().join(SOCKET_NAME);
         let mode = fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -322,6 +392,67 @@ mod tests {
         let _ = server.await;
         assert!(!socket.exists());
     }
+    #[tokio::test]
+    async fn online_chain_mutations_update_live_routes_without_touching_static_routes() {
+        use guvna::{config::Config, routing};
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: http://127.0.0.1:1\n    key_env: K\nchains:\n  - name: immutable\n    steps:\n      - provider: p\n        model: static\n"
+        ).unwrap();
+        let state = Arc::new(
+            AppState::new(
+                config.clone(),
+                HashMap::from([("K".to_owned(), "placeholder".to_owned())]),
+                vec!["local-client".to_owned()],
+            )
+            .unwrap(),
+        );
+        let server = spawn(dir.path(), Arc::clone(&state), Arc::new(config))
+            .await
+            .unwrap();
+        let definition = dir.path().join("new-chain.yaml");
+        fs::write(
+            &definition,
+            "name: dynamic\nsteps:\n  - provider: p\n    model: fresh\n",
+        )
+        .unwrap();
+        let before = state.route_snapshot();
+        assert!(routing::resolve(&before, "dynamic").is_err());
+        let result = query_chain_mutation(dir.path(), "chains_set", definition.to_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.contains("online"));
+        let after = state.route_snapshot();
+        assert_eq!(
+            routing::resolve(&after, "dynamic").unwrap()[0].model,
+            "fresh"
+        );
+        assert_eq!(
+            routing::resolve(&before, "immutable").unwrap()[0].model,
+            "static"
+        );
+        assert!(routing::resolve(&before, "dynamic").is_err());
+        assert!(after.chains.iter().any(|chain| chain.name == "dynamic"));
+        let delete = query_chain_mutation(dir.path(), "chains_delete", "dynamic")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(delete.contains("online"));
+        let latest = state.route_snapshot();
+        assert!(routing::resolve(&latest, "dynamic").is_err());
+        assert!(routing::resolve(&latest, "immutable").is_ok());
+        let forbidden = query_chain_mutation(dir.path(), "chains_delete", "immutable")
+            .await
+            .unwrap_err();
+        assert!(forbidden.contains("chain_update_failed"));
+        assert!(routing::resolve(&state.route_snapshot(), "immutable").is_ok());
+        server.abort();
+        let _ = server.await;
+    }
+
     #[tokio::test]
     async fn oversized_control_lines_are_rejected() {
         let (mut writer, mut reader) = tokio::io::duplex(MAX_CONTROL_LINE + 32);

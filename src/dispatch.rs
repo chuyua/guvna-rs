@@ -309,7 +309,7 @@ async fn dispatch_inner(
             state.auto_generation,
         )
     } else {
-        routing::resolve(&state.config, model)
+        routing::resolve(&state.route_snapshot(), model)
     } {
         Ok(steps) => steps,
         Err(_) => {

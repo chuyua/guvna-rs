@@ -80,3 +80,16 @@ The Linux release-binary CI gate exercises the CLI directly (create/update,
 backup, delete, invalid YAML rejection, recovery and permissions) before
 existing SSE/failover/load tests. Rust integration tests also race eight
 independent CLI processes writing distinct routes to the same store.
+
+## Issue #129: same-UID online runtime chain updates
+
+On Linux, while guvna is running with its permission-restricted local
+control.sock, guvna chains set --file and chains delete --name now send the
+validated operation through that same-UID Unix socket. The daemon uses the
+existing serialized filesystem lock and atomic chain_store write, reloads
+the complete validated static+runtime route table and swaps it in one
+pointer operation. In-flight requests keep their old route snapshot.
+CLI operations without a running control socket still update offline files,
+with a restart warning, preserving existing behavior. No TCP control route
+or Web backend exists. Chain names from static config remain read-only.
+Auto candidates discovered at startup are not live-updated until a restart.
