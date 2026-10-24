@@ -420,9 +420,10 @@ def exercise_opt_in_circuit_gate(binary: str, config: Path, root: str, env: dict
                               "      cooldown: 30s\n"
                               "      max_cooldown: 30s\n", 1)
     breaker_cfg.write_text(revised, encoding="utf-8")
+    breaker_data = Path(root) / "breaker-data"
     proc = subprocess.Popen(
         [str(Path(binary).resolve()), "serve", "-config", str(breaker_cfg),
-         "-data", root],
+         "-data", str(breaker_data)],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
     try:
         health = f"http://127.0.0.1:{breaker_port}/healthz"
@@ -729,8 +730,9 @@ auto:
     extra_env = dict(env)
     extra_env["RATE_TEST_KEY"] = "local-only-synthetic-limited-key"
     extra_env["GUVNA_LOG_EVENTS"] = "1"
+    rate_data = Path(root) / "rate-limit-data"
     proc = subprocess.Popen(
-        [str(Path(binary).resolve()), "serve", "-config", str(config), "-data", root],
+        [str(Path(binary).resolve()), "serve", "-config", str(config), "-data", str(rate_data)],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=extra_env)
     try:
         health = f"http://127.0.0.1:{gateway_port}/healthz"
