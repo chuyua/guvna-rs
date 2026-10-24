@@ -1071,7 +1071,7 @@ auto:
                 "SELECT SUM(request_count),SUM(failure_count) FROM hourly_stats "
                 "WHERE provider='down' AND model='down'").fetchone()
             journal_mode = db.execute("PRAGMA journal_mode").fetchone()[0].lower()
-            max_pages = db.execute("PRAGMA max_page_count").fetchone()[0]
+            actual_pages = db.execute("PRAGMA page_count").fetchone()[0]
             columns = {row[1].lower() for row in db.execute("PRAGMA table_info(request_events)")}
         finally:
             db.close()
@@ -1087,7 +1087,9 @@ auto:
               and down_health[1] >= 3 and down_health[2] == 1,
               f"provider health history was not persisted: {down_health}")
         check(journal_mode == "wal", f"telemetry database journal mode={journal_mode}")
-        check(max_pages <= 8192, f"telemetry SQLite page cap unexpectedly grew: {max_pages}")
+        # max_page_count is connection-local; a read-only inspection connection
+        # reports the compile-time limit, not the writer imposed limit.
+        check(actual_pages <= 8192, f"telemetry SQLite file exceeded the 32 MiB page target: {actual_pages}")
         forbidden = {"prompt", "body", "request_body", "api_key", "authorization", "headers"}
         check(not columns.intersection(forbidden),
               f"telemetry schema contains sensitive payload columns: {columns.intersection(forbidden)}")
@@ -1112,6 +1114,7 @@ auto:
             "sqlite_failure_breakdown": failure_breakdown,
             "sqlite_down_provider_hourly": {"attempts": down_hourly[0], "failures": down_hourly[1]},
             "sqlite_down_provider_health": {"penalty": down_health[0], "consecutive_failures": down_health[1], "demoted": bool(down_health[2])},
+            "sqlite_pages": actual_pages,
             "sqlite_bytes_with_wal": db_size,
             "rss_kib": usage["VmRSS"], "fds": usage["fd"],
             "threads": usage["Threads"]
