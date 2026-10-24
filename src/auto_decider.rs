@@ -153,7 +153,8 @@ impl AutoDecider {
             .post(&self.endpoint)
             .bearer_auth(&self.key)
             .timeout(self.timeout)
-            .json(&body);
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&body).ok()?);
         tokio::time::timeout(self.timeout, async {
             let mut response = req.send().await.ok()?;
             if !response.status().is_success()
