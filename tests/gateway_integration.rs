@@ -489,7 +489,7 @@ async fn stalled_authenticated_uploads_cannot_bypass_payload_memory_gate() {
     let router = make_app(&url, &url);
     let polls = Arc::new(AtomicUsize::new(0));
     let mut tasks = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..8 {
         let polls = polls.clone();
         let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
             polls.fetch_add(1, Ordering::SeqCst);
@@ -505,14 +505,14 @@ async fn stalled_authenticated_uploads_cannot_bypass_payload_memory_gate() {
         tasks.push(tokio::spawn(async move { router.oneshot(request).await }));
     }
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while polls.load(Ordering::SeqCst) < 4 {
+        while polls.load(Ordering::SeqCst) < 8 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("all stalled uploads must reach body polling");
 
-    // A fifth request must fail before touching its own never-ending body.
+    // A ninth request must fail before touching its own never-ending body.
     for path in ["/v1/chat/completions", "/v1/embeddings", "/v1/responses"] {
         let body =
             Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
@@ -1000,9 +1000,9 @@ async fn oversized_later_sse_chunk_returns_incomplete_without_failover() {
 async fn mixed_endpoint_slow_uploads_share_payload_admission_telemetry_and_recover() {
     let (url, calls) = start_upstream(StatusCode::OK).await;
     let router = make_app(&url, &url);
-    let mut upload_tasks = Vec::with_capacity(4);
+    let mut upload_tasks = Vec::with_capacity(8);
     // Exercise the payload-memory gate across all three body-reading routes.
-    for index in 0..4 {
+    for index in 0..8 {
         let path = match index % 3 {
             0 => "/v1/chat/completions",
             1 => "/v1/embeddings",
@@ -1022,7 +1022,7 @@ async fn mixed_endpoint_slow_uploads_share_payload_admission_telemetry_and_recov
     tokio::time::timeout(std::time::Duration::from_secs(4), async {
         loop {
             let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
-            if metric_value(&metrics, "active_requests") == 4 {
+            if metric_value(&metrics, "active_requests") == 8 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1053,7 +1053,7 @@ async fn mixed_endpoint_slow_uploads_share_payload_admission_telemetry_and_recov
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
     assert_eq!(metric_value(&metrics, "admission_rejections_total"), 3);
-    assert_eq!(metric_value(&metrics, "active_requests"), 4);
+    assert_eq!(metric_value(&metrics, "active_requests"), 8);
     for task in upload_tasks {
         task.abort();
         let _ = task.await;

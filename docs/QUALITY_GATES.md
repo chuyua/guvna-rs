@@ -51,7 +51,7 @@ concurrent clients, large-body fuzzing, prolonged soak, or live upstream
 compatibility. Those are separate extended/nightly gates and must report
 peak memory, P95/P99, error rate and throughput with the machine size.
 
-Inbound request bodies are capped at 8 MiB, with at most four requests
+Inbound request bodies are capped at 8 MiB, with at most eight requests
 simultaneously holding raw body buffers, parsed JSON trees, and per-candidate
 serialization buffers. Payload-slot wait is capped at one second and an
 authorized body read at 30 seconds, so a slow upload cannot pin a memory slot

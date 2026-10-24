@@ -47,7 +47,7 @@ const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_INFLIGHT_REQUESTS: usize = 128;
 // Bound concurrent request-body buffers and JSON trees independently from
 // long-lived SSE responses, which may remain admitted after parsing is done.
-const MAX_INFLIGHT_PAYLOADS: usize = 4;
+const MAX_INFLIGHT_PAYLOADS: usize = 8;
 const PAYLOAD_SLOT_WAIT: Duration = Duration::from_secs(1);
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_AGGREGATIONS: usize = 4;

@@ -60,7 +60,7 @@ body limit is enforced for authorized requests, including chunked requests;
 invalid credentials are rejected without consuming a slow or unbounded body.
 Authorized requests acquire a shared admission permit before reading the
 request body, preventing slow uploads from evading the global 128-request
-limit. A separate four-slot payload-memory gate bounds concurrent body reads,
+limit. A separate eight-slot payload-memory gate bounds concurrent body reads,
 JSON parsing and per-candidate serialization without reducing the number of
 already-started streams. Waiting for a payload slot is capped at one second,
 and authorized body reads at 30 seconds; payload slots release after dispatch,
