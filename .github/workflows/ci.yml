@@ -8,25 +8,10 @@ permissions:
   contents: read
 
 jobs:
-  resolve-lockfile:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo generate-lockfile
-      - uses: actions/upload-artifact@v4
-        with:
-          name: resolved-cargo-lockfile
-          path: Cargo.lock
-          retention-days: 1
   validate:
-    needs: resolve-lockfile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: resolved-cargo-lockfile
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -37,16 +22,12 @@ jobs:
       - run: target/release/guvna --version
 
   adversarial-resource-gate:
-    needs: resolve-lockfile
     name: Adversarial Linux resource gate
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
-        with:
-          name: resolved-cargo-lockfile
       - run: cargo build --release --locked
       - name: Enforce idle RSS, CPU, leak and local chaos pressure gates
         run: python3 scripts/quality_gate.py --binary target/release/guvna --requests 2000 --clients 64 --idle-seconds 10 --max-idle-rss-mib 16 --max-peak-rss-mib 48 --max-rss-growth-mib 6 --out quality-results.json
