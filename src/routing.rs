@@ -192,6 +192,32 @@ auto:
         }
     }
     #[test]
+    fn auto_fallback_limit_rejects_zero_and_oversized_values() {
+        let base = r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://p.example
+    key_env: P
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: m
+"#;
+        for invalid in [0, 33, usize::MAX] {
+            let yaml = base.replace(
+                "  enabled: true",
+                &format!("  enabled: true\n  max_candidates: {invalid}"),
+            );
+            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            assert!(cfg.validate().is_err(), "{invalid} should fail");
+        }
+        let cfg: Config = serde_yaml::from_str(base).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(resolve_auto(&cfg, 0).unwrap().len(), 1);
+    }
+    #[test]
     fn chain_and_namespaced_passthrough() {
         let cfg: Config = serde_yaml::from_str(
             r#"
