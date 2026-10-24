@@ -885,7 +885,8 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(4);
         let metrics = Arc::new(Metrics::default());
         let worker_metrics = Arc::clone(&metrics);
-        let handle = thread::spawn(move || worker(receiver, path, worker_metrics));
+        let worker_path = path.clone();
+        let handle = thread::spawn(move || worker(receiver, worker_path, worker_metrics));
         sender
             .try_send(event(123, "provider", "model", 503, 1, "provider_5xx"))
             .unwrap();
