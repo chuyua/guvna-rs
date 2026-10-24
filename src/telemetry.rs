@@ -137,6 +137,7 @@ fn allowed_failure_type(value: &'static str) -> &'static str {
     match value {
         "success"
         | "stream_started"
+        | "client_cancelled"
         | "rate_limited"
         | "credential_error"
         | "caller_error"
@@ -249,7 +250,11 @@ impl Telemetry {
     ) {
         let mut context = TelemetryContext::new(provider, model, failure_type);
         context.set_trace(trace.0, trace.1, true);
-        let status = if failure_type == "success" { 200 } else { 502 };
+        let status = match failure_type {
+            "success" => 200,
+            "client_cancelled" => 499,
+            _ => 502,
+        };
         self.enqueue_observation("chat", status, elapsed, context, false, metrics);
     }
 
@@ -508,6 +513,18 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
             disagreed INTEGER NOT NULL CHECK (disagreed IN (0,1))
         );
         CREATE INDEX IF NOT EXISTS shadow_events_ts ON shadow_events(ts);
+        CREATE TABLE IF NOT EXISTS stream_terminals (
+            ts INTEGER NOT NULL,
+            request_id TEXT NOT NULL,
+            attempt_index INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            outcome TEXT NOT NULL CHECK (outcome IN
+                ('success','transport_error','client_cancelled')),
+            elapsed_ms INTEGER NOT NULL,
+            PRIMARY KEY (request_id, attempt_index)
+        );
+        CREATE INDEX IF NOT EXISTS stream_terminals_ts ON stream_terminals(ts);
     ",
     )?;
     for table in ["request_events", "failure_events"] {
@@ -554,7 +571,10 @@ fn secure_sidecars(path: &Path) {
 fn secure_sidecars(_path: &Path) {}
 
 fn is_failure(event: &Event) -> bool {
-    !matches!(event.failure_type, "success" | "stream_started")
+    !matches!(
+        event.failure_type,
+        "success" | "stream_started" | "client_cancelled"
+    )
 }
 
 fn health_failure(event: &Event) -> Option<bool> {
@@ -602,6 +622,11 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
             "INSERT INTO shadow_events
              (ts,request_id,baseline_provider,baseline_model,suggested_provider,suggested_model,available,disagreed)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        )?;
+        let mut terminal = tx.prepare_cached(
+            "INSERT OR IGNORE INTO stream_terminals
+             (ts,request_id,attempt_index,provider,model,outcome,elapsed_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
         )?;
         let mut health = tx.prepare_cached(
             "INSERT INTO provider_health
@@ -711,6 +736,25 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                     event.elapsed_ms,
                 ])?;
             }
+            // Only actual SSE terminal callbacks enter this table. The initial
+            // stream_started request row and failed candidate attempts cannot
+            // masquerade as a completed stream or a client cancellation.
+            if event.stream_requested
+                && !event.record_request
+                && !event.count_attempt
+                && event.shadow.is_none()
+                && let (Some(request_id), Some(attempt)) = (&event.request_id, event.attempt_index)
+            {
+                terminal.execute(params![
+                    event.ts,
+                    request_id,
+                    attempt,
+                    event.provider,
+                    event.model,
+                    event.failure_type,
+                    event.elapsed_ms
+                ])?;
+            }
             if let Some(failed) = health_failure(event) {
                 let failed = i64::from(failed);
                 // Restore uses per-provider/model candidate rows, never '*'.
@@ -738,6 +782,10 @@ fn prune_expired(conn: &mut Connection, now: i64) -> rusqlite::Result<()> {
     )?;
     tx.execute(
         "DELETE FROM shadow_events WHERE ts < ?1 OR ts > ?2",
+        params![now - REQUEST_RETENTION_SECS, now.saturating_add(300)],
+    )?;
+    tx.execute(
+        "DELETE FROM stream_terminals WHERE ts < ?1 OR ts > ?2",
         params![now - REQUEST_RETENTION_SECS, now.saturating_add(300)],
     )?;
     tx.execute(
@@ -772,8 +820,13 @@ fn recover_page_capacity(conn: &mut Connection, now: i64) -> rusqlite::Result<bo
          (SELECT rowid FROM shadow_events ORDER BY ts LIMIT 2048)",
         [],
     )?;
+    let removed_terminals = tx.execute(
+        "DELETE FROM stream_terminals WHERE rowid IN
+         (SELECT rowid FROM stream_terminals ORDER BY ts LIMIT 2048)",
+        [],
+    )?;
     tx.commit()?;
-    Ok(removed_requests + removed_failures + removed_shadows > 0)
+    Ok(removed_requests + removed_failures + removed_shadows + removed_terminals > 0)
 }
 
 fn now_secs() -> i64 {
@@ -1002,6 +1055,118 @@ mod tests {
             stream_requested: false,
             shadow: None,
         }
+    }
+
+    #[test]
+    fn sse_terminal_outcomes_are_request_linked_and_cancellations_do_not_poison_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let telemetry = Telemetry::start(dir.path(), Arc::clone(&metrics)).unwrap();
+        for (trace, outcome) in [
+            ("trace-completed", "success"),
+            ("trace-failed", "transport_error"),
+            ("trace-cancelled", "client_cancelled"),
+        ] {
+            let mut start = TelemetryContext::new("p", "model", "stream_started");
+            start.set_trace(trace, 1, true);
+            telemetry.submit(
+                "chat",
+                200,
+                Duration::from_millis(12),
+                true,
+                Some(start),
+                &metrics,
+            );
+            telemetry.observe_stream_health(
+                "p",
+                "model",
+                outcome,
+                Duration::from_millis(40),
+                (trace, 1),
+                &metrics,
+            );
+        }
+        // Duplicate callback must not create a second terminal row.
+        telemetry.observe_stream_health(
+            "p",
+            "model",
+            "client_cancelled",
+            Duration::from_millis(60),
+            ("trace-cancelled", 1),
+            &metrics,
+        );
+        assert!(telemetry.flush(Duration::from_secs(3)));
+        let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        let starts: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM request_events WHERE failure_type='stream_started'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(starts, 3);
+        let terminals: Vec<(String, String, i64)> = {
+            let mut stmt = db.prepare(
+                "SELECT request_id,outcome,attempt_index FROM stream_terminals ORDER BY request_id"
+            ).unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            terminals,
+            vec![
+                ("trace-cancelled".into(), "client_cancelled".into(), 1),
+                ("trace-completed".into(), "success".into(), 1),
+                ("trace-failed".into(), "transport_error".into(), 1),
+            ]
+        );
+        let failures: i64 = db
+            .query_row("SELECT COUNT(*) FROM failure_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(failures, 1, "client cancellation is not a provider failure");
+        let summary = crate::scoring::read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(
+            summary["stream_terminal_metrics"]["terminal_observations"],
+            3
+        );
+        assert_eq!(summary["stream_terminal_metrics"]["completed"], 1);
+        assert_eq!(summary["stream_terminal_metrics"]["upstream_failed"], 1);
+        assert_eq!(summary["stream_terminal_metrics"]["client_cancelled"], 1);
+        assert_eq!(
+            summary["stream_terminal_metrics"]["completion_rate_excluding_client_cancellation"],
+            0.5
+        );
+        let hour_counts: i64 = db
+            .query_row("SELECT SUM(request_count) FROM hourly_stats", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            hour_counts, 3,
+            "terminal events cannot double count requests"
+        );
+    }
+
+    #[test]
+    fn terminal_only_capacity_recovery_reclaims_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-capacity.sqlite3");
+        let mut conn = open_database(&path).unwrap();
+        conn.execute(
+            "INSERT INTO stream_terminals VALUES (?1,'trace',1,'p','m','client_cancelled',10)",
+            [now_secs()],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA max_page_count=1").unwrap();
+        assert!(recover_page_capacity(&mut conn, now_secs()).unwrap());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stream_terminals", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

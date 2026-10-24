@@ -207,6 +207,37 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
     } else {
         None
     };
+    // Legacy databases without the terminal table remain readable. These
+    // are actual end-of-stream observations, not inferred from SSE headers.
+    let stream_terminal_metrics = if conn
+        .prepare("SELECT request_id,outcome FROM stream_terminals LIMIT 0")
+        .is_ok()
+    {
+        let (total, completed, failed, cancelled): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                    COALESCE(SUM(outcome='success'),0),
+                    COALESCE(SUM(outcome='transport_error'),0),
+                    COALESCE(SUM(outcome='client_cancelled'),0)
+                 FROM stream_terminals WHERE ts >= ?1",
+                params![since],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|_| "cannot read stream terminal summary")?;
+        Some(json!({
+            "terminal_observations":total,
+            "completed":completed,
+            "upstream_failed":failed,
+            "client_cancelled":cancelled,
+            "completion_rate_excluding_client_cancellation":
+                if total > cancelled {
+                    Some(completed as f64 / (total - cancelled) as f64)
+                } else {None},
+            "actual_terminal_only":true,
+        }))
+    } else {
+        None
+    };
     Ok(json!({
         "enabled":true,"source":"local_sqlite_read_only",
         "window_hours":hours,
@@ -217,6 +248,7 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
         "candidates":candidates,
         "request_metrics":request_metrics,
         "shadow_metrics":shadow_metrics,
+        "stream_terminal_metrics":stream_terminal_metrics,
          "request_metrics_notes":"Only traced terminal request rows count toward fallback rate; the first-attempt success rate is restricted to nonstream completions, not unverified SSE headers. Old SQLite databases report null until migrated.",
          "notes":"raw success_rate includes all failure classes; observed_success_rate counts only confirmed nonstream successes and attempted upstream provider failures, excluding caller/local/credential errors and unverified stream starts. Qualification requires 20 observed samples. p95 separates nonstream completion from SSE response-header latency, sampled from up to 512 recent downstream rows per candidate; neither is a counterfactual outcome or complete SSE duration.",
     }))
@@ -265,6 +297,7 @@ mod tests {
         }
         let result = read_scoring(dir.path(), 1).unwrap();
         assert!(result["shadow_metrics"].is_null());
+        assert!(result["stream_terminal_metrics"].is_null());
         assert_eq!(result["request_metrics"]["traced_requests"], 4);
         assert_eq!(result["request_metrics"]["requests_with_fallback"], 1);
         assert_eq!(result["request_metrics"]["fallback_rate"], 0.25);

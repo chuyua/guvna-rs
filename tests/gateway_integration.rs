@@ -2337,6 +2337,71 @@ async fn metrics_stream_success_failure_and_client_disconnect() {
 }
 
 #[tokio::test]
+async fn cancelled_chat_sse_persists_actual_terminal_with_same_trace_and_no_provider_failure() {
+    use guvna::gateway::app_with_state;
+    use http_body_util::BodyExt;
+    use rusqlite::Connection;
+    let dir = tempfile::tempdir().unwrap();
+    let (url, drops) = start_stalled_sse().await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_env: K\n\
+         chains:\n  - name: demo\n    steps:\n      - provider: p\n        model: m\n"
+    ))
+    .unwrap();
+    let mut state = AppState::new(
+        config,
+        HashMap::from([("K".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, shared) = app_with_state(state);
+    let response = router
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(first.into_data().unwrap().starts_with(b"data: "));
+    drop(body);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while drops.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(shared.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let (trace, attempt): (String, i64) = db.query_row(
+        "SELECT request_id,attempt_index FROM request_events WHERE failure_type='stream_started'",
+        [], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).unwrap();
+    let (terminal_trace, terminal_attempt, outcome): (String, i64, String) = db
+        .query_row(
+            "SELECT request_id,attempt_index,outcome FROM stream_terminals",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((trace, attempt), (terminal_trace, terminal_attempt));
+    assert_eq!(outcome, "client_cancelled");
+    let failures: i64 = db
+        .query_row("SELECT COUNT(*) FROM failure_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(failures, 0);
+    let provider_health: i64 = db
+        .query_row("SELECT COUNT(*) FROM provider_health", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(provider_health, 0);
+}
+
+#[tokio::test]
 async fn metrics_responses_stream_terminal_outcomes() {
     let (url, _) = start_sse(vec![RESP_START_A, RESP_START_B, RESP_END, SSE_DONE]).await;
     let app = make_app(&url, &url);

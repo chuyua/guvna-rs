@@ -41,6 +41,20 @@ impl Drop for ChatStreamState {
         // Dropping a partially consumed body must free the upstream request permit.
         if self._permit.is_some() && !self.terminal_reported {
             Metrics::inc(&self.owner.metrics.chat_stream_cancelled);
+            // Client disconnect is a terminal observation, not an upstream
+            // failure. Never punish the provider, key pool or circuit breaker.
+            if let Some(telemetry) = &self.owner.telemetry {
+                let provider = &self.owner.config.providers[self.provider_index].name;
+                telemetry.observe_stream_health(
+                    provider,
+                    self.owner
+                        .telemetry_model_name(self.provider_index, &self.model),
+                    "client_cancelled",
+                    self.started_at.elapsed(),
+                    (&self.request_id, self.attempt_index),
+                    &self.owner.metrics,
+                );
+            }
         }
     }
 }

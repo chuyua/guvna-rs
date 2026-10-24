@@ -193,3 +193,18 @@ downstream_p95_ms now measures nonstream downstream completions only.
 stream_header_p95_ms reports SSE response-header time separately, not full
 stream duration. Both derive from a bounded latest-512-row combined sample.
 Shadow comparisons remain advisory and never claim counterfactual success.
+
+### SSE terminal correlation (Issue #129)
+
+The opt-in SQLite writer stores actual Chat SSE terminal outcomes in
+stream_terminals with the same random request ID and attempt index as the
+initial stream_started row. Outcomes are success, transport_error or
+client_cancelled; a dropped downstream body records client_cancelled
+without penalizing the provider, circuit breaker or key pool. Only one
+terminal record is kept per request/attempt. No prompt or credential is
+persisted. guvna status --scoring exposes stream_terminal_metrics
+including actual completions, upstream failures and client cancellations.
+The completion rate excludes client cancellations from its denominator;
+it does not infer completion from SSE headers. Old SQLite databases without
+this table report null until the writer upgrades them. Terminal details
+expire after seven days and participate in bounded full-disk recovery.
