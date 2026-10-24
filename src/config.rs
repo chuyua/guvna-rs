@@ -71,6 +71,9 @@ pub struct AutoConfig {
     pub discover_from_chains: bool,
     /// External model selector, disabled by default and fail-open.
     pub decider: AutoDeciderConfig,
+    /// Opt-in Go-compatible conservative context/vision capability estimates.
+    pub use_model_registry: bool,
+    pub capability_overrides: BTreeMap<String, ModelCapabilityOverride>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -97,6 +100,13 @@ impl Default for AutoDeciderConfig {
             shadow_only: false,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCapabilityOverride {
+    pub context_tokens: Option<usize>,
+    pub supports_images: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -377,6 +387,14 @@ impl Config {
             .is_some_and(|limit| !(1..=32).contains(&limit))
         {
             return Err("auto max_candidates must be 1..=32".into());
+        }
+        if self
+            .auto
+            .capability_overrides
+            .values()
+            .any(|entry| entry.context_tokens == Some(0))
+        {
+            return Err("model capability context_tokens must be greater than zero".into());
         }
         if self.auto.decider.shadow_only && !self.auto.decider.enabled {
             return Err("auto decider shadow_only requires enabled: true".into());

@@ -7,6 +7,7 @@ pub mod config;
 pub mod gateway;
 pub mod keypool;
 pub mod metrics;
+pub mod model_capabilities;
 pub mod ops_log;
 pub mod outcome;
 pub mod routing;

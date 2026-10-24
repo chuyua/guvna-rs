@@ -171,3 +171,17 @@ Local-only runtime status exposes auto_shadow_total,
 auto_shadow_disagreements and auto_shadow_unavailable without model,
 provider or prompt labels. These are ranking agreement measurements, NOT
 counterfactual success rates or latency improvement guarantees.
+
+## Optional Go-compatible conservative capability registry (#129)
+
+Set auto.use_model_registry: true to enable an embedded conservative context
+window and known text-only model catalogue derived from the Go baseline.
+Unknown models receive an 8192-token limit (rather than zero) and otherwise
+remain image-eligible. To avoid silently changing legacy routes this feature
+is disabled by default.
+
+Explicit per-candidate max_context_tokens / supports_images take precedence.
+Local config.auto.capability_overrides can override context_tokens and
+supports_images by exact wire model name, without fetching external metadata.
+Overrides also work without enabling the embedded registry. The table is a
+conservative local hint and is not dynamically proven against upstream.
