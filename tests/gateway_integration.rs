@@ -1064,6 +1064,10 @@ async fn invalid_stream_and_empty_model_rejected_without_upstream_calls() {
     for (model, extra, code) in [
         ("demo", r#","stream":"true""#, "invalid_stream"),
         ("demo", r#","stream":null"#, "invalid_stream"),
+        ("demo", r#","n":0"#, "invalid_n"),
+        ("demo", r#","n":-1"#, "invalid_n"),
+        ("demo", r#","n":"1""#, "invalid_n"),
+        ("demo", r#","n":1.5"#, "invalid_n"),
         ("", "", "invalid_model"),
     ] {
         let (status, value) = call(router.clone(), request(model, extra, "client")).await;
@@ -2201,6 +2205,34 @@ async fn circuit_breaker_skips_repeated_failed_upstream_then_single_probe_recove
     assert_eq!(recovered["choices"][0]["message"]["content"], "recovered");
     assert_eq!(down_hits.load(Ordering::SeqCst), 5);
     assert!(healthy_hits.load(Ordering::SeqCst) >= 15);
+}
+
+#[tokio::test]
+async fn transient_5xx_quarantines_only_the_used_credential_for_configured_duration() {
+    let (url, hits) = start_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_env: KEY\n    quarantine:\n      transient: 30s\nchains:\n  - name: demo\n    steps:\n      - provider: p\n        model: provider-model\n"
+    ))
+    .unwrap();
+    let app = app(AppState::new(
+        config,
+        HashMap::from([("KEY".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, _) = call(app.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let (_, metrics) = get_metrics(app.clone(), Some("client")).await;
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 1);
+
+    let (status, _) = call(app, request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "quarantined credentials must not be retried early"
+    );
 }
 
 #[tokio::test]
@@ -3526,6 +3558,32 @@ async fn sse_only_aggregate_preserves_reasoning_and_refusal_without_replaying_to
         assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
         assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
     }
+}
+
+#[tokio::test]
+async fn failed_stream_only_aggregation_is_not_retried_for_duplicate_chain_steps() {
+    let bad = aggregate_chat_frame(json!({"choices":[{"index":0,
+        "delta":{"audio":{"data":"unsupported"}},"finish_reason":null}]}));
+    let (primary, primary_hits, _) =
+        start_strict_stream_only(vec![bad, b"data: [DONE]\n\n".to_vec()]).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let yaml = format!(
+        "providers:\n  - name: streaming\n    type: openai\n    base_url: {primary}\n    key_env: STREAM_KEY\n    stream_only: true\n  - name: backup\n    type: openai\n    base_url: {backup}\n    key_env: BACKUP_KEY\nchains:\n  - name: ordered\n    steps:\n      - provider: streaming\n        model: first-model\n      - provider: streaming\n        model: first-model\n      - provider: backup\n        model: backup-model\n"
+    );
+    let config: Config = serde_yaml::from_str(&yaml).unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("STREAM_KEY".into(), "stream-secret".into()),
+            ("BACKUP_KEY".into(), "backup-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, output) = call(router, request("ordered", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

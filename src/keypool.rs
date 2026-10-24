@@ -33,6 +33,7 @@ pub struct KeyPool {
     rotation: String,
     auth_cooldown: Duration,
     rate_cooldown: Duration,
+    transient_cooldown: Option<Duration>,
 }
 
 impl KeyPool {
@@ -63,6 +64,14 @@ impl KeyPool {
             rotation: provider.rotation.clone(),
             auth_cooldown: provider.quarantine.auth()?,
             rate_cooldown: provider.quarantine.rate_limit()?,
+            // Preserve historical behavior unless this formerly ignored
+            // provider policy is explicitly configured.
+            transient_cooldown: provider
+                .quarantine
+                .transient
+                .as_ref()
+                .map(|_| provider.quarantine.transient())
+                .transpose()?,
         })
     }
 
@@ -126,7 +135,13 @@ impl KeyPool {
                     .unwrap_or_default()
                     .min(Duration::from_secs(24 * 3600)),
             ),
-            _ => return false, // Never quarantine keys for 5xx, 400, DNS or cancellation.
+            Outcome::ProviderTransient | Outcome::TransportFailure => {
+                match self.transient_cooldown {
+                    Some(duration) if !duration.is_zero() => duration,
+                    _ => return false,
+                }
+            }
+            _ => return false, // Caller rejections and cancellations never quarantine keys.
         };
         let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         let Some(key) = inner.credentials.get_mut(lease.index) else {
@@ -180,6 +195,7 @@ impl KeyPool {
         match outcome {
             Outcome::CredentialAuth => Some(self.auth_cooldown),
             Outcome::RateLimited => Some(self.rate_cooldown),
+            Outcome::ProviderTransient | Outcome::TransportFailure => self.transient_cooldown,
             _ => None,
         }
     }
@@ -199,6 +215,7 @@ key_envs: [A, B]
 quarantine:
   auth: 48h
   rate_limit: 2h
+  transient: 30s
 "#,
         )
         .unwrap()
@@ -222,12 +239,52 @@ quarantine:
             pool.configured_cooldown(Outcome::RateLimited),
             Some(Duration::from_secs(2 * 3600))
         );
+        assert_eq!(
+            pool.configured_cooldown(Outcome::ProviderTransient),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            pool.configured_cooldown(Outcome::TransportFailure),
+            Some(Duration::from_secs(30))
+        );
         let a = pool.acquire(&HashSet::new()).unwrap();
         let a_late = a.clone();
         assert!(pool.record(&a, Outcome::RateLimited));
         assert!(!pool.record(&a_late, Outcome::RateLimited));
         assert!(pool.acquire(&HashSet::new()).is_some()); // other credential works
         assert!(!pool.record(&a_late, Outcome::ProviderTransient));
+    }
+
+    #[test]
+    fn transient_failures_quarantine_credentials_and_keep_generation_fencing() {
+        let mut provider = provider();
+        provider.key_envs = vec!["A".into()];
+        let keys = HashMap::from([("A".into(), "a-secret".into())]);
+        for outcome in [Outcome::ProviderTransient, Outcome::TransportFailure] {
+            let pool = KeyPool::new(&provider, &keys).unwrap();
+            let lease = pool.acquire(&HashSet::new()).unwrap();
+            let late = lease.clone();
+            assert!(pool.record(&lease, outcome));
+            assert!(!pool.record(&late, outcome));
+            assert!(pool.acquire(&HashSet::new()).is_none());
+        }
+    }
+
+    #[test]
+    fn transient_is_opt_in_to_preserve_existing_circuit_breaker_behavior() {
+        let mut provider = provider();
+        provider.quarantine.transient = None;
+        provider.key_envs = vec!["A".into()];
+        let pool = KeyPool::new(
+            &provider,
+            &HashMap::from([("A".into(), "safe-test-secret".into())]),
+        )
+        .unwrap();
+        let lease = pool.acquire(&HashSet::new()).unwrap();
+        assert_eq!(pool.configured_cooldown(Outcome::ProviderTransient), None);
+        assert!(!pool.record(&lease, Outcome::ProviderTransient));
+        assert!(!pool.record(&lease, Outcome::TransportFailure));
+        assert!(pool.acquire(&HashSet::new()).is_some());
     }
 
     #[test]

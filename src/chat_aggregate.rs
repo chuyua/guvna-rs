@@ -14,8 +14,14 @@ static SYNTHETIC_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TOTAL_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AGGREGATED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
-const MAX_EVENTS: usize = 16_384;
-const STREAM_IDLE: Duration = Duration::from_secs(15);
+// Reasoning models may emit one SSE event per reasoning token. Keep this
+// count high enough for long generations while the independent byte budgets
+// below remain the primary memory bound.
+const MAX_EVENTS: usize = 262_144;
+// A long prompt can leave a reasoning model silent for more than 15 seconds.
+// The separate 10-minute absolute lifetime and shared walk budget still bound
+// resource use and total request latency.
+const STREAM_IDLE: Duration = Duration::from_secs(60);
 // Long generations from SSE-only providers must not inherit the ordinary
 // 90-second JSON-body deadline. The idle timer still rejects stalled streams,
 // and this separate hard cap prevents indefinite drip-fed connections.
@@ -28,7 +34,9 @@ pub(super) enum AggregateError {
     InvalidStream,
     IdleTimeout,
     UpstreamTransport,
-    ResourceLimit,
+    EventLimit,
+    InputLimit,
+    OutputLimit,
 }
 impl From<()> for AggregateError {
     fn from(_: ()) -> Self {
@@ -41,7 +49,9 @@ impl AggregateError {
             Self::InvalidStream => "aggregation_invalid_sse",
             Self::IdleTimeout => "aggregation_idle_timeout",
             Self::UpstreamTransport => "aggregation_transport_failure",
-            Self::ResourceLimit => "aggregation_resource_limit",
+            Self::EventLimit => "aggregation_event_limit",
+            Self::InputLimit => "aggregation_input_limit",
+            Self::OutputLimit => "aggregation_output_limit",
         }
     }
 }
@@ -67,11 +77,19 @@ struct Choice {
 }
 
 fn account_bounded(used: &mut usize, size: usize) -> Result<(), AggregateError> {
-    *used = used
-        .checked_add(size)
-        .ok_or(AggregateError::ResourceLimit)?;
+    *used = used.checked_add(size).ok_or(AggregateError::OutputLimit)?;
     if *used > MAX_AGGREGATED_OUTPUT_BYTES {
-        return Err(AggregateError::ResourceLimit);
+        return Err(AggregateError::OutputLimit);
+    }
+    Ok(())
+}
+
+fn account_event(event_count: &mut usize) -> Result<(), AggregateError> {
+    *event_count = (*event_count)
+        .checked_add(1)
+        .ok_or(AggregateError::EventLimit)?;
+    if *event_count > MAX_EVENTS {
+        return Err(AggregateError::EventLimit);
     }
     Ok(())
 }
@@ -293,19 +311,16 @@ pub(super) async fn aggregate(
             Ok(Ok(Some(bytes))) => bytes,
         };
         if bytes.len() > MAX_CHUNK_BYTES {
-            return Err(AggregateError::ResourceLimit);
+            return Err(AggregateError::InputLimit);
         }
         total_received = total_received
             .checked_add(bytes.len())
-            .ok_or(AggregateError::ResourceLimit)?;
+            .ok_or(AggregateError::InputLimit)?;
         if total_received > MAX_TOTAL_STREAM_BYTES {
-            return Err(AggregateError::ResourceLimit);
+            return Err(AggregateError::InputLimit);
         }
         for frame in parser.push(&bytes).map_err(|_| ())? {
-            event_count += 1;
-            if event_count > MAX_EVENTS {
-                return Err(AggregateError::ResourceLimit);
-            }
+            account_event(&mut event_count)?;
             if let Some(event) = event_payload(&frame)? {
                 apply_event(
                     &event,
@@ -396,7 +411,7 @@ mod output_budget_tests {
         });
         assert!(matches!(
             with_event(json!({"choices":[],"usage":usage}), &mut used),
-            Err(AggregateError::ResourceLimit)
+            Err(AggregateError::OutputLimit)
         ));
 
         for event in [
@@ -412,7 +427,7 @@ mod output_budget_tests {
             let mut used = MAX_AGGREGATED_OUTPUT_BYTES - 100;
             assert!(matches!(
                 with_event(event, &mut used),
-                Err(AggregateError::ResourceLimit)
+                Err(AggregateError::OutputLimit)
             ));
         }
     }
@@ -447,7 +462,25 @@ mod output_budget_tests {
     fn lifetime_is_longer_than_header_timeout_but_not_unbounded() {
         assert!(MAX_AGGREGATION_LIFETIME > Duration::from_secs(90));
         assert!(MAX_AGGREGATION_LIFETIME <= Duration::from_secs(15 * 60));
+        assert!(STREAM_IDLE >= Duration::from_secs(60));
         assert!(STREAM_IDLE < MAX_AGGREGATION_LIFETIME);
+    }
+
+    #[test]
+    fn long_reasoning_generations_fit_event_budget_but_remain_bounded() {
+        let mut count = 0;
+        for _ in 0..22_000 {
+            account_event(&mut count).unwrap();
+        }
+        assert_eq!(count, 22_000);
+        for _ in count..MAX_EVENTS {
+            account_event(&mut count).unwrap();
+        }
+        assert_eq!(count, MAX_EVENTS);
+        assert!(matches!(
+            account_event(&mut count),
+            Err(AggregateError::EventLimit)
+        ));
     }
 }
 
@@ -464,7 +497,9 @@ mod error_contract_tests {
                 AggregateError::UpstreamTransport,
                 "aggregation_transport_failure",
             ),
-            (AggregateError::ResourceLimit, "aggregation_resource_limit"),
+            (AggregateError::EventLimit, "aggregation_event_limit"),
+            (AggregateError::InputLimit, "aggregation_input_limit"),
+            (AggregateError::OutputLimit, "aggregation_output_limit"),
         ] {
             assert_eq!(error.log_event(), expected);
             assert!(

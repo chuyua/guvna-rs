@@ -666,6 +666,30 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
 
 // Convert one fully buffered Chat Completion into a non-streaming Responses
 // document. This function performs no I/O, routing or retry decisions.
+fn reasoning_text(message: &Value) -> Result<Option<String>, ()> {
+    let reasoning = message.get("reasoning").filter(|value| !value.is_null());
+    let reasoning_content = message
+        .get("reasoning_content")
+        .filter(|value| !value.is_null());
+    let text = match (reasoning, reasoning_content) {
+        (Some(left), Some(right)) => Some(format!(
+            "{}{}",
+            left.as_str().ok_or(())?,
+            right.as_str().ok_or(())?
+        )),
+        (Some(value), None) | (None, Some(value)) => Some(value.as_str().ok_or(())?.to_owned()),
+        (None, None) => None,
+    };
+    Ok(text.filter(|text| !text.is_empty()))
+}
+
+fn reasoning_item(response_id: &str, text: &str, status: &str) -> Value {
+    json!({
+        "id":format!("rs_{response_id}"),"type":"reasoning","status":status,
+        "summary":[],"content":[{"type":"reasoning_text","text":text}]
+    })
+}
+
 fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) -> Response {
     // Validate and translate usage once for both text and function-call responses.
     let usage = &chat["usage"];
@@ -736,7 +760,18 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
         );
     }
     let created_at = chat["created"].as_i64();
-    let calls = chat["choices"][0]["message"]["tool_calls"].as_array();
+    let message = &chat["choices"][0]["message"];
+    let reasoning = match reasoning_text(message) {
+        Ok(reasoning) => reasoning,
+        Err(()) => {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_chat_reasoning",
+                "Upstream reasoning fields must contain text",
+            );
+        }
+    };
+    let calls = message["tool_calls"].as_array();
     if chat["choices"][0]["finish_reason"] == "tool_calls" && calls.is_none_or(Vec::is_empty) {
         return error(
             StatusCode::BAD_GATEWAY,
@@ -762,8 +797,11 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
                 "Tool calls require tool_calls finish reason",
             );
         }
-        let mut output = Vec::with_capacity(calls.map_or(0, Vec::len) + 1);
-        let content = &chat["choices"][0]["message"]["content"];
+        let mut output = Vec::with_capacity(calls.map_or(0, Vec::len) + 2);
+        if let Some(reasoning) = reasoning.as_deref() {
+            output.push(reasoning_item(response_id, reasoning, "completed"));
+        }
+        let content = &message["content"];
         if let Some(text) = content.as_str().filter(|text| !text.is_empty()) {
             output.push(json!({"id":format!("msg_{}",response_id),"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":text,"annotations":[]}]}));
         } else if !content.is_null() && content.as_str() != Some("") {
@@ -816,19 +854,24 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
             "output":output, "output_text":content.as_str().unwrap_or(""), "usage":translated_usage, "created_at":created_at, "incomplete_details":Value::Null, "metadata":metadata,
         }))).into_response();
     }
-    let content = chat["choices"][0]["message"]["content"].as_str();
-    let Some(content) = content else {
-        return error(
-            StatusCode::BAD_GATEWAY,
-            "unsupported_chat_output",
-            "Only text chat responses can be translated",
-        );
+    let content_value = &message["content"];
+    let content = match content_value.as_str() {
+        Some(content) => content,
+        None if content_value.is_null() && reasoning.is_some() => "",
+        _ => {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "unsupported_chat_output",
+                "Only text chat responses can be translated",
+            );
+        }
     };
     // A truncated chat completion must never be reported as a completed Response.
     let finish_reason = chat["choices"][0]["finish_reason"].as_str();
     let (response_status, incomplete_details) = match finish_reason {
         Some("stop") => ("completed", Value::Null),
         Some("length") => ("incomplete", json!({"reason":"max_output_tokens"})),
+        Some("content_filter") => ("incomplete", json!({"reason":"content_filter"})),
         _ => {
             return error(
                 StatusCode::BAD_GATEWAY,
@@ -838,10 +881,92 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
         }
     };
     let output_status = response_status;
+    let mut output = Vec::with_capacity(2);
+    if let Some(reasoning) = reasoning.as_deref() {
+        output.push(reasoning_item(response_id, reasoning, output_status));
+    }
+    if !content.is_empty() || reasoning.is_none() {
+        output.push(json!({"id":format!("msg_{response_id}"), "type":"message", "status":output_status,
+            "role":"assistant", "content":[{"type":"output_text","text":content,"annotations":[]}]}));
+    }
     (StatusCode::OK, Json(json!({
         "id":chat["id"], "object":"response", "status":response_status, "incomplete_details":incomplete_details, "created_at":created_at, "model":logical_model,
-        "output":[{"id":format!("msg_{}",response_id), "type":"message", "status":output_status, "role":"assistant", "content":[{"type":"output_text","text":content,"annotations":[]}]}],
+        "output":output,
         "output_text":content,
         "usage": translated_usage, "metadata":metadata
     }))).into_response()
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn nonstream_reasoning_fields_are_preserved_in_responses_output() {
+        for field in ["reasoning_content", "reasoning"] {
+            let mut message = json!({"role":"assistant","content":"answer"});
+            message[field] = json!("upstream reasoning");
+            let chat = json!({
+                "id":"chatcmpl-reasoning","created":123,"model":"provider-model",
+                "usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3},
+                "choices":[{"index":0,"message":message,"finish_reason":"stop"}]
+            });
+            let response = translate_chat_result(chat, "logical-model".into(), json!({}));
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["output"][0]["type"], "reasoning");
+            assert_eq!(value["output"][0]["content"][0]["type"], "reasoning_text");
+            assert_eq!(
+                value["output"][0]["content"][0]["text"],
+                "upstream reasoning"
+            );
+            assert_eq!(value["output"][1]["type"], "message");
+            assert_eq!(value["output_text"], "answer");
+        }
+    }
+
+    #[tokio::test]
+    async fn content_filter_is_incomplete_in_nonstream_mode_like_streaming() {
+        let chat = json!({
+            "id":"chatcmpl-filtered","created":123,"model":"provider-model",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"partial"},
+                "finish_reason":"content_filter"}]
+        });
+        let response = translate_chat_result(chat, "logical-model".into(), Value::Null);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["status"], "incomplete");
+        assert_eq!(value["incomplete_details"]["reason"], "content_filter");
+        assert_eq!(value["output"][0]["status"], "incomplete");
+        assert_eq!(value["output_text"], "partial");
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_response_can_have_null_visible_content() {
+        let chat = json!({
+            "id":"chatcmpl-reasoning-only","created":123,"model":"provider-model",
+            "choices":[{"index":0,"message":{"role":"assistant","content":null,
+                "reasoning_content":"upstream reasoning"},"finish_reason":"stop"}]
+        });
+        let response = translate_chat_result(chat, "logical-model".into(), json!({}));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["output"].as_array().unwrap().len(), 1);
+        assert_eq!(value["output"][0]["type"], "reasoning");
+        assert_eq!(value["output_text"], "");
+    }
+
+    #[test]
+    fn both_reasoning_aliases_are_preserved_in_order() {
+        let message = json!({"reasoning":"first ","reasoning_content":"second"});
+        assert_eq!(
+            reasoning_text(&message).unwrap().as_deref(),
+            Some("first second")
+        );
+        let invalid = json!({"reasoning":["invalid"]});
+        assert!(reasoning_text(&invalid).is_err());
+    }
 }

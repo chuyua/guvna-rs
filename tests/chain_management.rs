@@ -317,6 +317,51 @@ fn file_persistence_preserves_large_integer_parameters_without_float_rounding() 
 }
 
 #[test]
+fn auto_reserved_runtime_chain_name_is_rejected_before_write_and_on_load() {
+    let (dir, config, data) = setup();
+    fs::write(
+        &config,
+        "providers:\n  - name: p\n    type: openai\n    base_url: https://example.org\n    key_env: KEY\nchains:\n  - name: immutable\n    steps:\n      - provider: p\n        model: static\nauto:\n  enabled: true\n  candidates:\n    - provider: p\n      model: static\n",
+    )
+    .unwrap();
+    let definition_file = dir.path().join("chain.yaml");
+    definition(&definition_file, "auto", "shadow");
+    failure(
+        &run(
+            &config,
+            &data,
+            &["set", "--file", definition_file.to_str().unwrap()],
+        ),
+        "reserved when Auto is enabled",
+    );
+    assert!(
+        !data.join("chains.yaml").exists(),
+        "rejected writes must not create runtime chain state"
+    );
+
+    fs::create_dir_all(&data).unwrap();
+    let invalid =
+        "version: 1\nchains:\n  - name: auto\n    steps: [{provider: p, model: shadow}]\n";
+    fs::write(data.join("chains.yaml"), invalid).unwrap();
+    let config_value = Config::load(&config).unwrap();
+    assert!(
+        config_value
+            .clone()
+            .with_runtime_chains(&data)
+            .unwrap_err()
+            .contains("reserved when Auto is enabled")
+    );
+    failure(
+        &run(&config, &data, &["validate"]),
+        "reserved when Auto is enabled",
+    );
+    assert_eq!(
+        fs::read_to_string(data.join("chains.yaml")).unwrap(),
+        invalid
+    );
+}
+
+#[test]
 fn daemon_and_cli_reject_the_same_invalid_runtime_files() {
     let (_tmp, config_file, data) = setup();
     let base = Config::load(&config_file).unwrap();

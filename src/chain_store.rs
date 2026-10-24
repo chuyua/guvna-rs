@@ -95,6 +95,11 @@ fn validate_data(bytes: Option<&[u8]>, config: &Config) -> Result<RuntimeChains,
                 chain.name
             ));
         }
+        if config.auto.enabled && chain.name == "auto" {
+            return Err(
+                "runtime chain name auto is reserved when Auto is enabled (preserved)".into(),
+            );
+        }
         config.validate_chain(chain)?;
     }
     state.version = Some(1);
@@ -269,6 +274,9 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
                 .map_err(|e| format!("invalid chain definition {}: {e}", source.display()))?;
             if chain.name.is_empty() || config.chains.iter().any(|c| c.name == chain.name) {
                 return Err("chain name is empty or owned by config.yaml".into());
+            }
+            if config.auto.enabled && chain.name == "auto" {
+                return Err("chain name auto is reserved when Auto is enabled".into());
             }
             config.validate_chain(&chain)?;
             let (directory, _lock) = lock_directory(data_dir)?;
