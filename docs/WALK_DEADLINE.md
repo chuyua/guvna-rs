@@ -8,7 +8,12 @@ Configure one deadline for the entire non-streaming request:
     timeout:
       walk: 100s
 
-Default is 100 seconds; Go-style durations from 100ms through 1h are allowed.
+Default is 100 seconds; Go-style durations from 100ms through 1h remain
+parseable for older configurations, but the **effective non-streaming walk
+budget is hard-capped at 100 seconds**. This leaves 20 seconds of headroom
+before the deployment's 120-second front-proxy timeout, including all
+candidate retries, streaming-to-JSON aggregation and permit waits. Setting
+`timeout.walk: 600s` no longer permits a ten-minute non-streaming response.
 Invalid/unknown configuration keys fail validation. One monotonic budget
 includes all credentials/candidates, aggregation slots, upstream headers,
 JSON bodies and SSE-to-JSON aggregation. It never resets on fallback.

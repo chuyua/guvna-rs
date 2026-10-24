@@ -126,7 +126,7 @@ continues using incremental Chat SSE passthrough.
 
 The synthesis is bounded: at most 4 parallel aggregations, 8 MiB of received
 SSE data per attempt, 2 MiB of generated text and tool arguments, a 60-second
-upstream idle limit and a 10-minute aggregation lifetime (capped sooner by
+upstream idle limit and a 100-second aggregation lifetime (capped sooner by
 the configured total non-streaming walk deadline). Invalid, truncated
 or stalled streams fail closed and use the existing next-chain candidate
 before any downstream JSON response is emitted. Results must pass the same
@@ -210,7 +210,7 @@ boundaries and invariants.
 
 SSE-only upstream Chat providers can supply ordinary JSON completions via
 the existing bounded Chat stream aggregator. It enforces 60-second idle
-timeout, a separate 10-minute overall aggregation limit and a 2 MiB combined
+timeout, a separate 100-second overall aggregation limit and a 2 MiB combined
 output/metadata budget. Ordinary non-streaming JSON reads still use their
 90-second per-attempt upstream body-read deadline. The configurable
 non-streaming walk deadline can end aggregation sooner. Invalid or incomplete SSE fails over before

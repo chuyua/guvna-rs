@@ -20,13 +20,13 @@ const MAX_AGGREGATED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 // of accepted frames.
 const MAX_EVENTS: usize = 262_144;
 // A long prompt can leave a reasoning model silent for more than 15 seconds.
-// The separate 10-minute absolute lifetime and shared walk budget still bound
+// The separate 100-second absolute lifetime and shared walk budget still bound
 // resource use and total request latency.
 const STREAM_IDLE: Duration = Duration::from_secs(60);
 // Long generations from SSE-only providers must not inherit the ordinary
 // 90-second JSON-body deadline. The idle timer still rejects stalled streams,
 // and this separate hard cap prevents indefinite drip-fed connections.
-pub(super) const MAX_AGGREGATION_LIFETIME: Duration = Duration::from_secs(10 * 60);
+pub(super) const MAX_AGGREGATION_LIFETIME: Duration = Duration::from_secs(100);
 
 // Error classes are fixed, local-only log keys. Never attach prompt/model,
 // provider URL, API key, response data or client identity to these events.
@@ -501,7 +501,7 @@ mod output_budget_tests {
     #[test]
     fn lifetime_is_longer_than_header_timeout_but_not_unbounded() {
         assert!(MAX_AGGREGATION_LIFETIME > Duration::from_secs(90));
-        assert!(MAX_AGGREGATION_LIFETIME <= Duration::from_secs(15 * 60));
+        assert!(MAX_AGGREGATION_LIFETIME <= Duration::from_secs(100));
         assert!(STREAM_IDLE >= Duration::from_secs(60));
         assert!(STREAM_IDLE < MAX_AGGREGATION_LIFETIME);
     }

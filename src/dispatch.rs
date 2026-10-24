@@ -151,6 +151,9 @@ fn record_intermediate_candidate_failure(
 fn walk_expired(deadline: Option<tokio::time::Instant>) -> bool {
     deadline.is_some_and(|until| tokio::time::Instant::now() >= until)
 }
+fn nonstream_walk_budget(configured: Duration) -> Duration {
+    configured.min(chat_aggregate::MAX_AGGREGATION_LIFETIME)
+}
 
 fn walk_timeout(metrics: &Metrics) -> Response {
     // Deadline errors are local policy, not malformed upstream 2xx, a
@@ -245,13 +248,18 @@ async fn dispatch_inner(
     // One monotonic deadline across ALL candidates, key attempts, 429
     // retries, aggregation permit waits and response bodies. Client-facing
     // SSE is intentionally exempt: only its header preflight is time-bounded.
+    // The gateway sits behind a 120-second upstream reverse proxy in its
+    // primary deployment. End all non-streaming walks with a response before
+    // that external hard limit, even when an older config requests 10 minutes.
     let walk_deadline = (!streaming).then(|| {
         started
-            + state
-                .config
-                .timeout
-                .walk_duration()
-                .expect("config validated")
+            + nonstream_walk_budget(
+                state
+                    .config
+                    .timeout
+                    .walk_duration()
+                    .expect("config validated"),
+            )
     });
     if streaming && !matches!(endpoint, Endpoint::Chat) {
         return error(
@@ -674,7 +682,7 @@ async fn dispatch_inner(
                 let result = if upstream_stream && !streaming {
                     // JSON-capable providers retain a bounded body read.
                     // SSE-only generations have both a 60s idle limit and a
-                    // 10min absolute cap. The shared non-streaming walk
+                    // 100s absolute cap. The shared non-streaming walk
                     // budget still wins if shorter, preventing indefinite
                     // retries or heartbeats across multiple candidates.
                     let lifetime =
@@ -993,4 +1001,22 @@ async fn bounded_json(response: reqwest::Response) -> Result<Value, ()> {
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonstream_walk_cannot_cross_the_120_second_front_proxy_window() {
+        assert_eq!(
+            nonstream_walk_budget(Duration::from_secs(600)),
+            Duration::from_secs(100),
+        );
+        assert_eq!(
+            nonstream_walk_budget(Duration::from_secs(15)),
+            Duration::from_secs(15),
+        );
+        assert!(nonstream_walk_budget(Duration::from_secs(3600)) < Duration::from_secs(120));
+    }
 }

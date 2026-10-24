@@ -1612,9 +1612,67 @@ fn responses_stream_req(payload: Value) -> Request<Body> {
 const RESP_START_A: &[u8] = b"data: {\"id\":\"chat1\",\"created\":123,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",";
 const RESP_START_B: &[u8] = b"\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
 const RESP_END: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\n";
+const RESP_END_WITH_INLINE_USAGE: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\n";
 const RESP_LENGTH_END: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"length\"}]}\n\n";
 const RESP_FILTER_END: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n";
 const RESP_USAGE: &[u8] = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n";
+
+#[tokio::test]
+async fn inline_usage_plus_final_trailer_succeeds_for_chat_and_responses() {
+    let (url, upstream_hits) = start_sse(vec![
+        RESP_START_A,
+        RESP_START_B,
+        RESP_END_WITH_INLINE_USAGE,
+        RESP_USAGE,
+        SSE_DONE,
+    ])
+    .await;
+    let router = make_app(&url, &url);
+    let chat_response = router
+        .clone()
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), StatusCode::OK);
+    let chat_text = String::from_utf8(
+        to_bytes(chat_response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(chat_text.contains("data: [DONE]"), "{chat_text}");
+    let response = router
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hello","stream":true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        body.matches("event: response.completed").count(),
+        1,
+        "{body}"
+    );
+    assert!(!body.contains("event: response.failed"), "{body}");
+    let completed: Value = serde_json::from_str(
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .next_back()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(completed["response"]["usage"]["total_tokens"], 7);
+    assert_eq!(completed["response"]["output_text"], "hi!");
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+}
 
 #[tokio::test]
 async fn responses_sse_real_upstream_fragmentation_metadata_usage() {
@@ -3174,26 +3232,21 @@ timeout:
     .unwrap())
 }
 
-// The stream-only Chat -> JSON bridge must not inherit the non-stream
-// 90-second JSON read deadline. Use virtual time and real network sockets,
-// rather than imposing a 10-minute wall-clock delay on every CI build.
+// Endless progress cannot evade the 100-second non-streaming walk budget.
+// Healthy long-thinking streams are verified separately by the real-socket
+// sixteen-second idle-gap and 20k-delta integration tests.
 #[derive(Clone)]
 struct ProgressingAggregation {
     hits: Arc<AtomicUsize>,
-    terminal: bool,
 }
 
 async fn serve_progressing_aggregation(
     State(state): State<ProgressingAggregation>,
 ) -> impl IntoResponse {
     state.hits.fetch_add(1, Ordering::SeqCst);
-    let terminal = state.terminal;
     let chunks = futures_util::stream::unfold(0usize, move |index| async move {
         match index {
             0 => Some((Ok::<_, std::io::Error>(Bytes::from_static(SSE_START)), 1)),
-            21 if terminal => Some((Ok(Bytes::from_static(SSE_END)), 22)),
-            22 if terminal => Some((Ok(Bytes::from_static(SSE_DONE)), 23)),
-            23 if terminal => None,
             _ => {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 Some((
@@ -3293,14 +3346,11 @@ async fn sse_only_aggregation_tolerates_a_sixteen_second_reasoning_pause() {
     assert_eq!(metric_value(&metrics, "active_requests"), 0);
 }
 
-async fn start_progressing_aggregation(terminal: bool) -> (String, Arc<AtomicUsize>) {
+async fn start_progressing_aggregation() -> (String, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let router = Router::new()
         .route("/v1/chat/completions", post(serve_progressing_aggregation))
-        .with_state(ProgressingAggregation {
-            hits: hits.clone(),
-            terminal,
-        });
+        .with_state(ProgressingAggregation { hits: hits.clone() });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -3308,7 +3358,6 @@ async fn start_progressing_aggregation(terminal: bool) -> (String, Arc<AtomicUsi
 }
 
 async fn drive_aggregating_progress(
-    terminal: bool,
     walk: &str,
 ) -> (
     StatusCode,
@@ -3319,7 +3368,7 @@ async fn drive_aggregating_progress(
     u64,
     u64,
 ) {
-    let (primary, primary_hits) = start_progressing_aggregation(terminal).await;
+    let (primary, primary_hits) = start_progressing_aggregation().await;
     let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
     let app = app_with_stream_only_and_auto_walk(&primary, &backup, false, walk);
     let metrics_app = app.clone();
@@ -3369,47 +3418,35 @@ async fn drive_aggregating_progress(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn sse_only_aggregation_survives_ninety_seconds_of_valid_progress() {
+async fn sse_only_infinite_heartbeat_ends_before_front_proxy_hard_timeout() {
     let (status, result, elapsed, primary, backup, deadline_exhaustions, active) =
-        drive_aggregating_progress(true, "12m").await;
-    assert!(elapsed > std::time::Duration::from_secs(90), "{elapsed:?}");
-    assert!(elapsed < std::time::Duration::from_secs(10 * 60));
-    assert_eq!(status, StatusCode::OK, "{result}");
-    assert_eq!(result["choices"][0]["message"]["content"], "hi");
-    assert_eq!(result["choices"][0]["finish_reason"], "stop");
-    assert_eq!(primary, 1);
-    assert_eq!(backup, 0, "successful progress must not replay to backup");
-    assert_eq!(deadline_exhaustions, 0, "wrong total-walk deadline outcome");
-    assert_eq!(active, 0, "aggregation admission permit was not released");
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn sse_only_infinite_heartbeat_expires_and_uses_healthy_json_backup() {
-    let (status, result, elapsed, primary, backup, deadline_exhaustions, active) =
-        drive_aggregating_progress(false, "12m").await;
+        drive_aggregating_progress("12m").await;
+    assert!(elapsed >= std::time::Duration::from_secs(95), "{elapsed:?}");
     assert!(
-        elapsed >= std::time::Duration::from_secs(9 * 60),
+        elapsed <= std::time::Duration::from_secs(105),
         "{elapsed:?}"
     );
-    assert!(
-        elapsed <= std::time::Duration::from_secs(11 * 60),
-        "{elapsed:?}"
-    );
-    assert_eq!(status, StatusCode::OK, "{result}");
-    assert_eq!(result["choices"][0]["message"]["content"], "success");
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{result}");
+    assert_eq!(result["error"]["code"], "upstream_walk_timeout");
     assert_eq!(primary, 1, "no repeated attempts on a drip-fed primary");
-    assert_eq!(backup, 1, "hard deadline must allow exactly one fallback");
-    assert_eq!(deadline_exhaustions, 0, "wrong total-walk deadline outcome");
+    assert_eq!(
+        backup, 0,
+        "the exhausted budget must not start a late fallback"
+    );
+    assert_eq!(
+        deadline_exhaustions, 1,
+        "expected local 504 before front-proxy expiry"
+    );
     assert_eq!(active, 0, "aggregation admission permit was not released");
 }
 
 // Issue #65's shared walk budget is authoritative even if an SSE-only
 // upstream keeps sending heartbeats: it cannot silently monopolize a
-// non-streaming slot for the entire 10min per-stream cap.
+// non-streaming slot beyond the front-proxy-safe aggregate cap.
 #[tokio::test(flavor = "current_thread")]
 async fn sse_only_progressing_heartbeat_cannot_bypass_shared_walk_budget() {
     let (status, result, elapsed, primary, backup, deadline_exhaustions, active) =
-        drive_aggregating_progress(false, "100s").await;
+        drive_aggregating_progress("100s").await;
     assert!(elapsed >= std::time::Duration::from_secs(90), "{elapsed:?}");
     assert!(elapsed < std::time::Duration::from_secs(150), "{elapsed:?}");
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{result}");

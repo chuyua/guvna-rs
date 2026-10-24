@@ -16,6 +16,12 @@ as Chat Completions apply.
   preserve output order and call IDs. A text message's output_text.done,
   content_part.done and output_item.done occur before the first subsequent
   function_call output_item.added, exactly once per message.
+
+The upstream may include provisional `usage` alongside a nonempty
+`choices` content frame. As with `/v1/chat/completions`, only the
+subsequent standalone `choices: []` usage trailer is authoritative:
+exactly one such trailer is accepted, with complete, internally consistent
+token counts. Content-frame usage is ignored to avoid false duplicate errors.
 - A verified stop and terminal upstream [DONE] emits response.completed.
   Finish reason length emits response.incomplete with max_output_tokens.
   A stream error emits one response.failed event (or an error event if
