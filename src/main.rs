@@ -1,7 +1,13 @@
 #[cfg(unix)]
 mod control_socket;
 use guvna::{chain_store, config::Config, gateway};
-use std::{collections::HashMap, env, future::Future, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    env,
+    future::{Future, IntoFuture},
+    path::PathBuf,
+    time::Duration,
+};
 
 #[tokio::main]
 async fn main() {
@@ -245,9 +251,11 @@ async fn serve_until_shutdown(
     drain: Duration,
 ) -> Result<(), String> {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async {
-        let _ = rx.await;
-    });
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = rx.await;
+        })
+        .into_future();
     tokio::pin!(server);
     tokio::select! {
         result = &mut server => result.map_err(|e| format!("serving: {e}")),
