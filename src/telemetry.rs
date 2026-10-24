@@ -176,10 +176,8 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
             }
         }
         batches = batches.wrapping_add(1);
-        if batches.is_multiple_of(128) {
-            if prune_expired(&conn).is_err() {
-                Metrics::inc(&metrics.telemetry_write_failures);
-            }
+        if batches.is_multiple_of(128) && prune_expired(&conn).is_err() {
+            Metrics::inc(&metrics.telemetry_write_failures);
         }
     }
 }
