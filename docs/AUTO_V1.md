@@ -161,3 +161,13 @@ ranking as a bounded exception. An in-flight selector does not serialize
 concurrent callers: they use deterministic fallback rather than wait. Cache
 has 32 entries and is keyed by ordered candidates, size buckets and required
 capabilities. This is not an upstream model response cache.
+
+### Non-mutating Shadow rank comparison (Issue #129)
+
+Set auto.decider.shadow_only: true with an enabled decider. The
+decider runs asynchronously and its proposed first candidate is compared
+against the deterministic live route; it NEVER reorders the live request.
+Local-only runtime status exposes auto_shadow_total,
+auto_shadow_disagreements and auto_shadow_unavailable without model,
+provider or prompt labels. These are ranking agreement measurements, NOT
+counterfactual success rates or latency improvement guarantees.

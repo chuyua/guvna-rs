@@ -333,7 +333,37 @@ async fn dispatch_inner(
         let input_bytes = routing::auto_input_bytes(request.get("messages"));
         let context_estimate = routing::auto_context_estimate(&request);
         let requirements = routing::auto_requirements(&request);
-        if let Some(ranked) = decider
+        if state.config.auto.decider.shadow_only {
+            // Shadow adds zero selector latency to actual response selection.
+            let owner = Arc::clone(&state);
+            let selector = Arc::clone(decider);
+            let baseline = steps.clone();
+            tokio::spawn(async move {
+                let choice = selector
+                    .rank(
+                        &owner.config,
+                        &baseline,
+                        input_bytes,
+                        context_estimate,
+                        requirements,
+                    )
+                    .await;
+                match choice {
+                    Some(proposal) => {
+                        owner.shadow_total.fetch_add(1, Ordering::Relaxed);
+                        if let (Some(expected), Some(actual)) = (baseline.first(), proposal.first())
+                            && (expected.provider_index != actual.provider_index
+                                || expected.model != actual.model)
+                        {
+                            owner.shadow_disagreements.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    None => {
+                        owner.shadow_unavailable.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        } else if let Some(ranked) = decider
             .rank(
                 &state.config,
                 &steps,

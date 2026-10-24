@@ -83,6 +83,8 @@ pub struct AutoDeciderConfig {
     pub timeout_ms: u64,
     /// Cache a valid ranking, never a prompt or downstream response.
     pub cache_ttl_secs: u64,
+    /// Background comparison only, never change live model order.
+    pub shadow_only: bool,
 }
 impl Default for AutoDeciderConfig {
     fn default() -> Self {
@@ -92,6 +94,7 @@ impl Default for AutoDeciderConfig {
             model: String::new(),
             timeout_ms: 750,
             cache_ttl_secs: 30,
+            shadow_only: false,
         }
     }
 }
@@ -374,6 +377,9 @@ impl Config {
             .is_some_and(|limit| !(1..=32).contains(&limit))
         {
             return Err("auto max_candidates must be 1..=32".into());
+        }
+        if self.auto.decider.shadow_only && !self.auto.decider.enabled {
+            return Err("auto decider shadow_only requires enabled: true".into());
         }
         if self.auto.decider.enabled {
             let d = &self.auto.decider;

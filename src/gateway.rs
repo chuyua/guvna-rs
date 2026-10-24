@@ -12,7 +12,10 @@ use axum::{
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -66,7 +69,10 @@ pub struct AppState {
     telemetry: Option<Telemetry>,
     auto_health: Option<AutoHealth>,
     auto_route_cache: AutoRouteCache,
-    auto_decider: Option<AutoDecider>,
+    auto_decider: Option<Arc<AutoDecider>>,
+    shadow_total: AtomicU64,
+    shadow_disagreements: AtomicU64,
+    shadow_unavailable: AtomicU64,
     auto_generation: u64,
     started_at: Instant,
     model_catalog: Value,
@@ -162,7 +168,8 @@ impl AppState {
         let mut data: Vec<_> = model_details.values().cloned().collect();
         data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         let model_catalog = json!({"object":"list","data":data});
-        let auto_decider = AutoDecider::from_config(&config, &credentials, client.clone())?;
+        let auto_decider =
+            AutoDecider::from_config(&config, &credentials, client.clone())?.map(Arc::new);
         let auto_generation = routing::config_generation(&config);
         let auto_route_cache = AutoRouteCache::new();
         let auto_health = config
@@ -185,6 +192,9 @@ impl AppState {
             auto_health,
             auto_route_cache,
             auto_decider,
+            shadow_total: AtomicU64::new(0),
+            shadow_disagreements: AtomicU64::new(0),
+            shadow_unavailable: AtomicU64::new(0),
             auto_generation,
             started_at: Instant::now(),
         })
@@ -260,6 +270,9 @@ impl AppState {
             "circuit_open_providers": open_circuits,
             "auto_enabled": self.config.auto.enabled,
             "auto_health_aware": self.config.auto.health_aware,
+            "auto_shadow_total": self.shadow_total.load(Ordering::Relaxed),
+            "auto_shadow_disagreements": self.shadow_disagreements.load(Ordering::Relaxed),
+            "auto_shadow_unavailable": self.shadow_unavailable.load(Ordering::Relaxed),
             "sqlite_telemetry_enabled": self.telemetry.is_some(),
             "requests_dispatched": self.metrics.requests_dispatched.load(Ordering::Relaxed),
             "upstream_attempts": self.metrics.upstream_attempts.load(Ordering::Relaxed),
