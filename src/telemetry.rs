@@ -534,9 +534,11 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
             }
             if let Some(failed) = health_failure(event) {
                 let failed = i64::from(failed);
-                // Only per-model rows are consumed on restart. Do not write a
-                // redundant provider-wide '*' row for every single event.
-                health.execute(params![event.provider, event.model, failed, event.ts])?;
+                // Per-model observations coexist with the provider-wide
+                // aggregate that restores conservative health on startup.
+                for model in [event.model.as_str(), "*"] {
+                    health.execute(params![event.provider, model, failed, event.ts])?;
+                }
             }
         }
     }
@@ -626,7 +628,8 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
     let mut conn = match open_database(&path) {
         Ok(database) => Some(database),
         Err(_) => {
-            Metrics::inc(&metrics.telemetry_write_failures);
+            // The batch drop path below records the failed write exactly
+            // once; the initial open failure still emits an explicit warning.
             crate::ops_log::warn("telemetry_open_failed");
             None
         }

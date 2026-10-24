@@ -166,8 +166,8 @@ impl CircuitBreakerConfig {
 impl QuarantineConfig {
     fn checked_duration(value: &str) -> Result<Duration, String> {
         let duration = parse_duration(value)?;
-        if !(Duration::from_secs(1)..=Duration::from_secs(30 * 24 * 3600)).contains(&duration) {
-            return Err("quarantine duration must be between 1s and 30d".into());
+        if !(Duration::from_millis(100)..=Duration::from_secs(30 * 24 * 3600)).contains(&duration) {
+            return Err("quarantine duration must be between 100ms and 30d".into());
         }
         Ok(duration)
     }

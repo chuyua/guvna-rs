@@ -271,11 +271,13 @@ mod tests {
             .admit_at(start + Duration::from_millis(100))
             .unwrap();
         assert!(stalled.is_probe());
-        assert!(breaker.admit_at(start + Duration::from_secs(10)).is_none());
-        let retried = breaker.admit_at(start + Duration::from_secs(11));
-        assert!(retried.is_some(), "expired probe did not unlock recovery");
-        stalled.success_at(start + Duration::from_secs(11));
+        // The first arrival after expiry fences the stalled probe and
+        // starts a short neutral backoff before another probe is permitted.
         assert!(breaker.admit_at(start + Duration::from_secs(11)).is_none());
+        let retried = breaker.admit_at(start + Duration::from_secs(12));
+        assert!(retried.is_some(), "expired probe did not unlock recovery");
+        stalled.success_at(start + Duration::from_secs(12));
+        assert!(breaker.admit_at(start + Duration::from_secs(12)).is_none());
     }
 
     #[test]

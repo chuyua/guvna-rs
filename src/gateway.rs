@@ -306,7 +306,13 @@ fn retry_after_delay(headers: &reqwest::header::HeaderMap, now: SystemTime) -> O
         .ok()?
         .trim();
     let delay = if !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()) {
-        Duration::from_secs(raw.parse::<u64>().ok()?)
+        // A huge decimal Retry-After should saturate to the one-day policy
+        // instead of failing to parse and silently bypassing the cooldown.
+        Duration::from_secs(if raw.len() > 5 {
+            86400
+        } else {
+            raw.parse::<u64>().ok()?.min(86400)
+        })
     } else {
         httpdate::parse_http_date(raw)
             .ok()?

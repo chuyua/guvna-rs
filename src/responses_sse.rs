@@ -451,9 +451,7 @@ impl ResponsesSse {
         let event: Value = serde_json::from_slice(data).map_err(|_| ())?;
         let choices = event.get("choices").and_then(Value::as_array).ok_or(())?;
         let mut usage_on_frame = false;
-        if choices.is_empty()
-            && let Some(usage) = event.get("usage").filter(|value| !value.is_null())
-        {
+        if let Some(usage) = event.get("usage").filter(|value| !value.is_null()) {
             if self.usage_seen {
                 return Err(());
             }
