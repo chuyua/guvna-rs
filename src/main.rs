@@ -183,7 +183,13 @@ async fn run() -> Result<(), String> {
         .filter_map(|key| env::var(&key).ok().map(|value| (key, value)))
         .collect();
     let port = config.port;
-    let state = gateway::AppState::new(config, credentials, client_keys)?;
+    let mut state = gateway::AppState::new(config, credentials, client_keys)?;
+    if matches!(
+        env::var("GUVNA_TELEMETRY_SQLITE").as_deref(),
+        Ok("1" | "true")
+    ) {
+        state.enable_telemetry(&data_dir)?;
+    }
     let bind = env::var("GUVNA_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
     let listener = tokio::net::TcpListener::bind((bind.as_str(), port))
         .await

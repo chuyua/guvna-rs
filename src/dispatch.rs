@@ -49,6 +49,8 @@ pub(super) async fn dispatch(
 ) -> Response {
     let started = tokio::time::Instant::now();
     let id = ops_log::next_request_id();
+    let telemetry = state.telemetry.clone();
+    let metrics = Arc::clone(&state.metrics);
     let response = dispatch_inner(state, body, endpoint, admission, started).await;
     let sse_headers = response
         .headers()
@@ -60,6 +62,19 @@ pub(super) async fn dispatch(
         response.status().as_u16(),
         sse_headers,
     );
+    if let Some(telemetry) = telemetry {
+        let label = match endpoint {
+            Endpoint::Chat => "chat",
+            Endpoint::Embeddings => "embeddings",
+        };
+        telemetry.submit(
+            label,
+            response.status().as_u16(),
+            started.elapsed(),
+            sse_headers,
+            &metrics,
+        );
+    }
     response
 }
 

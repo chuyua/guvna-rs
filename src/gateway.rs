@@ -22,6 +22,7 @@ use crate::{
     config::Config,
     keypool::KeyPool,
     metrics::Metrics,
+    telemetry::Telemetry,
 };
 
 // Keep these children private to the gateway: only the route handlers and
@@ -52,6 +53,7 @@ pub struct AppState {
     inflight: Arc<Semaphore>,
     aggregation_slots: Arc<Semaphore>,
     metrics: Arc<Metrics>,
+    telemetry: Option<Telemetry>,
     model_catalog: Value,
     model_details: HashMap<String, Value>,
 }
@@ -119,9 +121,15 @@ impl AppState {
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             aggregation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_AGGREGATIONS)),
             metrics: Arc::new(Metrics::default()),
+            telemetry: None,
         })
     }
 
+    /// Optional local-only telemetry. Main enables this explicitly; test AppStates stay off.
+    pub fn enable_telemetry(&mut self, data_dir: &std::path::Path) -> Result<(), String> {
+        self.telemetry = Some(Telemetry::start(data_dir, Arc::clone(&self.metrics))?);
+        Ok(())
+    }
     fn allowed(&self, headers: &HeaderMap) -> bool {
         let Some(header) = headers
             .get(axum::http::header::AUTHORIZATION)

@@ -9,5 +9,6 @@ pub mod ops_log;
 pub mod outcome;
 pub mod routing;
 pub mod sse;
+pub mod telemetry;
 
 pub(crate) mod responses_sse;

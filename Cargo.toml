@@ -15,6 +15,7 @@ fs2 = "0.4.3"
 libc = "0.2.189"
 tempfile = "3.27.0"
 httpdate = "1.0.3"
+rusqlite = { version = "0.37", features = ["bundled"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
