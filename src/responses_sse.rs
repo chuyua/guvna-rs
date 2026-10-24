@@ -450,8 +450,14 @@ impl ResponsesSse {
         }
         let event: Value = serde_json::from_slice(data).map_err(|_| ())?;
         let choices = event.get("choices").and_then(Value::as_array).ok_or(())?;
-        let mut usage_on_frame = false;
-        if let Some(usage) = event.get("usage").filter(|value| !value.is_null()) {
+        // Mirror ChatSse: compatible providers may attach provisional usage
+        // to the final content choice and then send authoritative accounting
+        // in an empty-choices trailer. Count only that trailer, once.
+        if choices.is_empty() {
+            let usage = event
+                .get("usage")
+                .filter(|value| !value.is_null())
+                .ok_or(())?;
             if self.usage_seen {
                 return Err(());
             }
@@ -467,10 +473,7 @@ impl ResponsesSse {
             }
             self.usage = json!({"input_tokens":input,"output_tokens":output,"total_tokens":total});
             self.usage_seen = true;
-            usage_on_frame = true;
-        }
-        if choices.is_empty() {
-            if self.finish_reason.is_none() || !usage_on_frame {
+            if self.finish_reason.is_none() {
                 return Err(());
             }
             return Ok(());
@@ -860,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_on_a_content_frame_is_preserved_and_duplicate_usage_fails_closed() {
+    fn content_frame_usage_does_not_conflict_with_authoritative_trailer() {
         let usage = json!({"prompt_tokens":2,"completion_tokens":3,"total_tokens":5});
         let mut translator = ResponsesSse::new("logical".into(), Value::Null);
         let mut output = VecDeque::new();
@@ -872,21 +875,48 @@ mod tests {
                 &mut output,
             )
             .unwrap();
+        assert!(!translator.usage_seen);
+        assert_eq!(translator.usage, Value::Null);
+        translator
+            .feed(
+                &frame(json!({"choices":[],"usage":usage.clone()})),
+                &mut output,
+            )
+            .unwrap();
         assert_eq!(
             translator.usage,
             json!({"input_tokens":2,"output_tokens":3,"total_tokens":5})
         );
+        translator.feed(b"data: [DONE]\n\n", &mut output).unwrap();
+        assert!(translator.done);
+        assert_eq!(
+            output
+                .iter()
+                .filter(|event| event.starts_with(b"event: response.completed"))
+                .count(),
+            1
+        );
+        let mut duplicate = ResponsesSse::new("logical".into(), Value::Null);
+        let mut events = VecDeque::new();
+        duplicate
+            .feed(
+                &frame(json!({"id":"id",
+            "choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]})),
+                &mut events,
+            )
+            .unwrap();
+        duplicate
+            .feed(
+                &frame(json!({"choices":[],"usage":usage.clone()})),
+                &mut events,
+            )
+            .unwrap();
         assert!(
-            translator
-                .feed(&frame(json!({"choices":[],"usage":usage})), &mut output)
+            duplicate
+                .feed(&frame(json!({"choices":[],"usage":usage})), &mut events)
                 .is_err()
         );
-        assert!(!translator.done);
-        assert!(
-            !output
-                .iter()
-                .any(|event| event.starts_with(b"event: response.completed"))
-        );
+        assert!(!duplicate.done);
     }
 
     #[test]

@@ -572,6 +572,48 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    fn dynamic_passthrough_model_names_never_enter_telemetry_labels() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: bridge
+    type: openai
+    base_url: https://bridge.example
+    key_env: BRIDGE
+    models: [listed]
+chains:
+  - name: named
+    steps:
+      - provider: bridge
+        model: chain-model
+auto:
+  enabled: true
+  candidates:
+    - provider: bridge
+      model: auto-model
+"#,
+        )
+        .unwrap();
+        let state = AppState::new(
+            config,
+            HashMap::from([("BRIDGE".to_owned(), "test-only".to_owned())]),
+            vec!["client".to_owned()],
+        )
+        .unwrap();
+        for candidate in ["listed", "chain-model", "auto-model"] {
+            assert_eq!(state.telemetry_model_name(0, candidate), candidate);
+        }
+        for index in 0..512 {
+            let untrusted = format!("private_prompt_{index}_user_controlled");
+            assert_eq!(state.telemetry_model_name(0, &untrusted), "passthrough");
+        }
+        assert_eq!(
+            state.telemetry_model_name(0, "api_key_secret_fragment"),
+            "passthrough"
+        );
+    }
+
+    #[test]
     fn auto_model_health_isolated_within_shared_provider() {
         let config: Config = serde_yaml::from_str(
             r#"

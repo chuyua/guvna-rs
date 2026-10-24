@@ -1612,9 +1612,67 @@ fn responses_stream_req(payload: Value) -> Request<Body> {
 const RESP_START_A: &[u8] = b"data: {\"id\":\"chat1\",\"created\":123,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",";
 const RESP_START_B: &[u8] = b"\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
 const RESP_END: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\n";
+const RESP_END_WITH_INLINE_USAGE: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\n";
 const RESP_LENGTH_END: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"length\"}]}\n\n";
 const RESP_FILTER_END: &[u8] = b"data: {\"id\":\"chat1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n";
 const RESP_USAGE: &[u8] = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n";
+
+#[tokio::test]
+async fn inline_usage_plus_final_trailer_succeeds_for_chat_and_responses() {
+    let (url, upstream_hits) = start_sse(vec![
+        RESP_START_A,
+        RESP_START_B,
+        RESP_END_WITH_INLINE_USAGE,
+        RESP_USAGE,
+        SSE_DONE,
+    ])
+    .await;
+    let router = make_app(&url, &url);
+    let chat_response = router
+        .clone()
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(chat_response.status(), StatusCode::OK);
+    let chat_text = String::from_utf8(
+        to_bytes(chat_response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(chat_text.contains("data: [DONE]"), "{chat_text}");
+    let response = router
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hello","stream":true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        body.matches("event: response.completed").count(),
+        1,
+        "{body}"
+    );
+    assert!(!body.contains("event: response.failed"), "{body}");
+    let completed: Value = serde_json::from_str(
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(completed["response"]["usage"]["total_tokens"], 7);
+    assert_eq!(completed["response"]["output_text"], "hi!");
+    assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+}
 
 #[tokio::test]
 async fn responses_sse_real_upstream_fragmentation_metadata_usage() {

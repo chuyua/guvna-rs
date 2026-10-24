@@ -178,7 +178,7 @@ initiate the manual GitHub Release publishing workflow.
 ## Long-lived SSE-only JSON aggregation and bounded metadata
 
 SSE-only providers use two independent safety clocks: a reasoning-aware
-60-second stream-idle watchdog and a separate 10-minute absolute lifetime
+60-second stream-idle watchdog and a separate 100-second absolute lifetime
 for completing one aggregated Chat response. The ordinary bounded JSON-body
 read and upstream HTTP-header deadline remain 90 seconds. A healthy SSE
 generation with valid progress beyond 90 seconds must not spuriously
