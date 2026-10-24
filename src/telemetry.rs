@@ -422,16 +422,15 @@ fn worker(receiver: Receiver<Event>, path: PathBuf, metrics: Arc<Metrics>) {
         if batches.is_multiple_of(128)
             && let Some(database) = conn.as_mut()
         {
-                if prune_expired(database, now_secs()).is_err() {
-                    Metrics::inc(&metrics.telemetry_write_failures);
-                }
-                // Checkpoint and truncate WAL from the single writer, never on the request path.
-                if database
-                    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                    .is_err()
-                {
-                    Metrics::inc(&metrics.telemetry_write_failures);
-                }
+            if prune_expired(database, now_secs()).is_err() {
+                Metrics::inc(&metrics.telemetry_write_failures);
+            }
+            // Checkpoint and truncate WAL from the single writer, never on the request path.
+            if database
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .is_err()
+            {
+                Metrics::inc(&metrics.telemetry_write_failures);
             }
         }
     }
