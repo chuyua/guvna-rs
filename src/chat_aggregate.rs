@@ -473,7 +473,8 @@ mod output_budget_tests {
             account_event(&mut count).unwrap();
         }
         assert_eq!(count, 22_000);
-        for _ in count..MAX_EVENTS {
+        let remaining = MAX_EVENTS - count;
+        for _ in 0..remaining {
             account_event(&mut count).unwrap();
         }
         assert_eq!(count, MAX_EVENTS);
