@@ -179,7 +179,7 @@ chains:
 async fn uncatalogued_prefixed_model_strips_only_the_gateway_namespace_on_wire() {
     let (upstream_url, calls) = start_upstream(StatusCode::OK).await;
     let config: Config = serde_yaml::from_str(&format!(
-        "providers:\n  - name: bridge\n    type: openai\n    base_url: {upstream_url}\n    key_env: BRIDGE\n    prefixes: [bridge]\n"
+        "providers:\n  - name: bridge\n    type: openai\n    base_url: {upstream_url}\n    key_env: BRIDGE\n"
     ))
     .unwrap();
     let router = app(AppState::new(
