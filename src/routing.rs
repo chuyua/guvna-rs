@@ -1,5 +1,8 @@
 //! Named chain and provider-prefixed passthrough resolution.
-use crate::config::{Config, Step};
+use crate::{
+    config::{Config, Step},
+    model_capabilities,
+};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -13,11 +16,24 @@ const AUTO_CACHE_TTL: Duration = Duration::from_secs(30);
 const CONTEXT_SAFETY_MARGIN_PERCENT: usize = 20;
 
 /// Only well-known Chat request features are examined; no text or image bytes are retained.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AutoRequirements {
     tools: bool,
     images: bool,
     json_schema: bool,
+}
+
+impl AutoRequirements {
+    pub fn from_signals(tools: bool, images: bool, json_schema: bool) -> Self {
+        Self {
+            tools,
+            images,
+            json_schema,
+        }
+    }
+    fn requires_images(self) -> bool {
+        self.images
+    }
 }
 
 pub fn auto_requirements(request: &Value) -> AutoRequirements {
@@ -298,13 +314,24 @@ pub fn resolve_auto_with_requirements(
                             .iter()
                             .any(|model| model == &candidate.model)
                 });
+            let registry = config.auto.use_model_registry;
+            let overrides = config.auto.capability_overrides.get(&candidate.model);
+            let context_limit = candidate
+                .max_context_tokens
+                .or_else(|| overrides.and_then(|entry| entry.context_tokens))
+                .or_else(|| registry.then(|| model_capabilities::context_tokens(&candidate.model)));
+            let image_support = candidate.supports_images.or_else(|| {
+                overrides
+                    .and_then(|entry| entry.supports_images)
+                    .or_else(|| {
+                        registry.then_some(!model_capabilities::known_text_only(&candidate.model))
+                    })
+            });
             model_supported
                 && (!requirements.tools || candidate.supports_tools != Some(false))
-                && (!requirements.images || candidate.supports_images != Some(false))
+                && (!requirements.requires_images() || image_support != Some(false))
                 && (!requirements.json_schema || candidate.supports_json_schema != Some(false))
-                && candidate
-                    .max_context_tokens
-                    .is_none_or(|max| context_estimate <= max)
+                && context_limit.is_none_or(|max| context_estimate <= max)
                 && input_bytes >= candidate.min_input_bytes
                 && candidate
                     .max_input_bytes
@@ -677,6 +704,55 @@ auto:
                 .tools
         );
     }
+    #[test]
+    fn optional_go_capability_registry_and_local_overrides_filter_safely() {
+        let yaml = r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://provider.example
+    key_env: K
+    models: [DeepSeek-V4-Flash, Qwen3.8-27B]
+auto:
+  enabled: true
+  use_model_registry: true
+  candidates:
+    - provider: p
+      model: DeepSeek-V4-Flash
+      priority: 1
+    - provider: p
+      model: Qwen3.8-27B
+      priority: 2
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
+        let images = AutoRequirements::from_signals(false, true, false);
+        let ranked = resolve_auto_with_requirements(&cfg, 20, 100, images, &[]).unwrap();
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].model, "Qwen3.8-27B");
+        let huge =
+            resolve_auto_with_requirements(&cfg, 20, 140_000, AutoRequirements::default(), &[])
+                .unwrap();
+        assert_eq!(huge.len(), 1);
+        assert_eq!(huge[0].model, "DeepSeek-V4-Flash");
+
+        let disabled: Config = serde_yaml::from_str(
+            &yaml.replace("  use_model_registry: true", "  use_model_registry: false"),
+        )
+        .unwrap();
+        let all = resolve_auto_with_requirements(&disabled, 20, 140_000, images, &[]).unwrap();
+        assert_eq!(all.len(), 2);
+        let overridden: Config = serde_yaml::from_str(&yaml.replace(
+            "  use_model_registry: true",
+            "  use_model_registry: true\n  capability_overrides:\n    Qwen3.8-27B:\n      context_tokens: 256\n      supports_images: false",
+        )).unwrap();
+        assert!(
+            resolve_auto_with_requirements(&overridden, 20, 100, images, &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn auto_route_cache_is_bounded_ttl_limited_and_generation_fenced() {
         let cfg: Config = serde_yaml::from_str(

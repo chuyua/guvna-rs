@@ -12,12 +12,16 @@ use axum::{
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
+    auto_decider::AutoDecider,
     auto_health::AutoHealth,
     circuit::{Circuit, Ticket},
     config::Config,
@@ -65,10 +69,46 @@ pub struct AppState {
     telemetry: Option<Telemetry>,
     auto_health: Option<AutoHealth>,
     auto_route_cache: AutoRouteCache,
+    auto_decider: Option<Arc<AutoDecider>>,
+    shadow_total: AtomicU64,
+    shadow_disagreements: AtomicU64,
+    shadow_unavailable: AtomicU64,
     auto_generation: u64,
     started_at: Instant,
-    model_catalog: Value,
-    model_details: HashMap<String, Value>,
+    model_catalog: RwLock<Value>,
+    model_details: RwLock<HashMap<String, Value>>,
+    live_routes: RwLock<Arc<Config>>,
+}
+
+fn collect_models(config: &Config) -> (Value, HashMap<String, Value>) {
+    // Expose configured named chains and explicitly catalogued provider models.
+    let mut model_details = HashMap::new();
+    for chain in &config.chains {
+        model_details.insert(
+            chain.name.clone(),
+            json!({"id":chain.name,"object":"model","owned_by":"guvna"}),
+        );
+    }
+    if config.auto.enabled {
+        model_details.insert(
+            "auto".to_owned(),
+            json!({"id":"auto","object":"model","owned_by":"guvna-auto"}),
+        );
+    }
+    for provider in &config.providers {
+        for prefix in provider.prefixes() {
+            for model in &provider.models {
+                let id = format!("{prefix}/{model}");
+                model_details
+                    .entry(id.clone())
+                    .or_insert_with(|| json!({"id":id,"object":"model","owned_by":provider.name}));
+            }
+        }
+    }
+    let mut data: Vec<_> = model_details.values().cloned().collect();
+    data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    let model_catalog = json!({"object":"list","data":data});
+    (model_catalog, model_details)
 }
 
 impl AppState {
@@ -106,11 +146,15 @@ impl AppState {
             .is_none_or(|telemetry| telemetry.flush(deadline))
     }
     pub fn new(
-        config: Config,
+        mut config: Config,
         credentials: HashMap<String, String>,
         client_keys: Vec<String>,
     ) -> Result<Self, String> {
         config.validate()?;
+        config.discover_auto_candidates();
+        if config.auto.enabled && config.auto.candidates.is_empty() {
+            return Err("auto discovery produced no eligible provider/model candidates".into());
+        }
         if client_keys.is_empty() || client_keys.iter().any(String::is_empty) {
             return Err("API_KEYS or ADMIN_KEY is required".into());
         }
@@ -129,33 +173,9 @@ impl AppState {
             .redirect(reqwest::redirect::Policy::none()) // Do not redirect provider credentials.
             .build()
             .map_err(|e| format!("building HTTP client: {e}"))?;
-        // Expose configured named chains and explicitly catalogued provider models.
-        let mut model_details = HashMap::new();
-        for chain in &config.chains {
-            model_details.insert(
-                chain.name.clone(),
-                json!({"id":chain.name,"object":"model","owned_by":"guvna"}),
-            );
-        }
-        if config.auto.enabled {
-            model_details.insert(
-                "auto".to_owned(),
-                json!({"id":"auto","object":"model","owned_by":"guvna-auto"}),
-            );
-        }
-        for provider in &config.providers {
-            for prefix in provider.prefixes() {
-                for model in &provider.models {
-                    let id = format!("{prefix}/{model}");
-                    model_details.entry(id.clone()).or_insert_with(
-                        || json!({"id":id,"object":"model","owned_by":provider.name}),
-                    );
-                }
-            }
-        }
-        let mut data: Vec<_> = model_details.values().cloned().collect();
-        data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-        let model_catalog = json!({"object":"list","data":data});
+        let (model_catalog, model_details) = collect_models(&config);
+        let auto_decider =
+            AutoDecider::from_config(&config, &credentials, client.clone())?.map(Arc::new);
         let auto_generation = routing::config_generation(&config);
         let auto_route_cache = AutoRouteCache::new();
         let auto_health = config
@@ -163,8 +183,9 @@ impl AppState {
             .health_aware
             .then(|| AutoHealth::new(config.auto.candidates.len()));
         Ok(Self {
-            model_catalog,
-            model_details,
+            model_catalog: RwLock::new(model_catalog),
+            model_details: RwLock::new(model_details),
+            live_routes: RwLock::new(Arc::new(config.clone())),
             config,
             client,
             pools,
@@ -177,9 +198,34 @@ impl AppState {
             telemetry: None,
             auto_health,
             auto_route_cache,
+            auto_decider,
+            shadow_total: AtomicU64::new(0),
+            shadow_disagreements: AtomicU64::new(0),
+            shadow_unavailable: AtomicU64::new(0),
             auto_generation,
             started_at: Instant::now(),
         })
+    }
+
+    pub fn route_snapshot(&self) -> Arc<Config> {
+        Arc::clone(&self.live_routes.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Atomically publish the already-persisted and revalidated local route
+    /// snapshot. Requests already underway retain the old Arc snapshot.
+    pub fn replace_route_snapshot(&self, next: Config) -> Result<(), String> {
+        next.validate()?;
+        let (catalog, details) = collect_models(&next);
+        *self
+            .model_catalog
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = catalog;
+        *self
+            .model_details
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = details;
+        *self.live_routes.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+        Ok(())
     }
 
     fn auto_candidate_index(&self, provider_index: usize, model: &str) -> Option<usize> {
@@ -252,6 +298,9 @@ impl AppState {
             "circuit_open_providers": open_circuits,
             "auto_enabled": self.config.auto.enabled,
             "auto_health_aware": self.config.auto.health_aware,
+            "auto_shadow_total": self.shadow_total.load(Ordering::Relaxed),
+            "auto_shadow_disagreements": self.shadow_disagreements.load(Ordering::Relaxed),
+            "auto_shadow_unavailable": self.shadow_unavailable.load(Ordering::Relaxed),
             "sqlite_telemetry_enabled": self.telemetry.is_some(),
             "requests_dispatched": self.metrics.requests_dispatched.load(Ordering::Relaxed),
             "upstream_attempts": self.metrics.upstream_attempts.load(Ordering::Relaxed),
@@ -475,7 +524,12 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     if !state.allowed(&headers) {
         return unauthorized();
     }
-    (StatusCode::OK, Json(state.model_catalog.clone())).into_response()
+    let snapshot = state
+        .model_catalog
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    (StatusCode::OK, Json(snapshot)).into_response()
 }
 
 async fn model_detail(
@@ -486,7 +540,11 @@ async fn model_detail(
     if !state.allowed(&headers) {
         return unauthorized();
     }
-    match state.model_details.get(&model) {
+    let details = state
+        .model_details
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    match details.get(&model) {
         Some(detail) => (StatusCode::OK, Json(detail.clone())).into_response(),
         None => error(StatusCode::NOT_FOUND, "model_not_found", "Unknown model"),
     }

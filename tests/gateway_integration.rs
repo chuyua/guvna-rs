@@ -3640,6 +3640,97 @@ async fn chain_default_n_is_used_by_stream_and_stream_only_aggregation() {
 }
 
 #[tokio::test]
+async fn streaming_auto_never_waits_for_a_cold_llm_decider() {
+    let (live, hits, _) = start_strict_stream_only(vec![
+        SSE_START.to_vec(),
+        SSE_END.to_vec(),
+        SSE_DONE.to_vec(),
+    ])
+    .await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let selector_hits = Arc::new(AtomicUsize::new(0));
+    let selector_calls = Arc::clone(&selector_hits);
+    let selector = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let selector_calls = Arc::clone(&selector_calls);
+            async move {
+                selector_calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+                axum::Json(json!({"choices":[{"message":{"content":r#"{"order":[1,0]}"#}}]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let selector_addr = listener.local_addr().unwrap();
+    let selector_task = tokio::spawn(async move {
+        axum::serve(listener, selector).await.unwrap();
+    });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: live
+    type: openai
+    base_url: {live}
+    key_env: LIVE
+    stream_only: true
+  - name: backup
+    type: openai
+    base_url: {backup}
+    key_env: BACKUP
+  - name: selector
+    type: openai
+    base_url: http://{selector_addr}
+    key_env: SELECTOR
+auto:
+  enabled: true
+  candidates:
+    - provider: live
+      model: primary
+      priority: 1
+    - provider: backup
+      model: fallback
+      priority: 2
+  decider:
+    enabled: true
+    provider: selector
+    model: ranker
+    timeout_ms: 1500
+    cache_ttl_secs: 30
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("LIVE".into(), "live-key".into()),
+            ("BACKUP".into(), "backup-key".into()),
+            ("SELECTOR".into(), "selector-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(700),
+        router.oneshot(auto_request(
+            "/v1/auto",
+            "client",
+            json!({"model":"auto","stream":true,"messages":[{"role":"user","content":"hello"}]}),
+        )),
+    )
+    .await
+    .expect("SSE headers must not wait for the 1100ms selector")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("data: [DONE]"));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(selector_hits.load(Ordering::SeqCst), 1);
+    selector_task.abort();
+}
+
+#[tokio::test]
 async fn auto_basic_uses_ordered_chain_without_remote_management_or_scoring() {
     let frames = vec![SSE_START.to_vec(), SSE_END.to_vec(), SSE_DONE.to_vec()];
     let (a, hits, streaming) = start_strict_stream_only(frames).await;

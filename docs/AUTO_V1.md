@@ -123,3 +123,76 @@ restored at startup only if the last failure is within the 300-second freshness
 window. Failed intermediate candidates are recorded separately from the single
 downstream request row, so fallback failures survive restart without double-counting
 the request. If SQLite is disabled or unreadable, routing falls back to in-memory hints.
+## Issue #129: optional dynamic chain discovery
+
+When auto.enabled: true, auto.discover_from_chains: true can add
+provider/model candidates from validated named chains at gateway startup.
+Explicit auto.candidates remain first, duplicate provider/model pairs are
+removed, the configured default_chain is considered first, and discovery
+never produces more than 32 candidates. Steps with custom params or models
+missing from an explicitly declared provider model catalog are not silently
+coerced into Auto candidates. Missing candidates after discovery
+cause startup to fail safely. This discovery is a startup snapshot, not live
+reconfiguration; it does not enable remote management or a second scheduler.
+
+## Issue #129: bounded optional LLM Decider (experimental)
+
+Example under the Auto configuration (leave disabled by default):
+
+    auto:
+      enabled: true
+      decider:
+        enabled: true
+        provider: p
+        model: your-selector-model
+        timeout_ms: 750
+        cache_ttl_secs: 30
+
+The provider must already be declared and have a credential. The selector
+connects directly to that provider's OpenAI-compatible chat endpoint using
+the explicitly selected wire model, not the local /v1/auto endpoint.
+Only candidate labels, context-size estimates and capability flags are
+sent to the selector. Actual user prompts, messages, tool schemas, request
+bodies and keys are never part of the ranking prompt or persisted.
+Response must be a strict JSON permutation of eligible candidate indexes.
+Unavailable, slow or malformed selectors fall back immediately to existing
+priority/health ranking, with at most 120 seconds of previously verified stale
+ranking as a bounded exception. An in-flight selector does not serialize
+concurrent callers: they use deterministic fallback rather than wait. Cache
+has 32 entries and is keyed by ordered candidates, size buckets and required
+capabilities. This is not an upstream model response cache.
+
+### Non-mutating Shadow rank comparison (Issue #129)
+
+Set auto.decider.shadow_only: true with an enabled decider. The
+decider runs asynchronously and its proposed first candidate is compared
+against the deterministic live route; it NEVER reorders the live request.
+Local-only runtime status exposes auto_shadow_total,
+auto_shadow_disagreements and auto_shadow_unavailable without model,
+provider or prompt labels. These are ranking agreement measurements, NOT
+counterfactual success rates or latency improvement guarantees.
+
+## Optional Go-compatible conservative capability registry (#129)
+
+Set auto.use_model_registry: true to enable an embedded conservative context
+window and known text-only model catalogue derived from the Go baseline.
+Unknown models receive an 8192-token limit (rather than zero) and otherwise
+remain image-eligible. To avoid silently changing legacy routes this feature
+is disabled by default.
+
+Explicit per-candidate max_context_tokens / supports_images take precedence.
+Local config.auto.capability_overrides can override context_tokens and
+supports_images by exact wire model name, without fetching external metadata.
+Overrides also work without enabling the embedded registry. The table is a
+conservative local hint and is not dynamically proven against upstream.
+
+
+### Streaming isolation
+
+Streaming Auto requests never wait for an external selector: the gateway
+uses a fresh cached ranking, a verified stale ranking (at most 120 seconds
+beyond TTL), or the original deterministic/health order. Cold or stale
+rankings trigger a bounded background refresh, with concurrent requests
+falling back instead of queuing behind the selector. The refresh does not
+alter an already-running SSE response or the shared candidate fallback walk.
+Nonstreaming requests retain the existing bounded synchronous selector.

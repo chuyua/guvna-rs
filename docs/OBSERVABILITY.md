@@ -163,3 +163,33 @@ An unavailable or stale control socket causes `guvna status` to use the
 loopback health probe. Existing user-supplied data directories retain their
 permissions; newly created ones are secured at 0700. The control socket is
 secured at 0600 and peer credentials are verified on Linux.
+## Issue #129: local historical scoring inspection
+
+Use guvna status --scoring --window 1h|6h|24h|7d --data DIR on Linux.
+The request uses only the same-UID, permission-restricted Unix control socket;
+the service opens a separate read-only SQLite connection with a short busy
+timeout and bounded response size. It never queries SQLite on the public
+HTTP request path. Summaries include actual candidate attempt/failure counts,
+mean attempt time and up to 512 samples per candidate of downstream-completion
+p95. The totals come from hour buckets (window start is rounded down);
+the downstream p95 is not an upstream attempt p95. Results are advisory only
+and only qualify candidates after at least 20 attempts. This does not
+silently activate telemetry-based model ordering or expose another TCP port.
+
+
+### Conservative provider attribution (Issue #129)
+
+Local scoring keeps the original raw attempts, failures and success_rate for
+compatibility, but these raw figures include caller/local errors and stream
+header starts. They must not be used as a model quality ranking. New
+observed_success_rate counts confirmed nonstream upstream successes and
+actual upstream provider failures (5xx, transport, invalid response, timeout,
+unavailable); excludes caller errors, local capacity failures, credential
+errors, 429 cooldown and stream starts. The qualified gate requires at least
+20 such observed samples; zero samples return null, not a fabricated 100%.
+Stream terminal failures with no additional upstream attempt are excluded
+from this conservative score, pending request-correlated outcome telemetry.
+downstream_p95_ms now measures nonstream downstream completions only.
+stream_header_p95_ms reports SSE response-header time separately, not full
+stream duration. Both derive from a bounded latest-512-row combined sample.
+Shadow comparisons remain advisory and never claim counterfactual success.

@@ -23,7 +23,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime},
 };
 use tokio::sync::OwnedSemaphorePermit;
@@ -291,7 +291,7 @@ async fn dispatch_inner(
     let auto_enabled = model == "auto" && state.config.auto.enabled;
     // Keep byte-range eligibility and context-window budgeting separate.
     // The context estimate includes the full request, output allowance and safety reserve.
-    let steps = match if auto_enabled {
+    let mut steps = match if auto_enabled {
         let input_bytes = routing::auto_input_bytes(request.get("messages"));
         let context_estimate = routing::auto_context_estimate(&request);
         let requirements = routing::auto_requirements(&request);
@@ -309,7 +309,7 @@ async fn dispatch_inner(
             state.auto_generation,
         )
     } else {
-        routing::resolve(&state.config, model)
+        routing::resolve(&state.route_snapshot(), model)
     } {
         Ok(steps) => steps,
         Err(_) => {
@@ -327,6 +327,79 @@ async fn dispatch_inner(
             "auto_no_eligible_candidate",
             "No configured Auto candidate satisfies input-size, context-window and model-capability constraints",
         );
+    }
+
+    if auto_enabled && let Some(decider) = &state.auto_decider {
+        let input_bytes = routing::auto_input_bytes(request.get("messages"));
+        let context_estimate = routing::auto_context_estimate(&request);
+        let requirements = routing::auto_requirements(&request);
+        if state.config.auto.decider.shadow_only {
+            // Shadow adds zero selector latency to actual response selection.
+            let owner = Arc::clone(&state);
+            let selector = Arc::clone(decider);
+            let baseline = steps.clone();
+            tokio::spawn(async move {
+                let choice = selector
+                    .rank(
+                        &owner.config,
+                        &baseline,
+                        input_bytes,
+                        context_estimate,
+                        requirements,
+                    )
+                    .await;
+                match choice {
+                    Some(proposal) => {
+                        owner.shadow_total.fetch_add(1, Ordering::Relaxed);
+                        if let (Some(expected), Some(actual)) = (baseline.first(), proposal.first())
+                            && (expected.provider_index != actual.provider_index
+                                || expected.model != actual.model)
+                        {
+                            owner.shadow_disagreements.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    None => {
+                        owner.shadow_unavailable.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        } else if streaming {
+            // A selector can take up to 2s; never add that delay to SSE
+            // response headers or its first token. Cold/stale rankings are
+            // refreshed in the background, with one in-flight fetch per cache.
+            let baseline = steps.clone();
+            let (cached, refresh) =
+                decider.cached_rank(&baseline, input_bytes, context_estimate, requirements);
+            if let Some(ranked) = cached {
+                steps = ranked;
+            }
+            if refresh {
+                let owner = Arc::clone(&state);
+                let selector = Arc::clone(decider);
+                tokio::spawn(async move {
+                    let _ = selector
+                        .rank(
+                            &owner.config,
+                            &baseline,
+                            input_bytes,
+                            context_estimate,
+                            requirements,
+                        )
+                        .await;
+                });
+            }
+        } else if let Some(ranked) = decider
+            .rank(
+                &state.config,
+                &steps,
+                input_bytes,
+                context_estimate,
+                requirements,
+            )
+            .await
+        {
+            steps = ranked;
+        }
     }
 
     let mut permit = Some(admission);
