@@ -1665,7 +1665,7 @@ async fn inline_usage_plus_final_trailer_succeeds_for_chat_and_responses() {
     let completed: Value = serde_json::from_str(
         body.lines()
             .filter_map(|line| line.strip_prefix("data: "))
-            .last()
+            .next_back()
             .unwrap(),
     )
     .unwrap();
