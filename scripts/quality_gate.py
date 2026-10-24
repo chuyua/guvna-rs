@@ -1069,7 +1069,9 @@ auto:
             failed_candidates = sum(count for _status, _reason, count in failure_breakdown)
             down_health = db.execute(
                 "SELECT penalty,consecutive_failures,demoted FROM provider_health "
-                "WHERE provider='down' AND model='*'").fetchone()
+                "WHERE provider='down' AND model='down'").fetchone()
+            redundant_health = db.execute(
+                "SELECT COUNT(*) FROM provider_health WHERE model='*'").fetchone()[0]
             down_hourly = db.execute(
                 "SELECT SUM(request_count),SUM(failure_count) FROM hourly_stats "
                 "WHERE provider='down' AND model='down'").fetchone()
@@ -1089,6 +1091,8 @@ auto:
         check(down_health is not None and down_health[0] == 100
               and down_health[1] >= 3 and down_health[2] == 1,
               f"provider health history was not persisted: {down_health}")
+        check(redundant_health == 0,
+              f"unused provider-wide health rows were persisted: {redundant_health}")
         check(journal_mode == "wal", f"telemetry database journal mode={journal_mode}")
         # max_page_count is connection-local; a read-only inspection connection
         # reports the compile-time limit, not the writer imposed limit.

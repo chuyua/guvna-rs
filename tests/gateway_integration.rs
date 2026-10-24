@@ -225,6 +225,34 @@ async fn last_upstream_caller_rejection_preserves_client_status_without_key_leak
 }
 
 #[tokio::test]
+async fn upstream_4xx_error_messages_never_reflect_secret_or_prompt_content() {
+    async fn secret_bearing_error() -> impl IntoResponse {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(json!({
+                "error": {
+                    "code": "invalid_request_error",
+                    "message": "Bearer provider-secret: confidential prompt content"
+                }
+            })),
+        )
+    }
+    let routes = Router::new().route("/v1/chat/completions", post(secret_bearing_error));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+    let url = format!("http://{addr}");
+    let (status, body) = call(make_app(&url, &url), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        body["error"]["message"],
+        "Upstream rejected request parameters"
+    );
+    assert!(!body.to_string().contains("provider-secret"));
+    assert!(!body.to_string().contains("confidential prompt"));
+}
+
+#[tokio::test]
 async fn failover_skips_bad_provider_and_key_and_preserves_large_integers() {
     let (a, first_calls) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
     let (b, next_calls) = start_upstream(StatusCode::OK).await;

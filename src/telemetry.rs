@@ -1220,6 +1220,32 @@ mod tests {
     }
 
     #[test]
+    fn page_cap_recovery_evicts_bounded_history_and_allows_new_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_database(&dir.path().join("recover.sqlite3")).unwrap();
+        let now = 10_000_000;
+        let rows = (0..256)
+            .map(|i| event(now - 60 + i, "p", "m", 200, 1, "success"))
+            .collect::<Vec<_>>();
+        write_batch(&mut conn, &rows).unwrap();
+        let pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        let limit: i64 = conn
+            .query_row(&format!("PRAGMA max_page_count={pages}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(limit, pages);
+        assert!(recover_page_capacity(&mut conn, now).unwrap());
+        write_batch(&mut conn, &[event(now, "p", "m", 200, 1, "success")]).unwrap();
+        let retained: i64 = conn
+            .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained, 1);
+    }
+
+    #[test]
     fn sqlite_page_limit_rolls_back_whole_batch_without_partial_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("full.sqlite3");

@@ -813,18 +813,23 @@ async fn dispatch_inner(
             }
             if (400..500).contains(&status) && !matches!(status, 401 | 403 | 429) {
                 let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
-                // Do not reflect arbitrary provider JSON or secret-bearing
-                // error text. Only allow a short, structured diagnosis.
+                // Never reflect arbitrary upstream messages: some providers
+                // include credential fragments or request text in them. Map
+                // only recognized machine-readable error codes to fixed text.
                 let detail =
                     tokio::time::timeout(Duration::from_secs(2), bounded_error_json(upstream))
                         .await
                         .ok()
                         .flatten();
-                let message = detail
+                let message = match detail
                     .as_ref()
-                    .and_then(|body| body.pointer("/error/message").and_then(Value::as_str))
-                    .filter(|text| text.len() <= 512)
-                    .unwrap_or("Upstream rejected the request");
+                    .and_then(|body| body.pointer("/error/code").and_then(Value::as_str))
+                {
+                    Some("context_length_exceeded") => "Upstream context window exceeded",
+                    Some("model_not_found") => "The upstream model is unavailable",
+                    Some("invalid_request_error") => "Upstream rejected request parameters",
+                    _ => "Upstream rejected the request",
+                };
                 last_upstream_client_error = Some((
                     status_code,
                     json!({
