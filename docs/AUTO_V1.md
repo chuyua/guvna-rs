@@ -138,6 +138,15 @@ penalty/streak rather than inheriting potentially colliding history. Request,
 failure, and hourly telemetry remains intact. This intentionally allows
 unknown historical health to recover neutrally rather than demoting the wrong
 provider/model after an upgrade.
+Approved telemetry-based Auto ordering uses a stricter evidence boundary than
+the local diagnostic scoring view: each hourly candidate/failure-class bucket
+and each recent Chat request must have an exact verified provider/model
+identity. Legacy hourly/request rows are migrated as unverified, and even one
+sanitized-label collision or non-upstream observation makes the affected
+hourly bucket ineligible for Auto ranking. The operator's CLI diagnostics
+continue to show the original counts. Ranking safely falls back to the
+deterministic Auto order until enough clean, recent evidence accumulates;
+historical aggregate counts cannot be retroactively verified.
 ## Issue #129: optional dynamic chain discovery
 
 When auto.enabled: true, auto.discover_from_chains: true can add
