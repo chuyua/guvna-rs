@@ -37,8 +37,12 @@ A candidate may also declare supports_tools, supports_images, or
 supports_json_schema as false to hard-exclude incompatible Chat requests.
 When omitted, capability is unknown and old configurations remain eligible;
 true is an explicit local assertion, not runtime verification of the model.
-Capability requirements derive only from Chat tool declarations/history, image
-content-part types, and response_format.type=json_schema. The cache key
+Capability requirements derive from Chat tool declarations/history (including
+non-empty historical tool_calls and explicit required/named tool_choice), image
+content-part types, and response_format.type=json_schema. Null/empty historical
+tool_calls do not by themselves require tool support. Malformed non-null tool
+controls remain conservatively tool-required rather than bypassing a declared
+supports_tools: false candidate. The cache key
 includes these capability requirements to prevent cross-request misrouting.
 The process-local cache stores route metadata only (max 128 entries, 30s TTL),
 keys results by request-size estimates and live health scores, and clears on a
