@@ -246,6 +246,27 @@ fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
 /// Hourly attempt aggregates have hour precision. Nonstream completion p95
 /// and SSE response-header p95 share a bounded last-512 downstream row sample.
 pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
+    read_scoring_inner(data_dir, hours, None)
+}
+
+/// Auto ranking reads only its configured candidates, not the global top 32
+/// by traffic. Both views share exactly the same quality attribution logic.
+pub(crate) fn read_scoring_for_candidates(
+    data_dir: &Path,
+    hours: u32,
+    candidates: &[(String, String)],
+) -> Result<Value, String> {
+    if candidates.len() > MAX_CANDIDATES {
+        return Err("too many Auto scoring candidates".into());
+    }
+    read_scoring_inner(data_dir, hours, Some(candidates))
+}
+
+fn read_scoring_inner(
+    data_dir: &Path,
+    hours: u32,
+    candidates: Option<&[(String, String)]>,
+) -> Result<Value, String> {
     if ![1, 6, 24, 168].contains(&hours) {
         return Err("scoring window must be 1h, 6h, 24h or 7d".into());
     }
@@ -281,6 +302,21 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
     } else {
         "AND 1=0"
     };
+    let candidate_filter = match candidates {
+        Some([]) => "AND 1=0".to_owned(),
+        Some(candidates) => format!(
+            "AND (provider,model) IN ({})",
+            vec!["(?,?)"; candidates.len()].join(",")
+        ),
+        None => String::new(),
+    };
+    let mut args = vec![rusqlite::types::Value::Integer(start_hour)];
+    if let Some(candidates) = candidates {
+        for (provider, model) in candidates {
+            args.push(rusqlite::types::Value::Text(provider.clone()));
+            args.push(rusqlite::types::Value::Text(model.clone()));
+        }
+    }
     let sql = format!(
         "SELECT provider,model,COALESCE(SUM(request_count),0),COALESCE(SUM(failure_count),0),
                 COALESCE(SUM(total_elapsed_ms),0),COALESCE(MAX(max_elapsed_ms),0),
@@ -290,7 +326,7 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
                     THEN MIN(request_count,failure_count) ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN failure_type='stream_started' THEN request_count ELSE 0 END),0)
          FROM hourly_stats
-         WHERE hour_ts >= ?1 AND provider != 'unknown' {chat_filter}
+         WHERE hour_ts >= ?1 AND provider != 'unknown' {chat_filter} {candidate_filter}
          GROUP BY provider,model
          ORDER BY COALESCE(SUM(request_count),0) DESC,provider,model
          LIMIT 32"
@@ -300,7 +336,7 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
         .map_err(|_| "cannot prepare telemetry summary")?;
     let stream_outcomes = confirmed_chat_stream_outcomes(&conn, since)?;
     let rows = stmt
-        .query_map(params![start_hour], |row| {
+        .query_map(rusqlite::params_from_iter(args.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
