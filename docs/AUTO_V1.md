@@ -129,9 +129,13 @@ When auto.enabled: true, auto.discover_from_chains: true can add
 provider/model candidates from validated named chains at gateway startup.
 Explicit auto.candidates remain first, duplicate provider/model pairs are
 removed, the configured default_chain is considered first, and discovery
-never produces more than 32 candidates. Steps with custom params or models
-missing from an explicitly declared provider model catalog are not silently
-coerced into Auto candidates. Missing candidates after discovery
+never produces more than 32 candidates. Go-style step params are copied as
+fill-missing defaults: an explicit caller value, including null, always wins.
+Selection-only min_context/max_context in a chain step are not copied, and
+models missing from an explicitly declared provider catalog are excluded.
+Manual auto.candidates can also define params with the same semantics;
+routing-control and selection-only fields are rejected during validation.
+Missing candidates after discovery
 cause startup to fail safely. This discovery is a startup snapshot, not live
 reconfiguration; it does not enable remote management or a second scheduler.
 

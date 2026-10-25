@@ -458,6 +458,49 @@ async fn candidate_payload_overrides_do_not_leak_to_fallback_steps() {
 }
 
 #[tokio::test]
+async fn go_auto_discovered_chain_params_fill_missing_and_never_override_caller_values() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {url}
+    key_env: K
+    models: [x]
+chains:
+  - name: primary
+    steps:
+      - provider: p
+        model: x
+        params: {{temperature: 0.25}}
+default_chain: primary
+auto:
+  enabled: true
+  discover_from_chains: true
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for (extra, expected) in [
+        ("", json!(0.25)),
+        (r#","temperature":0.75"#, json!(0.75)),
+        (r#","temperature":null"#, Value::Null),
+    ] {
+        let (status, result) = call(router.clone(), request("auto", extra, "client")).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["model"], "x");
+        assert_eq!(result["debug_temperature"], expected);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
 async fn default_chain_routes_unknown_model_but_not_named_or_prefixed_models() {
     let (upstream_url, calls) = start_upstream(StatusCode::OK).await;
     let config: Config = serde_yaml::from_str(&format!(

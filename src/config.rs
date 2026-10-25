@@ -149,6 +149,9 @@ pub struct AutoCandidate {
     pub supports_tools: Option<bool>,
     pub supports_images: Option<bool>,
     pub supports_json_schema: Option<bool>,
+    /// Go-style candidate defaults: caller fields always take precedence.
+    #[serde(default)]
+    pub params: BTreeMap<String, Value>,
 }
 
 fn default_auto_priority() -> u16 {
@@ -348,6 +351,13 @@ fn parse_auto_min_context_env(value: Option<&str>) -> Option<usize> {
         .filter(|value| *value > 0 && *value <= 16_777_216)
 }
 
+/// Validate only top-level JSON field names; reject routing-control overrides.
+fn valid_step_param_key(key: &str) -> bool {
+    !key.is_empty()
+        && !matches!(key, "model" | "stream" | "messages")
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self, String> {
         // Gate G01: explicit path only, with no HOME fallback.
@@ -500,6 +510,13 @@ impl Config {
             {
                 return Err("auto candidate invalid input length range".into());
             }
+            for key in candidate.params.keys() {
+                if !valid_step_param_key(key)
+                    || matches!(key.as_str(), "min_context" | "max_context")
+                {
+                    return Err(format!("auto candidate: forbidden param key {key:?}"));
+                }
+            }
             if !auto_keys.insert((candidate.provider.as_str(), candidate.model.as_str())) {
                 return Err("auto has duplicate provider/model candidates".into());
             }
@@ -546,7 +563,13 @@ impl Config {
                 if self.auto.candidates.len() >= 32 {
                     return;
                 }
-                if !step.params.is_empty() || step.model.is_empty() {
+                if step.model.is_empty()
+                    || step
+                        .params
+                        .keys()
+                        .any(|key| matches!(key.as_str(), "min_context" | "max_context"))
+                {
+                    // Auto-only selection knobs must never be injected upstream.
                     continue;
                 }
                 let Some(provider) = self.providers.iter().find(|p| p.name == step.provider) else {
@@ -569,6 +592,7 @@ impl Config {
                     supports_tools: None,
                     supports_images: None,
                     supports_json_schema: None,
+                    params: step.params.clone(),
                 });
             }
         }
@@ -598,10 +622,7 @@ impl Config {
                 ));
             }
             for key in step.params.keys() {
-                if key.is_empty()
-                    || ["model", "stream", "messages"].contains(&key.as_str())
-                    || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                {
+                if !valid_step_param_key(key) {
                     return Err(format!(
                         "chain {}: forbidden param key {:?}",
                         chain.name, key
@@ -645,9 +666,10 @@ chains:
     steps:
       - provider: p
         model: known
+        params: {temperature: 0.5}
       - provider: p
         model: special
-        params: {temperature: 0.5}
+        params: {temperature: 0.9}
 default_chain: primary
 auto:
   enabled: true
@@ -668,9 +690,46 @@ auto:
             .collect();
         assert_eq!(list, vec!["explicit", "known", "next"]);
         assert_eq!(cfg.auto.candidates[0].priority, 1);
+        assert_eq!(
+            cfg.auto.candidates[1].params["temperature"],
+            serde_json::json!(0.5)
+        );
+        assert!(cfg.auto.candidates[2].params.is_empty());
         cfg.discover_auto_candidates();
         assert_eq!(cfg.auto.candidates.len(), 3);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn auto_candidate_params_reject_routing_and_selection_control_fields() {
+        let yaml = r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://example.invalid
+    key_env: K
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: x
+      params: {temperature: 0.2}
+"#;
+        let valid: Config = serde_yaml::from_str(yaml).unwrap();
+        valid.validate().unwrap();
+        for key in [
+            "model",
+            "messages",
+            "stream",
+            "min_context",
+            "max_context",
+            "bad-key",
+        ] {
+            let bad: Config =
+                serde_yaml::from_str(&yaml.replace("temperature: 0.2", &format!("{key}: 0.2")))
+                    .unwrap();
+            assert!(bad.validate().is_err(), "{key}");
+        }
     }
 
     #[test]

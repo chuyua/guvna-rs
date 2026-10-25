@@ -458,7 +458,7 @@ pub fn resolve_auto_with_requirements(
             Ok(ResolvedStep {
                 provider_index,
                 model: candidate.model.clone(),
-                params: BTreeMap::new(),
+                params: candidate.params.clone(),
             })
         })
         .collect()
