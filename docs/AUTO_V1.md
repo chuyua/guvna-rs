@@ -191,7 +191,7 @@ Unavailable, slow or malformed selectors fall back immediately to existing
 priority/health ranking, with at most 120 seconds of previously verified stale
 ranking as a bounded exception. An in-flight selector does not serialize
 concurrent callers: they use deterministic fallback rather than wait. Cache
-has 32 entries and is keyed by ordered candidates, size buckets and required
+has 32 entries and is keyed by ordered candidates, exact input/context estimates and required
 capabilities. This is not an upstream model response cache.
 
 ### Non-mutating Shadow rank comparison (Issue #129)

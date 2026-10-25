@@ -284,8 +284,11 @@ fn ranking_key(
         step.model.hash(&mut h);
         format!("{:?}", step.params).hash(&mut h);
     }
-    bytes.div_ceil(1024).hash(&mut h);
-    tokens.div_ceil(1024).hash(&mut h);
+    // The selector receives exact estimates. Do not reuse a cached rank for
+    // different context pressure just because both sizes share a KiB bucket.
+    // The cache remains bounded and remote refreshes are semaphore-limited.
+    bytes.hash(&mut h);
+    tokens.hash(&mut h);
     features.hash(&mut h);
     h.finish()
 }
@@ -537,6 +540,33 @@ auto:
             .unwrap();
         assert_eq!(cached[0].model, "two");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Previously both estimates rounded to the same 1-KiB bucket,
+        // reusing a selector decision that was made for another request.
+        assert!(
+            decider
+                .cached_rank(&steps, 124, 234, AutoRequirements::default())
+                .0
+                .is_none()
+        );
+        assert!(
+            decider
+                .cached_rank(&steps, 123, 235, AutoRequirements::default())
+                .0
+                .is_none()
+        );
+        assert!(
+            decider
+                .rank(&config, &steps, 124, 234, AutoRequirements::default())
+                .await
+                .is_some()
+        );
+        assert!(
+            decider
+                .rank(&config, &steps, 123, 235, AutoRequirements::default())
+                .await
+                .is_some()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         let (warm, needs_refresh) =
             decider.cached_rank(&steps, 123, 234, AutoRequirements::default());
         assert_eq!(warm.unwrap()[0].model, "two");
@@ -619,6 +649,16 @@ auto:
         assert_ne!(
             original,
             ranking_key(&[a.clone(), b.clone()], 4000, 3000, plain)
+        );
+        assert_ne!(
+            original,
+            ranking_key(&[a.clone(), b.clone()], 2001, 3000, plain),
+            "distinct byte estimates within the old bucket must not share a rank"
+        );
+        assert_ne!(
+            original,
+            ranking_key(&[a.clone(), b.clone()], 2000, 3001, plain),
+            "distinct token estimates within the old bucket must not share a rank"
         );
         // A live chain edit can change the forwarded parameters without
         // changing the candidate order. Never reuse the old selector ranking.
