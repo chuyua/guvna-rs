@@ -265,6 +265,9 @@ async fn handle_client(
     .map_err(|_| "control request timed out")?
     .map_err(str::to_string)?;
     let request: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid control JSON")?;
+    if !request.is_object() {
+        return Err("control command must be a JSON object".into());
+    }
     let response = match request.get("command").and_then(Value::as_str) {
         Some("status") => state.runtime_status(),
         Some("chains_list") => {
@@ -277,7 +280,7 @@ async fn handle_client(
                 .get("argument")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if value.is_empty() || value.len() > 2048 {
+            if value.is_empty() || value.len() > 2048 || value.contains('\0') {
                 json!({"error":"invalid_chain_argument"})
             } else {
                 let cmd = if action == "chains_set" {
@@ -389,6 +392,15 @@ async fn query_request(
         Ok(Err(error)) => return Err(format!("connect local control socket: {error}")),
         Err(_) => return Err("timed out connecting to local control socket".into()),
     };
+    #[cfg(target_os = "linux")]
+    if stream
+        .peer_cred()
+        .map_err(|_| "local control server credentials unavailable")?
+        .uid()
+        != unsafe { libc::geteuid() }
+    {
+        return Err("local control server uid mismatch".into());
+    }
     let mut request =
         serde_json::to_vec(&request).map_err(|_| "cannot serialize control request")?;
     if request.len() > MAX_CONTROL_LINE {

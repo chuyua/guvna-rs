@@ -84,7 +84,7 @@ impl AutoDecider {
         estimated_tokens: usize,
         requirements: AutoRequirements,
     ) -> (Option<Vec<ResolvedStep>>, bool) {
-        if steps.len() < 2 {
+        if !(2..=32).contains(&steps.len()) {
             return (None, false);
         }
         let Ok(mut cache) = self.cache.try_lock() else {
@@ -111,7 +111,7 @@ impl AutoDecider {
         estimated_tokens: usize,
         requirements: AutoRequirements,
     ) -> Option<Vec<ResolvedStep>> {
-        if steps.len() < 2 {
+        if !(2..=32).contains(&steps.len()) {
             return None;
         }
         let key = ranking_key(steps, input_bytes, estimated_tokens, requirements);
