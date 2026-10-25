@@ -4595,7 +4595,7 @@ auto:
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     assert_eq!(state.runtime_status()["auto_shadow_total"], 0);
     assert_eq!(state.runtime_status()["auto_shadow_unavailable"], 1);
-    assert!(state.flush_telemetry(Duration::from_secs(3)));
+    assert!(state.flush_telemetry(std::time::Duration::from_secs(3)));
     let conn = rusqlite::Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
     let shadow: (i64, i64) = conn
         .query_row(
