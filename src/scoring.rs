@@ -2,6 +2,7 @@
 //! Uses no new management TCP endpoint and no request-path SQL queries.
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::{
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -9,6 +10,7 @@ use std::{
 
 const MAX_CANDIDATES: usize = 32;
 const MAX_LATENCY_SAMPLES: usize = 512;
+const MAX_SHADOW_SAMPLES: usize = 256;
 const MIN_SCORE_SAMPLES: i64 = 20;
 
 /// Only actual upstream observations count toward a model's quality score.
@@ -21,6 +23,159 @@ fn p95(samples: &mut [i64]) -> Option<i64> {
     }
     samples.sort_unstable();
     samples.get((samples.len() * 95).div_ceil(100) - 1).copied()
+}
+
+/// Correlate bounded real outcomes with shadow advice; never infer the
+/// success of a route that was not actually executed.
+fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
+    // Timestamp-indexed bounded reads avoid unbounded request-id joins.
+    let mut requests = HashMap::new();
+    let mut query = conn
+        .prepare(
+            "SELECT request_id,provider,model,attempt_index,stream_requested,failure_type
+         FROM request_events WHERE ts >= ?1 AND request_id IS NOT NULL
+         ORDER BY ts DESC LIMIT 512",
+        )
+        .ok()?;
+    let rows = query
+        .query_map(params![since], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .ok()?;
+    for row in rows {
+        let (id, provider, model, attempt, stream, outcome) = row.ok()?;
+        requests
+            .entry(id)
+            .or_insert((provider, model, attempt, stream, outcome));
+    }
+    drop(query);
+
+    let mut terminals = HashMap::new();
+    // Old databases may have no terminal table. Unknown is never success.
+    if let Ok(mut query) = conn.prepare(
+        "SELECT request_id,attempt_index,outcome FROM stream_terminals
+         WHERE ts >= ?1 ORDER BY ts DESC LIMIT 512",
+    ) {
+        let rows = query
+            .query_map(params![since], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .ok()?;
+        for row in rows {
+            let (id, attempt, outcome) = row.ok()?;
+            terminals.entry((id, attempt)).or_insert(outcome);
+        }
+    }
+
+    let mut query = conn
+        .prepare(
+            "SELECT request_id,baseline_provider,baseline_model,
+                suggested_provider,suggested_model,available,disagreed
+         FROM shadow_events WHERE ts >= ?1 ORDER BY ts DESC LIMIT 256",
+        )
+        .ok()?;
+    let rows = query
+        .query_map(params![since], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .ok()?;
+    let mut sampled = 0_u64;
+    let mut linked = 0_u64;
+    let mut completed = 0_u64;
+    let mut failed = 0_u64;
+    let mut cancelled = 0_u64;
+    let mut pending_streams = 0_u64;
+    let mut fallbacks = 0_u64;
+    let mut first_choice_successes = 0_u64;
+    let mut proposed_matches_final = 0_u64;
+    let mut disagreed_actual_completions = 0_u64;
+    for row in rows {
+        let (
+            id,
+            baseline_provider,
+            baseline_model,
+            suggested_provider,
+            suggested_model,
+            available,
+            disagreed,
+        ) = row.ok()?;
+        sampled += 1;
+        let Some((provider, model, attempt, stream, outcome)) = requests.get(&id) else {
+            continue;
+        };
+        linked += 1;
+        if attempt.is_some_and(|value| value > 1) {
+            fallbacks += 1;
+        }
+        if available == 1
+            && suggested_provider.as_ref() == Some(provider)
+            && suggested_model.as_ref() == Some(model)
+        {
+            proposed_matches_final += 1;
+        }
+        let actual = if *stream == 1 {
+            // Terminal for another candidate cannot certify this stream.
+            attempt
+                .and_then(|index| terminals.get(&(id.clone(), index)))
+                .map(String::as_str)
+        } else {
+            Some(outcome.as_str())
+        };
+        match actual {
+            Some("success") => {
+                completed += 1;
+                if *attempt == Some(1) && baseline_provider == *provider && baseline_model == *model
+                {
+                    first_choice_successes += 1;
+                }
+                if disagreed == 1 {
+                    disagreed_actual_completions += 1;
+                }
+            }
+            Some("client_cancelled") => cancelled += 1,
+            Some(_) => failed += 1,
+            None => {
+                if *stream == 1 {
+                    pending_streams += 1;
+                }
+            }
+        }
+    }
+    Some(json!({
+        "sampled_shadow_rows":sampled,
+        "sample_limit":MAX_SHADOW_SAMPLES,
+        "linked_actual_requests":linked,
+        "unlinked_actual_requests":sampled.saturating_sub(linked),
+        "actual_completed":completed,
+        "actual_failed":failed,
+        "actual_client_cancelled":cancelled,
+        "actual_stream_pending_or_unobserved":pending_streams,
+        "actual_fallbacks":fallbacks,
+        "baseline_first_choice_successes":first_choice_successes,
+        "proposed_top_matches_actual_final_route":proposed_matches_final,
+        "disagreed_but_actual_completed":disagreed_actual_completions,
+        "observational_only":true,
+        "counterfactual_success_inferred":false,
+    }))
 }
 
 /// Hourly attempt aggregates have hour precision. Nonstream completion p95
@@ -203,6 +358,7 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
                 Some(disagreements as f64 / available as f64)
             } else {None},
             "advisory_only":true,
+            "observed_actual_sample":sampled_shadow_outcomes(&conn, since),
         }))
     } else {
         None
@@ -249,6 +405,7 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
         "request_metrics":request_metrics,
         "shadow_metrics":shadow_metrics,
         "stream_terminal_metrics":stream_terminal_metrics,
+         "shadow_sample_notes":"The bounded recent shadow sample links only real final request outcomes by request ID. SSE success requires a matching terminal observation. A proposed route matching the actual final route is not proof the proposed strategy would have succeeded; missing and pending observations remain unknown.",
          "request_metrics_notes":"Only traced terminal request rows count toward fallback rate; the first-attempt success rate is restricted to nonstream completions, not unverified SSE headers. Old SQLite databases report null until migrated.",
          "notes":"raw success_rate includes all failure classes; observed_success_rate counts only confirmed nonstream successes and attempted upstream provider failures, excluding caller/local/credential errors and unverified stream starts. Qualification requires 20 observed samples. p95 separates nonstream completion from SSE response-header latency, sampled from up to 512 recent downstream rows per candidate; neither is a counterfactual outcome or complete SSE duration.",
     }))
@@ -257,6 +414,137 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shadow_observation_only_counts_real_outcomes_and_correct_sse_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().join("telemetry");
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = Connection::open(directory.join("requests.sqlite3")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE hourly_stats (
+                hour_ts INTEGER,provider TEXT,model TEXT,request_count INTEGER,
+                failure_count INTEGER,total_elapsed_ms INTEGER,
+                max_elapsed_ms INTEGER,failure_type TEXT
+             );
+             CREATE TABLE request_events (
+                ts INTEGER,provider TEXT,model TEXT,elapsed_ms INTEGER,
+                sse_headers INTEGER,request_id TEXT,attempt_index INTEGER,
+                stream_requested INTEGER,failure_type TEXT
+             );
+             CREATE INDEX request_events_ts ON request_events(ts);
+             CREATE TABLE shadow_events (
+                ts INTEGER,request_id TEXT,baseline_provider TEXT,baseline_model TEXT,
+                suggested_provider TEXT,suggested_model TEXT,available INTEGER,disagreed INTEGER
+             );
+             CREATE INDEX shadow_events_ts ON shadow_events(ts);
+             CREATE TABLE stream_terminals (
+                ts INTEGER,request_id TEXT,attempt_index INTEGER,outcome TEXT
+             );
+             CREATE INDEX stream_terminals_ts ON stream_terminals(ts);",
+        )
+        .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for (id, proposed, available, disagreed) in [
+            ("direct", Some("b"), 1, 1),
+            ("fallback", Some("b"), 1, 1),
+            ("cancelled", Some("b"), 1, 1),
+            ("missing", None, 0, 0),
+            ("stream_ok", Some("a"), 1, 0),
+            ("wrong_terminal", Some("b"), 1, 1),
+        ] {
+            db.execute(
+                "INSERT INTO shadow_events VALUES(?1,?2,'p','a','p',?3,?4,?5)",
+                params![now, id, proposed, available, disagreed],
+            )
+            .unwrap();
+        }
+        for (id, model, attempt, stream, outcome) in [
+            ("direct", "a", 1, 0, "success"),
+            ("fallback", "b", 2, 0, "success"),
+            ("cancelled", "a", 1, 1, "stream_started"),
+            ("stream_ok", "a", 1, 1, "stream_started"),
+            ("wrong_terminal", "a", 1, 1, "stream_started"),
+        ] {
+            db.execute(
+                "INSERT INTO request_events VALUES(?1,'p',?2,15,?3,?4,?5,?3,?6)",
+                params![now, model, stream, id, attempt, outcome],
+            )
+            .unwrap();
+        }
+        for (id, attempt, outcome) in [
+            ("cancelled", 1, "client_cancelled"),
+            ("stream_ok", 1, "success"),
+            ("wrong_terminal", 2, "success"),
+        ] {
+            db.execute(
+                "INSERT INTO stream_terminals VALUES(?1,?2,?3,?4)",
+                params![now, id, attempt, outcome],
+            )
+            .unwrap();
+        }
+        let result = read_scoring(dir.path(), 1).unwrap();
+        let observed = &result["shadow_metrics"]["observed_actual_sample"];
+        assert_eq!(observed["sampled_shadow_rows"], 6);
+        assert_eq!(observed["linked_actual_requests"], 5);
+        assert_eq!(observed["unlinked_actual_requests"], 1);
+        assert_eq!(observed["actual_completed"], 3);
+        assert_eq!(observed["actual_failed"], 0);
+        assert_eq!(observed["actual_client_cancelled"], 1);
+        assert_eq!(observed["actual_stream_pending_or_unobserved"], 1);
+        assert_eq!(observed["actual_fallbacks"], 1);
+        assert_eq!(observed["baseline_first_choice_successes"], 2);
+        assert_eq!(observed["proposed_top_matches_actual_final_route"], 2);
+        assert_eq!(observed["disagreed_but_actual_completed"], 2);
+        assert_eq!(observed["counterfactual_success_inferred"], false);
+        // Fixed sample size even if the historical window contains many rows.
+        for i in 0..300 {
+            db.execute(
+                "INSERT INTO shadow_events VALUES(?1,?2,'p','a',NULL,NULL,0,0)",
+                params![now + 1, format!("unlinked-{i}")],
+            )
+            .unwrap();
+        }
+        let bounded = read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(bounded["shadow_metrics"]["evaluations"], 306);
+        assert_eq!(
+            bounded["shadow_metrics"]["observed_actual_sample"]["sampled_shadow_rows"],
+            256
+        );
+        assert_eq!(
+            bounded["shadow_metrics"]["observed_actual_sample"]["linked_actual_requests"],
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_shadow_table_without_request_ids_remains_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().join("telemetry");
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = Connection::open(directory.join("requests.sqlite3")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE hourly_stats (
+                hour_ts INTEGER,provider TEXT,model TEXT,request_count INTEGER,
+                failure_count INTEGER,total_elapsed_ms INTEGER,
+                max_elapsed_ms INTEGER,failure_type TEXT
+             );
+             CREATE TABLE request_events (
+                ts INTEGER,provider TEXT,model TEXT,elapsed_ms INTEGER,sse_headers INTEGER
+             );
+             CREATE TABLE shadow_events (
+                ts INTEGER,request_id TEXT,baseline_provider TEXT,baseline_model TEXT,
+                suggested_provider TEXT,suggested_model TEXT,available INTEGER,disagreed INTEGER
+             );",
+        )
+        .unwrap();
+        let result = read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(result["shadow_metrics"]["evaluations"], 0);
+        assert!(result["shadow_metrics"]["observed_actual_sample"].is_null());
+    }
+
     #[test]
     fn request_rates_use_terminal_rows_and_exclude_unverified_sse_success() {
         let dir = tempfile::tempdir().unwrap();
