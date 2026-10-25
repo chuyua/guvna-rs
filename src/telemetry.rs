@@ -872,7 +872,10 @@ fn recover_page_capacity(conn: &mut Connection, now: i64) -> rusqlite::Result<bo
         [],
     )?;
     tx.commit()?;
-    Ok(removed_requests + removed_failures + removed_shadows + removed_terminals + removed_hourly > 0)
+    Ok(
+        removed_requests + removed_failures + removed_shadows + removed_terminals + removed_hourly
+            > 0,
+    )
 }
 
 fn now_secs() -> i64 {

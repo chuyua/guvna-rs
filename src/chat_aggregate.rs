@@ -178,7 +178,13 @@ fn apply_event(
         let empty_delta = serde_json::Map::new();
         let delta = match event_choice.get("delta") {
             Some(Value::Object(delta)) => delta,
-            Some(Value::Null) if event_choice.get("finish_reason").is_some_and(Value::is_string) => &empty_delta,
+            Some(Value::Null)
+                if event_choice
+                    .get("finish_reason")
+                    .is_some_and(Value::is_string) =>
+            {
+                &empty_delta
+            }
             _ => return Err(AggregateError::InvalidStream),
         };
         if let Some(content) = delta.get("content").filter(|content| !content.is_null()) {
@@ -408,13 +414,30 @@ mod output_budget_tests {
         let mut id = None;
         let mut created = None;
         let mut model = None;
-        let mut feed = |value: Value| apply_event(&value, &mut choices, &mut used, &mut usage, &mut id, &mut created, &mut model);
-        feed(json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]})).unwrap();
+        let mut feed = |value: Value| {
+            apply_event(
+                &value,
+                &mut choices,
+                &mut used,
+                &mut usage,
+                &mut id,
+                &mut created,
+                &mut model,
+            )
+        };
+        feed(json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}))
+            .unwrap();
         feed(json!({"choices":[{"index":0,"delta":null,"finish_reason":"stop"}]})).unwrap();
         assert_eq!(choices[0].content, "ok");
         assert_eq!(choices[0].finish_reason.as_deref(), Some("stop"));
         let mut used = 0;
-        assert!(with_event(json!({"choices":[{"index":0,"delta":null,"finish_reason":null}]}), &mut used).is_err());
+        assert!(
+            with_event(
+                json!({"choices":[{"index":0,"delta":null,"finish_reason":null}]}),
+                &mut used
+            )
+            .is_err()
+        );
     }
     fn with_event(value: Value, used: &mut usize) -> Result<(), AggregateError> {
         let mut choices = vec![Choice::default()];

@@ -583,9 +583,9 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                 if !matches!(role, "user" | "assistant" | "system" | "developer")
                     || item.get("type").is_some_and(|kind| kind != "message")
                     || item.as_object().is_none_or(|obj| {
-                        obj.keys()
-                            .any(|k| !["role", "content", "type", "id", "status"].contains(&k.as_str()))
-                            || obj.get("id").is_some_and(|v| !v.is_string())
+                        obj.keys().any(|k| {
+                            !["role", "content", "type", "id", "status"].contains(&k.as_str())
+                        }) || obj.get("id").is_some_and(|v| !v.is_string())
                             || obj.get("status").is_some_and(|v| v != "completed")
                     })
                 {
@@ -618,10 +618,12 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                             part.get("type").and_then(Value::as_str),
                             Some("input_text") | Some("output_text")
                         ) || part.as_object().is_none_or(|obj| {
-                            obj.keys().any(|k| !["type", "text", "annotations"].contains(&k.as_str()))
-                                || obj.get("annotations").is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty()))
-                        })
-                        {
+                            obj.keys()
+                                .any(|k| !["type", "text", "annotations"].contains(&k.as_str()))
+                                || obj
+                                    .get("annotations")
+                                    .is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty()))
+                        }) {
                             return Err(Box::new(error(
                                 StatusCode::NOT_IMPLEMENTED,
                                 "responses_input_unsupported",
