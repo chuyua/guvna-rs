@@ -75,6 +75,12 @@ as the running service. Avoid concurrent manual edits that bypass the CLI's
 advisory lock.
 No API_KEYS or ADMIN_KEY is required for local file management, but OS
 filesystem permissions for the selected data directory are required.
+For the online Unix control socket, the existing data directory must belong
+to the running service UID and must not be group- or world-writable (for
+example, 0700 or 0755 is accepted; 0775 and 0777 are rejected). The daemon
+does not silently change existing directory permissions. Local CLI clients
+also refuse to connect through an unsafe directory to prevent socket
+replacement or impersonation by another local user.
 
 After a change, validate first, then restart deliberately. Corrupted runtime
 chains still prevent normal daemon startup rather than being silently ignored.
