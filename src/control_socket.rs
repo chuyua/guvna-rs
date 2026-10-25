@@ -30,6 +30,7 @@ const SCORING_TIMEOUT: Duration = Duration::from_millis(800);
 struct ControlSocket {
     listener: UnixListener,
     path: PathBuf,
+    socket_identity: (u64, u64),
     directory: PathBuf,
     state: Arc<AppState>,
     base_config: Arc<Config>,
@@ -57,9 +58,13 @@ impl ControlSocket {
             let _ = fs::remove_file(&path);
             return Err(format!("secure local control socket: {error}"));
         }
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect bound control socket: {error}"))?;
+        let socket_identity = (metadata.dev(), metadata.ino());
         Ok(Self {
             listener,
             path,
+            socket_identity,
             directory: data_dir.to_path_buf(),
             state,
             base_config,
@@ -94,11 +99,17 @@ impl ControlSocket {
     }
 }
 
+fn unlink_owned_socket(path: &Path, identity: (u64, u64)) {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_socket() && (metadata.dev(), metadata.ino()) == identity
+    }) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 impl Drop for ControlSocket {
     fn drop(&mut self) {
-        if fs::symlink_metadata(&self.path).is_ok_and(|metadata| metadata.file_type().is_socket()) {
-            let _ = fs::remove_file(&self.path);
-        }
+        unlink_owned_socket(&self.path, self.socket_identity);
     }
 }
 
@@ -757,6 +768,23 @@ mod tests {
         let (mut writer, mut reader) = tokio::io::duplex(16);
         writer.write_all(b"1234\n").await.unwrap();
         assert_eq!(read_line_bounded(&mut reader, 4).await.unwrap(), b"1234");
+    }
+
+    #[tokio::test]
+    async fn stale_owner_cannot_unlink_rebound_control_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
+        let old = UnixListener::bind(&path).unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let old_identity = (metadata.dev(), metadata.ino());
+        fs::remove_file(&path).unwrap();
+        let replacement = UnixListener::bind(&path).unwrap();
+        unlink_owned_socket(&path, old_identity);
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        unlink_owned_socket(&path, (metadata.dev(), metadata.ino()));
+        assert!(!path.exists());
+        drop((old, replacement));
     }
 
     #[tokio::test]
