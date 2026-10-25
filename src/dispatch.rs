@@ -570,6 +570,22 @@ async fn dispatch_inner(
         }
     }
 
+    // An opt-in shadow selector without credentials is unavailable, not
+    // silently absent. Preserve the baseline and account for every real
+    // request without sending any selector traffic or changing routing.
+    if auto_enabled && state.config.auto.decider.shadow_only && state.auto_decider.is_none() {
+        state.shadow_unavailable.fetch_add(1, Ordering::Relaxed);
+        if let (Some(telemetry), Some(expected)) = (&state.telemetry, steps.first()) {
+            let provider = &route_snapshot.providers[expected.provider_index].name;
+            telemetry.observe_shadow(
+                request_id,
+                (provider, expected.model.as_str()),
+                None,
+                &state.metrics,
+            );
+        }
+    }
+
     if auto_enabled && let Some(health) = &live.auto_health {
         preserve_auto_health_priority(&route_snapshot, &mut steps, &health.penalties());
     }

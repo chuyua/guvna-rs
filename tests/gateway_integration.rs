@@ -4543,6 +4543,75 @@ auto:
 }
 
 #[tokio::test]
+async fn missing_shadow_selector_key_is_counted_without_changing_live_route() {
+    use guvna::gateway::app_with_state;
+
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: business
+    type: openai
+    base_url: {url}
+    key_env: BUSINESS_KEY
+  - name: selector
+    type: openai
+    base_url: http://127.0.0.1:1
+    key_env: MISSING_SELECTOR_KEY
+auto:
+  enabled: true
+  candidates:
+    - provider: business
+      model: primary
+    - provider: business
+      model: secondary
+  decider:
+    enabled: true
+    shadow_only: true
+    provider: selector
+    model: ranker
+"#
+    ))
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut app_state = AppState::new(
+        config,
+        HashMap::from([("BUSINESS_KEY".into(), "business-secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    app_state.enable_telemetry(dir.path()).unwrap();
+    let (router, state) = app_with_state(app_state);
+    let (status, body) = call(
+        router,
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({"model":"auto","messages":[{"role":"user","content":"hello"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(state.runtime_status()["auto_shadow_total"], 0);
+    assert_eq!(state.runtime_status()["auto_shadow_unavailable"], 1);
+    assert!(state.flush_telemetry(Duration::from_secs(3)));
+    let conn = rusqlite::Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let shadow: (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(available), 0) FROM shadow_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        shadow,
+        (1, 0),
+        "missing selector is an unavailable shadow observation"
+    );
+}
+
+#[tokio::test]
 async fn streaming_auto_never_waits_for_a_cold_llm_decider() {
     let (live, hits, _) = start_strict_stream_only(vec![
         SSE_START.to_vec(),
