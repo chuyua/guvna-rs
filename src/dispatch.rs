@@ -1031,6 +1031,12 @@ async fn dispatch_inner(
                         }
                         if let Some(context) = telemetry_context.as_mut() {
                             context.set_failure_type("timeout");
+                            if upstream_stream && !streaming {
+                                // The gateway's aggregation deadline is local
+                                // policy, not evidence of provider health.
+                                // Match the in-memory AutoHealth decision.
+                                context.set_health_observation(false);
+                            }
                         }
                         break;
                     }
@@ -1067,6 +1073,13 @@ async fn dispatch_inner(
                             } else {
                                 "invalid_response"
                             });
+                            if upstream_stream && !streaming && !aggregation_upstream_transport {
+                                // Unsupported SSE-to-JSON forms, idle/absolute
+                                // caps and local size limits are not supplier
+                                // failures. Only genuine upstream transport
+                                // loss should persist a health penalty.
+                                context.set_health_observation(false);
+                            }
                         }
                         break;
                     } // next step
