@@ -1,6 +1,6 @@
 //! Named chain and provider-prefixed passthrough resolution.
 use crate::{
-    config::{Config, Step},
+    config::{AutoCandidate, Config, Step},
     model_capabilities,
 };
 use serde_json::Value;
@@ -335,6 +335,80 @@ pub fn resolve_auto_with_estimate(
     )
 }
 
+/// Evaluate all hard candidate constraints before applying an operator-only
+/// context-floor fallback. Keep this shared with normal routing so the
+/// fallback cannot accidentally bypass image, tool, schema or byte limits.
+fn auto_candidate_eligible(
+    config: &Config,
+    candidate: &AutoCandidate,
+    input_bytes: usize,
+    context_estimate: usize,
+    requirements: AutoRequirements,
+) -> bool {
+    let model_supported = config
+        .providers
+        .iter()
+        .find(|provider| provider.name == candidate.provider)
+        .is_some_and(|provider| {
+            provider.models.is_empty()
+                || provider
+                    .models
+                    .iter()
+                    .any(|model| model == &candidate.model)
+        });
+    let registry = config.auto.use_model_registry;
+    let overrides = config.auto.capability_overrides.get(&candidate.model);
+    let context_limit = candidate
+        .max_context_tokens
+        .or_else(|| overrides.and_then(|entry| entry.context_tokens))
+        .or_else(|| registry.then(|| model_capabilities::context_tokens(&candidate.model)));
+    let image_support = candidate.supports_images.or_else(|| {
+        overrides
+            .and_then(|entry| entry.supports_images)
+            .or_else(|| registry.then_some(!model_capabilities::known_text_only(&candidate.model)))
+    });
+    let meets_window_bounds = if requirements.min_context > 0 || requirements.max_context.is_some()
+    {
+        context_limit.is_some_and(|window| {
+            window >= requirements.min_context
+                && requirements.max_context.is_none_or(|max| window <= max)
+        })
+    } else {
+        true
+    };
+    model_supported
+        && meets_window_bounds
+        && (!requirements.tools || candidate.supports_tools != Some(false))
+        && (!requirements.requires_images() || image_support != Some(false))
+        && (!requirements.json_schema || candidate.supports_json_schema != Some(false))
+        && context_limit.is_none_or(|max| context_estimate <= max)
+        && input_bytes >= candidate.min_input_bytes
+        && candidate
+            .max_input_bytes
+            .is_none_or(|max| input_bytes <= max)
+}
+
+/// Go's service-level min-context is a preference, not a caller constraint.
+/// Relax it only if *every* candidate was excluded solely by that floor.
+/// Explicit request bounds are checked by the caller and never relaxed.
+pub fn auto_operator_default_can_degrade(
+    config: &Config,
+    input_bytes: usize,
+    context_estimate: usize,
+    requirements: AutoRequirements,
+) -> bool {
+    if requirements.min_context == 0
+        || requirements.max_context.is_some()
+        || config.auto.candidates.is_empty()
+    {
+        return false;
+    }
+    let relaxed = requirements.with_context_bounds(0, None);
+    config.auto.candidates.iter().all(|candidate| {
+        auto_candidate_eligible(config, candidate, input_bytes, context_estimate, relaxed)
+    })
+}
+
 /// Hard-exclude candidates only for capabilities explicitly declared unsupported.
 /// Unknown capability flags remain eligible for backward compatibility.
 pub fn resolve_auto_with_requirements(
@@ -353,49 +427,13 @@ pub fn resolve_auto_with_requirements(
         .iter()
         .enumerate()
         .filter(|(_, candidate)| {
-            let model_supported = config
-                .providers
-                .iter()
-                .find(|provider| provider.name == candidate.provider)
-                .is_some_and(|provider| {
-                    provider.models.is_empty()
-                        || provider
-                            .models
-                            .iter()
-                            .any(|model| model == &candidate.model)
-                });
-            let registry = config.auto.use_model_registry;
-            let overrides = config.auto.capability_overrides.get(&candidate.model);
-            let context_limit = candidate
-                .max_context_tokens
-                .or_else(|| overrides.and_then(|entry| entry.context_tokens))
-                .or_else(|| registry.then(|| model_capabilities::context_tokens(&candidate.model)));
-            let image_support = candidate.supports_images.or_else(|| {
-                overrides
-                    .and_then(|entry| entry.supports_images)
-                    .or_else(|| {
-                        registry.then_some(!model_capabilities::known_text_only(&candidate.model))
-                    })
-            });
-            let meets_window_bounds =
-                if requirements.min_context > 0 || requirements.max_context.is_some() {
-                    context_limit.is_some_and(|window| {
-                        window >= requirements.min_context
-                            && requirements.max_context.is_none_or(|max| window <= max)
-                    })
-                } else {
-                    true
-                };
-            model_supported
-                && meets_window_bounds
-                && (!requirements.tools || candidate.supports_tools != Some(false))
-                && (!requirements.requires_images() || image_support != Some(false))
-                && (!requirements.json_schema || candidate.supports_json_schema != Some(false))
-                && context_limit.is_none_or(|max| context_estimate <= max)
-                && input_bytes >= candidate.min_input_bytes
-                && candidate
-                    .max_input_bytes
-                    .is_none_or(|max| input_bytes <= max)
+            auto_candidate_eligible(
+                config,
+                candidate,
+                input_bytes,
+                context_estimate,
+                requirements,
+            )
         })
         .collect::<Vec<_>>();
     // Stable tie-break preserves configured order, avoiding non-deterministic
@@ -509,6 +547,77 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
 mod tests {
     use super::*;
     use crate::config::Config;
+    #[test]
+    fn go_operator_floor_degrades_only_when_all_other_constraints_hold() {
+        let yaml = r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://example.invalid
+    key_env: K
+    models: [short]
+auto:
+  enabled: true
+  default_min_context: 8192
+  candidates:
+    - provider: p
+      model: short
+      max_context_tokens: 4096
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.validate().unwrap();
+        let default = AutoRequirements::default().with_context_bounds(8192, None);
+        assert!(
+            resolve_auto_with_requirements(&config, 100, 500, default, &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(auto_operator_default_can_degrade(
+            &config, 100, 500, default
+        ));
+        assert_eq!(
+            resolve_auto_with_requirements(
+                &config,
+                100,
+                500,
+                default.with_context_bounds(0, None),
+                &[],
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert!(!auto_operator_default_can_degrade(
+            &config,
+            100,
+            500,
+            default.with_context_bounds(8192, Some(8192)),
+        ));
+        config.auto.candidates[0].supports_images = Some(false);
+        assert!(!auto_operator_default_can_degrade(
+            &config,
+            100,
+            500,
+            AutoRequirements::from_signals(false, true, false).with_context_bounds(8192, None),
+        ));
+        config.auto.candidates[0].supports_images = None;
+        config.auto.candidates[0].min_input_bytes = 1024;
+        assert!(!auto_operator_default_can_degrade(
+            &config, 100, 500, default
+        ));
+        config.auto.candidates[0].min_input_bytes = 0;
+        assert!(!auto_operator_default_can_degrade(
+            &config, 100, 8192, default
+        ));
+        config.auto.candidates[0].supports_tools = Some(false);
+        assert!(!auto_operator_default_can_degrade(
+            &config,
+            100,
+            500,
+            AutoRequirements::from_signals(true, false, false).with_context_bounds(8192, None),
+        ));
+    }
+
     #[test]
     fn go_service_min_context_default_respects_request_override_and_max_filter() {
         let request = serde_json::json!({});

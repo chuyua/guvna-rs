@@ -309,3 +309,16 @@ override, the existing Rust default remains unrestricted when the registry
 is disabled, or 512 with the registry enabled. Changes take effect on the
 next configuration load, not in-flight requests. No environment values are
 forwarded to the upstream.
+
+### Go-compatible fallback for the operator context floor
+
+When the operator's default min_context excludes every Auto candidate solely
+because of its context window, the gateway may retry local candidate selection
+with that default floor removed. This is not a network retry, and the caller's
+request is not modified. Explicit positive min_context or max_context never
+permit this relaxation. Capability, model catalog, input size and estimated
+context-fit requirements must *all* still pass for every candidate before
+relaxation; an incompatible image/tool request or oversized prompt therefore
+cannot silently fall back to an unsuitable model. The effective relaxed bounds
+are also used in the Decider/Shadow cache key. Disable Auto or specify a
+positive request min_context to enforce a strict window requirement.

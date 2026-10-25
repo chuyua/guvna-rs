@@ -3442,6 +3442,93 @@ auto:
 }
 
 #[tokio::test]
+async fn go_auto_operator_floor_degrades_without_weakening_explicit_bounds_or_capabilities() {
+    let (url, hits) = start_strict_auto_upstream().await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {url}
+    key_env: P_KEY
+    models: [short]
+auto:
+  enabled: true
+  default_min_context: 8192
+  candidates:
+    - provider: p
+      model: short
+      max_context_tokens: 4096
+      supports_images: false
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("P_KEY".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for (path, bounds) in [
+        ("/v1/auto", json!({})),
+        ("/v1/chat/completions", json!({"min_context":0})),
+        ("/v1/auto", json!({"max_context":0})),
+        ("/v1/auto", json!({"min_context":1024})),
+    ] {
+        let mut payload = json!({"model":"auto","messages":[{"role":"user","content":"hello"}]});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(bounds.as_object().unwrap().clone());
+        let (status, result) = call(router.clone(), auto_request(path, "client", payload)).await;
+        assert_eq!(status, StatusCode::OK, "{path} {bounds}: {result}");
+        assert_eq!(result["model"], "short");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    for bounds in [
+        json!({"min_context":8192}),
+        json!({"max_context":8192}),
+        json!({"min_context":8192,"max_context":8192}),
+    ] {
+        let mut payload = json!({"model":"auto","messages":[{"role":"user","content":"hello"}]});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(bounds.as_object().unwrap().clone());
+        let (status, result) =
+            call(router.clone(), auto_request("/v1/auto", "client", payload)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{bounds}: {result}"
+        );
+        assert_eq!(result["error"]["code"], "auto_no_eligible_candidate");
+    }
+    let (status, result) = call(
+        router.clone(),
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({
+                "model":"auto",
+                "messages":[{"role":"user","content":[
+                    {"type":"text","text":"hello"},
+                    {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+                ]}]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{result}");
+    assert_eq!(result["error"]["code"], "auto_no_eligible_candidate");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        4,
+        "rejected requests reached upstream"
+    );
+}
+
+#[tokio::test]
 async fn auto_without_eligible_candidate_returns_422_without_network_attempt() {
     let (url, hits) = start_upstream(StatusCode::OK).await;
     let config: Config = serde_yaml::from_str(&format!(

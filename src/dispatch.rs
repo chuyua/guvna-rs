@@ -319,7 +319,17 @@ async fn dispatch_inner(
         );
     }
     let auto_enabled = model == "auto" && state.config.auto.enabled;
-    let auto_bounds = if auto_enabled {
+    // Go distinguishes an operator's default context floor from a caller's
+    // explicit hard bounds. Capture that distinction before stripping the
+    // Auto-only fields from the upstream request.
+    let caller_context_bound = auto_enabled
+        && ["min_context", "max_context"].iter().any(|name| {
+            request
+                .get(*name)
+                .and_then(Value::as_u64)
+                .is_some_and(|value| value > 0)
+        });
+    let mut auto_bounds = if auto_enabled {
         match routing::auto_context_bounds_with_default(
             &request,
             state.config.auto.use_model_registry,
@@ -353,14 +363,36 @@ async fn dispatch_inner(
             .as_ref()
             .map(|health| health.penalties())
             .unwrap_or_default();
-        state.auto_route_cache.resolve(
+        let mut resolved = state.auto_route_cache.resolve(
             &state.config,
             input_bytes,
             context_estimate,
             requirements,
             &penalties,
             state.auto_generation,
-        )
+        );
+        if matches!(&resolved, Ok(steps) if steps.is_empty())
+            && !caller_context_bound
+            && routing::auto_operator_default_can_degrade(
+                &state.config,
+                input_bytes,
+                context_estimate,
+                requirements,
+            )
+        {
+            // Keep context-length budgeting and capability hard filters intact.
+            // A second bounded cache lookup cannot issue network requests.
+            resolved = state.auto_route_cache.resolve(
+                &state.config,
+                input_bytes,
+                context_estimate,
+                requirements.with_context_bounds(0, None),
+                &penalties,
+                state.auto_generation,
+            );
+            auto_bounds = Some((0, None));
+        }
+        resolved
     } else {
         routing::resolve(&state.route_snapshot(), &model)
     } {
