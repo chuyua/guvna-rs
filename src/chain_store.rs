@@ -173,12 +173,22 @@ fn lock_directory(data_dir: &Path) -> Result<(PathBuf, File), String> {
     let lock = options
         .open(&path)
         .map_err(|e| format!("opening {}: {e}", path.display()))?;
-    if !lock
-        .metadata()
-        .map_err(|e| format!("lock metadata: {e}"))?
-        .is_file()
-    {
+    let metadata = lock.metadata().map_err(|e| format!("lock metadata: {e}"))?;
+    if !metadata.is_file() {
         return Err(format!("lock {} must be a regular file", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(format!("lock {} must not have hard links", path.display()));
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err(format!(
+                "lock {} must not be group/world writable",
+                path.display()
+            ));
+        }
     }
     lock.lock_exclusive()
         .map_err(|e| format!("locking {}: {e}", path.display()))?;
@@ -391,5 +401,29 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
                 preserved.map_or_else(|| "none".into(), |p| p.display().to_string())
             ))
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_security_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn shared_writable_lock_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".chains.yaml.lock");
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(lock_directory(dir.path()).is_err());
+    }
+
+    #[test]
+    fn hardlinked_lock_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".chains.yaml.lock");
+        fs::write(&path, b"").unwrap();
+        fs::hard_link(&path, dir.path().join("another-link")).unwrap();
+        assert!(lock_directory(dir.path()).is_err());
     }
 }

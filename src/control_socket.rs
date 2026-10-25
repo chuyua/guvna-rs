@@ -377,7 +377,12 @@ async fn query_request(
     ensure_private_control_directory(data_dir)?;
     let mut stream = match timeout(CONTROL_TIMEOUT, UnixStream::connect(&path)).await {
         Ok(Ok(stream)) => stream,
-        Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => {
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
             // A stale socket is equivalent to absence for status probing.
             return Ok(None);
         }
@@ -386,6 +391,9 @@ async fn query_request(
     };
     let mut request =
         serde_json::to_vec(&request).map_err(|_| "cannot serialize control request")?;
+    if request.len() > MAX_CONTROL_LINE {
+        return Err("local control request exceeds maximum frame size".into());
+    }
     request.push(b'\n');
     timeout(CONTROL_TIMEOUT, stream.write_all(&request))
         .await
