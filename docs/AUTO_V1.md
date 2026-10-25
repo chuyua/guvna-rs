@@ -316,16 +316,17 @@ forwarded to the upstream.
 
 ### Go-compatible fallback for the operator context floor
 
-When the operator's default min_context excludes every Auto candidate solely
-because of its context window, the gateway may retry local candidate selection
-with that default floor removed. This is not a network retry, and the caller's
-request is not modified. Explicit positive min_context or max_context never
-permit this relaxation. Capability, model catalog, input size and estimated
-context-fit requirements must *all* still pass for every candidate before
-relaxation; an incompatible image/tool request or oversized prompt therefore
-cannot silently fall back to an unsuitable model. The effective relaxed bounds
-are also used in the Decider/Shadow cache key. Disable Auto or specify a
-positive request min_context to enforce a strict window requirement.
+When the operator's default min_context excludes every Auto candidate under
+the normal selection, the gateway may retry local candidate selection with
+that default floor removed *if at least one candidate still passes all hard
+filters*. This is not a network retry, and the caller's request is not
+modified. Explicit positive min_context or max_context never permit this
+relaxation. Each candidate must independently pass capability, model catalog,
+input size and estimated context-fit requirements: an ineligible image/tool
+model or oversized prompt remains excluded. A different ineligible model does
+not prevent a safe, eligible candidate from being used. The effective relaxed
+bounds are also used in the Decider/Shadow cache key. Disable Auto or specify
+a positive request min_context to enforce a strict window requirement.
 
 
 ### Bounded real-outcome shadow correlation
@@ -353,3 +354,21 @@ object with status, source=local_health_probe, loopback host and port rather
 than silently returning plain text. Status --window is valid only together
 with --scoring; it is never silently ignored. No remote admin endpoint is
 introduced.
+
+### Issue #129: deliberate Go configuration compatibility boundary
+
+The Rust configuration remains authoritative. Issue #129 aims for **behavioral
+compatibility of core routing controls**, not a byte-for-byte clone of every
+Go-only configuration field. Existing Rust Auto V1 defaults and named-chain
+behavior are preserved. Supported Go-derived controls include context bounds,
+capability filters, configured candidate order, safe per-step parameter
+merging, and explicit opt-in for Decider/Telemetry/Shadow.
+
+Unknown fields and unsupported provider/Auto controls must fail validation
+clearly rather than silently pretending to work. Compatibility changes must
+never relax capability checks, override an explicit caller bound, expose
+secrets, create another request executor, or add remote Web/TCP management.
+Go-only optional fields that do not affect these contracts may remain
+unsupported; document actual differences instead of adding compatibility
+state machines. These scope changes do not waive Linux tests or resource
+gates.

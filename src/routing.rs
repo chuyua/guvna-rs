@@ -388,8 +388,10 @@ fn auto_candidate_eligible(
 }
 
 /// Go's service-level min-context is a preference, not a caller constraint.
-/// Relax it only if *every* candidate was excluded solely by that floor.
-/// Explicit request bounds are checked by the caller and never relaxed.
+/// Relax it only when at least one candidate survives every OTHER hard
+/// filter. A separate unsuitable candidate must not block that safe fallback.
+/// The caller only reaches this function after a normal selection found no
+/// candidates, and explicit request bounds are never relaxed.
 pub fn auto_operator_default_can_degrade(
     config: &Config,
     input_bytes: usize,
@@ -403,7 +405,7 @@ pub fn auto_operator_default_can_degrade(
         return false;
     }
     let relaxed = requirements.with_context_bounds(0, None);
-    config.auto.candidates.iter().all(|candidate| {
+    config.auto.candidates.iter().any(|candidate| {
         auto_candidate_eligible(config, candidate, input_bytes, context_estimate, relaxed)
     })
 }
@@ -615,6 +617,97 @@ auto:
             500,
             AutoRequirements::from_signals(true, false, false).with_context_bounds(8192, None),
         ));
+    }
+
+    #[test]
+    fn operator_floor_fallback_uses_only_hard_eligible_candidates_in_mixed_pool() {
+        let yaml = r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://example.invalid
+    key_env: K
+    models: [text-only, tools-small, oversized]
+auto:
+  enabled: true
+  default_min_context: 8192
+  candidates:
+    - provider: p
+      model: text-only
+      priority: 1
+      max_context_tokens: 4096
+      supports_tools: false
+    - provider: p
+      model: tools-small
+      priority: 10
+      max_context_tokens: 4096
+      supports_tools: true
+      supports_images: false
+    - provider: p
+      model: oversized
+      priority: 0
+      max_context_tokens: 4096
+      supports_tools: true
+      min_input_bytes: 200
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
+        let required =
+            AutoRequirements::from_signals(true, false, false).with_context_bounds(8192, None);
+        let cache = AutoRouteCache::new();
+        assert!(
+            cache
+                .resolve(&cfg, 100, 500, required, &[], 1)
+                .unwrap()
+                .is_empty(),
+            "the operator floor initially excludes all candidates"
+        );
+        assert!(
+            auto_operator_default_can_degrade(&cfg, 100, 500, required),
+            "incompatible neighbors cannot veto an otherwise safe fallback"
+        );
+        let relaxed = required.with_context_bounds(0, None);
+        let chosen = cache.resolve(&cfg, 100, 500, relaxed, &[], 1).unwrap();
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].model, "tools-small");
+        assert_eq!(
+            cache.resolve(&cfg, 100, 500, relaxed, &[], 1).unwrap()[0].model,
+            "tools-small"
+        );
+
+        let needs_images =
+            AutoRequirements::from_signals(true, true, false).with_context_bounds(8192, None);
+        assert!(!auto_operator_default_can_degrade(
+            &cfg,
+            100,
+            500,
+            needs_images
+        ));
+        assert!(
+            resolve_auto_with_requirements(
+                &cfg,
+                100,
+                500,
+                needs_images.with_context_bounds(0, None),
+                &[]
+            )
+            .unwrap()
+            .is_empty(),
+            "relaxing min_context must not bypass image and tool hard filters"
+        );
+        assert!(
+            !auto_operator_default_can_degrade(&cfg, 100, 4097, required),
+            "context fit remains a hard limit"
+        );
+        assert!(
+            !auto_operator_default_can_degrade(
+                &cfg,
+                100,
+                500,
+                required.with_context_bounds(8192, Some(16384))
+            ),
+            "the presence of a caller max_context must prohibit relaxation"
+        );
     }
 
     #[test]
