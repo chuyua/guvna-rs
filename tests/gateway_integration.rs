@@ -4399,6 +4399,92 @@ auto:
 }
 
 #[tokio::test]
+async fn online_provider_reorder_is_visible_to_decider_without_stale_identity() {
+    use guvna::gateway::app_with_state;
+
+    let (first_url, first_hits) = start_upstream(StatusCode::OK).await;
+    let (second_url, _) = start_upstream(StatusCode::OK).await;
+    let captured = Arc::new(tokio::sync::Mutex::new(None::<Value>));
+    let capture = Arc::clone(&captured);
+    let selector = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(body): axum::Json<Value>| {
+            let capture = Arc::clone(&capture);
+            async move {
+                *capture.lock().await = Some(body);
+                axum::Json(json!({"choices":[{"message":{"content":r#"{"order":[0,1]}"#}}]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, selector).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: first
+    type: openai
+    base_url: {first_url}
+    key_env: FIRST
+  - name: second
+    type: openai
+    base_url: {second_url}
+    key_env: SECOND
+  - name: selector
+    type: openai
+    base_url: http://{address}
+    key_env: SELECTOR
+auto:
+  enabled: true
+  candidates:
+    - provider: first
+      model: one
+    - provider: second
+      model: two
+  decider:
+    enabled: true
+    provider: selector
+    model: ranker
+"#
+    ))
+    .unwrap();
+    let (router, state) = app_with_state(
+        AppState::new(
+            config.clone(),
+            HashMap::from([
+                ("FIRST".into(), "first-key".into()),
+                ("SECOND".into(), "second-key".into()),
+                ("SELECTOR".into(), "selector-key".into()),
+            ]),
+            vec!["client".into()],
+        )
+        .unwrap(),
+    );
+    // A live config generation can change provider indexes without changing
+    // candidate names. Selector prompts must use the admitted snapshot.
+    let mut reordered = config;
+    reordered.providers.swap(0, 1);
+    state.replace_route_snapshot(reordered).unwrap();
+    let (status, body) = call(
+        router,
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({"model":"auto","messages":[{"role":"user","content":"hello"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+    let selector_request = captured.lock().await.take().expect("selector called");
+    let summary: Value =
+        serde_json::from_str(selector_request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(summary["candidates"][0]["provider"], "first");
+    assert_eq!(summary["candidates"][1]["provider"], "second");
+    server.abort();
+}
+
+#[tokio::test]
 async fn streaming_auto_never_waits_for_a_cold_llm_decider() {
     let (live, hits, _) = start_strict_stream_only(vec![
         SSE_START.to_vec(),

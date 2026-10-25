@@ -467,12 +467,13 @@ async fn dispatch_inner(
             let selector = Arc::clone(decider);
             let baseline = steps.clone();
             let trace_id = request_id.to_owned();
+            let selector_config = Arc::clone(&route_snapshot);
             if let Ok(permit) = state.auto_background_slots.clone().try_acquire_owned() {
                 tokio::spawn(async move {
                     let _permit = permit;
                     let choice = selector
                         .rank(
-                            &owner.config,
+                            &selector_config,
                             &baseline,
                             input_bytes,
                             context_estimate,
@@ -482,13 +483,13 @@ async fn dispatch_inner(
                     if let (Some(telemetry), Some(expected)) = (&owner.telemetry, baseline.first())
                     {
                         let expected_provider =
-                            &owner.config.providers[expected.provider_index].name;
+                            &selector_config.providers[expected.provider_index].name;
                         let suggested =
                             choice
                                 .as_ref()
                                 .and_then(|ranked| ranked.first())
                                 .and_then(|step| {
-                                    owner.config.providers.get(step.provider_index).map(
+                                    selector_config.providers.get(step.provider_index).map(
                                         |provider| (provider.name.as_str(), step.model.as_str()),
                                     )
                                 });
@@ -520,7 +521,7 @@ async fn dispatch_inner(
                 // unbounded background tasks or delaying live traffic.
                 state.shadow_unavailable.fetch_add(1, Ordering::Relaxed);
                 if let (Some(telemetry), Some(expected)) = (&state.telemetry, steps.first()) {
-                    let provider = &state.config.providers[expected.provider_index].name;
+                    let provider = &route_snapshot.providers[expected.provider_index].name;
                     telemetry.observe_shadow(
                         request_id,
                         (provider, expected.model.as_str()),
@@ -540,13 +541,13 @@ async fn dispatch_inner(
                 steps = ranked;
             }
             if refresh && let Ok(permit) = state.auto_background_slots.clone().try_acquire_owned() {
-                let owner = Arc::clone(&state);
                 let selector = Arc::clone(decider);
+                let selector_config = Arc::clone(&route_snapshot);
                 tokio::spawn(async move {
                     let _permit = permit;
                     let _ = selector
                         .rank(
-                            &owner.config,
+                            &selector_config,
                             &baseline,
                             input_bytes,
                             context_estimate,
@@ -557,7 +558,7 @@ async fn dispatch_inner(
             }
         } else if let Some(ranked) = decider
             .rank(
-                &state.config,
+                &route_snapshot,
                 &steps,
                 input_bytes,
                 context_estimate,
