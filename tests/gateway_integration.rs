@@ -3989,6 +3989,113 @@ async fn chain_default_n_is_used_by_stream_and_stream_only_aggregation() {
 }
 
 #[tokio::test]
+async fn shadow_selector_backpressure_skips_unbounded_tasks_without_affecting_live_requests() {
+    use guvna::gateway::app_with_state;
+    use std::time::Duration;
+    let (live, live_hits) = start_upstream(StatusCode::OK).await;
+    let selector_hits = Arc::new(AtomicUsize::new(0));
+    let released = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::clone(&selector_hits);
+    let release = Arc::clone(&released);
+    let selector = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let calls = Arc::clone(&calls);
+            let release = Arc::clone(&release);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+                axum::Json(json!({"choices":[{"message":{"content":r#"{"order":[1,0]}"#}}]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, selector).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: live
+    type: openai
+    base_url: {live}
+    key_env: LIVE
+  - name: selector
+    type: openai
+    base_url: http://{address}
+    key_env: SELECTOR
+auto:
+  enabled: true
+  candidates:
+    - provider: live
+      model: first
+    - provider: live
+      model: second
+  decider:
+    enabled: true
+    provider: selector
+    model: ranker
+    shadow_only: true
+    timeout_ms: 2000
+"#
+    ))
+    .unwrap();
+    let (router, state) = app_with_state(
+        AppState::new(
+            config,
+            HashMap::from([
+                ("LIVE".into(), "live-key".into()),
+                ("SELECTOR".into(), "selector-key".into()),
+            ]),
+            vec!["client".into()],
+        )
+        .unwrap(),
+    );
+    let payload = json!({"model":"auto","messages":[{"role":"user","content":"hello"}]});
+    let (status, body) = call(
+        router.clone(),
+        auto_request("/v1/auto", "client", payload.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while selector_hits.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("one selector should start");
+    let tasks = (0..32).map(|_| {
+        let router = router.clone();
+        let payload = payload.clone();
+        async move { call(router, auto_request("/v1/auto", "client", payload)).await }
+    });
+    let responses = tokio::time::timeout(
+        Duration::from_secs(3),
+        futures_util::future::join_all(tasks),
+    )
+    .await
+    .expect("shadow backpressure must not block live traffic");
+    for (status, body) in responses {
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(selector_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(live_hits.load(Ordering::SeqCst), 33);
+    let before = state.runtime_status();
+    assert_eq!(before["auto_shadow_total"], 0);
+    assert_eq!(before["auto_shadow_unavailable"], 32);
+    released.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.runtime_status()["auto_shadow_total"] != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first selector must finish and release the permit");
+    assert_eq!(state.runtime_status()["auto_shadow_disagreements"], 1);
+    server.abort();
+}
+
+#[tokio::test]
 async fn streaming_auto_never_waits_for_a_cold_llm_decider() {
     let (live, hits, _) = start_strict_stream_only(vec![
         SSE_START.to_vec(),

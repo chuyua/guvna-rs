@@ -282,3 +282,15 @@ Request processing never queries SQLite; snapshots expire after 75 seconds
 if refresh stops. The local status command reports only approval and active
 state, never sensitive model labels. Turn off telemetry_ranking.enabled
 to restore static Auto ordering without modifying the telemetry database.
+
+
+### Speculative Decider backpressure
+
+At most one background selector task may be in flight across SSE cache
+refresh and Shadow comparison. Excess Shadow requests are recorded as
+unavailable (not as a disagreement or an upstream failure), while their
+real requests continue using the existing deterministic candidate order.
+SSE refresh is skipped when the slot is occupied; the next request may
+retry. This prevents speculative tasks from growing without bound under
+concurrency or a stalled selector. Direct non-streaming Decider requests
+continue to use the existing singleflight cache and bounded timeout.

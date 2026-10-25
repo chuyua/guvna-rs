@@ -56,6 +56,8 @@ const MAX_INFLIGHT_PAYLOADS: usize = 8;
 const PAYLOAD_SLOT_WAIT: Duration = Duration::from_secs(1);
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_AGGREGATIONS: usize = 4;
+// Only one speculative selector call may run; the real request path never waits.
+const MAX_BACKGROUND_DECIDERS: usize = 1;
 
 pub struct AppState {
     pub config: Config,
@@ -66,6 +68,7 @@ pub struct AppState {
     inflight: Arc<Semaphore>,
     payload_slots: Arc<Semaphore>,
     aggregation_slots: Arc<Semaphore>,
+    auto_background_slots: Arc<Semaphore>,
     metrics: Arc<Metrics>,
     telemetry: Option<Telemetry>,
     auto_health: Option<AutoHealth>,
@@ -196,6 +199,7 @@ impl AppState {
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             payload_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_PAYLOADS)),
             aggregation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_AGGREGATIONS)),
+            auto_background_slots: Arc::new(Semaphore::new(MAX_BACKGROUND_DECIDERS)),
             metrics: Arc::new(Metrics::default()),
             telemetry: None,
             auto_health,
