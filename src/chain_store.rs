@@ -192,6 +192,22 @@ fn lock_directory(data_dir: &Path) -> Result<(PathBuf, File), String> {
     }
     lock.lock_exclusive()
         .map_err(|e| format!("locking {}: {e}", path.display()))?;
+    // The pathname must still identify the locked inode. Otherwise a
+    // concurrent unlink/recreate could give two writers different locks.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current = fs::symlink_metadata(&path)
+            .map_err(|e| format!("checking locked file {}: {e}", path.display()))?;
+        if !current.file_type().is_file()
+            || (current.dev(), current.ino()) != (metadata.dev(), metadata.ino())
+        {
+            return Err(format!(
+                "lock file {} changed while locking",
+                path.display()
+            ));
+        }
+    }
     Ok((directory, lock))
 }
 
@@ -416,6 +432,17 @@ mod lock_security_tests {
         fs::write(&path, b"").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
         assert!(lock_directory(dir.path()).is_err());
+    }
+
+    #[test]
+    fn ordinary_private_lock_remains_usable_across_sequential_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first_directory, first) = lock_directory(dir.path()).unwrap();
+        assert_eq!(first_directory, fs::canonicalize(dir.path()).unwrap());
+        drop(first);
+        let (second_directory, second) = lock_directory(dir.path()).unwrap();
+        assert_eq!(first_directory, second_directory);
+        drop(second);
     }
 
     #[test]

@@ -149,7 +149,7 @@ async fn ensure_socket_available(path: &Path) -> Result<(), String> {
         Ok(metadata) if !metadata.file_type().is_socket() => {
             Err("control socket path exists but is not a socket; refusing to replace it".into())
         }
-        Ok(_) => match timeout(CONTROL_TIMEOUT, UnixStream::connect(path)).await {
+        Ok(metadata) => match timeout(CONTROL_TIMEOUT, UnixStream::connect(path)).await {
             Ok(Ok(_)) => Err("another guvna process already owns the local control socket".into()),
             Ok(Err(error))
                 if matches!(
@@ -157,10 +157,21 @@ async fn ensure_socket_available(path: &Path) -> Result<(), String> {
                     io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
                 ) =>
             {
-                match fs::remove_file(path) {
-                    Ok(()) => Ok(()),
+                // Do not unlink a socket installed by a new daemon while
+                // our connection attempt was waiting on a stale pathname.
+                let current = fs::symlink_metadata(path);
+                match current {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                    Err(error) => Err(format!("remove stale local control socket: {error}")),
+                    Ok(current)
+                        if current.file_type().is_socket()
+                            && (current.dev(), current.ino())
+                                == (metadata.dev(), metadata.ino()) =>
+                    {
+                        fs::remove_file(path)
+                            .map_err(|error| format!("remove stale local control socket: {error}"))
+                    }
+                    Ok(_) => Err("control socket changed during stale socket check".into()),
+                    Err(error) => Err(format!("recheck stale local control socket: {error}")),
                 }
             }
             Ok(Err(error)) => Err(format!("check local control socket: {error}")),
