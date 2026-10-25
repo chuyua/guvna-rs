@@ -181,7 +181,9 @@ async fn read_line_bounded<R: AsyncRead + Unpin>(
             return if bytes.is_empty() {
                 Err("empty_request")
             } else {
-                Ok(bytes)
+                // The protocol is newline-delimited. A peer closing mid-frame
+                // must never turn a partial command into an executable mutation.
+                Err("truncated_control_line")
             };
         }
         let line_end = chunk[..read].iter().position(|byte| *byte == b'\n');
@@ -683,6 +685,24 @@ mod tests {
         assert_eq!(
             read_line_bounded(&mut empty, 4096).await,
             Err("empty_request")
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_without_newline_never_executes_partial_control_command() {
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        writer.write_all(br#"{"command":"chains_delete","argument":"important"}"#).await.unwrap();
+        drop(writer);
+        assert_eq!(
+            read_line_bounded(&mut reader, MAX_CONTROL_LINE).await,
+            Err("truncated_control_line")
+        );
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        writer.write_all(b"{\"command\":\"status\"}\n").await.unwrap();
+        drop(writer);
+        assert_eq!(
+            read_line_bounded(&mut reader, MAX_CONTROL_LINE).await.unwrap(),
+            br#"{"command":"status"}"#
         );
     }
 
