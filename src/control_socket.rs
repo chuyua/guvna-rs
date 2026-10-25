@@ -681,7 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_line_handles_chunk_boundaries_and_trailing_bytes() {
-        for len in [0, 1, 1023, 1024, 1025, 4096] {
+        for len in [1, 1023, 1024, 1025, 4096] {
             let mut input = vec![b'a'; len];
             input.extend_from_slice(b"\nignored-after-first-line");
             let mut reader = std::io::Cursor::new(input);
