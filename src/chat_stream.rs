@@ -1,7 +1,7 @@
 //! Owns the Chat SSE streaming lifecycle, preflight and cancellation metrics.
 //! No request routing or key retry policy: the single dispatch candidate walk
 //! transfers ownership only after the first valid event is observed.
-use super::{AppState, record_circuit_failure, record_circuit_success};
+use super::{AppState, LiveRouteSnapshot, record_circuit_failure, record_circuit_success};
 use crate::{circuit::Ticket, keypool::Lease, metrics::Metrics, sse::ChatSse};
 use axum::{
     body::{Body, Bytes},
@@ -16,6 +16,8 @@ const MAX_STREAM_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 pub(super) struct StreamRoute {
     pub(super) provider_index: usize,
     pub(super) model: String,
+    pub(super) telemetry_model: String,
+    pub(super) live: Arc<LiveRouteSnapshot>,
     pub(super) request_id: String,
     pub(super) attempt_index: u16,
 }
@@ -23,6 +25,8 @@ struct ChatStreamState {
     owner: Arc<AppState>,
     provider_index: usize,
     model: String,
+    telemetry_model: String,
+    live: Arc<LiveRouteSnapshot>,
     request_id: String,
     attempt_index: u16,
     started_at: tokio::time::Instant,
@@ -47,8 +51,7 @@ impl Drop for ChatStreamState {
                 let provider = &self.owner.config.providers[self.provider_index].name;
                 telemetry.observe_stream_health(
                     provider,
-                    self.owner
-                        .telemetry_model_name(self.provider_index, &self.model),
+                    &self.telemetry_model,
                     "client_cancelled",
                     self.started_at.elapsed(),
                     (&self.request_id, self.attempt_index),
@@ -87,6 +90,8 @@ pub(super) async fn start(
         owner,
         provider_index: route.provider_index,
         model: route.model,
+        telemetry_model: route.telemetry_model,
+        live: route.live,
         request_id: route.request_id,
         attempt_index: route.attempt_index,
         started_at: tokio::time::Instant::now(),
@@ -131,17 +136,17 @@ fn stream_response(state: ChatStreamState) -> Response {
                     state.owner.pools[state.provider_index].record_success(&state.lease);
                     record_circuit_success(&mut state.circuit_ticket, &state.owner.metrics);
                     Metrics::inc(&state.owner.metrics.upstream_success);
-                    state
-                        .owner
-                        .mark_auto_success(state.provider_index, &state.model);
+                    state.owner.mark_auto_success_in(
+                        &state.live,
+                        state.provider_index,
+                        &state.model,
+                    );
 
                     if let Some(telemetry) = &state.owner.telemetry {
                         let provider = &state.owner.config.providers[state.provider_index].name;
                         telemetry.observe_stream_health(
                             provider,
-                            state
-                                .owner
-                                .telemetry_model_name(state.provider_index, &state.model),
+                            &state.telemetry_model,
                             "success",
                             state.started_at.elapsed(),
                             (&state.request_id, state.attempt_index),
@@ -184,15 +189,13 @@ fn stream_response(state: ChatStreamState) -> Response {
                 Metrics::inc(&state.owner.metrics.chat_stream_failed);
                 state
                     .owner
-                    .mark_auto_failure(state.provider_index, &state.model);
+                    .mark_auto_failure_in(&state.live, state.provider_index, &state.model);
 
                 if let Some(telemetry) = &state.owner.telemetry {
                     let provider = &state.owner.config.providers[state.provider_index].name;
                     telemetry.observe_stream_health(
                         provider,
-                        state
-                            .owner
-                            .telemetry_model_name(state.provider_index, &state.model),
+                        &state.telemetry_model,
                         "transport_error",
                         state.started_at.elapsed(),
                         (&state.request_id, state.attempt_index),

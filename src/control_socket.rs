@@ -6,7 +6,7 @@ use std::{
     fs, io,
     os::unix::{
         ffi::OsStrExt,
-        fs::{FileTypeExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     sync::Arc,
@@ -25,6 +25,7 @@ const MAX_CONTROL_LINE: usize = 4096;
 const MAX_CONTROL_RESPONSE_LINE: usize = 32768;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CLIENTS: usize = 4;
+const SCORING_TIMEOUT: Duration = Duration::from_millis(800);
 
 struct ControlSocket {
     listener: UnixListener,
@@ -44,15 +45,11 @@ impl ControlSocket {
         let newly_created = !data_dir.exists();
         fs::create_dir_all(data_dir)
             .map_err(|error| format!("create local control directory: {error}"))?;
-        let directory_metadata = fs::symlink_metadata(data_dir)
-            .map_err(|error| format!("inspect local control directory: {error}"))?;
-        if !directory_metadata.file_type().is_dir() {
-            return Err("GUVNA_DATA_DIR must be a real directory, not a symlink".into());
-        }
         if newly_created {
             fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700))
                 .map_err(|error| format!("secure local control directory: {error}"))?;
         }
+        ensure_private_control_directory(data_dir)?;
         ensure_socket_available(&path).await?;
         let listener = UnixListener::bind(&path)
             .map_err(|error| format!("bind local control socket {}: {error}", path.display()))?;
@@ -72,6 +69,9 @@ impl ControlSocket {
     async fn run(self) {
         let permits = Arc::new(Semaphore::new(MAX_CLIENTS));
         let mutation_gate = Arc::new(Mutex::new(()));
+        // Timed-out blocking SQLite reads are not cancelled by Tokio.
+        // Bound the underlying work, not just the socket handlers.
+        let scoring_gate = Arc::new(Semaphore::new(1));
         loop {
             let (stream, _) = match self.listener.accept().await {
                 Ok(connection) => connection,
@@ -85,9 +85,10 @@ impl ControlSocket {
             let directory = self.directory.clone();
             let base_config = Arc::clone(&self.base_config);
             let gate = Arc::clone(&mutation_gate);
+            let scoring = Arc::clone(&scoring_gate);
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = handle_client(stream, state, directory, base_config, gate).await;
+                let _ = handle_client(stream, state, directory, base_config, gate, scoring).await;
             });
         }
     }
@@ -110,6 +111,24 @@ fn socket_path(data_dir: &Path) -> Result<PathBuf, String> {
         );
     }
     Ok(path)
+}
+
+fn ensure_private_control_directory(data_dir: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(data_dir)
+        .map_err(|error| format!("inspect local control directory: {error}"))?;
+    if !metadata.file_type().is_dir() {
+        return Err("GUVNA_DATA_DIR must be a real directory, not a symlink".into());
+    }
+    // A writable parent lets another local UID unlink/rebind even a 0600
+    // socket. A spoofed daemon could then capture CLI mutations or status
+    // responses. Preserve safe existing permissions; reject unsafe ones.
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+        return Err(
+            "local control directory must be owned by the service UID and not group/world writable"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 async fn ensure_socket_available(path: &Path) -> Result<(), String> {
@@ -173,12 +192,32 @@ async fn read_line_bounded<R: AsyncRead + Unpin>(
     }
 }
 
+async fn bounded_scoring<F>(gate: Arc<Semaphore>, deadline: Duration, read: F) -> Value
+where
+    F: FnOnce() -> Result<Value, String> + Send + 'static,
+{
+    let Ok(permit) = gate.try_acquire_owned() else {
+        return json!({"error":"scoring_busy"});
+    };
+    // The blocking reader outlives the response deadline on timeout. Its
+    // owned permit remains held until that work actually exits.
+    let work = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read()
+    });
+    match timeout(deadline, work).await {
+        Ok(Ok(Ok(report))) => report,
+        _ => json!({"error":"scoring_unavailable"}),
+    }
+}
+
 async fn handle_client(
     mut stream: UnixStream,
     state: Arc<AppState>,
     directory: PathBuf,
     base_config: Arc<Config>,
     mutation_gate: Arc<Mutex<()>>,
+    scoring_gate: Arc<Semaphore>,
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     if stream
@@ -244,13 +283,10 @@ async fn handle_client(
             if ![1, 6, 24, 168].contains(&hours) {
                 json!({"error":"invalid_scoring_window"})
             } else {
-                let work = tokio::task::spawn_blocking(move || {
+                bounded_scoring(scoring_gate, SCORING_TIMEOUT, move || {
                     guvna::scoring::read_scoring(&directory, hours as u32)
-                });
-                match timeout(Duration::from_millis(800), work).await {
-                    Ok(Ok(Ok(report))) => report,
-                    _ => json!({"error":"scoring_unavailable"}),
-                }
+                })
+                .await
             }
         }
         _ => json!({"error":"unsupported_command"}),
@@ -309,6 +345,7 @@ async fn query_request(
         }
         Ok(_) => {}
     }
+    ensure_private_control_directory(data_dir)?;
     let mut stream = match timeout(CONTROL_TIMEOUT, UnixStream::connect(&path)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => {
@@ -345,6 +382,42 @@ async fn query_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn timed_out_scoring_reader_holds_slot_until_blocking_work_exits() {
+        let gate = Arc::new(Semaphore::new(1));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let result = bounded_scoring(Arc::clone(&gate), Duration::from_millis(20), move || {
+            wait.recv_timeout(Duration::from_secs(3))
+                .map_err(|_| "mock scoring reader stalled".to_string())?;
+            Ok(json!({"ok":true}))
+        })
+        .await;
+        assert_eq!(result["error"], "scoring_unavailable");
+        // The lost response does NOT free the worker's permit or queue more
+        // SQLite jobs. Even repeated readers must fail fast while it runs.
+        for _ in 0..64 {
+            let busy = bounded_scoring(Arc::clone(&gate), Duration::from_secs(1), || {
+                Ok(json!({"unexpected":true}))
+            })
+            .await;
+            assert_eq!(busy["error"], "scoring_busy");
+        }
+        release.send(()).unwrap();
+        timeout(Duration::from_secs(3), async {
+            while gate.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader releases slot after completing its work");
+        let recovered = bounded_scoring(Arc::clone(&gate), Duration::from_secs(1), || {
+            Ok(json!({"recovered":true}))
+        })
+        .await;
+        assert_eq!(recovered["recovered"], true);
+    }
+
     #[tokio::test]
     async fn local_status_round_trip_is_private_and_reports_runtime_counters() {
         use guvna::config::Config;
@@ -401,6 +474,53 @@ mod tests {
         let _ = server.await;
         assert!(!socket.exists());
     }
+
+    #[tokio::test]
+    async fn insecure_existing_control_directory_rejects_daemon_and_spoofed_client() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(SOCKET_NAME);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let config: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: http://127.0.0.1:1\n    key_env: K\n",
+        )
+        .unwrap();
+        let state = Arc::new(
+            AppState::new(
+                config.clone(),
+                HashMap::from([("K".to_owned(), "test-key".to_owned())]),
+                vec!["client-key".to_owned()],
+            )
+            .unwrap(),
+        );
+        for mode in [0o777, 0o770] {
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
+            let error = query(dir.path()).await.unwrap_err();
+            assert!(error.contains("not group/world writable"), "{error}");
+            let error = spawn(dir.path(), Arc::clone(&state), Arc::new(config.clone()))
+                .await
+                .expect_err("daemon must reject an unsafe pre-existing control directory");
+            assert!(error.contains("not group/world writable"), "{error}");
+            assert!(socket.exists(), "must not unlink someone else's socket");
+        }
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_control_directory(dir.path()).unwrap();
+        drop(listener);
+    }
+
+    #[test]
+    fn symlinked_control_directory_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        assert!(
+            ensure_private_control_directory(&link)
+                .unwrap_err()
+                .contains("not a symlink")
+        );
+    }
+
     #[tokio::test]
     async fn online_chain_mutations_update_live_routes_without_touching_static_routes() {
         use guvna::{config::Config, routing};

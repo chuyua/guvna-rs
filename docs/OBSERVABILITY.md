@@ -182,6 +182,11 @@ p95. The totals come from hour buckets (window start is rounded down);
 the downstream p95 is not an upstream attempt p95. Results are advisory only
 and only qualify candidates after at least 20 attempts. This does not
 silently activate telemetry-based model ordering or expose another TCP port.
+Only one blocking scoring reader may run at a time. If a read takes more
+than 800 ms, the caller gets scoring_unavailable, but the reader keeps its
+slot until its actual SQLite work exits. Concurrent scoring requests fail
+fast with scoring_busy instead of accumulating orphaned blocking jobs. This
+does not block ordinary status, in-flight API requests or chain management.
 
 
 ### Conservative provider attribution (Issue #129)

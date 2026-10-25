@@ -176,6 +176,93 @@ chains:
 }
 
 #[tokio::test]
+async fn online_chain_addition_is_recorded_as_verified_model_not_passthrough() {
+    use guvna::gateway::app_with_state;
+    use rusqlite::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let base: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_env: KEY\nchains:\n  - name: fixed\n    steps:\n      - provider: p\n        model: static\n"
+    ))
+    .unwrap();
+    let mut state = AppState::new(
+        base.clone(),
+        HashMap::from([("KEY".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, running) = app_with_state(state);
+    let next: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_env: KEY\nchains:\n  - name: fixed\n    steps:\n      - provider: p\n        model: static\n  - name: dynamic\n    steps:\n      - provider: p\n        model: fresh\n"
+    ))
+    .unwrap();
+    running.replace_route_snapshot(next).unwrap();
+    let (status, result) = call(router.clone(), request("dynamic", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(running.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let (model, verified): (String, i64) = db
+        .query_row(
+            "SELECT model, identity_verified FROM request_events WHERE endpoint='chat'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((model.as_str(), verified), ("fresh", 1));
+    running.replace_route_snapshot(base).unwrap();
+    let (status, result) = call(router, request("dynamic", "", "client")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{result}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn live_auto_candidate_add_and_delete_invalidates_empty_route_cache() {
+    use guvna::gateway::app_with_state;
+
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let base: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_env: KEY\nauto:\n  enabled: true\n  discover_from_chains: true\n  candidates:\n    - provider: p\n      model: impossible\n      min_input_bytes: 9999999\n"
+    ))
+    .unwrap();
+    let (router, state) = app_with_state(
+        AppState::new(
+            base.clone(),
+            HashMap::from([("KEY".into(), "secret".into())]),
+            vec!["client".into()],
+        )
+        .unwrap(),
+    );
+    let (status, _) = call(router.clone(), request("auto", "", "client")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+    let mut added = base.clone();
+    added.chains.push(
+        serde_yaml::from_str("name: online\nsteps:\n  - provider: p\n    model: discovered\n")
+            .unwrap(),
+    );
+    state.replace_route_snapshot(added).unwrap();
+    assert_eq!(state.runtime_status()["auto_candidate_count"], 2);
+    let (status, result) = call(router.clone(), request("auto", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(result["model"], "discovered");
+
+    state.replace_route_snapshot(base).unwrap();
+    assert_eq!(state.runtime_status()["auto_candidate_count"], 1);
+    let (status, _) = call(router, request("auto", "", "client")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "deleted Auto candidate must never be retried from cache"
+    );
+}
+
+#[tokio::test]
 async fn failed_first_candidate_is_correlated_with_one_terminal_request_and_scoring() {
     use guvna::gateway::app_with_state;
     use rusqlite::{Connection, params};
@@ -267,6 +354,19 @@ chains:
         )
         .unwrap();
     assert_eq!(unknown, 1);
+    let (penalty, failures): (i64, i64) = db
+        .query_row(
+            "SELECT penalty,consecutive_failures FROM provider_health
+             WHERE provider='broken' AND model='one'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (penalty, failures),
+        (35, 1),
+        "a genuine upstream 5xx must still update persisted provider health"
+    );
 }
 
 #[tokio::test]
@@ -4692,6 +4792,93 @@ chains:
     let (_, metrics) = get_metrics(router, Some("client")).await;
     assert_eq!(metric_value(&metrics, "circuit_openings_total"), 0);
     assert_eq!(metric_value(&metrics, "aggregation_failures_total"), 8);
+}
+
+#[tokio::test]
+async fn local_aggregation_policy_does_not_poison_auto_health_or_sqlite_restart() {
+    use guvna::gateway::app_with_state;
+    use rusqlite::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let invalid = aggregate_chat_frame(json!({"choices":[{"index":0,
+        "delta":{"audio":{"data":"unsupported"}},"finish_reason":null}]}));
+    let (primary, primary_hits, _) =
+        start_strict_stream_only(vec![invalid, b"data: [DONE]\n\n".to_vec()]).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: streaming
+    type: openai
+    base_url: {primary}
+    key_env: STREAM_KEY
+    stream_only: true
+  - name: backup
+    type: openai
+    base_url: {backup}
+    key_env: BACKUP_KEY
+auto:
+  enabled: true
+  health_aware: true
+  candidates:
+    - provider: streaming
+      model: stream-model
+      priority: 1
+    - provider: backup
+      model: backup-model
+      priority: 2
+"#
+    ))
+    .unwrap();
+    let credentials = HashMap::from([
+        ("STREAM_KEY".into(), "stream-secret".into()),
+        ("BACKUP_KEY".into(), "backup-secret".into()),
+    ]);
+    let mut state =
+        AppState::new(config.clone(), credentials.clone(), vec!["client".into()]).unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, shared) = app_with_state(state);
+    for _ in 0..3 {
+        let (status, output) = call(router.clone(), request("auto", "", "client")).await;
+        assert_eq!(status, StatusCode::OK, "{output}");
+    }
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 3);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 3);
+    assert!(shared.flush_telemetry(std::time::Duration::from_secs(3)));
+
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let poisoned: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM provider_health WHERE provider='streaming' AND model='stream-model'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        poisoned, 0,
+        "local SSE-to-JSON aggregation policy cannot silently demote a provider after restart"
+    );
+    let recorded: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM failure_events WHERE provider='streaming' AND model='stream-model'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 3, "diagnostic failures still appear in telemetry");
+    drop(db);
+
+    let mut restarted = AppState::new(config, credentials, vec!["client".into()]).unwrap();
+    restarted.enable_telemetry(dir.path()).unwrap();
+    let (router, _) = app_with_state(restarted);
+    let (status, output) = call(router, request("auto", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(
+        primary_hits.load(Ordering::SeqCst),
+        4,
+        "SQLite restart must not reintroduce an unsupported aggregation health penalty"
+    );
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 4);
 }
 
 #[tokio::test]

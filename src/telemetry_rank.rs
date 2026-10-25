@@ -16,6 +16,7 @@ const MIN_SAMPLES: i64 = 20;
 struct Snapshot {
     order: Vec<(String, String)>,
     loaded: Instant,
+    generation: u64,
 }
 
 /// Never exposes SQLite or score-derived weights to an upstream model.
@@ -25,16 +26,17 @@ pub struct TelemetryRank {
 }
 
 impl TelemetryRank {
-    pub fn new(order: Option<Vec<(String, String)>>) -> Self {
+    pub fn new(order: Option<Vec<(String, String)>>, generation: u64) -> Self {
         let rank = Self::default();
-        rank.set(order);
+        rank.set(order, generation);
         rank
     }
 
-    pub fn set(&self, order: Option<Vec<(String, String)>>) {
+    pub fn set(&self, order: Option<Vec<(String, String)>>, generation: u64) {
         *self.current.write().unwrap_or_else(|e| e.into_inner()) = order.map(|order| Snapshot {
             order,
             loaded: Instant::now(),
+            generation,
         });
     }
 
@@ -45,6 +47,7 @@ impl TelemetryRank {
         config: &Config,
         steps: &mut [ResolvedStep],
         has_health_penalties: bool,
+        generation: u64,
     ) -> bool {
         if has_health_penalties || steps.len() < 2 {
             return false;
@@ -53,7 +56,7 @@ impl TelemetryRank {
         let Some(snapshot) = guard.as_ref() else {
             return false;
         };
-        if snapshot.loaded.elapsed() > MAX_SNAPSHOT_LIFETIME {
+        if snapshot.loaded.elapsed() > MAX_SNAPSHOT_LIFETIME || snapshot.generation != generation {
             return false;
         }
         // An incomplete/mismatched snapshot must not change even one route.
@@ -79,12 +82,15 @@ impl TelemetryRank {
         true
     }
 
-    pub fn active(&self) -> bool {
+    pub fn active_for_generation(&self, generation: u64) -> bool {
         self.current
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .is_some_and(|snapshot| snapshot.loaded.elapsed() <= MAX_SNAPSHOT_LIFETIME)
+            .is_some_and(|snapshot| {
+                snapshot.generation == generation
+                    && snapshot.loaded.elapsed() <= MAX_SNAPSHOT_LIFETIME
+            })
     }
 }
 
@@ -131,6 +137,7 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
         // cannot be trusted as an identity for automatic routing.
         if Telemetry::normalize_label(&candidate.provider) != candidate.provider
             || Telemetry::normalize_label(&candidate.model) != candidate.model
+            || candidate.model == "passthrough"
         {
             return None;
         }
@@ -151,7 +158,7 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
             .query_row(
                 "SELECT MAX(ts) FROM request_events
              WHERE provider=?1 AND model=?2 AND ts BETWEEN ?3 AND ?4
-             AND endpoint='chat'
+             AND endpoint='chat' AND identity_verified=1
              AND failure_type IN ('success','provider_5xx','transport_error',
                  'invalid_response','timeout','upstream_unavailable')",
                 params![candidate.provider, candidate.model, since, now],
@@ -166,6 +173,7 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
                    ON r.request_id=t.request_id AND r.attempt_index=t.attempt_index
                  WHERE t.provider=?1 AND t.model=?2 AND t.ts BETWEEN ?3 AND ?4
                    AND r.endpoint='chat' AND r.stream_requested=1
+                   AND r.identity_verified=1
                    AND r.failure_type='stream_started'
                    AND r.provider=t.provider AND r.model=t.model
                    AND t.outcome IN ('success','transport_error')",
@@ -294,9 +302,32 @@ auto:
             .unwrap();
         }
         let cfg = config();
+        // Pre-migration aggregates have no identity proof. Even 40+ apparent
+        // successes and a recent request must not authorize Auto reordering.
+        assert!(load(dir.path(), &cfg).is_none());
+        conn.execute_batch(
+            "ALTER TABLE hourly_stats ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 1;
+             ALTER TABLE request_events ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 1;",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE request_events SET identity_verified=0 WHERE model='second'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            load(dir.path(), &cfg).is_none(),
+            "an unverified recent request must not satisfy the freshness gate"
+        );
+        conn.execute(
+            "UPDATE request_events SET identity_verified=1 WHERE model='second'",
+            [],
+        )
+        .unwrap();
         let order = load(dir.path(), &cfg).unwrap();
         assert_eq!(order[0].1, "second");
-        let rank = TelemetryRank::new(Some(order));
+        let generation = crate::routing::config_generation(&cfg);
+        let rank = TelemetryRank::new(Some(order), generation);
         let mut steps = vec![
             ResolvedStep {
                 provider_index: 0,
@@ -309,10 +340,10 @@ auto:
                 params: Default::default(),
             },
         ];
-        assert!(rank.rank(&cfg, &mut steps, false));
+        assert!(rank.rank(&cfg, &mut steps, false, generation));
         assert_eq!(steps[0].model, "second");
         steps.reverse();
-        assert!(!rank.rank(&cfg, &mut steps, true));
+        assert!(!rank.rank(&cfg, &mut steps, true, generation));
         assert_eq!(steps[0].model, "first");
         // A refresh task that dies or stalls cannot leave old approval live.
         {
@@ -320,10 +351,11 @@ auto:
             guard.as_mut().unwrap().loaded =
                 Instant::now() - MAX_SNAPSHOT_LIFETIME - Duration::from_secs(1);
         }
-        assert!(!rank.active());
-        assert!(!rank.rank(&cfg, &mut steps, false));
-        rank.set(load(dir.path(), &cfg));
-        assert!(rank.active());
+        assert!(!rank.active_for_generation(generation));
+        assert!(!rank.rank(&cfg, &mut steps, false, generation));
+        rank.set(load(dir.path(), &cfg), generation);
+        assert!(rank.active_for_generation(generation));
+        assert!(!rank.rank(&cfg, &mut steps, false, generation.wrapping_add(1)));
         conn.execute(
             "UPDATE request_events SET ts=?1 WHERE model='second'",
             params![now - 1000],
@@ -337,9 +369,9 @@ auto:
         .unwrap();
         conn.execute("UPDATE hourly_stats SET request_count=1 WHERE model='second' AND failure_type='success'",[]).unwrap();
         assert!(load(dir.path(), &cfg).is_none());
-        rank.set(None);
-        assert!(!rank.active());
-        assert!(!rank.rank(&cfg, &mut steps, false));
+        rank.set(None, generation);
+        assert!(!rank.active_for_generation(generation));
+        assert!(!rank.rank(&cfg, &mut steps, false, generation));
     }
 
     #[test]

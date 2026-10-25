@@ -34,6 +34,7 @@ fn confirmed_chat_stream_outcomes(
     conn: &Connection,
     since: i64,
     targets: &[(String, String)],
+    verified_only: bool,
 ) -> Result<StreamOutcomeCounts, String> {
     let mut outcomes = HashMap::new();
     if targets.is_empty() {
@@ -43,6 +44,11 @@ fn confirmed_chat_stream_outcomes(
     // needed. Grouping every historical provider/model into a HashMap made
     // a local scoring read grow with unrelated telemetry cardinality.
     let filter = vec!["(?,?)"; targets.len()].join(",");
+    let verified_filter = if verified_only {
+        "AND r.identity_verified=1"
+    } else {
+        ""
+    };
     let mut args = vec![rusqlite::types::Value::Integer(since)];
     for (provider, model) in targets {
         args.push(rusqlite::types::Value::Text(provider.clone()));
@@ -59,7 +65,7 @@ fn confirmed_chat_stream_outcomes(
            AND r.stream_requested=1 AND r.failure_type='stream_started'
            AND r.provider=t.provider AND r.model=t.model
            AND t.outcome IN ('success','transport_error')
-           AND (t.provider,t.model) IN ({filter})
+           AND (t.provider,t.model) IN ({filter}) {verified_filter}
          GROUP BY t.provider,t.model,t.outcome"
     )) else {
         return Ok(outcomes);
@@ -92,11 +98,16 @@ fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
     // Timestamp-indexed bounded reads avoid unbounded request-id joins.
     // Multiple attempts can share a one-second timestamp; a first failed
     // attempt must never overwrite the final candidate's real outcome.
+    // Old endpoint-less traces can contain Embeddings traffic: without a
+    // reliable Chat label, no shadow-to-actual link can be verified.
+    conn.prepare("SELECT endpoint FROM request_events LIMIT 0")
+        .ok()?;
     let mut requests: HashMap<String, (String, String, Option<i64>, i64, String)> = HashMap::new();
     let mut query = conn
         .prepare(
             "SELECT request_id,provider,model,attempt_index,stream_requested,failure_type
-         FROM request_events WHERE ts >= ?1 AND request_id IS NOT NULL
+         FROM request_events WHERE ts >= ?1 AND endpoint='chat'
+           AND request_id IS NOT NULL
          ORDER BY ts DESC, attempt_index DESC LIMIT 512",
         )
         .ok()?;
@@ -319,6 +330,13 @@ fn read_scoring_inner(
     } else {
         "AND 1=0"
     };
+    // Historical and colliding diagnostic labels cannot establish an
+    // operator-approved automatic routing score.
+    let verified_filter = if candidates.is_some() {
+        "AND identity_verified=1"
+    } else {
+        ""
+    };
     let candidate_filter = match candidates {
         Some([]) => "AND 1=0".to_owned(),
         Some(candidates) => format!(
@@ -343,7 +361,7 @@ fn read_scoring_inner(
                     THEN MIN(request_count,failure_count) ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN failure_type='stream_started' THEN request_count ELSE 0 END),0)
          FROM hourly_stats
-         WHERE hour_ts >= ?1 AND provider != 'unknown' {chat_filter} {candidate_filter}
+         WHERE hour_ts >= ?1 AND provider != 'unknown' {chat_filter} {candidate_filter} {verified_filter}
          GROUP BY provider,model
          ORDER BY COALESCE(SUM(request_count),0) DESC,provider,model
          LIMIT 32"
@@ -372,7 +390,8 @@ fn read_scoring_inner(
         .iter()
         .map(|row| (row.0.clone(), row.1.clone()))
         .collect::<Vec<_>>();
-    let stream_outcomes = confirmed_chat_stream_outcomes(&conn, since, &targets)?;
+    let stream_outcomes =
+        confirmed_chat_stream_outcomes(&conn, since, &targets, candidates.is_some())?;
     let mut candidates = Vec::new();
     for record in rows {
         let (
@@ -412,7 +431,7 @@ fn read_scoring_inner(
         };
         let latency_sql = format!(
             "SELECT elapsed_ms,sse_headers FROM request_events
-             WHERE provider=?1 AND model=?2 AND ts >= ?3 {latency_filter}
+             WHERE provider=?1 AND model=?2 AND ts >= ?3 {latency_filter} {verified_filter}
              ORDER BY ts DESC LIMIT 512"
         );
         let mut sample_stmt = conn
@@ -473,14 +492,16 @@ fn read_scoring_inner(
     {
         let (traced, fallback, first_nonstream, first_success): (i64, i64, i64, i64) = conn
             .query_row(
-                "SELECT COUNT(DISTINCT request_id),
+                &format!(
+                    "SELECT COUNT(DISTINCT request_id),
                         COUNT(DISTINCT CASE WHEN attempt_index > 1 THEN request_id END),
                         COUNT(DISTINCT CASE WHEN stream_requested = 0 THEN request_id END),
                         COUNT(DISTINCT CASE WHEN attempt_index = 1 AND stream_requested = 0
                                             AND failure_type = 'success' THEN request_id END)
                  FROM request_events
                  WHERE ts >= ?1 AND endpoint='chat'
-                   AND request_id IS NOT NULL AND attempt_index IS NOT NULL",
+                   AND request_id IS NOT NULL AND attempt_index IS NOT NULL {verified_filter}"
+                ),
                 params![since],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -580,7 +601,7 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
             "CREATE TABLE request_events (
-                ts INTEGER,request_id TEXT,provider TEXT,model TEXT,
+                ts INTEGER,endpoint TEXT,request_id TEXT,provider TEXT,model TEXT,
                 attempt_index INTEGER,stream_requested INTEGER,failure_type TEXT
              );
              CREATE INDEX request_events_ts ON request_events(ts);
@@ -621,7 +642,7 @@ mod tests {
             (1002, "unverified", "b", 2, 1, "stream_started"),
         ] {
             db.execute(
-                "INSERT INTO request_events VALUES(?1, ?2, 'p', ?3, ?4, ?5, ?6)",
+                "INSERT INTO request_events VALUES(?1, 'chat', ?2, 'p', ?3, ?4, ?5, ?6)",
                 params![ts, id, model, attempt, streaming, outcome],
             )
             .unwrap();
@@ -650,6 +671,36 @@ mod tests {
     }
 
     #[test]
+    fn shadow_endpointless_legacy_traces_cannot_claim_real_chat_outcomes() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE request_events(
+                ts INTEGER,request_id TEXT,provider TEXT,model TEXT,
+                attempt_index INTEGER,stream_requested INTEGER,failure_type TEXT
+             );
+             CREATE TABLE shadow_events(
+                ts INTEGER,request_id TEXT,baseline_provider TEXT,baseline_model TEXT,
+                suggested_provider TEXT,suggested_model TEXT,available INTEGER,disagreed INTEGER
+             );",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO request_events VALUES(1000,'trace','p','m',1,0,'success')",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO shadow_events VALUES(1000,'trace','p','m','p','m',1,0)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            sampled_shadow_outcomes(&db, 999).is_none(),
+            "an endpoint-less trace could be Embeddings; it cannot certify a Chat Shadow outcome"
+        );
+    }
+
+    #[test]
     fn shadow_observation_only_counts_real_outcomes_and_correct_sse_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let directory = dir.path().join("telemetry");
@@ -662,7 +713,7 @@ mod tests {
                 max_elapsed_ms INTEGER,failure_type TEXT
              );
              CREATE TABLE request_events (
-                ts INTEGER,provider TEXT,model TEXT,elapsed_ms INTEGER,
+                ts INTEGER,endpoint TEXT,provider TEXT,model TEXT,elapsed_ms INTEGER,
                 sse_headers INTEGER,request_id TEXT,attempt_index INTEGER,
                 stream_requested INTEGER,failure_type TEXT
              );
@@ -711,8 +762,23 @@ mod tests {
             ("unverified_success", "a", 1, 0, 1, "success"),
         ] {
             db.execute(
-                "INSERT INTO request_events VALUES(?1,'p',?2,15,?3,?4,?5,?6,?7)",
+                "INSERT INTO request_events VALUES(?1,'chat','p',?2,15,?3,?4,?5,?6,?7)",
                 params![now, model, headers, id, attempt, stream, outcome],
+            )
+            .unwrap();
+        }
+        // Later Embeddings traffic must neither impersonate a Chat request
+        // (even with the same ID) nor evict all Chat traces from the bounded
+        // 512-row sample used to join actual outcomes to Shadow advice.
+        db.execute(
+            "INSERT INTO request_events VALUES(?1,'embeddings','p','wrong',1,0,'direct',9,0,'success')",
+            [now + 1],
+        )
+        .unwrap();
+        for i in 0..600 {
+            db.execute(
+                "INSERT INTO request_events VALUES(?1,'embeddings','p','embedding-model',1,0,?2,1,0,'success')",
+                params![now + 1, format!("embedding-{i}")],
             )
             .unwrap();
         }
@@ -1070,13 +1136,22 @@ mod tests {
             .unwrap();
         }
         let outcomes =
-            confirmed_chat_stream_outcomes(&db, now - 3600, &[("p".into(), "m".into())]).unwrap();
+            confirmed_chat_stream_outcomes(&db, now - 3600, &[("p".into(), "m".into())], false)
+                .unwrap();
         assert_eq!(
             outcomes.len(),
             1,
             "unrelated stream outcomes must not be retained"
         );
         assert_eq!(outcomes.get(&("p".into(), "m".into())), Some(&(20, 1)));
+        // A legacy database remains readable for diagnostics, but cannot
+        // supply trusted candidate scores without provenance markers.
+        assert!(read_scoring_for_candidates(dir.path(), 1, &[("p".into(), "m".into())]).is_err());
+        db.execute_batch(
+            "ALTER TABLE hourly_stats ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 1;
+             ALTER TABLE request_events ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 1;",
+        )
+        .unwrap();
         let scoped =
             read_scoring_for_candidates(dir.path(), 1, &[("p".into(), "m".into())]).unwrap();
         assert_eq!(scoped["candidate_count"], 1);

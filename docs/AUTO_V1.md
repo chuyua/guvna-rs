@@ -37,8 +37,12 @@ A candidate may also declare supports_tools, supports_images, or
 supports_json_schema as false to hard-exclude incompatible Chat requests.
 When omitted, capability is unknown and old configurations remain eligible;
 true is an explicit local assertion, not runtime verification of the model.
-Capability requirements derive only from Chat tool declarations/history, image
-content-part types, and response_format.type=json_schema. The cache key
+Capability requirements derive from Chat tool declarations/history (including
+non-empty historical tool_calls and explicit required/named tool_choice), image
+content-part types, and response_format.type=json_schema. Null/empty historical
+tool_calls do not by themselves require tool support. Malformed non-null tool
+controls remain conservatively tool-required rather than bypassing a declared
+supports_tools: false candidate. The cache key
 includes these capability requirements to prevent cross-request misrouting.
 The process-local cache stores route metadata only (max 128 entries, 30s TTL),
 keys results by request-size estimates and live health scores, and clears on a
@@ -123,6 +127,30 @@ restored at startup only if the last failure is within the 300-second freshness
 window. Failed intermediate candidates are recorded separately from the single
 downstream request row, so fallback failures survive restart without double-counting
 the request. If SQLite is disabled or unreadable, routing falls back to in-memory hints.
+SQLite provider-health persistence uses the same failure attribution as the
+in-memory Auto health hints: a genuine upstream transport/5xx failure remains
+health evidence, while local SSE-to-JSON aggregation policy failures (such as
+unsupported delta formats, size caps, or local idle/lifetime limits) remain
+visible in failure telemetry without demoting a provider after a restart.
+This distinction is verified by an end-to-end Auto fallback/restart test.
+Provider-health identity must also be exact: names truncated or sanitized for
+diagnostic labels, and the generic passthrough label, never update or restore
+SQLite Auto penalties. When migrating an older SQLite database, existing
+provider-health rows lack proof of their original identities and are ignored
+for Auto ordering; the first new trusted observation resets that row's
+penalty/streak rather than inheriting potentially colliding history. Request,
+failure, and hourly telemetry remains intact. This intentionally allows
+unknown historical health to recover neutrally rather than demoting the wrong
+provider/model after an upgrade.
+Approved telemetry-based Auto ordering uses a stricter evidence boundary than
+the local diagnostic scoring view: each hourly candidate/failure-class bucket
+and each recent Chat request must have an exact verified provider/model
+identity. Legacy hourly/request rows are migrated as unverified, and even one
+sanitized-label collision or non-upstream observation makes the affected
+hourly bucket ineligible for Auto ranking. The operator's CLI diagnostics
+continue to show the original counts. Ranking safely falls back to the
+deterministic Auto order until enough clean, recent evidence accumulates;
+historical aggregate counts cannot be retroactively verified.
 ## Issue #129: optional dynamic chain discovery
 
 When auto.enabled: true, auto.discover_from_chains: true can add
@@ -358,6 +386,10 @@ counts as a
 completed stream; response headers alone do not. A stream request rejected
 before headers retains its explicit request-row failure even without a terminal
 callback; an unverified success still remains pending.
+Only Chat request rows are eligible for actual Shadow correlation. Other
+endpoints (including Embeddings) cannot evict Chat traces from the bounded
+sample or impersonate a Chat outcome. Legacy endpoint-less request tables
+return a null optional outcome sample rather than an unverified match.
 Completed, failed, cancelled, pending and unlinked actual requests, actual
 fallbacks and first-choice successes are separated. A proposed model
 matching the actual final route is NOT a counterfactual success claim:

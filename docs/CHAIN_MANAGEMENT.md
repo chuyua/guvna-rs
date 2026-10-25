@@ -75,6 +75,12 @@ as the running service. Avoid concurrent manual edits that bypass the CLI's
 advisory lock.
 No API_KEYS or ADMIN_KEY is required for local file management, but OS
 filesystem permissions for the selected data directory are required.
+For the online Unix control socket, the existing data directory must belong
+to the running service UID and must not be group- or world-writable (for
+example, 0700 or 0755 is accepted; 0775 and 0777 are rejected). The daemon
+does not silently change existing directory permissions. Local CLI clients
+also refuse to connect through an unsafe directory to prevent socket
+replacement or impersonation by another local user.
 
 After a change, validate first, then restart deliberately. Corrupted runtime
 chains still prevent normal daemon startup rather than being silently ignored.
@@ -91,8 +97,32 @@ control.sock, guvna chains set --file and chains delete --name now send the
 validated operation through that same-UID Unix socket. The daemon uses the
 existing serialized filesystem lock and atomic chain_store write, reloads
 the complete validated static+runtime route table and swaps it in one
-pointer operation. In-flight requests keep their old route snapshot.
+pointer operation. The named route snapshot, authenticated /v1/models list
+and /v1/models/{model} detail are derived from the same immutable generation:
+concurrent readers cannot see a half-published route and stale model listing
+inside a single snapshot. In-flight requests keep their old route snapshot.
+Request and SSE-terminal telemetry also retain the admitted route generation
+for provider/model identity: a newly added named model is recorded with its
+exact model name (not the generic passthrough label), and deleting a chain
+cannot relabel a stream that was already in flight. Unknown direct
+passthrough model names remain excluded from verified model-health evidence.
 CLI operations without a running control socket still update offline files,
 with a restart warning, preserving existing behavior. No TCP control route
 or Web backend exists. Chain names from static config remain read-only.
-Auto candidates discovered at startup are not live-updated until a restart.
+With `auto.discover_from_chains: true`, online chain additions and deletions
+also rebuild the bounded Auto candidate set in the same published generation.
+Before changing `chains.yaml` (offline or online), set/delete/recover verify
+that enabled Auto would still have at least one eligible discovered or explicit
+candidate on the next boot. Removing or replacing the **last** discoverable
+candidate is rejected *without changing the live file or its backup*. This
+prevents a successful runtime edit from silently making the daemon unable to
+restart. Explicit configured Auto candidates allow all runtime chains to be
+removed safely.
+Explicit Auto candidates remain unchanged. The Auto route cache uses that
+generation to discard obsolete entries; retained provider/model health scores
+follow their exact identities even when candidate indexes shift. In-flight
+requests and SSE streams keep their admission-time health snapshot, while
+newly discovered candidates begin with neutral in-memory health. The optional
+SQLite telemetry ranker refuses stale candidate generations until its next
+background refresh; Decider's cache key includes the eligible candidate set.
+No restart, remote management endpoint, or second dispatch loop is required.

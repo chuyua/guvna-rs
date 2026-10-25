@@ -71,18 +71,51 @@ pub struct AppState {
     auto_background_slots: Arc<Semaphore>,
     metrics: Arc<Metrics>,
     telemetry: Option<Telemetry>,
-    auto_health: Option<AutoHealth>,
     auto_route_cache: AutoRouteCache,
     auto_decider: Option<Arc<AutoDecider>>,
     auto_telemetry_rank: Option<Arc<TelemetryRank>>,
     shadow_total: AtomicU64,
     shadow_disagreements: AtomicU64,
     shadow_unavailable: AtomicU64,
-    auto_generation: u64,
     started_at: Instant,
-    model_catalog: RwLock<Value>,
-    model_details: RwLock<HashMap<String, Value>>,
-    live_routes: RwLock<Arc<Config>>,
+    // A single publication makes the route resolver, model list and detail
+    // view consistent. Readers keep an immutable Arc across a live update.
+    live_routes: Arc<RwLock<Arc<LiveRouteSnapshot>>>,
+}
+
+struct LiveRouteSnapshot {
+    config: Arc<Config>,
+    model_catalog: Value,
+    model_details: HashMap<String, Value>,
+    auto_health: Option<AutoHealth>,
+    auto_generation: u64,
+}
+
+impl LiveRouteSnapshot {
+    fn new(config: Config, previous: Option<&Self>) -> Self {
+        let (model_catalog, model_details) = collect_models(&config);
+        let auto_health = config.auto.health_aware.then(|| {
+            previous
+                .and_then(|old| old.auto_health.as_ref().map(|health| (old, health)))
+                .map_or_else(
+                    || AutoHealth::new(config.auto.candidates.len()),
+                    |(old, health)| {
+                        AutoHealth::remap(
+                            health,
+                            &old.config.auto.candidates,
+                            &config.auto.candidates,
+                        )
+                    },
+                )
+        });
+        Self {
+            auto_generation: routing::config_generation(&config),
+            config: Arc::new(config),
+            model_catalog,
+            model_details,
+            auto_health,
+        }
+    }
 }
 
 fn collect_models(config: &Config) -> (Value, HashMap<String, Value>) {
@@ -117,18 +150,36 @@ fn collect_models(config: &Config) -> (Value, HashMap<String, Value>) {
 }
 
 impl AppState {
+    #[cfg(test)]
     pub(crate) fn telemetry_model_name<'a>(
         &self,
         provider_index: usize,
         model: &'a str,
     ) -> &'a str {
+        let routes = self.route_snapshot();
+        self.telemetry_model_name_in(&routes, provider_index, model)
+    }
+
+    /// A request or SSE stream must attribute events using the route
+    /// generation with which it was admitted. A later online chains delete
+    /// must not turn an already running named model into 'passthrough'.
+    pub(crate) fn telemetry_model_name_in<'a>(
+        &self,
+        routes: &Config,
+        provider_index: usize,
+        model: &'a str,
+    ) -> &'a str {
         let provider = &self.config.providers[provider_index];
         if provider.models.iter().any(|name| name == model)
-            || self
-                .config
+            || routes
                 .chains
                 .iter()
                 .flat_map(|chain| &chain.steps)
+                .any(|step| step.provider == provider.name && step.model == model)
+            || routes
+                .auto
+                .candidates
+                .iter()
                 .any(|step| step.provider == provider.name && step.model == model)
             || self
                 .config
@@ -178,19 +229,12 @@ impl AppState {
             .redirect(reqwest::redirect::Policy::none()) // Do not redirect provider credentials.
             .build()
             .map_err(|e| format!("building HTTP client: {e}"))?;
-        let (model_catalog, model_details) = collect_models(&config);
         let auto_decider =
             AutoDecider::from_config(&config, &credentials, client.clone())?.map(Arc::new);
-        let auto_generation = routing::config_generation(&config);
         let auto_route_cache = AutoRouteCache::new();
-        let auto_health = config
-            .auto
-            .health_aware
-            .then(|| AutoHealth::new(config.auto.candidates.len()));
+        let live = Arc::new(LiveRouteSnapshot::new(config.clone(), None));
         Ok(Self {
-            model_catalog: RwLock::new(model_catalog),
-            model_details: RwLock::new(model_details),
-            live_routes: RwLock::new(Arc::new(config.clone())),
+            live_routes: Arc::new(RwLock::new(live)),
             config,
             client,
             pools,
@@ -202,75 +246,121 @@ impl AppState {
             auto_background_slots: Arc::new(Semaphore::new(MAX_BACKGROUND_DECIDERS)),
             metrics: Arc::new(Metrics::default()),
             telemetry: None,
-            auto_health,
             auto_route_cache,
             auto_decider,
             auto_telemetry_rank: None,
             shadow_total: AtomicU64::new(0),
             shadow_disagreements: AtomicU64::new(0),
             shadow_unavailable: AtomicU64::new(0),
-            auto_generation,
             started_at: Instant::now(),
         })
     }
 
-    pub fn route_snapshot(&self) -> Arc<Config> {
+    fn live_snapshot(&self) -> Arc<LiveRouteSnapshot> {
         Arc::clone(&self.live_routes.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    pub fn route_snapshot(&self) -> Arc<Config> {
+        Arc::clone(&self.live_snapshot().config)
     }
 
     /// Atomically publish the already-persisted and revalidated local route
     /// snapshot. Requests already underway retain the old Arc snapshot.
-    pub fn replace_route_snapshot(&self, next: Config) -> Result<(), String> {
+    pub fn replace_route_snapshot(&self, mut next: Config) -> Result<(), String> {
         next.validate()?;
-        let (catalog, details) = collect_models(&next);
-        *self
-            .model_catalog
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = catalog;
-        *self
-            .model_details
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = details;
-        *self.live_routes.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+        // The local control socket supplies the unmaterialized base config
+        // plus current runtime chains. Re-discover after every mutation,
+        // including deletions; never inherit stale discovered candidates.
+        next.discover_auto_candidates();
+        let mut guard = self.live_routes.write().unwrap_or_else(|e| e.into_inner());
+        *guard = Arc::new(LiveRouteSnapshot::new(next, Some(&guard)));
         Ok(())
     }
 
+    #[cfg(test)]
     fn auto_candidate_index(&self, provider_index: usize, model: &str) -> Option<usize> {
         let provider = self.config.providers.get(provider_index)?;
-        self.config
+        self.live_snapshot()
+            .config
             .auto
             .candidates
             .iter()
             .position(|candidate| candidate.provider == provider.name && candidate.model == model)
     }
 
+    #[cfg(test)]
     fn mark_auto_failure(&self, provider_index: usize, model: &str) {
-        if let Some(health) = &self.auto_health
-            && let Some(index) = self.auto_candidate_index(provider_index, model)
+        self.mark_auto_failure_in(&self.live_snapshot(), provider_index, model);
+    }
+
+    fn mark_auto_failure_in(
+        &self,
+        snapshot: &LiveRouteSnapshot,
+        provider_index: usize,
+        model: &str,
+    ) {
+        if let Some(health) = &snapshot.auto_health
+            && let Some(provider) = self.config.providers.get(provider_index)
+            && let Some(index) = snapshot
+                .config
+                .auto
+                .candidates
+                .iter()
+                .position(|candidate| {
+                    candidate.provider == provider.name && candidate.model == model
+                })
         {
             health.mark_failure(index);
         }
     }
 
+    #[cfg(test)]
     fn mark_auto_success(&self, provider_index: usize, model: &str) {
-        if let Some(health) = &self.auto_health
-            && let Some(index) = self.auto_candidate_index(provider_index, model)
+        self.mark_auto_success_in(&self.live_snapshot(), provider_index, model);
+    }
+
+    fn mark_auto_success_in(
+        &self,
+        snapshot: &LiveRouteSnapshot,
+        provider_index: usize,
+        model: &str,
+    ) {
+        if let Some(health) = &snapshot.auto_health
+            && let Some(provider) = self.config.providers.get(provider_index)
+            && let Some(index) = snapshot
+                .config
+                .auto
+                .candidates
+                .iter()
+                .position(|candidate| {
+                    candidate.provider == provider.name && candidate.model == model
+                })
         {
             health.mark_success(index);
         }
     }
     /// Optional local-only telemetry. Main enables this explicitly; test AppStates stay off.
     pub fn enable_telemetry(&mut self, data_dir: &std::path::Path) -> Result<(), String> {
-        let restored = if self.auto_health.is_some() {
+        let live = self.live_snapshot();
+        let restored = if live.auto_health.is_some() {
             Telemetry::load_provider_health(data_dir)
         } else {
             Vec::new()
         };
         let telemetry = Telemetry::start(data_dir, Arc::clone(&self.metrics))?;
-        if let Some(health) = &self.auto_health {
-            for (index, candidate) in self.config.auto.candidates.iter().enumerate() {
+        if let Some(health) = &live.auto_health {
+            for (index, candidate) in live.config.auto.candidates.iter().enumerate() {
                 let provider_label = Telemetry::normalize_label(&candidate.provider);
                 let model_label = Telemetry::normalize_label(&candidate.model);
+                // Sanitized/truncated labels are not injective. An unsafe
+                // candidate must never inherit another model's persisted
+                // health, even if its normalized key appears in SQLite.
+                if provider_label != candidate.provider
+                    || model_label != candidate.model
+                    || candidate.model == "passthrough"
+                {
+                    continue;
+                }
                 if let Some(snapshot) = restored
                     .iter()
                     .find(|item| item.provider == provider_label && item.model == model_label)
@@ -287,14 +377,14 @@ impl AppState {
         }
         self.telemetry = Some(telemetry);
         if self.config.auto.telemetry_ranking.enabled {
-            let initial = telemetry_rank::load(data_dir, &self.config);
-            let rank = Arc::new(TelemetryRank::new(initial));
+            let initial = telemetry_rank::load(data_dir, &live.config);
+            let rank = Arc::new(TelemetryRank::new(initial, live.auto_generation));
             // No request-path database reads, and no extra permanent OS thread.
             // If a test constructs state outside Tokio, the initial snapshot
             // safely expires rather than staying approved indefinitely.
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let weak = Arc::downgrade(&rank);
-                let config = self.config.clone();
+                let routes = Arc::clone(&self.live_routes);
                 let directory = data_dir.to_path_buf();
                 handle.spawn(async move {
                     let mut ticker = tokio::time::interval(telemetry_rank::refresh_interval());
@@ -304,7 +394,9 @@ impl AppState {
                         let Some(rank) = weak.upgrade() else {
                             break;
                         };
-                        let config = config.clone();
+                        let live = Arc::clone(&routes.read().unwrap_or_else(|e| e.into_inner()));
+                        let config = Arc::clone(&live.config);
+                        let generation = live.auto_generation;
                         let directory = directory.clone();
                         // SQLite is exclusively accessed by a bounded blocking
                         // task, never on the gateway's async request workers.
@@ -314,7 +406,7 @@ impl AppState {
                         .await
                         .ok()
                         .flatten();
-                        rank.set(snapshot);
+                        rank.set(snapshot, generation);
                     }
                 });
             }
@@ -345,7 +437,8 @@ impl AppState {
             "auto_enabled": self.config.auto.enabled,
             "auto_health_aware": self.config.auto.health_aware,
             "auto_telemetry_rank_approved": self.config.auto.telemetry_ranking.enabled && self.config.auto.telemetry_ranking.approved,
-            "auto_telemetry_rank_active": self.auto_telemetry_rank.as_ref().is_some_and(|rank| rank.active()),
+            "auto_telemetry_rank_active": self.auto_telemetry_rank.as_ref().is_some_and(|rank| rank.active_for_generation(self.live_snapshot().auto_generation)),
+            "auto_candidate_count": self.live_snapshot().config.auto.candidates.len(),
             "auto_shadow_total": self.shadow_total.load(Ordering::Relaxed),
             "auto_shadow_disagreements": self.shadow_disagreements.load(Ordering::Relaxed),
             "auto_shadow_unavailable": self.shadow_unavailable.load(Ordering::Relaxed),
@@ -572,11 +665,7 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     if !state.allowed(&headers) {
         return unauthorized();
     }
-    let snapshot = state
-        .model_catalog
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let snapshot = state.live_snapshot().model_catalog.clone();
     (StatusCode::OK, Json(snapshot)).into_response()
 }
 
@@ -588,11 +677,8 @@ async fn model_detail(
     if !state.allowed(&headers) {
         return unauthorized();
     }
-    let details = state
-        .model_details
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    match details.get(&model) {
+    let live = state.live_snapshot();
+    match live.model_details.get(&model) {
         Some(detail) => (StatusCode::OK, Json(detail.clone())).into_response(),
         None => error(StatusCode::NOT_FOUND, "model_not_found", "Unknown model"),
     }
@@ -720,6 +806,182 @@ auto:
     }
 
     #[test]
+    fn live_chain_identity_uses_admission_generation_even_after_delete() {
+        let initial: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: https://example.test\n    key_env: KEY\nchains:\n  - name: fixed\n    steps:\n      - provider: p\n        model: static\n",
+        )
+        .unwrap();
+        let state = AppState::new(
+            initial.clone(),
+            HashMap::from([("KEY".to_owned(), "key".to_owned())]),
+            vec!["client".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(state.telemetry_model_name(0, "fresh"), "passthrough");
+        let updated: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: https://example.test\n    key_env: KEY\nchains:\n  - name: fixed\n    steps:\n      - provider: p\n        model: static\n  - name: dynamic\n    steps:\n      - provider: p\n        model: fresh\n",
+        )
+        .unwrap();
+        state.replace_route_snapshot(updated).unwrap();
+        let admitted = state.route_snapshot();
+        assert_eq!(state.telemetry_model_name(0, "fresh"), "fresh");
+        assert_eq!(
+            state.telemetry_model_name_in(&admitted, 0, "fresh"),
+            "fresh"
+        );
+        assert_eq!(
+            state.telemetry_model_name(0, "unknown-password-like-model"),
+            "passthrough"
+        );
+        state.replace_route_snapshot(initial).unwrap();
+        assert_eq!(state.telemetry_model_name(0, "fresh"), "passthrough");
+        assert_eq!(
+            state.telemetry_model_name_in(&admitted, 0, "fresh"),
+            "fresh",
+            "an in-flight stream cannot be retroactively relabeled by a later chain delete"
+        );
+        assert_eq!(state.telemetry_model_name(0, "static"), "static");
+    }
+
+    #[test]
+    fn live_auto_discovery_preserves_health_by_identity_and_drops_deleted_candidates() {
+        let base: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: https://example.test\n    key_env: KEY\nauto:\n  enabled: true\n  health_aware: true\n  discover_from_chains: true\n  candidates:\n    - provider: p\n      model: fixed\nchains:\n  - name: original\n    steps:\n      - provider: p\n        model: stable\n",
+        )
+        .unwrap();
+        let state = AppState::new(
+            base.clone(),
+            HashMap::from([("KEY".to_owned(), "key".to_owned())]),
+            vec!["client".to_owned()],
+        )
+        .unwrap();
+        let old = state.live_snapshot();
+        assert_eq!(old.config.auto.candidates.len(), 2);
+        for _ in 0..3 {
+            state.mark_auto_failure_in(&old, 0, "stable");
+        }
+        assert_eq!(old.auto_health.as_ref().unwrap().penalties(), vec![0, 100]);
+        let mut added = base.clone();
+        added.chains.insert(
+            0,
+            serde_yaml::from_str("name: dynamic\nsteps:\n  - provider: p\n    model: fresh\n")
+                .unwrap(),
+        );
+        state.replace_route_snapshot(added).unwrap();
+        let next = state.live_snapshot();
+        assert_ne!(old.auto_generation, next.auto_generation);
+        assert_eq!(
+            next.config
+                .auto
+                .candidates
+                .iter()
+                .map(|c| c.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fixed", "fresh", "stable"]
+        );
+        assert_eq!(
+            next.auto_health.as_ref().unwrap().penalties(),
+            vec![0, 0, 100]
+        );
+        // An admitted request using the previous generation must still
+        // update the same physical candidate, not the newly inserted index.
+        state.mark_auto_success_in(&old, 0, "stable");
+        assert_eq!(
+            next.auto_health.as_ref().unwrap().penalties(),
+            vec![0, 0, 80]
+        );
+        state.replace_route_snapshot(base).unwrap();
+        let deleted = state.live_snapshot();
+        assert_eq!(deleted.config.auto.candidates.len(), 2);
+        assert!(
+            deleted
+                .config
+                .auto
+                .candidates
+                .iter()
+                .all(|c| c.model != "fresh")
+        );
+        assert_eq!(
+            deleted.auto_health.as_ref().unwrap().penalties(),
+            vec![0, 80]
+        );
+    }
+
+    #[test]
+    fn online_route_and_model_views_publish_one_consistent_generation() {
+        use std::sync::Barrier;
+
+        let config_for = |model: &str| -> Config {
+            serde_yaml::from_str(&format!(
+                "providers:\n  - name: p\n    type: openai\n    base_url: https://provider.example\n    key_env: KEY\nchains:\n  - name: chain-{model}\n    steps:\n      - provider: p\n        model: {model}\n"
+            ))
+            .unwrap()
+        };
+        let state = Arc::new(
+            AppState::new(
+                config_for("before"),
+                HashMap::from([("KEY".to_owned(), "secret".to_owned())]),
+                vec!["client".to_owned()],
+            )
+            .unwrap(),
+        );
+        let held_before = state.live_snapshot();
+        let ready = Arc::new(Barrier::new(5));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let state = Arc::clone(&state);
+                let ready = Arc::clone(&ready);
+                scope.spawn(move || {
+                    ready.wait();
+                    for _ in 0..600 {
+                        let snapshot = state.live_snapshot();
+                        let configured = &snapshot.config.chains[0].steps[0].model;
+                        let route_name = &snapshot.config.chains[0].name;
+                        assert_eq!(route_name, &format!("chain-{configured}"));
+                        let detail = snapshot.model_details.get(route_name).unwrap();
+                        let listed = snapshot.model_catalog["data"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|value| value["id"].as_str() == Some(route_name.as_str()))
+                            .unwrap();
+                        assert_eq!(detail, listed);
+                        assert_eq!(detail["id"].as_str(), Some(route_name.as_str()));
+                        assert!(matches!(configured.as_str(), "before" | "after"));
+                        // Every reader owns one internally coherent
+                        // generation; no separate catalog/details locks.
+                        assert_eq!(
+                            snapshot.model_catalog["data"][0]["id"].as_str(),
+                            Some(route_name.as_str())
+                        );
+                        assert_eq!(snapshot.model_details.len(), 1);
+                    }
+                });
+            }
+            ready.wait();
+            for index in 0..100 {
+                state
+                    .replace_route_snapshot(config_for(if index % 2 == 0 {
+                        "after"
+                    } else {
+                        "before"
+                    }))
+                    .unwrap();
+            }
+        });
+        assert_eq!(
+            held_before.config.chains[0].steps[0].model, "before",
+            "in-flight requests keep their original route snapshot"
+        );
+        assert_eq!(
+            held_before.model_details["chain-before"]["id"],
+            "chain-before"
+        );
+        let latest = state.live_snapshot();
+        assert_eq!(latest.config.chains[0].steps[0].model, "before");
+    }
+
+    #[test]
     fn auto_model_health_isolated_within_shared_provider() {
         let config: Config = serde_yaml::from_str(
             r#"
@@ -754,13 +1016,81 @@ auto:
         for _ in 0..3 {
             state.mark_auto_failure(0, "unstable");
         }
-        let health = state.auto_health.as_ref().unwrap();
+        let live = state.live_snapshot();
+        let health = live.auto_health.as_ref().unwrap();
         assert_eq!(health.penalties(), vec![100, 0]);
         state.mark_auto_success(0, "stable");
         assert_eq!(health.penalties(), vec![100, 0]);
         state.mark_auto_success(0, "unstable");
         assert_eq!(health.penalties(), vec![80, 0]);
     }
+
+    #[test]
+    fn normalized_model_collision_cannot_restore_wrong_auto_candidate_health() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("telemetry")).unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE provider_health(
+                provider TEXT NOT NULL, model TEXT NOT NULL,
+                penalty INTEGER NOT NULL, consecutive_failures INTEGER NOT NULL,
+                demoted INTEGER NOT NULL, last_failure_ts INTEGER NOT NULL,
+                last_success_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL,
+                identity_verified INTEGER NOT NULL,
+                PRIMARY KEY(provider, model)
+             );",
+        )
+        .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        db.execute(
+            "INSERT INTO provider_health VALUES('p','model_a',100,3,1,?1,0,?1,1)",
+            [now],
+        )
+        .unwrap();
+        drop(db);
+        let config: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://example.test
+    key_env: K
+    models: ["model a", model_a]
+auto:
+  enabled: true
+  health_aware: true
+  candidates:
+    - provider: p
+      model: "model a"
+    - provider: p
+      model: model_a
+"#,
+        )
+        .unwrap();
+        let mut state = AppState::new(
+            config,
+            HashMap::from([("K".to_owned(), "test-key".to_owned())]),
+            vec!["client".to_owned()],
+        )
+        .unwrap();
+        state.enable_telemetry(dir.path()).unwrap();
+        assert_eq!(
+            state
+                .live_snapshot()
+                .auto_health
+                .as_ref()
+                .unwrap()
+                .penalties(),
+            vec![0, 100],
+            "only the exact unmodified model_a may inherit verified health"
+        );
+    }
+
     #[test]
     fn retry_after_parser_caps_valid_hints_but_rejects_overflow() {
         let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);

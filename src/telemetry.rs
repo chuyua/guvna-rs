@@ -55,11 +55,18 @@ pub struct ProviderHealthSnapshot {
 
 impl TelemetryContext {
     pub fn new(provider: &str, model: &str, failure_type: &'static str) -> Self {
+        let provider_label = safe_label(provider);
+        let model_label = safe_label(model);
+        let identity_trusted =
+            provider == provider_label && model == model_label && model != "passthrough";
         Self {
-            provider: safe_label(provider),
-            model: safe_label(model),
+            provider: provider_label,
+            model: model_label,
             failure_type: allowed_failure_type(failure_type),
-            is_upstream: true,
+            // Lossy labels are fine for diagnostics but never trustworthy
+            // as the identity key of persisted provider health.
+            // "passthrough" also aliases arbitrary uncatalogued models.
+            is_upstream: identity_trusted,
             upstream_status: None,
             request_id: None,
             attempt_index: None,
@@ -459,6 +466,7 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
             status INTEGER NOT NULL,
             elapsed_ms INTEGER NOT NULL,
             sse_headers INTEGER NOT NULL CHECK (sse_headers IN (0,1)),
+            identity_verified INTEGER NOT NULL DEFAULT 0 CHECK (identity_verified IN (0,1)),
             failure_type TEXT NOT NULL CHECK (failure_type IN (
                 'success','stream_started','rate_limited','credential_error',
                 'caller_error','provider_4xx','provider_5xx','transport_error','invalid_response',
@@ -487,6 +495,7 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
             failure_count INTEGER NOT NULL,
             total_elapsed_ms INTEGER NOT NULL,
             max_elapsed_ms INTEGER NOT NULL,
+            identity_verified INTEGER NOT NULL DEFAULT 0 CHECK (identity_verified IN (0,1)),
             PRIMARY KEY (hour_ts, endpoint, provider, model, failure_type)
         );
         CREATE INDEX IF NOT EXISTS hourly_stats_ts ON hourly_stats(hour_ts);
@@ -499,6 +508,7 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
             last_failure_ts INTEGER NOT NULL,
             last_success_ts INTEGER NOT NULL,
             updated_ts INTEGER NOT NULL,
+            identity_verified INTEGER NOT NULL DEFAULT 0 CHECK (identity_verified IN (0,1)),
             PRIMARY KEY (provider, model)
         );
         CREATE INDEX IF NOT EXISTS provider_health_updated_ts ON provider_health(updated_ts);
@@ -539,6 +549,23 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
                 ))?;
             }
         }
+    }
+    // Older request and hourly aggregates contain only lossy labels.
+    // Fail closed for Auto ranking instead of treating them as exact IDs.
+    for table in ["request_events", "hourly_stats"] {
+        if !has_column(&conn, table, "identity_verified")? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 0"
+            ))?;
+        }
+    }
+    // Old databases stored only lossy labels in provider_health. A migration
+    // must not silently treat those potentially collided rows as verified.
+    if !has_column(&conn, "provider_health", "identity_verified")? {
+        conn.execute_batch(
+            "ALTER TABLE provider_health
+             ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 0",
+        )?;
     }
     #[cfg(unix)]
     {
@@ -600,8 +627,8 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
     {
         let mut request = tx.prepare_cached(
             "INSERT INTO request_events
-             (ts,endpoint,provider,model,status,elapsed_ms,sse_headers,failure_type,request_id,attempt_index,stream_requested)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+             (ts,endpoint,provider,model,status,elapsed_ms,sse_headers,failure_type,request_id,attempt_index,stream_requested,identity_verified)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         )?;
         let mut failure = tx.prepare_cached(
             "INSERT INTO failure_events
@@ -610,13 +637,14 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
         )?;
         let mut hourly = tx.prepare_cached(
             "INSERT INTO hourly_stats
-             (hour_ts,endpoint,provider,model,failure_type,request_count,failure_count,total_elapsed_ms,max_elapsed_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)
+             (hour_ts,endpoint,provider,model,failure_type,request_count,failure_count,total_elapsed_ms,max_elapsed_ms,identity_verified)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)
              ON CONFLICT(hour_ts,endpoint,provider,model,failure_type) DO UPDATE SET
              request_count=request_count+excluded.request_count,
              failure_count=failure_count+excluded.failure_count,
              total_elapsed_ms=total_elapsed_ms+excluded.total_elapsed_ms,
-             max_elapsed_ms=MAX(max_elapsed_ms,excluded.max_elapsed_ms)",
+             max_elapsed_ms=MAX(max_elapsed_ms,excluded.max_elapsed_ms),
+             identity_verified=MIN(hourly_stats.identity_verified,excluded.identity_verified)",
         )?;
         let mut shadow = tx.prepare_cached(
             "INSERT INTO shadow_events
@@ -630,22 +658,27 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
         )?;
         let mut health = tx.prepare_cached(
             "INSERT INTO provider_health
-             (provider,model,penalty,consecutive_failures,demoted,last_failure_ts,last_success_ts,updated_ts)
+             (provider,model,penalty,consecutive_failures,demoted,last_failure_ts,last_success_ts,updated_ts,identity_verified)
              VALUES (?1,?2,CASE WHEN ?3=1 THEN 35 ELSE 0 END,
                      CASE WHEN ?3=1 THEN 1 ELSE 0 END,0,
                      CASE WHEN ?3=1 THEN ?4 ELSE 0 END,
-                     CASE WHEN ?3=0 THEN ?4 ELSE 0 END,?4)
+                     CASE WHEN ?3=0 THEN ?4 ELSE 0 END,?4,1)
              ON CONFLICT(provider,model) DO UPDATE SET
-             penalty=CASE WHEN ?4 < provider_health.last_failure_ts
+             penalty=CASE WHEN provider_health.identity_verified=0
+                          THEN CASE WHEN ?3=1 THEN 35 ELSE 0 END
+                          WHEN ?4 < provider_health.last_failure_ts
                                OR ?4-provider_health.last_failure_ts>300
                           THEN CASE WHEN ?3=1 THEN 35 ELSE 0 END
                           WHEN ?3=1 THEN MIN(provider_health.penalty+35,100)
                           ELSE MAX(provider_health.penalty-20,0) END,
-             consecutive_failures=CASE WHEN ?3=0 THEN 0
+             consecutive_failures=CASE WHEN provider_health.identity_verified=0
+                          THEN CASE WHEN ?3=1 THEN 1 ELSE 0 END
+                          WHEN ?3=0 THEN 0
                           WHEN ?4 < provider_health.last_failure_ts
                                OR ?4-provider_health.last_failure_ts>300 THEN 1
                           ELSE MIN(provider_health.consecutive_failures+1,65535) END,
-             demoted=CASE WHEN ?4 < provider_health.last_failure_ts
+             demoted=CASE WHEN provider_health.identity_verified=0 THEN 0
+                          WHEN ?4 < provider_health.last_failure_ts
                                OR ?4-provider_health.last_failure_ts>300 THEN 0
                           WHEN ?3=1 THEN
                           CASE WHEN provider_health.consecutive_failures+1>=3
@@ -653,9 +686,13 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                                THEN 1 ELSE provider_health.demoted END
                           ELSE CASE WHEN MAX(provider_health.penalty-20,0)<=30
                                     THEN 0 ELSE provider_health.demoted END END,
-             last_failure_ts=CASE WHEN ?3=1 THEN ?4 ELSE provider_health.last_failure_ts END,
-             last_success_ts=CASE WHEN ?3=0 THEN ?4 ELSE provider_health.last_success_ts END,
-             updated_ts=?4",
+             last_failure_ts=CASE WHEN ?3=1 THEN ?4
+                                  WHEN provider_health.identity_verified=0 THEN 0
+                                  ELSE provider_health.last_failure_ts END,
+             last_success_ts=CASE WHEN ?3=0 THEN ?4
+                                  WHEN provider_health.identity_verified=0 THEN 0
+                                  ELSE provider_health.last_success_ts END,
+             updated_ts=?4,identity_verified=1",
         )?;
         for event in batch {
             if let Some(observation) = &event.shadow {
@@ -683,6 +720,7 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                     event.request_id,
                     event.attempt_index,
                     i64::from(event.stream_requested),
+                    i64::from(event.health_observation),
                 ])?;
                 if is_failure(event) {
                     failure.execute(params![
@@ -708,6 +746,7 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                     i64::from(event.count_attempt),
                     i64::from(is_failure(event)),
                     event.elapsed_ms,
+                    i64::from(event.health_observation),
                 ])?;
             } else if is_failure(event) {
                 // Streaming starts are counted once at response creation. Record the
@@ -734,6 +773,7 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                     i64::from(event.count_attempt),
                     1_i64,
                     event.elapsed_ms,
+                    i64::from(event.health_observation),
                 ])?;
             }
             // Only actual SSE terminal callbacks enter this table. The initial
@@ -863,7 +903,7 @@ fn load_provider_health_from_path(path: &Path, now: i64) -> Vec<ProviderHealthSn
     }
     let Ok(mut statement) = conn.prepare(
         "SELECT provider,model,penalty,consecutive_failures,demoted,last_failure_ts
-         FROM provider_health WHERE model!='*' AND updated_ts >= ?1
+         FROM provider_health WHERE model!='*' AND identity_verified=1 AND updated_ts >= ?1
          ORDER BY updated_ts DESC LIMIT 256",
     ) else {
         return Vec::new();
@@ -1525,6 +1565,181 @@ mod tests {
 
         let stale = load_provider_health_from_path(&path, 7202 + HISTORY_RETENTION_SECS + 1);
         assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn old_unverified_health_is_not_restored_or_carried_into_new_observations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-health.sqlite3");
+        // Reproduce the pre-identity-verification SQLite layout. These rows
+        // may have been written by unrelated names that sanitize identically.
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE provider_health(
+                provider TEXT NOT NULL, model TEXT NOT NULL,
+                penalty INTEGER NOT NULL, consecutive_failures INTEGER NOT NULL,
+                demoted INTEGER NOT NULL, last_failure_ts INTEGER NOT NULL,
+                last_success_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL,
+                PRIMARY KEY(provider,model)
+             );
+             INSERT INTO provider_health
+             VALUES('p','model_a',100,10,1,7200,0,7200);",
+        )
+        .unwrap();
+        drop(db);
+        // Before the migration even runs, absence of the proof column must
+        // fail closed rather than restoring ambiguous historical penalties.
+        assert!(load_provider_health_from_path(&path, 7201).is_empty());
+        let mut conn = open_database(&path).unwrap();
+        assert!(has_column(&conn, "provider_health", "identity_verified").unwrap());
+        assert!(load_provider_health_from_path(&path, 7201).is_empty());
+
+        write_batch(
+            &mut conn,
+            &[event(7201, "p", "model_a", 503, 10, "provider_5xx")],
+        )
+        .unwrap();
+        let (penalty, failures, demoted, verified): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT penalty,consecutive_failures,demoted,identity_verified
+                 FROM provider_health WHERE provider='p' AND model='model_a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((penalty, failures, demoted, verified), (35, 1, 0, 1));
+        assert_eq!(load_provider_health_from_path(&path, 7201).len(), 1);
+    }
+
+    #[test]
+    fn colliding_diagnostic_labels_cannot_write_verified_provider_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let telemetry = Telemetry::start(dir.path(), Arc::clone(&metrics)).unwrap();
+        let oversized = "x".repeat(MAX_LABEL_CHARS + 1);
+        for model in ["model a", "model?b", "passthrough", oversized.as_str()] {
+            let context = TelemetryContext::new("p", model, "provider_5xx");
+            assert!(!context.is_upstream, "lossy identity {model:?}");
+            telemetry.observe_attempt("chat", 503, Duration::from_millis(1), context, &metrics);
+        }
+        let bad_provider = TelemetryContext::new("p a", "model_a", "provider_5xx");
+        assert!(!bad_provider.is_upstream);
+        telemetry.observe_attempt(
+            "chat",
+            503,
+            Duration::from_millis(1),
+            bad_provider,
+            &metrics,
+        );
+        assert!(telemetry.flush(Duration::from_secs(3)));
+        let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        let health: i64 = db
+            .query_row("SELECT COUNT(*) FROM provider_health", [], |row| row.get(0))
+            .unwrap();
+        let failures: i64 = db
+            .query_row("SELECT COUNT(*) FROM failure_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(health, 0, "lossy telemetry IDs never poison Auto health");
+        assert_eq!(failures, 5, "diagnostic failures remain observable");
+
+        // A genuine exact candidate remains eligible for persistence.
+        drop(db);
+        let trusted = TelemetryContext::new("p", "model_a", "provider_5xx");
+        assert!(trusted.is_upstream);
+        telemetry.observe_attempt("chat", 503, Duration::from_millis(1), trusted, &metrics);
+        assert!(telemetry.flush(Duration::from_secs(3)));
+        let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        let (penalty, verified): (i64, i64) = db
+            .query_row(
+                "SELECT penalty,identity_verified FROM provider_health WHERE provider='p' AND model='model_a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((penalty, verified), (35, 1));
+    }
+
+    #[test]
+    fn colliding_hourly_scoring_evidence_fails_closed_without_losing_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.sqlite3");
+        let mut conn = open_database(&path).unwrap();
+        let now = now_secs();
+        let mut events = (0..20)
+            .map(|_| event(now, "p", "model_a", 200, 10, "success"))
+            .collect::<Vec<_>>();
+        let mut collision = event(now, "p", "model a", 200, 10, "success");
+        collision.health_observation = false;
+        events.push(collision);
+        write_batch(&mut conn, &events).unwrap();
+        let (total, verified): (i64, i64) = conn
+            .query_row(
+                "SELECT request_count,identity_verified FROM hourly_stats
+                 WHERE provider='p' AND model='model_a' AND failure_type='success'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((total, verified), (21, 0));
+        let (trusted, untrusted): (i64, i64) = conn
+            .query_row(
+                "SELECT SUM(identity_verified),SUM(1-identity_verified)
+                 FROM request_events WHERE provider='p' AND model='model_a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((trusted, untrusted), (20, 1));
+        // The 20 valid samples cannot override one ambiguous aggregate;
+        // the CLI still sees all 21 diagnostic requests.
+        drop(conn);
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(data_dir.path().join("telemetry")).unwrap();
+        std::fs::copy(&path, data_dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        let scoped = crate::scoring::read_scoring_for_candidates(
+            data_dir.path(),
+            1,
+            &[("p".into(), "model_a".into())],
+        )
+        .unwrap();
+        assert_eq!(scoped["candidate_count"], 0);
+        let diagnostic = crate::scoring::read_scoring(data_dir.path(), 1).unwrap();
+        assert_eq!(diagnostic["candidates"][0]["attempts"], 21);
+    }
+
+    #[test]
+    fn old_hourly_evidence_stays_unverified_after_new_exact_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-hourly.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        let now = now_secs();
+        let hour = now - now.rem_euclid(3600);
+        db.execute_batch(
+            "CREATE TABLE hourly_stats(
+                hour_ts INTEGER,endpoint TEXT,provider TEXT,model TEXT,
+                failure_type TEXT,request_count INTEGER,failure_count INTEGER,
+                total_elapsed_ms INTEGER,max_elapsed_ms INTEGER,
+                PRIMARY KEY(hour_ts,endpoint,provider,model,failure_type)
+            );",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO hourly_stats VALUES (?1,'chat','p','model_a','success',200,0,2000,10)",
+            [hour],
+        )
+        .unwrap();
+        drop(db);
+        let mut conn = open_database(&path).unwrap();
+        write_batch(&mut conn, &[event(now, "p", "model_a", 200, 10, "success")]).unwrap();
+        let (total, verified): (i64, i64) = conn
+            .query_row(
+                "SELECT request_count,identity_verified FROM hourly_stats
+                 WHERE provider='p' AND model='model_a' AND failure_type='success'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((total, verified), (201, 0));
     }
 
     #[test]
