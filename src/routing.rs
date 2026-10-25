@@ -398,6 +398,111 @@ fn auto_candidate_eligible(
             .is_none_or(|max| input_bytes <= max)
 }
 
+/// Evaluate the payload actually emitted for this candidate without copying
+/// the caller's messages (which can be multi-megabyte). Unset default fields
+/// contribute their serialized byte count; explicit caller fields always win.
+fn auto_candidate_eligible_for_request(
+    config: &Config,
+    candidate: &AutoCandidate,
+    input_bytes: usize,
+    request: &Value,
+    request_bytes: usize,
+    requirements: AutoRequirements,
+) -> bool {
+    let effective = |name: &str| request.get(name).or_else(|| candidate.params.get(name));
+    let mut extra_bytes = 0usize;
+    let mut field_count = request.as_object().map_or(0, serde_json::Map::len);
+    for (name, value) in &candidate.params {
+        if request.get(name).is_none() {
+            let separator = usize::from(field_count != 0);
+            extra_bytes = extra_bytes
+                .saturating_add(separator)
+                .saturating_add(encoded_json_bytes(Some(&Value::String(name.clone()))))
+                .saturating_add(1)
+                .saturating_add(encoded_json_bytes(Some(value)));
+            field_count += 1;
+        }
+    }
+    let output_budget = effective("max_completion_tokens")
+        .or_else(|| effective("max_tokens"))
+        .and_then(Value::as_u64)
+        .map(|tokens| tokens.min(usize::MAX as u64) as usize)
+        .unwrap_or(1024);
+    let context_estimate = with_context_safety_margin(request_bytes.saturating_add(extra_bytes))
+        .saturating_add(output_budget);
+    let tools = requirements.tools
+        || effective("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+        || effective("tool_choice").is_some_and(|choice| match choice {
+            Value::String(value) => !matches!(value.as_str(), "auto" | "none"),
+            Value::Null => false,
+            _ => true,
+        });
+    let json_schema = requirements.json_schema
+        || effective("response_format")
+            .and_then(|format| format.get("type"))
+            .and_then(Value::as_str)
+            == Some("json_schema");
+    auto_candidate_eligible(
+        config,
+        candidate,
+        input_bytes,
+        context_estimate,
+        AutoRequirements {
+            tools,
+            json_schema,
+            ..requirements
+        },
+    )
+}
+
+pub fn auto_operator_default_can_degrade_for_request(
+    config: &Config,
+    input_bytes: usize,
+    request: &Value,
+    requirements: AutoRequirements,
+) -> bool {
+    if requirements.min_context == 0
+        || requirements.max_context.is_some()
+        || config.auto.candidates.is_empty()
+    {
+        return false;
+    }
+    let request_bytes = encoded_json_bytes(Some(request));
+    let relaxed = requirements.with_context_bounds(0, None);
+    config.auto.candidates.iter().any(|candidate| {
+        auto_candidate_eligible_for_request(
+            config,
+            candidate,
+            input_bytes,
+            request,
+            request_bytes,
+            relaxed,
+        )
+    })
+}
+
+pub fn resolve_auto_for_request(
+    config: &Config,
+    input_bytes: usize,
+    request: &Value,
+    requirements: AutoRequirements,
+    penalties: &[u8],
+) -> Result<Vec<ResolvedStep>, String> {
+    let request_bytes = encoded_json_bytes(Some(request));
+    resolve_auto_filtered(config, penalties, |candidate| {
+        auto_candidate_eligible_for_request(
+            config,
+            candidate,
+            input_bytes,
+            request,
+            request_bytes,
+            requirements,
+        )
+    })
+}
+
 /// Go's service-level min-context is a preference, not a caller constraint.
 /// Relax it only when at least one candidate survives every OTHER hard
 /// filter. A separate unsuitable candidate must not block that safe fallback.
@@ -430,6 +535,22 @@ pub fn resolve_auto_with_requirements(
     requirements: AutoRequirements,
     penalties: &[u8],
 ) -> Result<Vec<ResolvedStep>, String> {
+    resolve_auto_filtered(config, penalties, |candidate| {
+        auto_candidate_eligible(
+            config,
+            candidate,
+            input_bytes,
+            context_estimate,
+            requirements,
+        )
+    })
+}
+
+fn resolve_auto_filtered(
+    config: &Config,
+    penalties: &[u8],
+    mut eligible: impl FnMut(&AutoCandidate) -> bool,
+) -> Result<Vec<ResolvedStep>, String> {
     if !config.auto.enabled {
         return Err("auto routing is disabled".into());
     }
@@ -438,15 +559,7 @@ pub fn resolve_auto_with_requirements(
         .candidates
         .iter()
         .enumerate()
-        .filter(|(_, candidate)| {
-            auto_candidate_eligible(
-                config,
-                candidate,
-                input_bytes,
-                context_estimate,
-                requirements,
-            )
-        })
+        .filter(|(_, candidate)| eligible(candidate))
         .collect::<Vec<_>>();
     // Stable tie-break preserves configured order, avoiding non-deterministic
     // model selection on restart or across concurrent requests.
@@ -559,6 +672,85 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
 mod tests {
     use super::*;
     use crate::config::Config;
+    use serde_json::json;
+    #[test]
+    fn auto_candidate_defaults_respect_actual_wire_budget_and_caller_precedence() {
+        let yaml = r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://example.invalid
+    key_env: K
+    models: [default-large, fallback]
+auto:
+  enabled: true
+  max_candidates: 1
+  candidates:
+    - provider: p
+      model: default-large
+      max_context_tokens: 4096
+      params:
+        max_tokens: 10000
+    - provider: p
+      model: fallback
+      max_context_tokens: 4096
+"#;
+        let mut cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        cfg.validate().unwrap();
+        let request = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+        let choose = |cfg: &Config, request: &Value| {
+            resolve_auto_for_request(
+                cfg,
+                auto_input_bytes(request.get("messages")),
+                request,
+                auto_requirements(request),
+                &[],
+            )
+            .unwrap()
+        };
+        assert_eq!(choose(&cfg, &request)[0].model, "fallback");
+
+        // The caller's explicit field, even if smaller than the candidate
+        // default, must override it both for routing and eventual injection.
+        let caller_budget =
+            json!({"model":"auto","messages":[{"role":"user","content":"hi"}],"max_tokens":64});
+        assert_eq!(choose(&cfg, &caller_budget)[0].model, "default-large");
+
+        cfg.auto.candidates[0].params.remove("max_tokens");
+        cfg.auto.candidates[0].supports_tools = Some(false);
+        cfg.auto.candidates[0].params.insert(
+            "tools".into(),
+            json!([{"type":"function","function":{"name":"noop"}}]),
+        );
+        assert_eq!(choose(&cfg, &request)[0].model, "fallback");
+
+        cfg.auto.candidates[0].supports_tools = Some(true);
+        assert_eq!(choose(&cfg, &request)[0].model, "default-large");
+
+        // Serialization of large default tool schemas must count toward the
+        // candidate context window, not just the caller's original message.
+        cfg.auto.candidates[0].params.insert(
+            "tools".into(),
+            json!([{"type":"function","function":{"name":"noop","description":"x".repeat(6000)}}]),
+        );
+        assert_eq!(choose(&cfg, &request)[0].model, "fallback");
+        // An explicit empty caller tool array wins over the long default.
+        let caller_no_tools =
+            json!({"model":"auto","messages":[{"role":"user","content":"hi"}],"tools":[]});
+        assert_eq!(choose(&cfg, &caller_no_tools)[0].model, "default-large");
+
+        cfg.auto.candidates[0].params.clear();
+        cfg.auto.candidates[0].supports_json_schema = Some(false);
+        cfg.auto.candidates[0].params.insert(
+            "response_format".into(),
+            json!({"type":"json_schema","json_schema":{"name":"strict","schema":{"type":"object"}}}),
+        );
+        assert_eq!(choose(&cfg, &request)[0].model, "fallback");
+        let caller_plain = json!({"model":"auto","messages":[{"role":"user","content":"hi"}],
+            "response_format":{"type":"text"}});
+        assert_eq!(choose(&cfg, &caller_plain)[0].model, "default-large");
+    }
+
     #[test]
     fn go_operator_floor_degrades_only_when_all_other_constraints_hold() {
         let yaml = r#"

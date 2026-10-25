@@ -8,12 +8,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Half-open probes have a renewable idle lease and a strict total lifetime.
+const PROBE_IDLE_LEASE: Duration = Duration::from_secs(10);
+const PROBE_MAX_LIFETIME: Duration = Duration::from_secs(120);
+
 struct State {
     failures: u32,
     generation: u64,
     open_until: Option<Instant>,
     probing: bool,
     probe_deadline: Option<Instant>,
+    probe_hard_deadline: Option<Instant>,
     next_cooldown: Duration,
 }
 
@@ -44,6 +49,7 @@ impl Circuit {
                 open_until: None,
                 probing: false,
                 probe_deadline: None,
+                probe_hard_deadline: None,
                 next_cooldown: base,
             }),
             threshold: config.failure_threshold,
@@ -62,6 +68,7 @@ impl Circuit {
             // Fence off the outstanding long-lived SSE probe result.
             state.probing = false;
             state.probe_deadline = None;
+            state.probe_hard_deadline = None;
             state.generation = state.generation.wrapping_add(1);
             state.open_until = now.checked_add(self.base);
             return None;
@@ -71,7 +78,8 @@ impl Circuit {
                 return None;
             }
             state.probing = true;
-            state.probe_deadline = now.checked_add(Duration::from_secs(10));
+            state.probe_deadline = now.checked_add(PROBE_IDLE_LEASE);
+            state.probe_hard_deadline = now.checked_add(PROBE_MAX_LIFETIME);
             true
         } else {
             false
@@ -98,6 +106,7 @@ impl Circuit {
             state.failures = 0;
             state.probing = false;
             state.probe_deadline = None;
+            state.probe_hard_deadline = None;
             state.open_until = None;
             state.next_cooldown = self.base;
             return false;
@@ -111,9 +120,33 @@ impl Circuit {
         state.next_cooldown = delay.saturating_mul(2).min(self.max);
         state.probing = false;
         state.probe_deadline = None;
+        state.probe_hard_deadline = None;
         state.generation = state.generation.wrapping_add(1);
         state.failures = 0;
         true
+    }
+
+    fn probe_progress(&self, ticket: &Ticket, now: Instant) {
+        if !ticket.probe {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.generation != ticket.generation || !state.probing {
+            return;
+        }
+        let (Some(deadline), Some(hard_deadline)) =
+            (state.probe_deadline, state.probe_hard_deadline)
+        else {
+            return;
+        };
+        if now >= deadline || now >= hard_deadline {
+            return;
+        }
+        state.probe_deadline = Some(
+            now.checked_add(PROBE_IDLE_LEASE)
+                .unwrap_or(hard_deadline)
+                .min(hard_deadline),
+        );
     }
 
     fn abandoned_probe(&self, ticket: &Ticket) {
@@ -124,6 +157,7 @@ impl Circuit {
         if state.generation == ticket.generation && state.probing {
             state.probing = false;
             state.probe_deadline = None;
+            state.probe_hard_deadline = None;
             // Client cancellation is neutral, not a provider failure. Delay
             // another probe briefly instead of unleashing a stampede.
             state.open_until = Instant::now().checked_add(self.base);
@@ -134,6 +168,16 @@ impl Circuit {
 impl Ticket {
     pub fn is_probe(&self) -> bool {
         self.probe
+    }
+    /// Renew the idle lease without counting a partial stream as success.
+    pub fn progress(&mut self) {
+        self.progress_at(Instant::now());
+    }
+
+    pub fn progress_at(&mut self, now: Instant) {
+        if !self.settled {
+            self.circuit.probe_progress(self, now);
+        }
     }
     /// True if the provider circuit was opened/reopened by this failure.
     pub fn failure(&mut self) -> bool {
@@ -278,6 +322,64 @@ mod tests {
         assert!(retried.is_some(), "expired probe did not unlock recovery");
         stalled.success_at(start + Duration::from_secs(12));
         assert!(breaker.admit_at(start + Duration::from_secs(12)).is_none());
+    }
+
+    #[test]
+    fn productive_slow_probe_survives_concurrent_arrivals_and_recovers() {
+        let breaker = circuit();
+        let start = Instant::now();
+        for round in 0..3 {
+            let t = start + Duration::from_secs(round * 30);
+            for _ in 0..3 {
+                let mut ticket = breaker.admit_at(t).unwrap();
+                ticket.failure_at(t);
+            }
+            let opened = t + Duration::from_millis(100);
+            let mut probe = breaker.admit_at(opened).unwrap();
+            for second in 1..=20 {
+                probe.progress_at(opened + Duration::from_secs(second));
+                if second == 11 {
+                    assert!(
+                        breaker
+                            .admit_at(opened + Duration::from_secs(second))
+                            .is_none()
+                    );
+                }
+            }
+            probe.success_at(opened + Duration::from_secs(20));
+            assert!(breaker.admit_at(opened + Duration::from_secs(21)).is_some());
+        }
+    }
+
+    #[test]
+    fn endlessly_progressing_probe_still_has_hard_deadline_and_stale_fence() {
+        let breaker = circuit();
+        let start = Instant::now();
+        for _ in 0..3 {
+            let mut ticket = breaker.admit_at(start).unwrap();
+            ticket.failure_at(start);
+        }
+        let opened = start + Duration::from_millis(100);
+        let mut probe = breaker.admit_at(opened).unwrap();
+        for second in 1..=120 {
+            probe.progress_at(opened + Duration::from_secs(second));
+        }
+        assert!(
+            breaker
+                .admit_at(opened + Duration::from_secs(120))
+                .is_none()
+        );
+        probe.success_at(opened + Duration::from_secs(121));
+        assert!(
+            breaker
+                .admit_at(opened + Duration::from_secs(120) + Duration::from_millis(99))
+                .is_none()
+        );
+        assert!(
+            breaker
+                .admit_at(opened + Duration::from_secs(120) + Duration::from_millis(100))
+                .is_some()
+        );
     }
 
     #[test]

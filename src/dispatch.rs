@@ -394,33 +394,70 @@ async fn dispatch_inner(
             .as_ref()
             .map(|health| health.penalties())
             .unwrap_or_default();
-        let mut resolved = state.auto_route_cache.resolve(
-            &route_snapshot,
-            input_bytes,
-            context_estimate,
-            requirements,
-            &penalties,
-            live.auto_generation,
-        );
-        if matches!(&resolved, Ok(steps) if steps.is_empty())
-            && !caller_context_bound
-            && routing::auto_operator_default_can_degrade(
+        // Request-specific candidate defaults are not covered by the shared
+        // cache key. Resolve them directly, avoiding a large request clone and
+        // filtering BEFORE max_candidates truncates the candidate walk.
+        let has_candidate_defaults = route_snapshot
+            .auto
+            .candidates
+            .iter()
+            .any(|candidate| !candidate.params.is_empty());
+        let mut resolved = if has_candidate_defaults {
+            routing::resolve_auto_for_request(
+                &route_snapshot,
+                input_bytes,
+                &request,
+                requirements,
+                &penalties,
+            )
+        } else {
+            state.auto_route_cache.resolve(
                 &route_snapshot,
                 input_bytes,
                 context_estimate,
                 requirements,
+                &penalties,
+                live.auto_generation,
             )
+        };
+        if matches!(&resolved, Ok(steps) if steps.is_empty())
+            && !caller_context_bound
+            && if has_candidate_defaults {
+                routing::auto_operator_default_can_degrade_for_request(
+                    &route_snapshot,
+                    input_bytes,
+                    &request,
+                    requirements,
+                )
+            } else {
+                routing::auto_operator_default_can_degrade(
+                    &route_snapshot,
+                    input_bytes,
+                    context_estimate,
+                    requirements,
+                )
+            }
         {
             // Keep context-length budgeting and capability hard filters intact.
             // A second bounded cache lookup cannot issue network requests.
-            resolved = state.auto_route_cache.resolve(
-                &route_snapshot,
-                input_bytes,
-                context_estimate,
-                requirements.with_context_bounds(0, None),
-                &penalties,
-                live.auto_generation,
-            );
+            resolved = if has_candidate_defaults {
+                routing::resolve_auto_for_request(
+                    &route_snapshot,
+                    input_bytes,
+                    &request,
+                    requirements.with_context_bounds(0, None),
+                    &penalties,
+                )
+            } else {
+                state.auto_route_cache.resolve(
+                    &route_snapshot,
+                    input_bytes,
+                    context_estimate,
+                    requirements.with_context_bounds(0, None),
+                    &penalties,
+                    live.auto_generation,
+                )
+            };
             auto_bounds = Some((0, None));
         }
         resolved

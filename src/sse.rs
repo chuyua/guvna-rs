@@ -36,6 +36,7 @@ enum ToolChoice {
 pub struct ChatSse {
     line: Vec<u8>,
     data: Vec<u8>,
+    progress_since_push: bool,
     finished_mask: u64,
     tool_calls_mask: u64,
     tool_calls: Vec<StreamToolCall>,
@@ -59,6 +60,10 @@ impl ChatSse {
 
     pub fn is_done(&self) -> bool {
         self.done
+    }
+    /// Only validated content/tool deltas count as useful upstream progress.
+    pub fn take_progress(&mut self) -> bool {
+        std::mem::take(&mut self.progress_since_push)
     }
     /// Some OpenAI-compatible SSE providers close at EOF after every choice's
     /// finish_reason without sending the optional [DONE] sentinel. Only
@@ -231,6 +236,14 @@ impl ChatSse {
                 let call = call.as_object().ok_or(SseError)?;
                 self.process_tool_call(index, call)?;
             }
+        }
+        if has_tool_delta
+            || delta
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| !content.is_empty())
+        {
+            self.progress_since_push = true;
         }
         if let Some(reason) = choice.get("finish_reason").filter(|v| !v.is_null()) {
             let reason = reason.as_str().ok_or(SseError)?;
@@ -426,6 +439,28 @@ mod tests {
     const END: &[u8] = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 "#;
+    #[test]
+    fn only_valid_content_or_tool_deltas_refresh_probe_progress() {
+        let mut parser = ChatSse::new(1).unwrap();
+        let role =
+            br#"data: {"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+"#;
+        parser.push(role).unwrap();
+        assert!(
+            !parser.take_progress(),
+            "a role-only frame is not useful progress"
+        );
+        parser.push(START).unwrap();
+        assert!(parser.take_progress());
+        assert!(!parser.take_progress(), "progress must be consumed once");
+        parser.push(END).unwrap();
+        assert!(
+            !parser.take_progress(),
+            "terminal bookkeeping cannot renew a probe"
+        );
+    }
+
     #[test]
     fn fragmented_frames_complete_only_with_finish_and_done() {
         let mut parser = ChatSse::new(1).unwrap();

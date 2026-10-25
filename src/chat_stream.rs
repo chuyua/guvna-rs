@@ -105,6 +105,11 @@ pub(super) async fn start(
         circuit_ticket: None,
     };
     preflight_stream(&mut state).await?;
+    if state.parser.take_progress()
+        && let Some(ticket) = circuit_ticket.as_mut()
+    {
+        ticket.progress();
+    }
     state._permit = permit.take();
     state.circuit_ticket = circuit_ticket.take();
     Ok(stream_response(state))
@@ -171,7 +176,14 @@ fn stream_response(state: ChatStreamState) -> Response {
                         state.terminated = true;
                     } else {
                         match state.parser.push(&bytes) {
-                            Ok(events) => state.pending.extend(events),
+                            Ok(events) => {
+                                if state.parser.take_progress()
+                                    && let Some(ticket) = state.circuit_ticket.as_mut()
+                                {
+                                    ticket.progress();
+                                }
+                                state.pending.extend(events);
+                            }
                             Err(_) => state.terminated = true,
                         }
                     }
