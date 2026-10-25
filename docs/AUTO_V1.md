@@ -358,6 +358,10 @@ counts as a
 completed stream; response headers alone do not. A stream request rejected
 before headers retains its explicit request-row failure even without a terminal
 callback; an unverified success still remains pending.
+Only Chat request rows are eligible for actual Shadow correlation. Other
+endpoints (including Embeddings) cannot evict Chat traces from the bounded
+sample or impersonate a Chat outcome. Legacy endpoint-less request tables
+return a null optional outcome sample rather than an unverified match.
 Completed, failed, cancelled, pending and unlinked actual requests, actual
 fallbacks and first-choice successes are separated. A proposed model
 matching the actual final route is NOT a counterfactual success claim:
