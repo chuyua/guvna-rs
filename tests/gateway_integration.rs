@@ -267,6 +267,19 @@ chains:
         )
         .unwrap();
     assert_eq!(unknown, 1);
+    let (penalty, failures): (i64, i64) = db
+        .query_row(
+            "SELECT penalty,consecutive_failures FROM provider_health
+             WHERE provider='broken' AND model='one'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (penalty, failures),
+        (35, 1),
+        "a genuine upstream 5xx must still update persisted provider health"
+    );
 }
 
 #[tokio::test]
@@ -4692,6 +4705,93 @@ chains:
     let (_, metrics) = get_metrics(router, Some("client")).await;
     assert_eq!(metric_value(&metrics, "circuit_openings_total"), 0);
     assert_eq!(metric_value(&metrics, "aggregation_failures_total"), 8);
+}
+
+#[tokio::test]
+async fn local_aggregation_policy_does_not_poison_auto_health_or_sqlite_restart() {
+    use guvna::gateway::app_with_state;
+    use rusqlite::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let invalid = aggregate_chat_frame(json!({"choices":[{"index":0,
+        "delta":{"audio":{"data":"unsupported"}},"finish_reason":null}]}));
+    let (primary, primary_hits, _) =
+        start_strict_stream_only(vec![invalid, b"data: [DONE]\n\n".to_vec()]).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: streaming
+    type: openai
+    base_url: {primary}
+    key_env: STREAM_KEY
+    stream_only: true
+  - name: backup
+    type: openai
+    base_url: {backup}
+    key_env: BACKUP_KEY
+auto:
+  enabled: true
+  health_aware: true
+  candidates:
+    - provider: streaming
+      model: stream-model
+      priority: 1
+    - provider: backup
+      model: backup-model
+      priority: 2
+"#
+    ))
+    .unwrap();
+    let credentials = HashMap::from([
+        ("STREAM_KEY".into(), "stream-secret".into()),
+        ("BACKUP_KEY".into(), "backup-secret".into()),
+    ]);
+    let mut state = AppState::new(config.clone(), credentials.clone(), vec!["client".into()])
+        .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, shared) = app_with_state(state);
+    for _ in 0..3 {
+        let (status, output) = call(router.clone(), request("auto", "", "client")).await;
+        assert_eq!(status, StatusCode::OK, "{output}");
+    }
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 3);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 3);
+    assert!(shared.flush_telemetry(std::time::Duration::from_secs(3)));
+
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let poisoned: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM provider_health WHERE provider='streaming' AND model='stream-model'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        poisoned, 0,
+        "local SSE-to-JSON aggregation policy cannot silently demote a provider after restart"
+    );
+    let recorded: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM failure_events WHERE provider='streaming' AND model='stream-model'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 3, "diagnostic failures still appear in telemetry");
+    drop(db);
+
+    let mut restarted = AppState::new(config, credentials, vec!["client".into()]).unwrap();
+    restarted.enable_telemetry(dir.path()).unwrap();
+    let (router, _) = app_with_state(restarted);
+    let (status, output) = call(router, request("auto", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(
+        primary_hits.load(Ordering::SeqCst),
+        4,
+        "SQLite restart must not reintroduce an unsupported aggregation health penalty"
+    );
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 4);
 }
 
 #[tokio::test]

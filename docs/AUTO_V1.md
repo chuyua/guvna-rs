@@ -123,6 +123,12 @@ restored at startup only if the last failure is within the 300-second freshness
 window. Failed intermediate candidates are recorded separately from the single
 downstream request row, so fallback failures survive restart without double-counting
 the request. If SQLite is disabled or unreadable, routing falls back to in-memory hints.
+SQLite provider-health persistence uses the same failure attribution as the
+in-memory Auto health hints: a genuine upstream transport/5xx failure remains
+health evidence, while local SSE-to-JSON aggregation policy failures (such as
+unsupported delta formats, size caps, or local idle/lifetime limits) remain
+visible in failure telemetry without demoting a provider after a restart.
+This distinction is verified by an end-to-end Auto fallback/restart test.
 ## Issue #129: optional dynamic chain discovery
 
 When auto.enabled: true, auto.discover_from_chains: true can add
