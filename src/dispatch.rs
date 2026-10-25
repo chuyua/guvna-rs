@@ -455,7 +455,7 @@ async fn dispatch_inner(
                 if let (Some(telemetry), Some(expected)) = (&state.telemetry, steps.first()) {
                     let provider = &state.config.providers[expected.provider_index].name;
                     telemetry.observe_shadow(
-                        &request_id,
+                        request_id,
                         (provider, expected.model.as_str()),
                         None,
                         &state.metrics,
