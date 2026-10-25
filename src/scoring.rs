@@ -64,7 +64,7 @@ fn confirmed_chat_stream_outcomes(
          WHERE r.ts>=?1 AND t.ts>=?1 AND r.endpoint='chat'
            AND r.stream_requested=1 AND r.failure_type='stream_started'
            AND r.provider=t.provider AND r.model=t.model
-           AND t.outcome IN ('success','transport_error')
+           AND t.outcome IN ('success','transport_error','invalid_response')
            AND (t.provider,t.model) IN ({filter}) {verified_filter}
          GROUP BY t.provider,t.model,t.outcome"
     )) else {
@@ -551,15 +551,24 @@ fn read_scoring_inner(
         .prepare("SELECT request_id,outcome FROM stream_terminals LIMIT 0")
         .is_ok()
     {
-        let (total, completed, failed, cancelled): (i64, i64, i64, i64) = conn
+        let (total, completed, failed, cancelled, local_policy): (i64, i64, i64, i64, i64) = conn
             .query_row(
                 "SELECT COUNT(*),
                     COALESCE(SUM(outcome='success'),0),
-                    COALESCE(SUM(outcome='transport_error'),0),
-                    COALESCE(SUM(outcome='client_cancelled'),0)
+                    COALESCE(SUM(outcome IN ('transport_error','invalid_response')),0),
+                    COALESCE(SUM(outcome='client_cancelled'),0),
+                    COALESCE(SUM(outcome IN ('timeout','local_error')),0)
                  FROM stream_terminals WHERE ts >= ?1",
                 params![since],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .map_err(|_| "cannot read stream terminal summary")?;
         Some(json!({
@@ -567,6 +576,7 @@ fn read_scoring_inner(
             "completed":completed,
             "upstream_failed":failed,
             "client_cancelled":cancelled,
+            "local_policy_terminated":local_policy,
             "completion_rate_excluding_client_cancellation":
                 if total > cancelled {
                     Some(completed as f64 / (total - cancelled) as f64)

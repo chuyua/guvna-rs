@@ -447,13 +447,50 @@ fn migrate_legacy_request_events(conn: &Connection) -> rusqlite::Result<()> {
     }
     Ok(())
 }
+/// Existing installations have a three-outcome CHECK constraint. Rebuild
+/// only that small, bounded history table in one transaction so a restart
+/// retains old trace links while recording local terminal failures precisely.
+fn migrate_stream_terminal_outcomes(conn: &mut Connection) -> rusqlite::Result<()> {
+    let schema: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='stream_terminals'",
+        [],
+        |row| row.get(0),
+    )?;
+    if schema.contains("'local_error'") {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE stream_terminals_migrated (
+            ts INTEGER NOT NULL,
+            request_id TEXT NOT NULL,
+            attempt_index INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            outcome TEXT NOT NULL CHECK (outcome IN
+                ('success','transport_error','invalid_response',
+                 'timeout','local_error','client_cancelled')),
+            elapsed_ms INTEGER NOT NULL,
+            PRIMARY KEY (request_id, attempt_index)
+         );
+         INSERT INTO stream_terminals_migrated
+             (ts,request_id,attempt_index,provider,model,outcome,elapsed_ms)
+         SELECT ts,request_id,attempt_index,provider,model,outcome,elapsed_ms
+         FROM stream_terminals;
+         DROP TABLE stream_terminals;
+         ALTER TABLE stream_terminals_migrated RENAME TO stream_terminals;
+         CREATE INDEX stream_terminals_ts ON stream_terminals(ts);",
+    )?;
+    tx.commit()
+}
+
 fn open_database(path: &Path) -> rusqlite::Result<Connection> {
     // Avoid opening a pre-existing symlink or special file in the service
     // data directory. The normal path is owned by this local daemon.
     if std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.file_type().is_file()) {
         return Err(rusqlite::Error::InvalidPath(path.to_path_buf()));
     }
-    let conn = Connection::open(path)?;
+    let mut conn = Connection::open(path)?;
     conn.busy_timeout(Duration::from_secs(1))?;
     migrate_legacy_request_events(&conn)?;
     conn.execute_batch(
@@ -536,13 +573,15 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
             provider TEXT NOT NULL,
             model TEXT NOT NULL,
             outcome TEXT NOT NULL CHECK (outcome IN
-                ('success','transport_error','client_cancelled')),
+                ('success','transport_error','invalid_response',
+                 'timeout','local_error','client_cancelled')),
             elapsed_ms INTEGER NOT NULL,
             PRIMARY KEY (request_id, attempt_index)
         );
         CREATE INDEX IF NOT EXISTS stream_terminals_ts ON stream_terminals(ts);
     ",
     )?;
+    migrate_stream_terminal_outcomes(&mut conn)?;
     for table in ["request_events", "failure_events"] {
         for (column, definition) in [
             ("request_id", "TEXT"),
@@ -1158,6 +1197,64 @@ mod tests {
             })
             .unwrap();
         assert_eq!(terminals, 2, "diagnostic terminal outcomes were lost");
+        let score = crate::scoring::read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(
+            score["stream_terminal_metrics"]["local_policy_terminated"],
+            2
+        );
+        assert_eq!(score["stream_terminal_metrics"]["upstream_failed"], 0);
+    }
+
+    #[test]
+    fn older_stream_terminal_schema_migrates_without_losing_trace_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old-terminal-schema.sqlite3");
+        let conn = open_database(&path).unwrap();
+        let now = now_secs();
+        conn.execute_batch(
+            "DROP TABLE stream_terminals;
+             CREATE TABLE stream_terminals (
+                 ts INTEGER NOT NULL,
+                 request_id TEXT NOT NULL,
+                 attempt_index INTEGER NOT NULL,
+                 provider TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 outcome TEXT NOT NULL CHECK (outcome IN
+                     ('success','transport_error','client_cancelled')),
+                 elapsed_ms INTEGER NOT NULL,
+                 PRIMARY KEY (request_id, attempt_index)
+             );
+             CREATE INDEX stream_terminals_ts ON stream_terminals(ts);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stream_terminals VALUES (?1,'legacy',1,'p','m','transport_error',23)",
+            [now],
+        )
+        .unwrap();
+        drop(conn);
+        let conn = open_database(&path).unwrap();
+        let retained: String = conn
+            .query_row(
+                "SELECT outcome FROM stream_terminals WHERE request_id='legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, "transport_error");
+        conn.execute(
+            "INSERT INTO stream_terminals VALUES (?1,'new',1,'p','m','timeout',42)",
+            [now],
+        )
+        .unwrap();
+        drop(conn);
+        let reopened = open_database(&path).unwrap();
+        let count: i64 = reopened
+            .query_row("SELECT COUNT(*) FROM stream_terminals", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2, "migration must be repeatable and lossless");
     }
 
     #[test]
