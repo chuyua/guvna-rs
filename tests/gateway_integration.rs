@@ -219,6 +219,50 @@ async fn online_chain_addition_is_recorded_as_verified_model_not_passthrough() {
 }
 
 #[tokio::test]
+async fn live_auto_candidate_add_and_delete_invalidates_empty_route_cache() {
+    use guvna::gateway::app_with_state;
+
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let base: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_env: KEY\nauto:\n  enabled: true\n  discover_from_chains: true\n  candidates:\n    - provider: p\n      model: impossible\n      min_input_bytes: 9999999\n"
+    ))
+    .unwrap();
+    let (router, state) = app_with_state(
+        AppState::new(
+            base.clone(),
+            HashMap::from([("KEY".into(), "secret".into())]),
+            vec!["client".into()],
+        )
+        .unwrap(),
+    );
+    let (status, _) = call(router.clone(), request("auto", "", "client")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+    let mut added = base.clone();
+    added.chains.push(
+        serde_yaml::from_str("name: online\nsteps:\n  - provider: p\n    model: discovered\n")
+            .unwrap(),
+    );
+    state.replace_route_snapshot(added).unwrap();
+    assert_eq!(state.runtime_status()["auto_candidate_count"], 2);
+    let (status, result) = call(router.clone(), request("auto", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(result["model"], "discovered");
+
+    state.replace_route_snapshot(base).unwrap();
+    assert_eq!(state.runtime_status()["auto_candidate_count"], 1);
+    let (status, _) = call(router, request("auto", "", "client")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "deleted Auto candidate must never be retried from cache"
+    );
+}
+
+#[tokio::test]
 async fn failed_first_candidate_is_correlated_with_one_terminal_request_and_scoring() {
     use guvna::gateway::app_with_state;
     use rusqlite::{Connection, params};

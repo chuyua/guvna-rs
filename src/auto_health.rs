@@ -1,7 +1,7 @@
 //! Bounded opt-in Auto candidate health hints, no network requests, user data or timers.
 use std::{
-    sync::Mutex,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering},
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -51,13 +51,38 @@ fn count_observation(counter: &AtomicU16) -> u16 {
 }
 
 pub struct AutoHealth {
-    providers: Vec<ProviderScore>,
+    providers: Vec<Arc<ProviderScore>>,
 }
 
 impl AutoHealth {
     pub fn new(count: usize) -> Self {
         Self {
-            providers: (0..count).map(|_| ProviderScore::default()).collect(),
+            providers: (0..count)
+                .map(|_| Arc::new(ProviderScore::default()))
+                .collect(),
+        }
+    }
+
+    /// Preserve health by exact physical identity, never by the position in
+    /// a newly discovered Auto candidate list. In-flight observations on a
+    /// retained candidate update the same score through its shared Arc.
+    pub fn remap(
+        previous: &Self,
+        old: &[crate::config::AutoCandidate],
+        next: &[crate::config::AutoCandidate],
+    ) -> Self {
+        Self {
+            providers: next
+                .iter()
+                .map(|candidate| {
+                    old.iter()
+                        .position(|item| {
+                            item.provider == candidate.provider && item.model == candidate.model
+                        })
+                        .and_then(|index| previous.providers.get(index).cloned())
+                        .unwrap_or_else(|| Arc::new(ProviderScore::default()))
+                })
+                .collect(),
         }
     }
 
