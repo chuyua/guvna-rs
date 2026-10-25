@@ -1321,13 +1321,24 @@ async fn midstream_tcp_error_quarantines_transient_key_without_replaying_stream(
             "/v1/chat/completions",
             post(|State(hits): State<Arc<AtomicUsize>>| async move {
                 hits.fetch_add(1, Ordering::SeqCst);
-                let chunks = futures_util::stream::iter([
-                    Ok::<_, std::io::Error>(Bytes::from_static(SSE_START)),
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionReset,
-                        "injected upstream body reset",
-                    )),
-                ]);
+                // Flush a valid SSE frame before injecting the transport
+                // error, so the preflight has already committed HTTP 200.
+                let chunks = futures_util::stream::unfold(0u8, |step| async move {
+                    match step {
+                        0 => Some((Ok::<_, std::io::Error>(Bytes::from_static(SSE_START)), 1)),
+                        1 => {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            Some((
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    "injected upstream body reset",
+                                )),
+                                2,
+                            ))
+                        }
+                        _ => None,
+                    }
+                });
                 (
                     [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
                     Body::from_stream(chunks),
