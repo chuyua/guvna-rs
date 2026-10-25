@@ -92,11 +92,16 @@ fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
     // Timestamp-indexed bounded reads avoid unbounded request-id joins.
     // Multiple attempts can share a one-second timestamp; a first failed
     // attempt must never overwrite the final candidate's real outcome.
+    // Old endpoint-less traces can contain Embeddings traffic: without a
+    // reliable Chat label, no shadow-to-actual link can be verified.
+    conn.prepare("SELECT endpoint FROM request_events LIMIT 0")
+        .ok()?;
     let mut requests: HashMap<String, (String, String, Option<i64>, i64, String)> = HashMap::new();
     let mut query = conn
         .prepare(
             "SELECT request_id,provider,model,attempt_index,stream_requested,failure_type
-         FROM request_events WHERE ts >= ?1 AND request_id IS NOT NULL
+         FROM request_events WHERE ts >= ?1 AND endpoint='chat'
+           AND request_id IS NOT NULL
          ORDER BY ts DESC, attempt_index DESC LIMIT 512",
         )
         .ok()?;
@@ -580,7 +585,7 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
             "CREATE TABLE request_events (
-                ts INTEGER,request_id TEXT,provider TEXT,model TEXT,
+                ts INTEGER,endpoint TEXT,request_id TEXT,provider TEXT,model TEXT,
                 attempt_index INTEGER,stream_requested INTEGER,failure_type TEXT
              );
              CREATE INDEX request_events_ts ON request_events(ts);
@@ -621,7 +626,7 @@ mod tests {
             (1002, "unverified", "b", 2, 1, "stream_started"),
         ] {
             db.execute(
-                "INSERT INTO request_events VALUES(?1, ?2, 'p', ?3, ?4, ?5, ?6)",
+                "INSERT INTO request_events VALUES(?1, 'chat', ?2, 'p', ?3, ?4, ?5, ?6)",
                 params![ts, id, model, attempt, streaming, outcome],
             )
             .unwrap();
@@ -650,6 +655,36 @@ mod tests {
     }
 
     #[test]
+    fn shadow_endpointless_legacy_traces_cannot_claim_real_chat_outcomes() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE request_events(
+                ts INTEGER,request_id TEXT,provider TEXT,model TEXT,
+                attempt_index INTEGER,stream_requested INTEGER,failure_type TEXT
+             );
+             CREATE TABLE shadow_events(
+                ts INTEGER,request_id TEXT,baseline_provider TEXT,baseline_model TEXT,
+                suggested_provider TEXT,suggested_model TEXT,available INTEGER,disagreed INTEGER
+             );",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO request_events VALUES(1000,'trace','p','m',1,0,'success')",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO shadow_events VALUES(1000,'trace','p','m','p','m',1,0)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            sampled_shadow_outcomes(&db, 999).is_none(),
+            "an endpoint-less trace could be Embeddings; it cannot certify a Chat Shadow outcome"
+        );
+    }
+
+    #[test]
     fn shadow_observation_only_counts_real_outcomes_and_correct_sse_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let directory = dir.path().join("telemetry");
@@ -662,7 +697,7 @@ mod tests {
                 max_elapsed_ms INTEGER,failure_type TEXT
              );
              CREATE TABLE request_events (
-                ts INTEGER,provider TEXT,model TEXT,elapsed_ms INTEGER,
+                ts INTEGER,endpoint TEXT,provider TEXT,model TEXT,elapsed_ms INTEGER,
                 sse_headers INTEGER,request_id TEXT,attempt_index INTEGER,
                 stream_requested INTEGER,failure_type TEXT
              );
@@ -711,8 +746,23 @@ mod tests {
             ("unverified_success", "a", 1, 0, 1, "success"),
         ] {
             db.execute(
-                "INSERT INTO request_events VALUES(?1,'p',?2,15,?3,?4,?5,?6,?7)",
+                "INSERT INTO request_events VALUES(?1,'chat','p',?2,15,?3,?4,?5,?6,?7)",
                 params![now, model, headers, id, attempt, stream, outcome],
+            )
+            .unwrap();
+        }
+        // Later Embeddings traffic must neither impersonate a Chat request
+        // (even with the same ID) nor evict all Chat traces from the bounded
+        // 512-row sample used to join actual outcomes to Shadow advice.
+        db.execute(
+            "INSERT INTO request_events VALUES(?1,'embeddings','p','wrong',1,0,'direct',9,0,'success')",
+            [now + 1],
+        )
+        .unwrap();
+        for i in 0..600 {
+            db.execute(
+                "INSERT INTO request_events VALUES(?1,'embeddings','p','embedding-model',1,0,?2,1,0,'success')",
+                params![now + 1, format!("embedding-{i}")],
             )
             .unwrap();
         }
