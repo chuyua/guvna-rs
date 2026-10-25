@@ -289,6 +289,10 @@ qualified fresh data, the existing deterministic order is preserved.
 Ranking applies only after all request context/capability filters and is
 suppressed when any provider has a live health penalty. It never adds
 candidates or bypasses the unified fallback loop.
+Both local scoring and Auto's read-only telemetry ranking aggregate confirmed
+stream outcomes only for the at-most-32 candidates selected by the bounded
+hourly summary; unrelated historical model labels do not enlarge the
+in-memory stream outcome map or influence the candidate scores.
 
 A background task refreshes the read-only snapshot every 30 seconds.
 Request processing never queries SQLite; snapshots expire after 75 seconds
