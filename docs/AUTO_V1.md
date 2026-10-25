@@ -228,6 +228,10 @@ in its denominator (even when its first attempt failed); only a successful
 index-one attempt counts in the numerator. In-window requests without a
 known terminal outcome may still appear in traced requests, so these metrics
 must not be confused with completed-request success rates.
+These request-level Auto metrics include only Chat rows, not Embeddings or
+other endpoints. Pre-migration SQLite tables missing an endpoint column
+return null request_metrics instead of treating mixed old observations as
+qualified Chat traffic. The writer upgrades legacy schemas on startup.
 
 ## Shadow comparison persistence
 

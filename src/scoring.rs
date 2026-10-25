@@ -459,10 +459,13 @@ fn read_scoring_inner(
         }
     }
     // Legacy databases are still readable before the writer migrates them.
-    // Only terminal request rows enter the denominator: failed intermediate
-    // candidates are recorded separately and cannot inflate request counts.
+    // Require an endpoint label for request-level rates: old endpoint-less
+    // tables can mix Chat with Embeddings and must not produce a false Auto
+    // success/fallback rate. Intermediate failures live in failure_events.
     let request_metrics = if conn
-        .prepare("SELECT request_id,attempt_index,stream_requested FROM request_events LIMIT 0")
+        .prepare(
+            "SELECT request_id,attempt_index,stream_requested,endpoint FROM request_events LIMIT 0",
+        )
         .is_ok()
     {
         let (traced, fallback, first_nonstream, first_success): (i64, i64, i64, i64) = conn
@@ -473,7 +476,8 @@ fn read_scoring_inner(
                         COUNT(DISTINCT CASE WHEN attempt_index = 1 AND stream_requested = 0
                                             AND failure_type = 'success' THEN request_id END)
                  FROM request_events
-                 WHERE ts >= ?1 AND request_id IS NOT NULL AND attempt_index IS NOT NULL",
+                 WHERE ts >= ?1 AND endpoint='chat'
+                   AND request_id IS NOT NULL AND attempt_index IS NOT NULL",
                 params![since],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -560,7 +564,7 @@ fn read_scoring_inner(
         "shadow_metrics":shadow_metrics,
         "stream_terminal_metrics":stream_terminal_metrics,
          "shadow_sample_notes":"The bounded recent shadow sample links only real final request outcomes by request ID. SSE success requires a matching terminal observation. A proposed route matching the actual final route is not proof the proposed strategy would have succeeded; missing and pending observations remain unknown.",
-         "request_metrics_notes":"Only traced terminal request rows count toward fallback rate; the first-attempt success rate is restricted to nonstream completions, not unverified SSE headers. Old SQLite databases report null until migrated.",
+         "request_metrics_notes":"Only traced Chat terminal request rows count toward fallback rate; Embeddings and endpoint-less legacy rows are excluded. The first-attempt success rate is restricted to nonstream completions, not unverified SSE headers. Old SQLite databases report null until migrated.",
          "notes":"raw success_rate includes all failure classes; observed_success_rate counts confirmed nonstream successes, verified Chat SSE terminal successes, and upstream provider failures, excluding caller/local/credential errors and unverified stream starts. Qualification requires 20 observed samples. p95 separates nonstream completion from SSE response-header latency, sampled from up to 512 recent downstream rows per candidate; neither is a counterfactual outcome or complete SSE duration.",
     }))
 }
@@ -795,7 +799,7 @@ mod tests {
                 max_elapsed_ms INTEGER, failure_type TEXT
              );
              CREATE TABLE request_events (
-                ts INTEGER, provider TEXT, model TEXT, elapsed_ms INTEGER,
+                ts INTEGER, endpoint TEXT, provider TEXT, model TEXT, elapsed_ms INTEGER,
                 sse_headers INTEGER, request_id TEXT, attempt_index INTEGER,
                 stream_requested INTEGER, failure_type TEXT
              );",
@@ -818,8 +822,18 @@ mod tests {
             ("d", 1, 1, "stream_started"),
         ] {
             db.execute(
-                "INSERT INTO request_events VALUES(?1,'p','m',20,?2,?3,?4,?5,?6)",
+                "INSERT INTO request_events VALUES(?1,'chat','p','m',20,?2,?3,?4,?5,?6)",
                 params![now, stream, id, attempt, stream, outcome],
+            )
+            .unwrap();
+        }
+        // Embeddings must not turn this into five requests, a second fallback,
+        // or a fabricated Chat first-attempt success. Even a colliding trace
+        // label from another endpoint must never change these rates.
+        for (id, attempt) in [("embeddings-only", 3), ("b", 9)] {
+            db.execute(
+                "INSERT INTO request_events VALUES(?1,'embeddings','p','m',20,0,?2,?3,0,'success')",
+                params![now, id, attempt],
             )
             .unwrap();
         }
@@ -838,6 +852,38 @@ mod tests {
             .as_f64()
             .unwrap();
         assert!((rate - 1.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn legacy_endpointless_traces_do_not_claim_chat_request_rates() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().join("telemetry");
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = Connection::open(directory.join("requests.sqlite3")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE hourly_stats(
+                hour_ts INTEGER,provider TEXT,model TEXT,request_count INTEGER,
+                failure_count INTEGER,total_elapsed_ms INTEGER,
+                max_elapsed_ms INTEGER,failure_type TEXT
+             );
+             CREATE TABLE request_events(
+                ts INTEGER,provider TEXT,model TEXT,elapsed_ms INTEGER,
+                sse_headers INTEGER,request_id TEXT,attempt_index INTEGER,
+                stream_requested INTEGER,failure_type TEXT
+             );",
+        )
+        .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        db.execute(
+            "INSERT INTO request_events VALUES(?1,'p','m',1,0,'legacy',2,0,'success')",
+            [now],
+        )
+        .unwrap();
+        let report = read_scoring(dir.path(), 1).unwrap();
+        assert!(report["request_metrics"].is_null());
     }
 
     #[test]
