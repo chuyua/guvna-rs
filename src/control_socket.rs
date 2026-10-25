@@ -515,9 +515,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join("alias");
         std::os::unix::fs::symlink(dir.path(), &link).unwrap();
-        assert!(ensure_private_control_directory(&link)
-            .unwrap_err()
-            .contains("not a symlink"));
+        assert!(
+            ensure_private_control_directory(&link)
+                .unwrap_err()
+                .contains("not a symlink")
+        );
     }
 
     #[tokio::test]
