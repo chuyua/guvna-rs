@@ -865,8 +865,14 @@ fn recover_page_capacity(conn: &mut Connection, now: i64) -> rusqlite::Result<bo
          (SELECT rowid FROM stream_terminals ORDER BY ts LIMIT 2048)",
         [],
     )?;
+    // Aggregates can exhaust the page budget even when all event tables are empty.
+    let removed_hourly = tx.execute(
+        "DELETE FROM hourly_stats WHERE rowid IN
+         (SELECT rowid FROM hourly_stats ORDER BY hour_ts LIMIT 2048)",
+        [],
+    )?;
     tx.commit()?;
-    Ok(removed_requests + removed_failures + removed_shadows + removed_terminals > 0)
+    Ok(removed_requests + removed_failures + removed_shadows + removed_terminals + removed_hourly > 0)
 }
 
 fn now_secs() -> i64 {

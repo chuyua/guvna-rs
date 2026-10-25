@@ -175,10 +175,12 @@ fn apply_event(
         let choice = choices
             .get_mut(usize::try_from(index).map_err(|_| ())?)
             .ok_or(())?;
-        let delta = event_choice
-            .get("delta")
-            .and_then(Value::as_object)
-            .ok_or(())?;
+        let empty_delta = serde_json::Map::new();
+        let delta = match event_choice.get("delta") {
+            Some(Value::Object(delta)) => delta,
+            Some(Value::Null) if event_choice.get("finish_reason").is_some_and(Value::is_string) => &empty_delta,
+            _ => return Err(AggregateError::InvalidStream),
+        };
         if let Some(content) = delta.get("content").filter(|content| !content.is_null()) {
             append_bounded(&mut choice.content, content.as_str().ok_or(())?, used)?;
         }
@@ -398,6 +400,22 @@ pub(super) async fn aggregate(
 #[cfg(test)]
 mod output_budget_tests {
     use super::*;
+    #[test]
+    fn terminal_null_delta_is_valid_but_nonterminal_null_is_not() {
+        let mut choices = vec![Choice::default()];
+        let mut used = 0;
+        let mut usage = Value::Null;
+        let mut id = None;
+        let mut created = None;
+        let mut model = None;
+        let mut feed = |value: Value| apply_event(&value, &mut choices, &mut used, &mut usage, &mut id, &mut created, &mut model);
+        feed(json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]})).unwrap();
+        feed(json!({"choices":[{"index":0,"delta":null,"finish_reason":"stop"}]})).unwrap();
+        assert_eq!(choices[0].content, "ok");
+        assert_eq!(choices[0].finish_reason.as_deref(), Some("stop"));
+        let mut used = 0;
+        assert!(with_event(json!({"choices":[{"index":0,"delta":null,"finish_reason":null}]}), &mut used).is_err());
+    }
     fn with_event(value: Value, used: &mut usize) -> Result<(), AggregateError> {
         let mut choices = vec![Choice::default()];
         let mut usage = Value::Null;
