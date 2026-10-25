@@ -694,8 +694,18 @@ mod tests {
         std::os::unix::fs::symlink(&target, &alias).unwrap();
         let error = ensure_socket_available(&alias).await.unwrap_err();
         assert!(error.contains("not a socket"), "{error}");
-        assert!(fs::symlink_metadata(&alias).unwrap().file_type().is_symlink());
-        assert!(fs::symlink_metadata(&target).unwrap().file_type().is_socket());
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
     }
 
     #[tokio::test]
