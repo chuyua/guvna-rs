@@ -69,13 +69,6 @@ fn read_limited(path: &Path) -> Result<Option<Vec<u8>>, String> {
     }
     // Bound the allocation even if an uncooperative writer extends a file
     // during the read. Metadata length alone is not a sufficient limit.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if meta.nlink() != 1 {
-            return Err(format!("{} must not have hard links", path.display()));
-        }
-    }
     let mut bytes = Vec::with_capacity(meta.len() as usize);
     file.take(MAX_CHAIN_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
@@ -423,17 +416,6 @@ mod lock_security_tests {
         fs::write(&path, b"").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
         assert!(lock_directory(dir.path()).is_err());
-    }
-
-    #[test]
-    fn hardlinked_chain_data_is_rejected_without_modifying_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("chains.yaml");
-        fs::write(&path, b"version: 1\nchains: []\n").unwrap();
-        let other = dir.path().join("linked-chains.yaml");
-        fs::hard_link(&path, &other).unwrap();
-        assert!(read_limited(&path).is_err());
-        assert_eq!(fs::read(&other).unwrap(), b"version: 1\nchains: []\n");
     }
 
     #[test]

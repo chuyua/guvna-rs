@@ -269,6 +269,7 @@ fn ranking_key(
     features: AutoRequirements,
 ) -> u64 {
     let mut h = DefaultHasher::new();
+    steps.len().hash(&mut h);
     for step in steps {
         step.provider_index.hash(&mut h);
         step.model.hash(&mut h);
