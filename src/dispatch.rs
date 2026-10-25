@@ -294,7 +294,11 @@ async fn dispatch_inner(
             "Only Chat Completions streaming is supported",
         );
     }
-    let Some(model) = request.get("model").and_then(Value::as_str) else {
+    let Some(model) = request
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
         return error(
             StatusCode::BAD_REQUEST,
             "missing_model",
@@ -354,7 +358,7 @@ async fn dispatch_inner(
             state.auto_generation,
         )
     } else {
-        routing::resolve(&state.route_snapshot(), model)
+        routing::resolve(&state.route_snapshot(), &model)
     } {
         Ok(steps) => steps,
         Err(_) => {
