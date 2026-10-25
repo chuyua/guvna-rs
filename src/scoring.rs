@@ -60,7 +60,7 @@ fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
     let mut terminals = HashMap::new();
     // Old databases may have no terminal table. Unknown is never success.
     if let Ok(mut query) = conn.prepare(
-        "SELECT request_id,attempt_index,outcome FROM stream_terminals
+        "SELECT request_id,attempt_index,provider,model,outcome FROM stream_terminals
          WHERE ts >= ?1 ORDER BY ts DESC LIMIT 512",
     ) {
         let rows = query
@@ -69,12 +69,16 @@ fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })
             .ok()?;
         for row in rows {
-            let (id, attempt, outcome) = row.ok()?;
-            terminals.entry((id, attempt)).or_insert(outcome);
+            let (id, attempt, provider, model, outcome) = row.ok()?;
+            terminals
+                .entry((id, attempt))
+                .or_insert((provider, model, outcome));
         }
     }
 
@@ -136,7 +140,10 @@ fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
             // Terminal for another candidate cannot certify this stream.
             attempt
                 .and_then(|index| terminals.get(&(id.clone(), index)))
-                .map(String::as_str)
+                .and_then(|(terminal_provider, terminal_model, terminal_outcome)| {
+                    (terminal_provider == provider && terminal_model == model)
+                        .then_some(terminal_outcome.as_str())
+                })
         } else {
             Some(outcome.as_str())
         };
@@ -438,7 +445,8 @@ mod tests {
              );
              CREATE INDEX shadow_events_ts ON shadow_events(ts);
              CREATE TABLE stream_terminals (
-                ts INTEGER,request_id TEXT,attempt_index INTEGER,outcome TEXT
+                ts INTEGER,request_id TEXT,attempt_index INTEGER,
+                provider TEXT,model TEXT,outcome TEXT
              );
              CREATE INDEX stream_terminals_ts ON stream_terminals(ts);",
         )
@@ -454,6 +462,7 @@ mod tests {
             ("missing", None, 0, 0),
             ("stream_ok", Some("a"), 1, 0),
             ("wrong_terminal", Some("b"), 1, 1),
+            ("failed", None, 0, 0),
         ] {
             db.execute(
                 "INSERT INTO shadow_events VALUES(?1,?2,'p','a','p',?3,?4,?5)",
@@ -467,6 +476,7 @@ mod tests {
             ("cancelled", "a", 1, 1, "stream_started"),
             ("stream_ok", "a", 1, 1, "stream_started"),
             ("wrong_terminal", "a", 1, 1, "stream_started"),
+            ("failed", "a", 1, 1, "stream_started"),
         ] {
             db.execute(
                 "INSERT INTO request_events VALUES(?1,'p',?2,15,?3,?4,?5,?3,?6)",
@@ -474,24 +484,26 @@ mod tests {
             )
             .unwrap();
         }
-        for (id, attempt, outcome) in [
-            ("cancelled", 1, "client_cancelled"),
-            ("stream_ok", 1, "success"),
-            ("wrong_terminal", 2, "success"),
+        for (id, attempt, provider, model, outcome) in [
+            ("cancelled", 1, "p", "a", "client_cancelled"),
+            ("stream_ok", 1, "p", "a", "success"),
+            // A wrong model with the same request and attempt is unverified.
+            ("wrong_terminal", 1, "p", "other", "success"),
+            ("failed", 1, "p", "a", "transport_error"),
         ] {
             db.execute(
-                "INSERT INTO stream_terminals VALUES(?1,?2,?3,?4)",
-                params![now, id, attempt, outcome],
+                "INSERT INTO stream_terminals VALUES(?1,?2,?3,?4,?5,?6)",
+                params![now, id, attempt, provider, model, outcome],
             )
             .unwrap();
         }
         let result = read_scoring(dir.path(), 1).unwrap();
         let observed = &result["shadow_metrics"]["observed_actual_sample"];
-        assert_eq!(observed["sampled_shadow_rows"], 6);
-        assert_eq!(observed["linked_actual_requests"], 5);
+        assert_eq!(observed["sampled_shadow_rows"], 7);
+        assert_eq!(observed["linked_actual_requests"], 6);
         assert_eq!(observed["unlinked_actual_requests"], 1);
         assert_eq!(observed["actual_completed"], 3);
-        assert_eq!(observed["actual_failed"], 0);
+        assert_eq!(observed["actual_failed"], 1);
         assert_eq!(observed["actual_client_cancelled"], 1);
         assert_eq!(observed["actual_stream_pending_or_unobserved"], 1);
         assert_eq!(observed["actual_fallbacks"], 1);
@@ -508,7 +520,7 @@ mod tests {
             .unwrap();
         }
         let bounded = read_scoring(dir.path(), 1).unwrap();
-        assert_eq!(bounded["shadow_metrics"]["evaluations"], 306);
+        assert_eq!(bounded["shadow_metrics"]["evaluations"], 307);
         assert_eq!(
             bounded["shadow_metrics"]["observed_actual_sample"]["sampled_shadow_rows"],
             256
