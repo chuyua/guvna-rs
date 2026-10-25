@@ -142,6 +142,11 @@ health_aware enabled, per-provider/model health summaries are restored from SQLi
 when the last failure is within the 300-second freshness window. Live routing
 uses bounded candidate-level scores,
 not a learned model. The telemetry directory is local and limited to the service user.
+The startup health restore opens only an existing regular database, with
+SQLite read-only/no-follow flags; an absent, unreadable or symlinked database
+provides no restored health hints. Startup health restore does not open the
+main database for writes or create a new database.
+Only the separate telemetry writer owns writable connections and migration.
 The daemon sets umask 0077 before creating SQLite or binding its control
 socket; main DB, WAL and SHM are owner-only (0600) and an existing database
 symlink is rejected to avoid opening an unexpected target.
@@ -152,8 +157,10 @@ directory is set to mode 0700 and the socket to 0600. guvna status sends one
 bounded JSON-line status command and prints a runtime snapshot containing
 uptime, in-flight count, open-circuit count, provider count, Auto/SQLite flags
 and fixed request/telemetry counters. No provider names, model names, secrets,
-credentials or request bodies are returned. Only the read-only status command
-is supported; there is no mutation protocol and no additional TCP listener.
+credentials or request bodies are returned. Status queries are read-only; the
+same-UID socket also supports bounded chains set/delete
+operations that atomically persist and publish runtime routing. No remote
+management TCP listener is added.
 If the socket is absent, status retains the legacy loopback HTTP health probe.
 Stale sockets are cleaned on startup only after confirming the path is a Unix
 socket and a connection is refused; non-socket files and active sockets are

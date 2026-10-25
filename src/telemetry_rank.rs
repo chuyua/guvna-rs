@@ -114,7 +114,11 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
     }
     let candidates = summary.get("candidates")?.as_array()?;
     let path = data_dir.join("telemetry").join("requests.sqlite3");
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .ok()?;
     conn.busy_timeout(Duration::from_millis(50)).ok()?;
     // Old endpoint-less rows can mix Chat and Embeddings; never auto-rank them.
     conn.prepare("SELECT endpoint FROM request_events LIMIT 0")

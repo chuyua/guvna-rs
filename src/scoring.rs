@@ -295,8 +295,11 @@ fn read_scoring_inner(
     if !metadata.file_type().is_file() {
         return Err("telemetry database is not a regular file".into());
     }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|_| "cannot open telemetry database for read-only scoring")?;
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|_| "cannot open telemetry database for read-only scoring")?;
     conn.busy_timeout(Duration::from_millis(50))
         .map_err(|_| "cannot configure SQLite reader")?;
     let now = SystemTime::now()

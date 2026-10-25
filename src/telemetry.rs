@@ -1,7 +1,7 @@
 //! Opt-in, fail-open SQLite metadata. Never persist prompts, credentials, URLs or request bodies.
 //! A bounded queue keeps SQLite I/O off the request path; one worker owns the connection.
 use crate::metrics::Metrics;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 use std::sync::atomic::Ordering;
 use std::{
     path::{Path, PathBuf},
@@ -838,10 +838,16 @@ fn now_secs() -> i64 {
 }
 
 fn load_provider_health_from_path(path: &Path, now: i64) -> Vec<ProviderHealthSnapshot> {
-    if !path.is_file() {
+    // Startup health restore is advisory. Never create, mutate or follow a
+    // substituted database file while rebuilding Auto's local health hints.
+    // The telemetry writer owns schema migration and writable connections.
+    if !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file()) {
         return Vec::new();
     }
-    let Ok(conn) = Connection::open(path) else {
+    let Ok(conn) = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    ) else {
         return Vec::new();
     };
     if conn.busy_timeout(Duration::from_millis(100)).is_err() {
@@ -1519,6 +1525,62 @@ mod tests {
 
         let stale = load_provider_health_from_path(&path, 7202 + HISTORY_RETENTION_SECS + 1);
         assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn health_restore_reads_existing_readonly_database_without_modifying_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health-readonly.sqlite3");
+        let mut db = open_database(&path).unwrap();
+        write_batch(&mut db, &[event(7200, "p", "m", 503, 1, "provider_5xx")]).unwrap();
+        drop(db);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let snapshots = load_provider_health_from_path(&path, 7201);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].provider, "p");
+        assert_eq!(snapshots[0].penalty, 35);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+    }
+
+    #[test]
+    fn health_restore_rejects_symlink_to_valid_database_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside.sqlite3");
+        let mut db = open_database(&target).unwrap();
+        write_batch(&mut db, &[event(7200, "p", "m", 503, 1, "provider_5xx")]).unwrap();
+        drop(db);
+        let before = std::fs::read(&target).unwrap();
+        let link = dir.path().join("requests.sqlite3");
+        symlink(&target, &link).unwrap();
+
+        assert!(load_provider_health_from_path(&link, 7201).is_empty());
+        assert_eq!(std::fs::read(&target).unwrap(), before);
+        assert_eq!(
+            load_provider_health_from_path(&dir.path().join("absent"), 7201).len(),
+            0
+        );
+    }
+
+    #[test]
+    fn health_restore_fails_open_on_legacy_database_without_health_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE request_events (ts INTEGER NOT NULL);")
+            .unwrap();
+        drop(conn);
+
+        let before = std::fs::read(&path).unwrap();
+        assert!(load_provider_health_from_path(&path, 7201).is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
     #[test]
     fn future_timestamp_metadata_is_pruned_without_waiting_for_clock_recovery() {
