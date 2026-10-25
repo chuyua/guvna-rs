@@ -29,12 +29,14 @@ fn p95(samples: &mut [i64]) -> Option<i64> {
 /// success of a route that was not actually executed.
 fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
     // Timestamp-indexed bounded reads avoid unbounded request-id joins.
-    let mut requests = HashMap::new();
+    // Multiple attempts can share a one-second timestamp; a first failed
+    // attempt must never overwrite the final candidate's real outcome.
+    let mut requests: HashMap<String, (String, String, Option<i64>, i64, String)> = HashMap::new();
     let mut query = conn
         .prepare(
             "SELECT request_id,provider,model,attempt_index,stream_requested,failure_type
          FROM request_events WHERE ts >= ?1 AND request_id IS NOT NULL
-         ORDER BY ts DESC LIMIT 512",
+         ORDER BY ts DESC, attempt_index DESC LIMIT 512",
         )
         .ok()?;
     let rows = query
@@ -51,9 +53,15 @@ fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
         .ok()?;
     for row in rows {
         let (id, provider, model, attempt, stream, outcome) = row.ok()?;
-        requests
-            .entry(id)
-            .or_insert((provider, model, attempt, stream, outcome));
+        // Prefer the highest attempt index even if the timestamp order was
+        // disturbed by a clock adjustment or an asynchronous telemetry flush.
+        // For identical indexes, the first (newest) row remains authoritative.
+        let final_attempt = requests
+            .get(&id)
+            .is_none_or(|current| attempt.unwrap_or(0) > current.2.unwrap_or(0));
+        if final_attempt {
+            requests.insert(id, (provider, model, attempt, stream, outcome));
+        }
     }
     drop(query);
 
@@ -424,6 +432,80 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shadow_uses_final_attempt_with_same_second_and_reordered_timestamps() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE request_events (
+                ts INTEGER,request_id TEXT,provider TEXT,model TEXT,
+                attempt_index INTEGER,stream_requested INTEGER,failure_type TEXT
+             );
+             CREATE INDEX request_events_ts ON request_events(ts);
+             CREATE TABLE shadow_events (
+                ts INTEGER,request_id TEXT,baseline_provider TEXT,baseline_model TEXT,
+                suggested_provider TEXT,suggested_model TEXT,available INTEGER,disagreed INTEGER
+             );
+             CREATE TABLE stream_terminals (
+                ts INTEGER,request_id TEXT,attempt_index INTEGER,
+                provider TEXT,model TEXT,outcome TEXT
+             );",
+        )
+        .unwrap();
+
+        for id in [
+            "same-second",
+            "clock-adjustment",
+            "streamed-fallback",
+            "unverified",
+        ] {
+            db.execute(
+                "INSERT INTO shadow_events VALUES(1003, ?1, 'p', 'a', 'p', 'b', 1, 1)",
+                params![id],
+            )
+            .unwrap();
+        }
+        // Failed first attempts are inserted before successful fallbacks.
+        // ts is intentionally identical for both rows of the first request.
+        for (ts, id, model, attempt, streaming, outcome) in [
+            (1002, "same-second", "a", 1, 0, "provider_5xx"),
+            (1002, "same-second", "b", 2, 0, "success"),
+            // Clock moves backwards before the final attempt arrives.
+            (1003, "clock-adjustment", "a", 1, 0, "provider_5xx"),
+            (1002, "clock-adjustment", "b", 2, 0, "success"),
+            (1002, "streamed-fallback", "a", 1, 1, "provider_5xx"),
+            (1002, "streamed-fallback", "b", 2, 1, "stream_started"),
+            (1002, "unverified", "a", 1, 1, "provider_5xx"),
+            (1002, "unverified", "b", 2, 1, "stream_started"),
+        ] {
+            db.execute(
+                "INSERT INTO request_events VALUES(?1, ?2, 'p', ?3, ?4, ?5, ?6)",
+                params![ts, id, model, attempt, streaming, outcome],
+            )
+            .unwrap();
+        }
+        for (id, attempt, model, outcome) in [
+            ("streamed-fallback", 2, "b", "success"),
+            // A terminal for an earlier attempt is NOT the final stream.
+            ("unverified", 1, "a", "success"),
+        ] {
+            db.execute(
+                "INSERT INTO stream_terminals VALUES(1003, ?1, ?2, 'p', ?3, ?4)",
+                params![id, attempt, model, outcome],
+            )
+            .unwrap();
+        }
+        let sample = sampled_shadow_outcomes(&db, 999).unwrap();
+        assert_eq!(sample["sampled_shadow_rows"], 4);
+        assert_eq!(sample["linked_actual_requests"], 4);
+        assert_eq!(sample["actual_fallbacks"], 4);
+        assert_eq!(sample["actual_completed"], 3);
+        assert_eq!(sample["actual_failed"], 0);
+        assert_eq!(sample["actual_stream_pending_or_unobserved"], 1);
+        assert_eq!(sample["baseline_first_choice_successes"], 0);
+        assert_eq!(sample["proposed_top_matches_actual_final_route"], 4);
+        assert_eq!(sample["counterfactual_success_inferred"], false);
+    }
+
     #[test]
     fn shadow_observation_only_counts_real_outcomes_and_correct_sse_attempt() {
         let dir = tempfile::tempdir().unwrap();

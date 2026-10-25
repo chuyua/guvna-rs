@@ -333,8 +333,11 @@ a positive request min_context to enforce a strict window requirement.
 
 Local guvna status --scoring includes shadow_metrics.observed_actual_sample:
 a maximum of 256 recent shadow rows correlated with up to 512 real terminal
-request rows and 512 SSE terminal observations. Only a matching SSE terminal
-success with matching request ID, attempt, provider and model counts as a
+request rows and 512 SSE terminal observations. Multiple attempts for one
+request ID are resolved by the highest attempt index, not an ambiguous
+one-second timestamp or asynchronous event insertion order. Only a matching
+SSE terminal success with matching request ID, attempt, provider and model
+counts as a
 completed stream; response headers alone do not. A stream request rejected
 before headers retains its explicit request-row failure even without a terminal
 callback; an unverified success still remains pending.
