@@ -4747,8 +4747,8 @@ auto:
         ("STREAM_KEY".into(), "stream-secret".into()),
         ("BACKUP_KEY".into(), "backup-secret".into()),
     ]);
-    let mut state = AppState::new(config.clone(), credentials.clone(), vec!["client".into()])
-        .unwrap();
+    let mut state =
+        AppState::new(config.clone(), credentials.clone(), vec!["client".into()]).unwrap();
     state.enable_telemetry(dir.path()).unwrap();
     let (router, shared) = app_with_state(state);
     for _ in 0..3 {
