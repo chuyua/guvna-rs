@@ -341,3 +341,13 @@ matching the actual final route is NOT a counterfactual success claim:
 the shadow proposal is never executed. Legacy SQLite databases lacking
 request ID columns report null for this optional sample. Timestamp-indexed
 bounded reads preserve low-memory local CLI behavior.
+
+
+### Local CLI status JSON fallback
+
+The local status socket returns structured JSON. When it is absent but the
+loopback health probe succeeds, guvna status --json now also prints a JSON
+object with status, source=local_health_probe, loopback host and port rather
+than silently returning plain text. Status --window is valid only together
+with --scoring; it is never silently ignored. No remote admin endpoint is
+introduced.

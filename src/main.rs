@@ -38,6 +38,8 @@ async fn run() -> Result<(), String> {
     let mut healthcheck = false;
     let mut status = false;
     let mut status_scoring = false;
+    let mut status_json = false;
+    let mut scoring_window_explicit = false;
     let mut scoring_hours: u32 = 24;
     let mut logs = false;
     let mut system_journal = false;
@@ -72,8 +74,9 @@ async fn run() -> Result<(), String> {
                 data_dir = PathBuf::from(args.next().ok_or("missing -data value")?);
             }
             "--scoring" if status => status_scoring = true,
-            "--json" if status => {}
+            "--json" if status => status_json = true,
             "--window" if status => {
+                scoring_window_explicit = true;
                 scoring_hours = match args.next().as_deref() {
                     Some("1h") => 1,
                     Some("6h") => 6,
@@ -117,6 +120,8 @@ async fn run() -> Result<(), String> {
             other => return Err(format!("unknown or not-yet-migrated argument {other:?}")),
         }
     }
+
+    validate_status_options(status_scoring, scoring_window_explicit)?;
 
     if logs {
         #[cfg(not(target_os = "linux"))]
@@ -230,7 +235,10 @@ async fn run() -> Result<(), String> {
             return Err(format!("healthcheck HTTP {}", response.status()));
         }
         if status {
-            println!("guvna running on {probe_host}:{}", config.port);
+            println!(
+                "{}",
+                status_probe_output(probe_host, config.port, status_json)
+            );
         }
         return Ok(());
     }
@@ -337,6 +345,27 @@ async fn serve_until_shutdown(
     }
 }
 
+fn validate_status_options(scoring: bool, window_specified: bool) -> Result<(), String> {
+    if window_specified && !scoring {
+        return Err("status --window requires --scoring".into());
+    }
+    Ok(())
+}
+
+fn status_probe_output(host: &str, port: u16, json_output: bool) -> String {
+    if json_output {
+        serde_json::json!({
+            "status": "running",
+            "source": "local_health_probe",
+            "host": host,
+            "port": port,
+        })
+        .to_string()
+    } else {
+        format!("guvna running on {host}:{port}")
+    }
+}
+
 fn local_probe_host(bind: &str) -> Result<&str, String> {
     match bind {
         "0.0.0.0" => Ok("127.0.0.1"),
@@ -354,7 +383,9 @@ fn local_probe_host(bind: &str) -> Result<&str, String> {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{local_probe_host, serve_until_shutdown};
+    use super::{
+        local_probe_host, serve_until_shutdown, status_probe_output, validate_status_options,
+    };
     use std::{sync::Arc, time::Duration};
     use tokio::sync::{Notify, oneshot};
 
@@ -457,6 +488,25 @@ mod cli_tests {
             .unwrap()
             .unwrap();
         request.abort();
+    }
+
+    #[test]
+    fn status_json_fallback_is_machine_readable_and_window_requires_scoring() {
+        assert!(validate_status_options(true, true).is_ok());
+        assert!(validate_status_options(false, false).is_ok());
+        assert_eq!(
+            validate_status_options(false, true).unwrap_err(),
+            "status --window requires --scoring"
+        );
+        let text = status_probe_output("127.0.0.1", 8800, false);
+        assert_eq!(text, "guvna running on 127.0.0.1:8800");
+        let json: serde_json::Value =
+            serde_json::from_str(&status_probe_output("[::1]", 8800, true)).unwrap();
+        assert_eq!(json["status"], "running");
+        assert_eq!(json["source"], "local_health_probe");
+        assert_eq!(json["host"], "[::1]");
+        assert_eq!(json["port"], 8800);
+        assert!(!json.to_string().contains("API_KEYS"));
     }
 
     #[test]

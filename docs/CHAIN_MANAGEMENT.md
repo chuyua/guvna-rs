@@ -67,9 +67,12 @@ semantics remain unchanged, including explicit operator recovery.
 
 ## Deployment limits
 
-Management is offline: no live daemon reload, Unix socket or remote mutation
-API is added. Use the same Linux service user and paths as the running
-service. Avoid concurrent manual edits that bypass the CLI's advisory lock.
+Management stays local: when a running daemon exposes its permission-restricted
+Unix control socket, supported chain mutations apply online; otherwise they
+are written offline and require a deliberate restart. No remote management
+TCP endpoint or Web API is added. Use the same Linux service user and paths
+as the running service. Avoid concurrent manual edits that bypass the CLI's
+advisory lock.
 No API_KEYS or ADMIN_KEY is required for local file management, but OS
 filesystem permissions for the selected data directory are required.
 
