@@ -500,8 +500,7 @@ mod tests {
             assert!(error.contains("not group/world writable"), "{error}");
             let error = spawn(dir.path(), Arc::clone(&state), Arc::new(config.clone()))
                 .await
-                .err()
-                .expect("daemon must reject an unsafe pre-existing control directory");
+                .expect_err("daemon must reject an unsafe pre-existing control directory");
             assert!(error.contains("not group/world writable"), "{error}");
             assert!(socket.exists(), "must not unlink someone else's socket");
         }
