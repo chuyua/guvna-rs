@@ -2,7 +2,7 @@
 //! No request routing or key retry policy: the single dispatch candidate walk
 //! transfers ownership only after the first valid event is observed.
 use super::{AppState, LiveRouteSnapshot, record_circuit_failure, record_circuit_success};
-use crate::{circuit::Ticket, keypool::Lease, metrics::Metrics, sse::ChatSse};
+use crate::{circuit::Ticket, keypool::Lease, metrics::Metrics, outcome::Outcome, sse::ChatSse};
 use axum::{
     body::{Body, Bytes},
     response::Response,
@@ -187,6 +187,11 @@ fn stream_response(state: ChatStreamState) -> Response {
             }
             if state.terminated {
                 Metrics::inc(&state.owner.metrics.chat_stream_failed);
+                if state.owner.pools[state.provider_index]
+                    .record(&state.lease, Outcome::TransportFailure)
+                {
+                    Metrics::inc(&state.owner.metrics.credential_quarantines);
+                }
                 state
                     .owner
                     .mark_auto_failure_in(&state.live, state.provider_index, &state.model);
