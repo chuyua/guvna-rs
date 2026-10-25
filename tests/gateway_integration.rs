@@ -3241,6 +3241,133 @@ auto:
     assert!(config.validate().unwrap_err().contains("enabled: true"));
 }
 
+/// Mock enforces that Go-only Auto selector fields never reach any provider.
+async fn strict_auto_upstream(
+    State(calls): State<Arc<AtomicUsize>>,
+    axum::Json(request): axum::Json<Value>,
+) -> impl IntoResponse {
+    calls.fetch_add(1, Ordering::SeqCst);
+    assert!(
+        request.get("min_context").is_none(),
+        "leaked Auto min_context"
+    );
+    assert!(
+        request.get("max_context").is_none(),
+        "leaked Auto max_context"
+    );
+    axum::Json(json!({
+        "id":"mock-auto-context",
+        "object":"chat.completion",
+        "model":request["model"],
+        "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]
+    }))
+}
+
+async fn start_strict_auto_upstream() -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(strict_auto_upstream))
+        .with_state(calls.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{address}"), calls)
+}
+
+#[tokio::test]
+async fn go_auto_context_filters_are_stripped_and_route_cache_isolated() {
+    let (small, small_calls) = start_strict_auto_upstream().await;
+    let (large, large_calls) = start_strict_auto_upstream().await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: small
+    type: openai
+    base_url: {small}
+    key_env: SMALL_KEY
+    models: [short]
+  - name: large
+    type: openai
+    base_url: {large}
+    key_env: LARGE_KEY
+    models: [long]
+auto:
+  enabled: true
+  candidates:
+    - provider: small
+      model: short
+      max_context_tokens: 4096
+    - provider: large
+      model: long
+      max_context_tokens: 32768
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("SMALL_KEY".into(), "small-secret".into()),
+            ("LARGE_KEY".into(), "large-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let messages = json!([{"role":"user","content":"hello"}]);
+    for (path, context, expected) in [
+        ("/v1/auto", json!({"min_context":8192}), "long"),
+        ("/v1/chat/completions", json!({"max_context":8192}), "short"),
+        (
+            "/v1/auto",
+            json!({"min_context":0,"max_context":0}),
+            "short",
+        ),
+        ("/v1/chat/completions", json!({"min_context":8192}), "long"),
+        ("/v1/auto", json!({"min_context":-1}), "short"),
+    ] {
+        let mut payload = json!({"model":"auto","messages":messages});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(context.as_object().unwrap().clone());
+        let (status, result) = call(router.clone(), auto_request(path, "client", payload)).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {result}");
+        assert_eq!(result["model"], expected, "{path}: {result}");
+    }
+    assert_eq!(small_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(large_calls.load(Ordering::SeqCst), 2);
+    for bounds in [
+        json!({"min_context":1000,"max_context":500}),
+        json!({"min_context":null}),
+        json!({"min_context":"8192"}),
+        json!({"max_context":1.5}),
+        json!({"max_context":true}),
+        json!({"min_context":[]}),
+    ] {
+        let mut payload = json!({"model":"auto","messages":messages});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(bounds.as_object().unwrap().clone());
+        let (status, result) =
+            call(router.clone(), auto_request("/v1/auto", "client", payload)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bounds}: {result}");
+        assert_eq!(result["error"]["code"], "invalid_auto_context");
+    }
+    let (status, result) = call(
+        router,
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({"messages":messages,"min_context":65536}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(result["error"]["code"], "auto_no_eligible_candidate");
+    assert_eq!(small_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(large_calls.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test]
 async fn auto_without_eligible_candidate_returns_422_without_network_attempt() {
     let (url, hits) = start_upstream(StatusCode::OK).await;

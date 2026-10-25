@@ -315,12 +315,31 @@ async fn dispatch_inner(
         );
     }
     let auto_enabled = model == "auto" && state.config.auto.enabled;
+    let auto_bounds = if auto_enabled {
+        match routing::auto_context_bounds(&request, state.config.auto.use_model_registry) {
+            Ok(bounds) => Some(bounds),
+            Err(message) => {
+                return error(StatusCode::BAD_REQUEST, "invalid_auto_context", message);
+            }
+        }
+    } else {
+        None
+    };
+    // Go Auto context controls are selection-only. Never send them to a
+    // provider (including SSE-only aggregation and later fallback steps).
+    if auto_enabled {
+        let object = request.as_object_mut().expect("checked above");
+        object.remove("min_context");
+        object.remove("max_context");
+    }
     // Keep byte-range eligibility and context-window budgeting separate.
     // The context estimate includes the full request, output allowance and safety reserve.
     let mut steps = match if auto_enabled {
         let input_bytes = routing::auto_input_bytes(request.get("messages"));
         let context_estimate = routing::auto_context_estimate(&request);
-        let requirements = routing::auto_requirements(&request);
+        let (min_context, max_context) = auto_bounds.expect("Auto bounds validated");
+        let requirements =
+            routing::auto_requirements(&request).with_context_bounds(min_context, max_context);
         let penalties = state
             .auto_health
             .as_ref()
@@ -358,7 +377,9 @@ async fn dispatch_inner(
     if auto_enabled && let Some(decider) = &state.auto_decider {
         let input_bytes = routing::auto_input_bytes(request.get("messages"));
         let context_estimate = routing::auto_context_estimate(&request);
-        let requirements = routing::auto_requirements(&request);
+        let (min_context, max_context) = auto_bounds.expect("Auto bounds validated");
+        let requirements =
+            routing::auto_requirements(&request).with_context_bounds(min_context, max_context);
         if state.config.auto.decider.shadow_only {
             // Shadow adds zero selector latency to actual response selection.
             let owner = Arc::clone(&state);

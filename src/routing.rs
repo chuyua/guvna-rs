@@ -21,6 +21,8 @@ pub struct AutoRequirements {
     tools: bool,
     images: bool,
     json_schema: bool,
+    min_context: usize,
+    max_context: Option<usize>,
 }
 
 impl AutoRequirements {
@@ -29,8 +31,16 @@ impl AutoRequirements {
             tools,
             images,
             json_schema,
+            ..Self::default()
         }
     }
+
+    pub fn with_context_bounds(mut self, min_context: usize, max_context: Option<usize>) -> Self {
+        self.min_context = min_context;
+        self.max_context = max_context;
+        self
+    }
+
     fn requires_images(self) -> bool {
         self.images
     }
@@ -73,12 +83,42 @@ pub fn auto_requirements(request: &Value) -> AutoRequirements {
         .and_then(|value| value.get("type"))
         .and_then(Value::as_str)
         == Some("json_schema");
-    AutoRequirements {
-        tools,
-        images,
-        json_schema,
-    }
+    AutoRequirements::from_signals(tools, images, json_schema)
 }
+
+/// Go-compatible Auto-only window filters. Zero/negative values mean
+/// unspecified. Unknown window sizes must not satisfy an explicit bound.
+/// The 512-token Go default is used only when the local registry is opted in:
+/// existing Rust configs with unknown model windows must remain usable.
+pub fn auto_context_bounds(
+    request: &Value,
+    use_model_registry: bool,
+) -> Result<(usize, Option<usize>), &'static str> {
+    fn bound(value: Option<&Value>) -> Result<Option<usize>, &'static str> {
+        match value {
+            None => Ok(None),
+            Some(Value::Number(number)) => {
+                if number.as_i64().is_some_and(|value| value <= 0) {
+                    return Ok(None);
+                }
+                let positive = number.as_u64().ok_or("context bounds must be integers")?;
+                usize::try_from(positive)
+                    .map(Some)
+                    .map_err(|_| "context bounds exceed platform range")
+                    .map(|value| value.filter(|number| *number > 0))
+            }
+            _ => Err("context bounds must be integers"),
+        }
+    }
+    let min_context =
+        bound(request.get("min_context"))?.unwrap_or(if use_model_registry { 512 } else { 0 });
+    let max_context = bound(request.get("max_context"))?;
+    if max_context.is_some_and(|max| max < min_context) {
+        return Err("max_context must be >= min_context");
+    }
+    Ok((min_context, max_context))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CacheKey {
     generation: u64,
@@ -327,7 +367,17 @@ pub fn resolve_auto_with_requirements(
                         registry.then_some(!model_capabilities::known_text_only(&candidate.model))
                     })
             });
+            let meets_window_bounds =
+                if requirements.min_context > 0 || requirements.max_context.is_some() {
+                    context_limit.is_some_and(|window| {
+                        window >= requirements.min_context
+                            && requirements.max_context.is_none_or(|max| window <= max)
+                    })
+                } else {
+                    true
+                };
             model_supported
+                && meets_window_bounds
                 && (!requirements.tools || candidate.supports_tools != Some(false))
                 && (!requirements.requires_images() || image_support != Some(false))
                 && (!requirements.json_schema || candidate.supports_json_schema != Some(false))
@@ -449,6 +499,39 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
 mod tests {
     use super::*;
     use crate::config::Config;
+    #[test]
+    fn go_auto_context_bound_parser_is_bounded_and_registry_opt_in() {
+        assert_eq!(
+            auto_context_bounds(&serde_json::json!({}), false),
+            Ok((0, None))
+        );
+        assert_eq!(
+            auto_context_bounds(&serde_json::json!({}), true),
+            Ok((512, None))
+        );
+        assert_eq!(
+            auto_context_bounds(
+                &serde_json::json!({"min_context":8192,"max_context":16384}),
+                false
+            ),
+            Ok((8192, Some(16384)))
+        );
+        assert_eq!(
+            auto_context_bounds(&serde_json::json!({"min_context":-9,"max_context":0}), true),
+            Ok((512, None))
+        );
+        for bad in [
+            serde_json::json!({"min_context":1000,"max_context":999}),
+            serde_json::json!({"max_context":200}),
+            serde_json::json!({"min_context":"8192"}),
+            serde_json::json!({"max_context":1.25}),
+            serde_json::json!({"min_context":null}),
+            serde_json::json!({"max_context":false}),
+        ] {
+            assert!(auto_context_bounds(&bad, true).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn auto_context_size_matches_original_serialization_without_copying() {
         let samples = [
@@ -678,7 +761,8 @@ auto:
             AutoRequirements {
                 tools: true,
                 images: true,
-                json_schema: true
+                json_schema: true,
+                ..AutoRequirements::default()
             }
         );
         let cache = AutoRouteCache::new();

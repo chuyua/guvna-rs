@@ -227,3 +227,26 @@ shadow_metrics for comparison coverage and disagreements; the shadow route
 is **never executed** and is not credited with a hypothetical success.
 Operators may correlate shadow_events with request_events by request_id
 offline. Old databases without the new table return null shadow_metrics.
+
+## Issue #129: Go Auto context-window request controls
+
+Both POST /v1/auto and Chat Completions with model auto now accept optional
+integer min_context and max_context fields (token-window bounds). For example,
+min_context: 8192 selects only models with a known window of at least 8192
+tokens, and max_context: 16384 excludes larger-window models. A positive
+max_context smaller than the effective min_context is rejected locally with
+400 invalid_auto_context. Strings, null, booleans and fractional values are
+also rejected before any upstream request. Zero/negative bounds are treated
+as unspecified, matching the Go selector's nonpositive-bound convention.
+
+These fields are **selection-only**: the gateway strips both before forwarding
+to the upstream, including retry and SSE-to-JSON paths. The Auto route cache
+and Decider cache include both bounds in their keys to prevent a permissive
+ranking from leaking into a stricter request. A candidate without a known
+window cannot satisfy an explicit context bound; operators can declare
+max_context_tokens per candidate or opt into the local model registry and
+capability overrides. The Go default min_context=512 is applied only when
+use_model_registry is true. Legacy Rust installations with the registry
+disabled retain their prior unrestricted default, avoiding silent outages
+when models have no declared context length. The request context estimate
+and 20-percent safety margin remain an independent hard upper bound.
