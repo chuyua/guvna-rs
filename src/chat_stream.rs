@@ -219,6 +219,8 @@ fn stream_response(state: ChatStreamState) -> Response {
                     {
                         Metrics::inc(&state.owner.metrics.credential_quarantines);
                     }
+                } else if state.failure_type == "invalid_response" {
+                    Metrics::inc(&state.owner.metrics.upstream_invalid_responses);
                 }
                 state
                     .owner

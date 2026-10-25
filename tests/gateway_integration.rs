@@ -1363,6 +1363,10 @@ chains:
             metric_value(&metrics, "upstream_transport_failures_total"),
             0
         );
+        assert_eq!(
+            metric_value(&metrics, "upstream_invalid_responses_total"),
+            2
+        );
         assert_eq!(metric_value(&metrics, "chat_stream_failed_total"), 2);
     }
 }
@@ -1438,6 +1442,14 @@ chains:
     assert!(!text.contains("data: [DONE]"), "{text}");
     let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
     assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 1);
+    assert_eq!(
+        metric_value(&metrics, "upstream_transport_failures_total"),
+        1
+    );
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        0
+    );
     let rejected = router
         .oneshot(request("demo", r#","stream":true"#, "client"))
         .await
