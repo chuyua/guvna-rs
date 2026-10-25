@@ -1314,6 +1314,60 @@ async fn malformed_sse_after_first_event_does_not_fail_over_or_claim_success() {
 }
 
 #[tokio::test]
+async fn malformed_or_truncated_sse_never_quarantines_a_healthy_credential() {
+    for frames in [
+        vec![SSE_START, b"data: not-json\n\n".as_slice()],
+        vec![SSE_START],
+    ] {
+        let (url, hits) = start_sse(frames).await;
+        let cfg: Config = serde_yaml::from_str(&format!(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {url}
+    key_env: K
+    quarantine:
+      transient: 30s
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: x
+"#
+        ))
+        .unwrap();
+        let app = app(AppState::new(
+            cfg,
+            HashMap::from([("K".into(), "key".into())]),
+            vec!["client".into()],
+        )
+        .unwrap());
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(request("demo", r#","stream":true"#, "client"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("upstream_stream_incomplete"),
+                "{body:?}"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "valid key was quarantined");
+        let (_, metrics) = get_metrics(app, Some("client")).await;
+        assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 0);
+        assert_eq!(
+            metric_value(&metrics, "upstream_transport_failures_total"),
+            0
+        );
+        assert_eq!(metric_value(&metrics, "chat_stream_failed_total"), 2);
+    }
+}
+
+#[tokio::test]
 async fn midstream_tcp_error_quarantines_transient_key_without_replaying_stream() {
     let hits = Arc::new(AtomicUsize::new(0));
     let broken = Router::new()

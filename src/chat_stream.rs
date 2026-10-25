@@ -35,6 +35,7 @@ struct ChatStreamState {
     parser: ChatSse,
     pending: VecDeque<Bytes>,
     terminated: bool,
+    failure_type: &'static str,
     terminal_reported: bool,
     _permit: Option<OwnedSemaphorePermit>,
     circuit_ticket: Option<Ticket>,
@@ -100,6 +101,7 @@ pub(super) async fn start(
         parser,
         pending: VecDeque::new(),
         terminated: false,
+        failure_type: "invalid_response",
         terminal_reported: false,
         _permit: None,
         circuit_ticket: None,
@@ -195,14 +197,28 @@ fn stream_response(state: ChatStreamState) -> Response {
                         state.terminated = true;
                     }
                 }
-                Ok(Err(_)) | Err(_) => state.terminated = true,
+                Ok(Err(_)) => {
+                    state.failure_type = "transport_error";
+                    state.terminated = true;
+                }
+                Err(_) => {
+                    state.failure_type = "timeout";
+                    state.terminated = true;
+                }
             }
             if state.terminated {
                 Metrics::inc(&state.owner.metrics.chat_stream_failed);
-                if state.owner.pools[state.provider_index]
-                    .record(&state.lease, Outcome::TransportFailure)
-                {
-                    Metrics::inc(&state.owner.metrics.credential_quarantines);
+                // A bad SSE frame, premature EOF or oversized chunk is a
+                // provider protocol failure, not evidence of a bad key.
+                // A long generation timeout is likewise not credential
+                // specific. Only a real body transport error quarantines.
+                if state.failure_type == "transport_error" {
+                    Metrics::inc(&state.owner.metrics.upstream_transport_failures);
+                    if state.owner.pools[state.provider_index]
+                        .record(&state.lease, Outcome::TransportFailure)
+                    {
+                        Metrics::inc(&state.owner.metrics.credential_quarantines);
+                    }
                 }
                 state
                     .owner
@@ -213,7 +229,7 @@ fn stream_response(state: ChatStreamState) -> Response {
                     telemetry.observe_stream_health(
                         provider,
                         &state.telemetry_model,
-                        "transport_error",
+                        state.failure_type,
                         state.started_at.elapsed(),
                         (&state.request_id, state.attempt_index),
                         &state.owner.metrics,
