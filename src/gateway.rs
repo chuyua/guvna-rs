@@ -29,6 +29,7 @@ use crate::{
     metrics::Metrics,
     routing::{self, AutoRouteCache},
     telemetry::Telemetry,
+    telemetry_rank::{self, TelemetryRank},
 };
 
 // Keep these children private to the gateway: only the route handlers and
@@ -70,6 +71,7 @@ pub struct AppState {
     auto_health: Option<AutoHealth>,
     auto_route_cache: AutoRouteCache,
     auto_decider: Option<Arc<AutoDecider>>,
+    auto_telemetry_rank: Option<Arc<TelemetryRank>>,
     shadow_total: AtomicU64,
     shadow_disagreements: AtomicU64,
     shadow_unavailable: AtomicU64,
@@ -199,6 +201,7 @@ impl AppState {
             auto_health,
             auto_route_cache,
             auto_decider,
+            auto_telemetry_rank: None,
             shadow_total: AtomicU64::new(0),
             shadow_disagreements: AtomicU64::new(0),
             shadow_unavailable: AtomicU64::new(0),
@@ -279,6 +282,40 @@ impl AppState {
             }
         }
         self.telemetry = Some(telemetry);
+        if self.config.auto.telemetry_ranking.enabled {
+            let initial = telemetry_rank::load(data_dir, &self.config);
+            let rank = Arc::new(TelemetryRank::new(initial));
+            // No request-path database reads, and no extra permanent OS thread.
+            // If a test constructs state outside Tokio, the initial snapshot
+            // safely expires rather than staying approved indefinitely.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let weak = Arc::downgrade(&rank);
+                let config = self.config.clone();
+                let directory = data_dir.to_path_buf();
+                handle.spawn(async move {
+                    let mut ticker = tokio::time::interval(telemetry_rank::refresh_interval());
+                    ticker.tick().await;
+                    loop {
+                        ticker.tick().await;
+                        let Some(rank) = weak.upgrade() else {
+                            break;
+                        };
+                        let config = config.clone();
+                        let directory = directory.clone();
+                        // SQLite is exclusively accessed by a bounded blocking
+                        // task, never on the gateway's async request workers.
+                        let snapshot = tokio::task::spawn_blocking(move || {
+                            telemetry_rank::load(&directory, &config)
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                        rank.set(snapshot);
+                    }
+                });
+            }
+            self.auto_telemetry_rank = Some(rank);
+        }
         Ok(())
     }
     pub fn runtime_status(&self) -> Value {
@@ -303,6 +340,8 @@ impl AppState {
             "circuit_open_providers": open_circuits,
             "auto_enabled": self.config.auto.enabled,
             "auto_health_aware": self.config.auto.health_aware,
+            "auto_telemetry_rank_approved": self.config.auto.telemetry_ranking.enabled && self.config.auto.telemetry_ranking.approved,
+            "auto_telemetry_rank_active": self.auto_telemetry_rank.as_ref().is_some_and(|rank| rank.active()),
             "auto_shadow_total": self.shadow_total.load(Ordering::Relaxed),
             "auto_shadow_disagreements": self.shadow_disagreements.load(Ordering::Relaxed),
             "auto_shadow_unavailable": self.shadow_unavailable.load(Ordering::Relaxed),

@@ -74,6 +74,8 @@ pub struct AutoConfig {
     /// Opt-in Go-compatible conservative context/vision capability estimates.
     pub use_model_registry: bool,
     pub capability_overrides: BTreeMap<String, ModelCapabilityOverride>,
+    /// Opt-in, operator-approved SQLite-derived routing; never reads SQL per request.
+    pub telemetry_ranking: TelemetryRankingConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -98,6 +100,26 @@ impl Default for AutoDeciderConfig {
             timeout_ms: 750,
             cache_ttl_secs: 30,
             shadow_only: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetryRankingConfig {
+    pub enabled: bool,
+    /// Explicit operator approval is required; there is no automatic promotion.
+    pub approved: bool,
+    pub window_hours: u32,
+    pub max_snapshot_age_secs: u64,
+}
+impl Default for TelemetryRankingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            approved: false,
+            window_hours: 24,
+            max_snapshot_age_secs: 300,
         }
     }
 }
@@ -397,6 +419,19 @@ impl Config {
             .any(|entry| entry.context_tokens == Some(0))
         {
             return Err("model capability context_tokens must be greater than zero".into());
+        }
+        let rank = &self.auto.telemetry_ranking;
+        if rank.enabled {
+            if !rank.approved
+                || !self.auto.enabled
+                || ![1, 6, 24, 168].contains(&rank.window_hours)
+                || !(30..=3_600).contains(&rank.max_snapshot_age_secs)
+                || (self.auto.decider.enabled && !self.auto.decider.shadow_only)
+            {
+                return Err("telemetry ranking requires explicit approval, enabled Auto, window 1h/6h/24h/7d, age 30..3600 seconds, and no active LLM Decider".into());
+            }
+        } else if rank.approved {
+            return Err("telemetry ranking approval requires enabled: true".into());
         }
         if self.auto.decider.shadow_only && !self.auto.decider.enabled {
             return Err("auto decider shadow_only requires enabled: true".into());

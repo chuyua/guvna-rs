@@ -378,6 +378,16 @@ async fn dispatch_inner(
         );
     }
 
+    if auto_enabled && let Some(rank) = &state.auto_telemetry_rank {
+        // A live health demotion takes precedence over historical scoring.
+        // Ranking only reorders the already-eligible bounded candidate walk.
+        let penalized = state
+            .auto_health
+            .as_ref()
+            .is_some_and(|health| health.penalties().iter().any(|value| *value > 0));
+        rank.rank(&state.config, &mut steps, penalized);
+    }
+
     if auto_enabled && let Some(decider) = &state.auto_decider {
         let input_bytes = routing::auto_input_bytes(request.get("messages"));
         let context_estimate = routing::auto_context_estimate(&request);

@@ -14,5 +14,6 @@ pub mod routing;
 pub mod scoring;
 pub mod sse;
 pub mod telemetry;
+pub(crate) mod telemetry_rank;
 
 pub(crate) mod responses_sse;

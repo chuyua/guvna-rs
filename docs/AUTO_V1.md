@@ -250,3 +250,35 @@ use_model_registry is true. Legacy Rust installations with the registry
 disabled retain their prior unrestricted default, avoiding silent outages
 when models have no declared context length. The request context estimate
 and 20-percent safety margin remain an independent hard upper bound.
+
+## Issue #129: operator-approved telemetry routing (opt-in)
+
+Historical SQLite scoring is advisory by default and never changes routes.
+Operators can explicitly opt into it with this Auto config:
+
+    auto:
+      enabled: true
+      telemetry_ranking:
+        enabled: true
+        approved: true
+        window_hours: 24
+        max_snapshot_age_secs: 300
+
+The SQLite writer must also be enabled with GUVNA_TELEMETRY_SQLITE=1.
+Active external LLM Decider ranking and telemetry ranking cannot be enabled
+together; Decider Shadow-only comparisons may run alongside telemetry.
+All configured candidates must have at least 20 genuine observed
+success/provider-failure samples in the selected 1h/6h/24h/7d window and
+a verified terminal observation no older than max_snapshot_age_secs.
+Caller errors, rate limits, unverified SSE starts, stale, missing, corrupt,
+locked or incomplete databases never qualify. If any candidate lacks
+qualified fresh data, the existing deterministic order is preserved.
+Ranking applies only after all request context/capability filters and is
+suppressed when any provider has a live health penalty. It never adds
+candidates or bypasses the unified fallback loop.
+
+A background task refreshes the read-only snapshot every 30 seconds.
+Request processing never queries SQLite; snapshots expire after 75 seconds
+if refresh stops. The local status command reports only approval and active
+state, never sensitive model labels. Turn off telemetry_ranking.enabled
+to restore static Auto ordering without modifying the telemetry database.
