@@ -1,7 +1,7 @@
 //! Bounded Chat SSE -> non-stream Chat completion synthesis.
 //! Reuses the already hardened ChatSse validator: no alternate framing
 //! logic, no replay after partial content, and no relaxed tool-call rules.
-use crate::sse::ChatSse;
+use crate::{circuit::Ticket, sse::ChatSse};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -294,6 +294,7 @@ pub(super) async fn aggregate(
     expected: u64,
     requested_model: &str,
     tool_choice: Option<&Value>,
+    mut circuit_ticket: Option<&mut Ticket>,
 ) -> Result<Value, AggregateError> {
     let mime = upstream
         .headers()
@@ -350,6 +351,14 @@ pub(super) async fn aggregate(
                     &mut model,
                 )?;
             }
+        }
+        // SSE-only JSON aggregation is also a long-lived probe. Only valid
+        // content/tool deltas extend its half-open idle lease; completion
+        // still requires the full, valid stream.
+        if parser.take_progress()
+            && let Some(ticket) = circuit_ticket.as_deref_mut()
+        {
+            ticket.progress();
         }
         if parser.is_done() {
             parser.finish().map_err(|_| ())?;

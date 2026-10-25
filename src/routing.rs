@@ -410,12 +410,30 @@ fn auto_candidate_eligible_for_request(
     requirements: AutoRequirements,
 ) -> bool {
     let effective = |name: &str| request.get(name).or_else(|| candidate.params.get(name));
-    let mut extra_bytes = 0usize;
+    // Dispatch always writes the physical model, even when /v1/auto callers
+    // omit model entirely. Account for that replacement in the same pass.
+    let physical_model_bytes = encoded_json_bytes(Some(&Value::String(candidate.model.clone())));
+    let mut effective_request_bytes = if let Some(original) = request.get("model") {
+        request_bytes
+            .saturating_sub(encoded_json_bytes(Some(original)))
+            .saturating_add(physical_model_bytes)
+    } else {
+        request_bytes
+            .saturating_add(usize::from(
+                request.as_object().is_some_and(|map| !map.is_empty()),
+            ))
+            .saturating_add(encoded_json_bytes(Some(&Value::String("model".into()))))
+            .saturating_add(1)
+            .saturating_add(physical_model_bytes)
+    };
     let mut field_count = request.as_object().map_or(0, serde_json::Map::len);
+    if request.get("model").is_none() {
+        field_count += 1;
+    }
     for (name, value) in &candidate.params {
-        if request.get(name).is_none() {
+        if name != "model" && request.get(name).is_none() {
             let separator = usize::from(field_count != 0);
-            extra_bytes = extra_bytes
+            effective_request_bytes = effective_request_bytes
                 .saturating_add(separator)
                 .saturating_add(encoded_json_bytes(Some(&Value::String(name.clone()))))
                 .saturating_add(1)
@@ -428,8 +446,8 @@ fn auto_candidate_eligible_for_request(
         .and_then(Value::as_u64)
         .map(|tokens| tokens.min(usize::MAX as u64) as usize)
         .unwrap_or(1024);
-    let context_estimate = with_context_safety_margin(request_bytes.saturating_add(extra_bytes))
-        .saturating_add(output_budget);
+    let context_estimate =
+        with_context_safety_margin(effective_request_bytes).saturating_add(output_budget);
     let tools = requirements.tools
         || effective("tools")
             .and_then(Value::as_array)

@@ -1013,6 +1013,7 @@ async fn dispatch_inner(
                             request
                                 .get("tool_choice")
                                 .or_else(|| step.params.get("tool_choice")),
+                            circuit_ticket.as_mut(),
                         ),
                     )
                     .await;

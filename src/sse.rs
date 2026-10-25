@@ -242,6 +242,14 @@ impl ChatSse {
                 .get("content")
                 .and_then(Value::as_str)
                 .is_some_and(|content| !content.is_empty())
+            || ["reasoning", "reasoning_content", "refusal"]
+                .iter()
+                .any(|field| {
+                    delta
+                        .get(*field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                })
         {
             self.progress_since_push = true;
         }
@@ -454,6 +462,14 @@ mod tests {
         parser.push(START).unwrap();
         assert!(parser.take_progress());
         assert!(!parser.take_progress(), "progress must be consumed once");
+        let reasoning = br#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"still thinking"},"finish_reason":null}]}
+
+"#;
+        parser.push(reasoning).unwrap();
+        assert!(
+            parser.take_progress(),
+            "a valid reasoning delta is useful progress"
+        );
         parser.push(END).unwrap();
         assert!(
             !parser.take_progress(),
