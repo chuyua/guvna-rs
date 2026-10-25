@@ -193,7 +193,11 @@ async fn read_line_bounded<R: AsyncRead + Unpin>(
         }
         bytes.extend_from_slice(&chunk[..content_len]);
         if line_end.is_some() {
-            return Ok(bytes);
+            return if bytes.is_empty() {
+                Err("empty_request")
+            } else {
+                Ok(bytes)
+            };
         }
     }
 }
@@ -215,6 +219,14 @@ where
         Ok(Ok(Ok(report))) => report,
         _ => json!({"error":"scoring_unavailable"}),
     }
+}
+
+fn scoring_window(request: &Value) -> Option<u32> {
+    let hours = request
+        .get("hours")
+        .map(Value::as_u64)
+        .unwrap_or(Some(24))?;
+    [1_u64, 6, 24, 168].contains(&hours).then_some(hours as u32)
 }
 
 async fn handle_client(
@@ -285,20 +297,20 @@ async fn handle_client(
             }
         }
         Some("scoring") => {
-            let hours = request.get("hours").and_then(Value::as_u64).unwrap_or(24);
-            if ![1, 6, 24, 168].contains(&hours) {
-                json!({"error":"invalid_scoring_window"})
-            } else {
+            if let Some(hours) = scoring_window(&request) {
                 bounded_scoring(scoring_gate, SCORING_TIMEOUT, move || {
-                    guvna::scoring::read_scoring(&directory, hours as u32)
+                    guvna::scoring::read_scoring(&directory, hours)
                 })
                 .await
+            } else {
+                json!({"error":"invalid_scoring_window"})
             }
         }
         _ => json!({"error":"unsupported_command"}),
     };
     let mut output = serde_json::to_vec(&response).map_err(|_| "encode control response")?;
-    if output.len() >= MAX_CONTROL_RESPONSE_LINE {
+    // The newline is a framing byte and is not counted by read_line_bounded.
+    if output.len() > MAX_CONTROL_RESPONSE_LINE {
         output = serde_json::to_vec(&json!({"error":"control_response_too_large"}))
             .map_err(|_| "encode bounded control response")?;
     }
@@ -691,19 +703,60 @@ mod tests {
     #[tokio::test]
     async fn eof_without_newline_never_executes_partial_control_command() {
         let (mut writer, mut reader) = tokio::io::duplex(128);
-        writer.write_all(br#"{"command":"chains_delete","argument":"important"}"#).await.unwrap();
+        writer
+            .write_all(br#"{"command":"chains_delete","argument":"important"}"#)
+            .await
+            .unwrap();
         drop(writer);
         assert_eq!(
             read_line_bounded(&mut reader, MAX_CONTROL_LINE).await,
             Err("truncated_control_line")
         );
         let (mut writer, mut reader) = tokio::io::duplex(128);
-        writer.write_all(b"{\"command\":\"status\"}\n").await.unwrap();
+        writer
+            .write_all(b"{\"command\":\"status\"}\n")
+            .await
+            .unwrap();
         drop(writer);
         assert_eq!(
-            read_line_bounded(&mut reader, MAX_CONTROL_LINE).await.unwrap(),
+            read_line_bounded(&mut reader, MAX_CONTROL_LINE)
+                .await
+                .unwrap(),
             br#"{"command":"status"}"#
         );
+    }
+
+    #[test]
+    fn scoring_window_rejects_wrong_types_without_silent_default() {
+        assert_eq!(scoring_window(&json!({"command":"scoring"})), Some(24));
+        for value in [
+            json!(null),
+            json!("24"),
+            json!(24.0),
+            json!(-1),
+            json!(true),
+            json!(2),
+        ] {
+            assert_eq!(scoring_window(&json!({"hours":value})), None);
+        }
+        assert_eq!(scoring_window(&json!({"hours":168})), Some(168));
+    }
+
+    #[tokio::test]
+    async fn blank_control_frames_are_rejected_before_dispatch() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer.write_all(b"\n").await.unwrap();
+        assert_eq!(
+            read_line_bounded(&mut reader, 4096).await,
+            Err("empty_request")
+        );
+    }
+
+    #[tokio::test]
+    async fn exactly_maximum_length_control_frame_is_accepted() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer.write_all(b"1234\n").await.unwrap();
+        assert_eq!(read_line_bounded(&mut reader, 4).await.unwrap(), b"1234");
     }
 
     #[tokio::test]
