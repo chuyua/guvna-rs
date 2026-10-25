@@ -172,9 +172,11 @@ async fn read_line_bounded<R: AsyncRead + Unpin>(
     limit: usize,
 ) -> Result<Vec<u8>, &'static str> {
     let mut bytes = Vec::with_capacity(128);
+    let mut chunk = [0_u8; 1024];
     loop {
-        let mut byte = [0_u8; 1];
-        let read = reader.read(&mut byte).await.map_err(|_| "read_failed")?;
+        // The protocol carries one JSON line per connection. Reading in
+        // chunks avoids thousands of individual reads for scoring responses.
+        let read = reader.read(&mut chunk).await.map_err(|_| "read_failed")?;
         if read == 0 {
             return if bytes.is_empty() {
                 Err("empty_request")
@@ -182,13 +184,15 @@ async fn read_line_bounded<R: AsyncRead + Unpin>(
                 Ok(bytes)
             };
         }
-        if byte[0] == b'\n' {
-            return Ok(bytes);
-        }
-        if bytes.len() >= limit {
+        let line_end = chunk[..read].iter().position(|byte| *byte == b'\n');
+        let content_len = line_end.unwrap_or(read);
+        if content_len > limit.saturating_sub(bytes.len()) {
             return Err("request_too_large");
         }
-        bytes.push(byte[0]);
+        bytes.extend_from_slice(&chunk[..content_len]);
+        if line_end.is_some() {
+            return Ok(bytes);
+        }
     }
 }
 
@@ -659,6 +663,24 @@ mod tests {
             read_line_bounded(&mut reader, MAX_CONTROL_LINE).await,
             Err("request_too_large")
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_line_handles_chunk_boundaries_and_trailing_bytes() {
+        for len in [0, 1, 1023, 1024, 1025, 4096] {
+            let mut input = vec![b'a'; len];
+            input.extend_from_slice(b"\nignored-after-first-line");
+            let mut reader = std::io::Cursor::new(input);
+            let line = read_line_bounded(&mut reader, 4096).await.unwrap();
+            assert_eq!(line, vec![b'a'; len]);
+        }
+        let mut too_long = std::io::Cursor::new(vec![b'a'; 4097]);
+        assert_eq!(
+            read_line_bounded(&mut too_long, 4096).await,
+            Err("request_too_large")
+        );
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        assert_eq!(read_line_bounded(&mut empty, 4096).await, Err("empty_request"));
     }
 
     #[tokio::test]
