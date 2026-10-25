@@ -101,7 +101,14 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
     if !options.enabled || !options.approved || config.auto.candidates.is_empty() {
         return None;
     }
-    let summary = scoring::read_scoring(data_dir, options.window_hours).ok()?;
+    let targets = config
+        .auto
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.provider.clone(), candidate.model.clone()))
+        .collect::<Vec<_>>();
+    let summary =
+        scoring::read_scoring_for_candidates(data_dir, options.window_hours, &targets).ok()?;
     if summary.get("enabled")?.as_bool() != Some(true) {
         return None;
     }
@@ -270,6 +277,15 @@ auto:
             conn.execute(
                 "INSERT INTO request_events VALUES (?1,'p',?2,10,0,'success','chat')",
                 params![now, model],
+            )
+            .unwrap();
+        }
+        // 40 unrelated high-traffic models must not crowd out configured Auto
+        // candidates from the scoring snapshot's 32-entry output limit.
+        for i in 0..40 {
+            conn.execute(
+                "INSERT INTO hourly_stats VALUES (?1,'chat','p',?2,'success',100,0,100,100)",
+                params![hour, format!("unrelated-{i}")],
             )
             .unwrap();
         }
