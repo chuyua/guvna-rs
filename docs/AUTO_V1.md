@@ -318,6 +318,10 @@ a verified terminal observation no older than max_snapshot_age_secs.
 Caller errors, rate limits, unverified SSE starts, stale, missing, corrupt,
 locked or incomplete databases never qualify. If any candidate lacks
 qualified fresh data, the existing deterministic order is preserved.
+A streaming response row marked `success` without a matching SSE terminal
+cannot refresh the approved ranking: response headers are not proof of
+completion. Only a matching confirmed stream terminal or a real nonstream
+success/provider failure can satisfy the freshness gate.
 Ranking applies only after all request context/capability filters and is
 suppressed when any provider has a live health penalty. It never adds
 candidates or bypasses the unified fallback loop.

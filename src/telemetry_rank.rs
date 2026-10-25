@@ -159,6 +159,7 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
                 "SELECT MAX(ts) FROM request_events
              WHERE provider=?1 AND model=?2 AND ts BETWEEN ?3 AND ?4
              AND endpoint='chat' AND identity_verified=1
+             AND (stream_requested=0 OR failure_type!='success')
              AND failure_type IN ('success','provider_5xx','transport_error',
                  'invalid_response','timeout','upstream_unavailable')",
                 params![candidate.provider, candidate.model, since, now],
@@ -262,7 +263,12 @@ auto:
               model TEXT,failure_type TEXT,request_count INTEGER,failure_count INTEGER,
               total_elapsed_ms INTEGER,max_elapsed_ms INTEGER);
              CREATE TABLE request_events (ts INTEGER,provider TEXT,model TEXT,
-              elapsed_ms INTEGER,sse_headers INTEGER,failure_type TEXT,endpoint TEXT);",
+              elapsed_ms INTEGER,sse_headers INTEGER,failure_type TEXT,endpoint TEXT,
+              stream_requested INTEGER NOT NULL DEFAULT 0,
+              request_id TEXT,attempt_index INTEGER);
+             CREATE TABLE stream_terminals (
+              ts INTEGER,request_id TEXT,attempt_index INTEGER,
+              provider TEXT,model TEXT,outcome TEXT);",
         )
         .unwrap();
         let now = SystemTime::now()
@@ -287,7 +293,8 @@ auto:
                 .unwrap();
             }
             conn.execute(
-                "INSERT INTO request_events VALUES (?1,'p',?2,10,0,'success','chat')",
+                "INSERT INTO request_events (ts,provider,model,elapsed_ms,sse_headers,failure_type,endpoint)
+                     VALUES (?1,'p',?2,10,0,'success','chat')",
                 params![now, model],
             )
             .unwrap();
@@ -321,6 +328,38 @@ auto:
         );
         conn.execute(
             "UPDATE request_events SET identity_verified=1 WHERE model='second'",
+            [],
+        )
+        .unwrap();
+        // SSE headers do not certify completion. Even a legacy 2xx row
+        // marked success cannot refresh an unconfirmed streaming candidate.
+        conn.execute(
+            "UPDATE request_events SET stream_requested=1 WHERE model='second'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            load(dir.path(), &cfg).is_none(),
+            "unconfirmed stream success must not refresh automatic ranking"
+        );
+        // A verified terminal for the exact Chat attempt is fresh evidence;
+        // merely opening an SSE response was not.
+        conn.execute(
+            "UPDATE request_events SET failure_type='stream_started',
+             request_id='verified-stream',attempt_index=1 WHERE model='second'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stream_terminals VALUES (?1,'verified-stream',1,'p','second','success')",
+            params![now],
+        )
+        .unwrap();
+        assert!(load(dir.path(), &cfg).is_some());
+        conn.execute("DELETE FROM stream_terminals", []).unwrap();
+        assert!(load(dir.path(), &cfg).is_none());
+        conn.execute(
+            "UPDATE request_events SET stream_requested=0,failure_type='success' WHERE model='second'",
             [],
         )
         .unwrap();
