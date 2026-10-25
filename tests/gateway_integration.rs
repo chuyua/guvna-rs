@@ -1314,6 +1314,78 @@ async fn malformed_sse_after_first_event_does_not_fail_over_or_claim_success() {
 }
 
 #[tokio::test]
+async fn midstream_tcp_error_quarantines_transient_key_without_replaying_stream() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let broken = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(|State(hits): State<Arc<AtomicUsize>>| async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let chunks = futures_util::stream::iter([
+                    Ok::<_, std::io::Error>(Bytes::from_static(SSE_START)),
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "injected upstream body reset",
+                    )),
+                ]);
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(chunks),
+                )
+            }),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, broken).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: K
+    quarantine:
+      transient: 30s
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: x
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "key".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let response = router
+        .clone()
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 1);
+    let rejected = router
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_ne!(rejected.status(), StatusCode::OK);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "quarantined key was retried"
+    );
+}
+
+#[tokio::test]
 async fn multi_event_chunk_preserves_order_and_one_terminal_marker() {
     let mut combined = Vec::new();
     combined.extend_from_slice(SSE_START);
@@ -3669,6 +3741,62 @@ auto:
         4,
         "rejected requests reached upstream"
     );
+}
+
+#[tokio::test]
+async fn auto_default_output_budget_filters_before_network_for_chat_and_responses() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {url}
+    key_env: FIRST
+    models: [x]
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: x
+      max_context_tokens: 4096
+      params:
+        max_tokens: 10000
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("FIRST".into(), "first".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let chat = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+    let responses = json!({"model":"auto","input":"hi"});
+    for (path, payload) in [
+        ("/v1/chat/completions", chat.clone()),
+        ("/v1/responses", responses.clone()),
+    ] {
+        let (status, body) = call(router.clone(), auto_request(path, "client", payload)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "auto_no_eligible_candidate");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+    // Explicit per-field caller values override large candidate defaults.
+    for (path, payload) in [
+        (
+            "/v1/chat/completions",
+            json!({"model":"auto","messages":[{"role":"user","content":"hi"}],"max_tokens":16}),
+        ),
+        (
+            "/v1/responses",
+            json!({"model":"auto","input":"hi","max_output_tokens":16}),
+        ),
+    ] {
+        let (status, body) = call(router.clone(), auto_request(path, "client", payload)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
