@@ -621,6 +621,8 @@ mod tests {
             "clock-adjustment",
             "streamed-fallback",
             "unverified",
+            "cancelled",
+            "wrong-terminal-model",
         ] {
             db.execute(
                 "INSERT INTO shadow_events VALUES(1003, ?1, 'p', 'a', 'p', 'b', 1, 1)",
@@ -640,6 +642,8 @@ mod tests {
             (1002, "streamed-fallback", "b", 2, 1, "stream_started"),
             (1002, "unverified", "a", 1, 1, "provider_5xx"),
             (1002, "unverified", "b", 2, 1, "stream_started"),
+            (1002, "cancelled", "b", 1, 1, "stream_started"),
+            (1002, "wrong-terminal-model", "b", 1, 1, "stream_started"),
         ] {
             db.execute(
                 "INSERT INTO request_events VALUES(?1, 'chat', ?2, 'p', ?3, ?4, ?5, ?6)",
@@ -651,6 +655,8 @@ mod tests {
             ("streamed-fallback", 2, "b", "success"),
             // A terminal for an earlier attempt is NOT the final stream.
             ("unverified", 1, "a", "success"),
+            ("cancelled", 1, "b", "client_cancelled"),
+            ("wrong-terminal-model", 1, "a", "success"),
         ] {
             db.execute(
                 "INSERT INTO stream_terminals VALUES(1003, ?1, ?2, 'p', ?3, ?4)",
@@ -659,14 +665,15 @@ mod tests {
             .unwrap();
         }
         let sample = sampled_shadow_outcomes(&db, 999).unwrap();
-        assert_eq!(sample["sampled_shadow_rows"], 4);
-        assert_eq!(sample["linked_actual_requests"], 4);
+        assert_eq!(sample["sampled_shadow_rows"], 6);
+        assert_eq!(sample["linked_actual_requests"], 6);
         assert_eq!(sample["actual_fallbacks"], 4);
         assert_eq!(sample["actual_completed"], 3);
         assert_eq!(sample["actual_failed"], 0);
-        assert_eq!(sample["actual_stream_pending_or_unobserved"], 1);
+        assert_eq!(sample["actual_stream_pending_or_unobserved"], 2);
+        assert_eq!(sample["actual_client_cancelled"], 1);
         assert_eq!(sample["baseline_first_choice_successes"], 0);
-        assert_eq!(sample["proposed_top_matches_actual_final_route"], 4);
+        assert_eq!(sample["proposed_top_matches_actual_final_route"], 6);
         assert_eq!(sample["counterfactual_success_inferred"], false);
     }
 
