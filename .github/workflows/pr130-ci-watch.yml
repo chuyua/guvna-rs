@@ -1,0 +1,44 @@
+name: PR 130 CI Watch (15 min)
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+permissions:
+  actions: read
+  pull-requests: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Inspect latest PR 130 Linux CI without rebuilding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pr=$(gh api repos/$GH_REPO/pulls/130 --jq '.state + " " + .head.sha')
+          read -r state sha <<< "$pr"
+          if [[ "$state" != open ]]; then
+            echo 'PR #130 is closed; no work required.'
+            exit 0
+          fi
+          echo "Checking PR #130 head: $sha"
+          response=$(gh api "repos/$GH_REPO/actions/runs?head_sha=$sha&per_page=30")
+          latest=$(jq -r '[.workflow_runs[] | select(.name == "Rust CI")] | sort_by(.created_at) | reverse | .[0] | [.id, .status, (.conclusion // "pending")] | @tsv' <<< "$response")
+          if [[ -z "$latest" || "$latest" == null ]]; then
+            echo 'No Rust CI run found for this head; awaiting normal PR CI.'
+            exit 0
+          fi
+          IFS=$'\t' read -r run_id status conclusion <<< "$latest"
+          echo "Rust CI: https://github.com/$GH_REPO/actions/runs/$run_id status=$status conclusion=$conclusion"
+          if [[ "$status" != completed ]]; then
+            echo 'CI still running; will recheck on the next interval.'
+            exit 0
+          fi
+          if [[ "$conclusion" != success ]]; then
+            echo "::error::PR #130 Rust CI is $conclusion; manual/authorized repair agent required."
+            exit 1
+          fi
+          echo 'Latest PR CI is green. No rebuild or repair needed.'
