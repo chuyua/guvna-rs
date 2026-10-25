@@ -97,7 +97,10 @@ control.sock, guvna chains set --file and chains delete --name now send the
 validated operation through that same-UID Unix socket. The daemon uses the
 existing serialized filesystem lock and atomic chain_store write, reloads
 the complete validated static+runtime route table and swaps it in one
-pointer operation. In-flight requests keep their old route snapshot.
+pointer operation. The named route snapshot, authenticated /v1/models list
+and /v1/models/{model} detail are derived from the same immutable generation:
+concurrent readers cannot see a half-published route and stale model listing
+inside a single snapshot. In-flight requests keep their old route snapshot.
 CLI operations without a running control socket still update offline files,
 with a restart warning, preserving existing behavior. No TCP control route
 or Web backend exists. Chain names from static config remain read-only.

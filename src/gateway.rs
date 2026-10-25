@@ -80,9 +80,26 @@ pub struct AppState {
     shadow_unavailable: AtomicU64,
     auto_generation: u64,
     started_at: Instant,
-    model_catalog: RwLock<Value>,
-    model_details: RwLock<HashMap<String, Value>>,
-    live_routes: RwLock<Arc<Config>>,
+    // A single publication makes the route resolver, model list and detail
+    // view consistent. Readers keep an immutable Arc across a live update.
+    live_routes: RwLock<Arc<LiveRouteSnapshot>>,
+}
+
+struct LiveRouteSnapshot {
+    config: Arc<Config>,
+    model_catalog: Value,
+    model_details: HashMap<String, Value>,
+}
+
+impl LiveRouteSnapshot {
+    fn new(config: Config) -> Self {
+        let (model_catalog, model_details) = collect_models(&config);
+        Self {
+            config: Arc::new(config),
+            model_catalog,
+            model_details,
+        }
+    }
 }
 
 fn collect_models(config: &Config) -> (Value, HashMap<String, Value>) {
@@ -178,7 +195,6 @@ impl AppState {
             .redirect(reqwest::redirect::Policy::none()) // Do not redirect provider credentials.
             .build()
             .map_err(|e| format!("building HTTP client: {e}"))?;
-        let (model_catalog, model_details) = collect_models(&config);
         let auto_decider =
             AutoDecider::from_config(&config, &credentials, client.clone())?.map(Arc::new);
         let auto_generation = routing::config_generation(&config);
@@ -187,10 +203,9 @@ impl AppState {
             .auto
             .health_aware
             .then(|| AutoHealth::new(config.auto.candidates.len()));
+        let live = Arc::new(LiveRouteSnapshot::new(config.clone()));
         Ok(Self {
-            model_catalog: RwLock::new(model_catalog),
-            model_details: RwLock::new(model_details),
-            live_routes: RwLock::new(Arc::new(config.clone())),
+            live_routes: RwLock::new(live),
             config,
             client,
             pools,
@@ -214,24 +229,20 @@ impl AppState {
         })
     }
 
-    pub fn route_snapshot(&self) -> Arc<Config> {
+    fn live_snapshot(&self) -> Arc<LiveRouteSnapshot> {
         Arc::clone(&self.live_routes.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    pub fn route_snapshot(&self) -> Arc<Config> {
+        Arc::clone(&self.live_snapshot().config)
     }
 
     /// Atomically publish the already-persisted and revalidated local route
     /// snapshot. Requests already underway retain the old Arc snapshot.
     pub fn replace_route_snapshot(&self, next: Config) -> Result<(), String> {
         next.validate()?;
-        let (catalog, details) = collect_models(&next);
-        *self
-            .model_catalog
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = catalog;
-        *self
-            .model_details
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = details;
-        *self.live_routes.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+        let next = Arc::new(LiveRouteSnapshot::new(next));
+        *self.live_routes.write().unwrap_or_else(|e| e.into_inner()) = next;
         Ok(())
     }
 
@@ -581,11 +592,7 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     if !state.allowed(&headers) {
         return unauthorized();
     }
-    let snapshot = state
-        .model_catalog
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let snapshot = state.live_snapshot().model_catalog.clone();
     (StatusCode::OK, Json(snapshot)).into_response()
 }
 
@@ -597,11 +604,8 @@ async fn model_detail(
     if !state.allowed(&headers) {
         return unauthorized();
     }
-    let details = state
-        .model_details
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    match details.get(&model) {
+    let live = state.live_snapshot();
+    match live.model_details.get(&model) {
         Some(detail) => (StatusCode::OK, Json(detail.clone())).into_response(),
         None => error(StatusCode::NOT_FOUND, "model_not_found", "Unknown model"),
     }
@@ -726,6 +730,80 @@ auto:
             state.telemetry_model_name(0, "api_key_secret_fragment"),
             "passthrough"
         );
+    }
+
+    #[test]
+    fn online_route_and_model_views_publish_one_consistent_generation() {
+        use std::sync::Barrier;
+
+        let config_for = |model: &str| -> Config {
+            serde_yaml::from_str(&format!(
+                "providers:\n  - name: p\n    type: openai\n    base_url: https://provider.example\n    key_env: KEY\nchains:\n  - name: chain-{model}\n    steps:\n      - provider: p\n        model: {model}\n"
+            ))
+            .unwrap()
+        };
+        let state = Arc::new(
+            AppState::new(
+                config_for("before"),
+                HashMap::from([("KEY".to_owned(), "secret".to_owned())]),
+                vec!["client".to_owned()],
+            )
+            .unwrap(),
+        );
+        let held_before = state.live_snapshot();
+        let ready = Arc::new(Barrier::new(5));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let state = Arc::clone(&state);
+                let ready = Arc::clone(&ready);
+                scope.spawn(move || {
+                    ready.wait();
+                    for _ in 0..600 {
+                        let snapshot = state.live_snapshot();
+                        let configured = &snapshot.config.chains[0].steps[0].model;
+                        let route_name = &snapshot.config.chains[0].name;
+                        assert_eq!(route_name, &format!("chain-{configured}"));
+                        let detail = snapshot.model_details.get(route_name).unwrap();
+                        let listed = snapshot.model_catalog["data"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|value| value["id"].as_str() == Some(route_name.as_str()))
+                            .unwrap();
+                        assert_eq!(detail, listed);
+                        assert_eq!(detail["id"].as_str(), Some(route_name.as_str()));
+                        assert!(matches!(configured.as_str(), "before" | "after"));
+                        // Every reader owns one internally coherent
+                        // generation; no separate catalog/details locks.
+                        assert_eq!(
+                            snapshot.model_catalog["data"][0]["id"].as_str(),
+                            Some(route_name.as_str())
+                        );
+                        assert_eq!(snapshot.model_details.len(), 1);
+                    }
+                });
+            }
+            ready.wait();
+            for index in 0..100 {
+                state
+                    .replace_route_snapshot(config_for(if index % 2 == 0 {
+                        "after"
+                    } else {
+                        "before"
+                    }))
+                    .unwrap();
+            }
+        });
+        assert_eq!(
+            held_before.config.chains[0].steps[0].model, "before",
+            "in-flight requests keep their original route snapshot"
+        );
+        assert_eq!(
+            held_before.model_details["chain-before"]["id"],
+            "chain-before"
+        );
+        let latest = state.live_snapshot();
+        assert_eq!(latest.config.chains[0].steps[0].model, "before");
     }
 
     #[test]
