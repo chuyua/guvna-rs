@@ -990,6 +990,63 @@ mod reasoning_tests {
     }
 
     #[tokio::test]
+    async fn incomplete_tool_calls_preserve_partial_arguments_without_claiming_completion() {
+        for (finish_reason, incomplete_reason) in [
+            ("length", "max_output_tokens"),
+            ("content_filter", "content_filter"),
+        ] {
+            let partial = r#"{"query":"unfinished"#;
+            let chat = json!({
+                "id":"chatcmpl-partial","created":123,"model":"provider-model",
+                "choices":[{"index":0,"message":{"role":"assistant","content":null,
+                    "tool_calls":[{"id":"call_partial","type":"function",
+                        "function":{"name":"lookup","arguments":partial}}]},
+                    "finish_reason":finish_reason}]
+            });
+            let response = translate_chat_result(chat, "logical-model".into(), Value::Null);
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["status"], "incomplete");
+            assert_eq!(value["incomplete_details"]["reason"], incomplete_reason);
+            assert_eq!(value["output"][0]["type"], "function_call");
+            assert_eq!(value["output"][0]["arguments"], partial);
+            assert_eq!(value["output"][0]["status"], "incomplete");
+        }
+        let invalid_completed = json!({
+            "id":"chatcmpl-broken","choices":[{"index":0,"message":{"role":"assistant","content":null,
+                "tool_calls":[{"id":"call_bad","type":"function",
+                    "function":{"name":"lookup","arguments":"{"}}]},
+                "finish_reason":"tool_calls"}]
+        });
+        let response = translate_chat_result(invalid_completed, "model".into(), Value::Null);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn completed_responses_messages_with_metadata_replay_as_chat_input() {
+        let input = json!([
+            {"type":"message","id":"msg_123","status":"completed","role":"assistant",
+                "content":[{"type":"output_text","text":"hello","annotations":[]}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}
+        ]);
+        assert_eq!(
+            translate_input(input).unwrap(),
+            json!([{"role":"assistant","content":"hello"},{"role":"user","content":"next"}])
+        );
+        assert!(
+            translate_input(json!([{"type":"message","role":"assistant",
+            "status":"in_progress","content":"untrusted"}]))
+            .is_err()
+        );
+        assert!(
+            translate_input(json!([{"type":"message","role":"assistant",
+            "content":[{"type":"output_text","text":"hi","annotations":[{"type":"citation"}]}]}]))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn reasoning_only_response_can_have_null_visible_content() {
         let chat = json!({
             "id":"chatcmpl-reasoning-only","created":123,"model":"provider-model",

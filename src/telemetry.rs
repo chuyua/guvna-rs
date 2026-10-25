@@ -1225,6 +1225,31 @@ mod tests {
     }
 
     #[test]
+    fn hourly_only_capacity_recovery_reclaims_aggregate_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hourly-capacity.sqlite3");
+        let mut conn = open_database(&path).unwrap();
+        let now = now_secs();
+        let hour = now.div_euclid(3600) * 3600;
+        for index in 0..8 {
+            conn.execute(
+                "INSERT INTO hourly_stats
+                 (hour_ts, endpoint, provider, model, failure_type,
+                  request_count, failure_count, total_elapsed_ms, max_elapsed_ms, identity_verified)
+                 VALUES (?1,'chat','p',?2,'success',1,0,10,10,1)",
+                rusqlite::params![hour, format!("model-{index}")],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA max_page_count=1").unwrap();
+        assert!(recover_page_capacity(&mut conn, now).unwrap());
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM hourly_stats", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "aggregate-only pressure must be reclaimable");
+    }
+
+    #[test]
     fn shadow_records_are_bounded_advisory_only_and_never_count_as_real_attempts() {
         let dir = tempfile::tempdir().unwrap();
         let metrics = Arc::new(Metrics::default());
