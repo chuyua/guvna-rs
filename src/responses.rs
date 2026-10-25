@@ -809,20 +809,26 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
         );
     }
     if calls.is_some_and(|items| !items.is_empty()) {
-        if chat["choices"][0]["finish_reason"] != "tool_calls" {
-            return error(
-                StatusCode::BAD_GATEWAY,
-                "invalid_tool_finish",
-                "Tool calls require tool_calls finish reason",
-            );
-        }
+        let finish_reason = chat["choices"][0]["finish_reason"].as_str();
+        let (output_status, incomplete_details) = match finish_reason {
+            Some("tool_calls") => ("completed", Value::Null),
+            Some("length") => ("incomplete", json!({"reason":"max_output_tokens"})),
+            Some("content_filter") => ("incomplete", json!({"reason":"content_filter"})),
+            _ => {
+                return error(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid_tool_finish",
+                    "Tool calls require tool_calls, length, or content_filter finish reason",
+                );
+            }
+        };
         let mut output = Vec::with_capacity(calls.map_or(0, Vec::len) + 2);
         if let Some(reasoning) = reasoning.as_deref() {
-            output.push(reasoning_item(response_id, reasoning, "completed"));
+            output.push(reasoning_item(response_id, reasoning, output_status));
         }
         let content = &message["content"];
         if let Some(text) = content.as_str().filter(|text| !text.is_empty()) {
-            output.push(json!({"id":format!("msg_{}",response_id),"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":text,"annotations":[]}]}));
+            output.push(json!({"id":format!("msg_{}",response_id),"type":"message","status":output_status,"role":"assistant","content":[{"type":"output_text","text":text,"annotations":[]}]}));
         } else if !content.is_null() && content.as_str() != Some("") {
             return error(
                 StatusCode::BAD_GATEWAY,
@@ -857,7 +863,8 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
                 );
             };
             if call["type"] != "function"
-                || (!arguments.is_empty()
+                || (output_status == "completed"
+                    && !arguments.is_empty()
                     && !serde_json::from_str::<Value>(arguments)
                         .is_ok_and(|value| value.is_object()))
                 || !seen_ids.insert(id)
@@ -868,11 +875,11 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
                     "Invalid or duplicate function call",
                 );
             }
-            output.push(json!({"type":"function_call","id":id,"call_id":id,"name":name,"arguments":if arguments.is_empty() {"{}"} else {arguments},"status":"completed"}));
+            output.push(json!({"type":"function_call","id":id,"call_id":id,"name":name,"arguments":if arguments.is_empty() && output_status == "completed" {"{}"} else {arguments},"status":output_status}));
         }
         return (StatusCode::OK, Json(json!({
-            "id":chat["id"], "object":"response", "status":"completed", "model":logical_model,
-            "output":output, "output_text":content.as_str().unwrap_or(""), "usage":translated_usage, "created_at":created_at, "incomplete_details":Value::Null, "metadata":metadata,
+            "id":chat["id"], "object":"response", "status":output_status, "model":logical_model,
+            "output":output, "output_text":content.as_str().unwrap_or(""), "usage":translated_usage, "created_at":created_at, "incomplete_details":incomplete_details, "metadata":metadata,
         }))).into_response();
     }
     let content_value = &message["content"];
