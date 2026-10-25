@@ -110,6 +110,7 @@ struct ResponsesSse {
     model: String,
     metadata: Value,
     json_mode: Option<bool>,
+    has_refusal: bool,
     buffer: Vec<u8>,
     scan_from: usize,
     id: Option<String>,
@@ -133,6 +134,7 @@ impl ResponsesSse {
             model,
             metadata,
             json_mode: None,
+            has_refusal: false,
             buffer: Vec::new(),
             scan_from: 0,
             id: None,
@@ -432,6 +434,7 @@ impl ResponsesSse {
                 return Err(());
             }
             if self.finish_reason.as_deref() == Some("stop")
+                && !self.has_refusal
                 && let Some(only_object) = self.json_mode
             {
                 // A model may ignore response_format even after a valid 200
@@ -560,6 +563,9 @@ impl ResponsesSse {
                 }
                 let part = content.as_str().ok_or(())?;
                 if !part.is_empty() {
+                    if field == "refusal" {
+                        self.has_refusal = true;
+                    }
                     if !self.tools.is_empty() {
                         return Err(());
                     }

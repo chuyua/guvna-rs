@@ -144,7 +144,11 @@ fn validate_chat_with_params(
                 .and_then(Value::as_str)
                 .and_then(|text| serde_json::from_str::<Value>(text).ok())
                 .is_some_and(|parsed| format != "json_object" || parsed.is_object());
-            if !valid_json {
+            let valid_refusal = message
+                .get("refusal")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty());
+            if !valid_json && !valid_refusal {
                 return false;
             }
         }
