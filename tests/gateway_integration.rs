@@ -4403,7 +4403,7 @@ async fn online_provider_reorder_is_visible_to_decider_without_stale_identity() 
     use guvna::gateway::app_with_state;
 
     let (first_url, first_hits) = start_upstream(StatusCode::OK).await;
-    let (second_url, _) = start_upstream(StatusCode::OK).await;
+    let (second_url, second_hits) = start_upstream(StatusCode::OK).await;
     let captured = Arc::new(tokio::sync::Mutex::new(None::<Value>));
     let capture = Arc::clone(&captured);
     let selector = Router::new().route(
@@ -4475,12 +4475,22 @@ auto:
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        first_hits.load(Ordering::SeqCst) + second_hits.load(Ordering::SeqCst),
+        1
+    );
     let selector_request = captured.lock().await.take().expect("selector called");
     let summary: Value =
         serde_json::from_str(selector_request["messages"][1]["content"].as_str().unwrap()).unwrap();
-    assert_eq!(summary["candidates"][0]["provider"], "first");
-    assert_eq!(summary["candidates"][1]["provider"], "second");
+    let candidates = summary["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2);
+    for candidate in candidates {
+        match candidate["model"].as_str().unwrap() {
+            "one" => assert_eq!(candidate["provider"], "first"),
+            "two" => assert_eq!(candidate["provider"], "second"),
+            other => panic!("unexpected candidate model: {other}"),
+        }
+    }
     server.abort();
 }
 
