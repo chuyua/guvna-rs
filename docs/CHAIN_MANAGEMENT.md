@@ -101,6 +101,11 @@ pointer operation. The named route snapshot, authenticated /v1/models list
 and /v1/models/{model} detail are derived from the same immutable generation:
 concurrent readers cannot see a half-published route and stale model listing
 inside a single snapshot. In-flight requests keep their old route snapshot.
+Request and SSE-terminal telemetry also retain the admitted route generation
+for provider/model identity: a newly added named model is recorded with its
+exact model name (not the generic passthrough label), and deleting a chain
+cannot relabel a stream that was already in flight. Unknown direct
+passthrough model names remain excluded from verified model-health evidence.
 CLI operations without a running control socket still update offline files,
 with a restart warning, preserving existing behavior. No TCP control route
 or Web backend exists. Chain names from static config remain read-only.

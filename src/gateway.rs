@@ -134,18 +134,36 @@ fn collect_models(config: &Config) -> (Value, HashMap<String, Value>) {
 }
 
 impl AppState {
+    #[cfg(test)]
     pub(crate) fn telemetry_model_name<'a>(
         &self,
         provider_index: usize,
         model: &'a str,
     ) -> &'a str {
+        let routes = self.route_snapshot();
+        self.telemetry_model_name_in(&routes, provider_index, model)
+    }
+
+    /// A request or SSE stream must attribute events using the route
+    /// generation with which it was admitted. A later online chains delete
+    /// must not turn an already running named model into 'passthrough'.
+    pub(crate) fn telemetry_model_name_in<'a>(
+        &self,
+        routes: &Config,
+        provider_index: usize,
+        model: &'a str,
+    ) -> &'a str {
         let provider = &self.config.providers[provider_index];
         if provider.models.iter().any(|name| name == model)
-            || self
-                .config
+            || routes
                 .chains
                 .iter()
                 .flat_map(|chain| &chain.steps)
+                .any(|step| step.provider == provider.name && step.model == model)
+            || routes
+                .auto
+                .candidates
+                .iter()
                 .any(|step| step.provider == provider.name && step.model == model)
             || self
                 .config
@@ -730,6 +748,44 @@ auto:
             state.telemetry_model_name(0, "api_key_secret_fragment"),
             "passthrough"
         );
+    }
+
+    #[test]
+    fn live_chain_identity_uses_admission_generation_even_after_delete() {
+        let initial: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: https://example.test\n    key_env: KEY\nchains:\n  - name: fixed\n    steps:\n      - provider: p\n        model: static\n",
+        )
+        .unwrap();
+        let state = AppState::new(
+            initial.clone(),
+            HashMap::from([("KEY".to_owned(), "key".to_owned())]),
+            vec!["client".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(state.telemetry_model_name(0, "fresh"), "passthrough");
+        let updated: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: https://example.test\n    key_env: KEY\nchains:\n  - name: fixed\n    steps:\n      - provider: p\n        model: static\n  - name: dynamic\n    steps:\n      - provider: p\n        model: fresh\n",
+        )
+        .unwrap();
+        state.replace_route_snapshot(updated).unwrap();
+        let admitted = state.route_snapshot();
+        assert_eq!(state.telemetry_model_name(0, "fresh"), "fresh");
+        assert_eq!(
+            state.telemetry_model_name_in(&admitted, 0, "fresh"),
+            "fresh"
+        );
+        assert_eq!(
+            state.telemetry_model_name(0, "unknown-password-like-model"),
+            "passthrough"
+        );
+        state.replace_route_snapshot(initial).unwrap();
+        assert_eq!(state.telemetry_model_name(0, "fresh"), "passthrough");
+        assert_eq!(
+            state.telemetry_model_name_in(&admitted, 0, "fresh"),
+            "fresh",
+            "an in-flight stream cannot be retroactively relabeled by a later chain delete"
+        );
+        assert_eq!(state.telemetry_model_name(0, "static"), "static");
     }
 
     #[test]

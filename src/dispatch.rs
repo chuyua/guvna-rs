@@ -377,6 +377,9 @@ async fn dispatch_inner(
         object.remove("min_context");
         object.remove("max_context");
     }
+    // A request owns the named-chain generation used for routing and
+    // telemetry. Later local CLI mutations cannot relabel its outcome.
+    let route_snapshot = state.route_snapshot();
     // Keep byte-range eligibility and context-window budgeting separate.
     // The context estimate includes the full request, output allowance and safety reserve.
     let mut steps = match if auto_enabled {
@@ -421,7 +424,7 @@ async fn dispatch_inner(
         }
         resolved
     } else {
-        routing::resolve(&state.route_snapshot(), &model)
+        routing::resolve(&route_snapshot, &model)
     } {
         Ok(steps) => steps,
         Err(_) => {
@@ -688,7 +691,7 @@ async fn dispatch_inner(
         candidate_attempted_network = false;
         let mut context = TelemetryContext::new(
             &provider.name,
-            state.telemetry_model_name(step.provider_index, &step.model),
+            state.telemetry_model_name_in(&route_snapshot, step.provider_index, &step.model),
             "upstream_unavailable",
         );
         if !request_id.is_empty() {
@@ -897,6 +900,13 @@ async fn dispatch_inner(
                         chat_stream::StreamRoute {
                             provider_index: step.provider_index,
                             model: step.model.clone(),
+                            telemetry_model: state
+                                .telemetry_model_name_in(
+                                    &route_snapshot,
+                                    step.provider_index,
+                                    &step.model,
+                                )
+                                .to_owned(),
                             request_id: request_id.to_owned(),
                             attempt_index: u16::try_from(candidates_visited).unwrap_or(u16::MAX),
                         },

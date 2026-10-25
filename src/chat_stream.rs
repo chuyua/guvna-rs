@@ -16,6 +16,7 @@ const MAX_STREAM_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 pub(super) struct StreamRoute {
     pub(super) provider_index: usize,
     pub(super) model: String,
+    pub(super) telemetry_model: String,
     pub(super) request_id: String,
     pub(super) attempt_index: u16,
 }
@@ -23,6 +24,7 @@ struct ChatStreamState {
     owner: Arc<AppState>,
     provider_index: usize,
     model: String,
+    telemetry_model: String,
     request_id: String,
     attempt_index: u16,
     started_at: tokio::time::Instant,
@@ -47,8 +49,7 @@ impl Drop for ChatStreamState {
                 let provider = &self.owner.config.providers[self.provider_index].name;
                 telemetry.observe_stream_health(
                     provider,
-                    self.owner
-                        .telemetry_model_name(self.provider_index, &self.model),
+                    &self.telemetry_model,
                     "client_cancelled",
                     self.started_at.elapsed(),
                     (&self.request_id, self.attempt_index),
@@ -87,6 +88,7 @@ pub(super) async fn start(
         owner,
         provider_index: route.provider_index,
         model: route.model,
+        telemetry_model: route.telemetry_model,
         request_id: route.request_id,
         attempt_index: route.attempt_index,
         started_at: tokio::time::Instant::now(),
@@ -139,9 +141,7 @@ fn stream_response(state: ChatStreamState) -> Response {
                         let provider = &state.owner.config.providers[state.provider_index].name;
                         telemetry.observe_stream_health(
                             provider,
-                            state
-                                .owner
-                                .telemetry_model_name(state.provider_index, &state.model),
+                            &state.telemetry_model,
                             "success",
                             state.started_at.elapsed(),
                             (&state.request_id, state.attempt_index),
@@ -190,9 +190,7 @@ fn stream_response(state: ChatStreamState) -> Response {
                     let provider = &state.owner.config.providers[state.provider_index].name;
                     telemetry.observe_stream_health(
                         provider,
-                        state
-                            .owner
-                            .telemetry_model_name(state.provider_index, &state.model),
+                        &state.telemetry_model,
                         "transport_error",
                         state.started_at.elapsed(),
                         (&state.request_id, state.attempt_index),

@@ -176,6 +176,49 @@ chains:
 }
 
 #[tokio::test]
+async fn online_chain_addition_is_recorded_as_verified_model_not_passthrough() {
+    use guvna::gateway::app_with_state;
+    use rusqlite::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let base: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_env: KEY\nchains:\n  - name: fixed\n    steps:\n      - provider: p\n        model: static\n"
+    ))
+    .unwrap();
+    let mut state = AppState::new(
+        base.clone(),
+        HashMap::from([("KEY".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, running) = app_with_state(state);
+    let next: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_env: KEY\nchains:\n  - name: fixed\n    steps:\n      - provider: p\n        model: static\n  - name: dynamic\n    steps:\n      - provider: p\n        model: fresh\n"
+    ))
+    .unwrap();
+    running.replace_route_snapshot(next).unwrap();
+    let (status, result) = call(router.clone(), request("dynamic", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(running.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let (model, verified): (String, i64) = db
+        .query_row(
+            "SELECT model, identity_verified FROM request_events WHERE endpoint='chat'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((model.as_str(), verified), ("fresh", 1));
+    running.replace_route_snapshot(base).unwrap();
+    let (status, result) = call(router, request("dynamic", "", "client")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{result}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn failed_first_candidate_is_correlated_with_one_terminal_request_and_scoring() {
     use guvna::gateway::app_with_state;
     use rusqlite::{Connection, params};
