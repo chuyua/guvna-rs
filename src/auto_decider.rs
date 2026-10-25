@@ -580,6 +580,15 @@ auto:
             original,
             ranking_key(&[a.clone(), b.clone()], 2000, 3000, image)
         );
-        assert_ne!(original, ranking_key(&[a, b], 4000, 3000, plain));
+        assert_ne!(original, ranking_key(&[a.clone(), b.clone()], 4000, 3000, plain));
+        // A live chain edit can change the forwarded parameters without
+        // changing the candidate order. Never reuse the old selector ranking.
+        let mut changed = a.clone();
+        changed.params.insert("temperature".into(), json!(0.75));
+        assert_ne!(
+            original,
+            ranking_key(&[changed, b], 2000, 3000, plain),
+            "changed chain parameters must invalidate the selector cache"
+        );
     }
 }
