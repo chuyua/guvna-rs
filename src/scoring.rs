@@ -25,6 +25,52 @@ fn p95(samples: &mut [i64]) -> Option<i64> {
     samples.get((samples.len() * 95).div_ceil(100) - 1).copied()
 }
 
+/// Match confirmed stream outcomes to the exact downstream Chat attempt.
+/// SSE headers, unverified terminals and caller cancellations are not quality
+/// evidence. The terminal primary key prevents duplicate completion samples.
+fn confirmed_chat_stream_outcomes(
+    conn: &Connection,
+    since: i64,
+) -> Result<HashMap<(String, String), (i64, i64)>, String> {
+    let mut outcomes = HashMap::new();
+    // Pre-migration databases may not have the terminal or trace columns.
+    // In that case we conservatively exclude stream starts from scoring.
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT t.provider,t.model,t.outcome,COUNT(*)
+         FROM request_events r
+         JOIN stream_terminals t
+           ON t.request_id=r.request_id AND t.attempt_index=r.attempt_index
+         WHERE r.ts>=?1 AND t.ts>=?1 AND r.endpoint='chat'
+           AND r.stream_requested=1 AND r.failure_type='stream_started'
+           AND r.provider=t.provider AND r.model=t.model
+           AND t.outcome IN ('success','transport_error')
+         GROUP BY t.provider,t.model,t.outcome",
+    ) else {
+        return Ok(outcomes);
+    };
+    let rows = stmt
+        .query_map(params![since], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|_| "cannot read confirmed Chat stream outcomes")?;
+    for row in rows {
+        let (provider, model, outcome, count) =
+            row.map_err(|_| "malformed Chat stream outcome")?;
+        let entry = outcomes.entry((provider, model)).or_insert((0_i64, 0_i64));
+        if outcome == "success" {
+            entry.0 += count.max(0);
+        } else {
+            entry.1 += count.max(0);
+        }
+    }
+    Ok(outcomes)
+}
+
 /// Correlate bounded real outcomes with shadow advice; never infer the
 /// success of a route that was not actually executed.
 fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
@@ -224,9 +270,15 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
         .min(i64::MAX as u64) as i64;
     let since = now - (hours as i64) * 3600;
     let start_hour = since - since.rem_euclid(3600);
-    let mut stmt = conn
-        .prepare(
-             "SELECT provider,model,COALESCE(SUM(request_count),0),COALESCE(SUM(failure_count),0),
+    // Legacy aggregates without endpoint labels cannot safely rank Chat.
+    // Continue to show request/shadow diagnostics, but fail closed for scores.
+    let chat_filter = if conn.prepare("SELECT endpoint FROM hourly_stats LIMIT 0").is_ok() {
+        "AND endpoint='chat'"
+    } else {
+        "AND 1=0"
+    };
+    let sql = format!(
+        "SELECT provider,model,COALESCE(SUM(request_count),0),COALESCE(SUM(failure_count),0),
                 COALESCE(SUM(total_elapsed_ms),0),COALESCE(MAX(max_elapsed_ms),0),
                 COALESCE(SUM(CASE WHEN failure_type='success' THEN request_count ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN failure_type IN
@@ -234,12 +286,15 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
                     THEN MIN(request_count,failure_count) ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN failure_type='stream_started' THEN request_count ELSE 0 END),0)
          FROM hourly_stats
-         WHERE hour_ts >= ?1 AND provider != 'unknown'
+         WHERE hour_ts >= ?1 AND provider != 'unknown' {chat_filter}
          GROUP BY provider,model
          ORDER BY COALESCE(SUM(request_count),0) DESC,provider,model
-         LIMIT 32",
-        )
+         LIMIT 32"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
         .map_err(|_| "cannot prepare telemetry summary")?;
+    let stream_outcomes = confirmed_chat_stream_outcomes(&conn, since)?;
     let rows = stmt
         .query_map(params![start_hour], |row| {
             Ok((
@@ -270,16 +325,32 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
         ) = record.map_err(|_| "malformed telemetry summary row")?;
         let attempts = attempts.max(0);
         let failures = failures.clamp(0, attempts);
-        let confirmed_successes = confirmed_successes.max(0).min(attempts);
-        let provider_failures = provider_failures.max(0).min(attempts - confirmed_successes);
+        let (stream_successes, stream_failures) = stream_outcomes
+            .get(&(provider.clone(), model.clone()))
+            .copied()
+            .unwrap_or_default();
+        let confirmed_successes = confirmed_successes
+            .saturating_add(stream_successes)
+            .max(0)
+            .min(attempts);
+        let provider_failures = provider_failures
+            .saturating_add(stream_failures)
+            .max(0)
+            .min(attempts - confirmed_successes);
         let observed = confirmed_successes + provider_failures;
         let eligible = observed >= MIN_SCORE_SAMPLES;
+        let latency_filter = if conn.prepare("SELECT endpoint FROM request_events LIMIT 0").is_ok() {
+            "AND endpoint='chat'"
+        } else {
+            "AND 1=0"
+        };
+        let latency_sql = format!(
+            "SELECT elapsed_ms,sse_headers FROM request_events
+             WHERE provider=?1 AND model=?2 AND ts >= ?3 {latency_filter}
+             ORDER BY ts DESC LIMIT 512"
+        );
         let mut sample_stmt = conn
-            .prepare(
-                "SELECT elapsed_ms,sse_headers FROM request_events
-             WHERE provider=?1 AND model=?2 AND ts >= ?3
-             ORDER BY ts DESC LIMIT 512",
-            )
+            .prepare(&latency_sql)
             .map_err(|_| "cannot prepare latency sample")?;
         let samples = sample_stmt
             .query_map(params![provider, model, since], |row| {
@@ -309,6 +380,8 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
             "stream_header_p95_ms":stream_header_p95,
             "stream_header_sample_count":stream_headers.len().min(MAX_LATENCY_SAMPLES),
             "stream_starts":stream_starts.max(0),
+            "confirmed_stream_successes":stream_successes,
+            "confirmed_stream_failures":stream_failures,
             "observed_samples":observed,
             "observed_successes":confirmed_successes,
             "observed_provider_failures":provider_failures,
@@ -425,7 +498,7 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
         "stream_terminal_metrics":stream_terminal_metrics,
          "shadow_sample_notes":"The bounded recent shadow sample links only real final request outcomes by request ID. SSE success requires a matching terminal observation. A proposed route matching the actual final route is not proof the proposed strategy would have succeeded; missing and pending observations remain unknown.",
          "request_metrics_notes":"Only traced terminal request rows count toward fallback rate; the first-attempt success rate is restricted to nonstream completions, not unverified SSE headers. Old SQLite databases report null until migrated.",
-         "notes":"raw success_rate includes all failure classes; observed_success_rate counts only confirmed nonstream successes and attempted upstream provider failures, excluding caller/local/credential errors and unverified stream starts. Qualification requires 20 observed samples. p95 separates nonstream completion from SSE response-header latency, sampled from up to 512 recent downstream rows per candidate; neither is a counterfactual outcome or complete SSE duration.",
+         "notes":"raw success_rate includes all failure classes; observed_success_rate counts confirmed nonstream successes, verified Chat SSE terminal successes, and upstream provider failures, excluding caller/local/credential errors and unverified stream starts. Qualification requires 20 observed samples. p95 separates nonstream completion from SSE response-header latency, sampled from up to 512 recent downstream rows per candidate; neither is a counterfactual outcome or complete SSE duration.",
     }))
 }
 
@@ -712,12 +785,12 @@ mod tests {
         let db = Connection::open(directory.join("requests.sqlite3")).unwrap();
         db.execute_batch(
             "CREATE TABLE hourly_stats(
-                hour_ts INTEGER,provider TEXT,model TEXT,request_count INTEGER,
+                hour_ts INTEGER,endpoint TEXT,provider TEXT,model TEXT,request_count INTEGER,
                 failure_count INTEGER,total_elapsed_ms INTEGER,max_elapsed_ms INTEGER,
                 failure_type TEXT
              );
              CREATE TABLE request_events(provider TEXT,model TEXT,ts INTEGER,
-                 elapsed_ms INTEGER,sse_headers INTEGER);",
+                 elapsed_ms INTEGER,sse_headers INTEGER,endpoint TEXT);",
         )
         .unwrap();
         let now = SystemTime::now()
@@ -726,48 +799,48 @@ mod tests {
             .as_secs() as i64;
         let hour = now - now.rem_euclid(3600);
         db.execute(
-            "INSERT INTO hourly_stats VALUES(?1,'test','alpha',20,0,2000,250,'success')",
+            "INSERT INTO hourly_stats VALUES(?1,'chat','test','alpha',20,0,2000,250,'success')",
             [hour],
         )
         .unwrap();
         db.execute(
-            "INSERT INTO hourly_stats VALUES(?1,'test','alpha',1,1,100,250,'provider_5xx')",
+            "INSERT INTO hourly_stats VALUES(?1,'chat','test','alpha',1,1,100,250,'provider_5xx')",
             [hour],
         )
         .unwrap();
         for t in 0..21 {
             db.execute(
-                "INSERT INTO request_events VALUES('test','alpha',?1,?2,0)",
+                "INSERT INTO request_events VALUES('test','alpha',?1,?2,0,'chat')",
                 params![now, t * 10],
             )
             .unwrap();
         }
         for _ in 0..3 {
             db.execute(
-                "INSERT INTO request_events VALUES('test','alpha',?1,10000,1)",
+                "INSERT INTO request_events VALUES('test','alpha',?1,10000,1,'chat')",
                 [now],
             )
             .unwrap();
         }
         db.execute(
-            "INSERT INTO hourly_stats VALUES(?1,'test','untrusted',60,60,300,100,'caller_error')",
+            "INSERT INTO hourly_stats VALUES(?1,'chat','test','untrusted',60,60,300,100,'caller_error')",
             [hour],
         )
         .unwrap();
         db.execute(
-            "INSERT INTO hourly_stats VALUES(?1,'test','untrusted',30,0,100,100,'stream_started')",
+            "INSERT INTO hourly_stats VALUES(?1,'chat','test','untrusted',30,0,100,100,'stream_started')",
             [hour],
         )
         .unwrap();
         // Neither a terminal SSE failure nor key cooldown is an observed
         // model-quality failure in this conservative scoring view.
         db.execute(
-            "INSERT INTO hourly_stats VALUES(?1,'test','untrusted',0,1,50,50,'provider_5xx')",
+            "INSERT INTO hourly_stats VALUES(?1,'chat','test','untrusted',0,1,50,50,'provider_5xx')",
             [hour],
         )
         .unwrap();
         db.execute(
-            "INSERT INTO hourly_stats VALUES(?1,'test','untrusted',20,20,100,100,'rate_limited')",
+            "INSERT INTO hourly_stats VALUES(?1,'chat','test','untrusted',20,20,100,100,'rate_limited')",
             [hour],
         )
         .unwrap();
@@ -791,4 +864,117 @@ mod tests {
         assert_eq!(valid["downstream_sample_count"], 21);
         assert_eq!(valid["stream_header_sample_count"], 3);
     }
+    #[test]
+    fn chat_scoring_ignores_embeddings_and_counts_only_verified_stream_terminals() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("telemetry")).unwrap();
+        let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE hourly_stats(
+                hour_ts INTEGER,endpoint TEXT,provider TEXT,model TEXT,
+                request_count INTEGER,failure_count INTEGER,total_elapsed_ms INTEGER,
+                max_elapsed_ms INTEGER,failure_type TEXT
+             );
+             CREATE TABLE request_events(
+                ts INTEGER,endpoint TEXT,provider TEXT,model TEXT,elapsed_ms INTEGER,
+                sse_headers INTEGER,request_id TEXT,attempt_index INTEGER,
+                stream_requested INTEGER,failure_type TEXT
+             );
+             CREATE TABLE stream_terminals(
+                ts INTEGER,request_id TEXT,attempt_index INTEGER,provider TEXT,
+                model TEXT,outcome TEXT,PRIMARY KEY(request_id,attempt_index)
+             );",
+        )
+        .unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let hour = now - now.rem_euclid(3600);
+        for (endpoint, outcome, requests, failures) in [
+            ("chat", "stream_started", 22, 0),
+            ("chat", "provider_5xx", 10, 10),
+            ("embeddings", "success", 30, 0),
+        ] {
+            db.execute(
+                "INSERT INTO hourly_stats VALUES(?1,?2,'p','m',?3,?4,100,100,?5)",
+                params![hour, endpoint, requests, failures, outcome],
+            )
+            .unwrap();
+        }
+        for i in 0..22 {
+            let id = format!("sse-{i}");
+            db.execute(
+                "INSERT INTO request_events VALUES(?1,'chat','p','m',50,1,?2,1,1,'stream_started')",
+                params![now, id],
+            )
+            .unwrap();
+            let outcome = if i < 20 {
+                "success"
+            } else if i == 20 {
+                "transport_error"
+            } else {
+                "client_cancelled"
+            };
+            db.execute(
+                "INSERT INTO stream_terminals VALUES(?1,?2,1,'p','m',?3)",
+                params![now, id, outcome],
+            )
+            .unwrap();
+        }
+        // Neither a fabricated attempt nor an incorrect model can qualify.
+        db.execute(
+            "INSERT INTO stream_terminals VALUES(?1,'forged',1,'p','m','success')",
+            [now],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO stream_terminals VALUES(?1,'sse-0',2,'p','m','success')",
+            [now],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO request_events VALUES(?1,'embeddings','p','m',10,0,'embed',1,0,'success')",
+            [now],
+        )
+        .unwrap();
+        let result = read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(result["candidate_count"], 1);
+        let chat = &result["candidates"][0];
+        assert_eq!(chat["attempts"], 32);
+        assert_eq!(chat["stream_starts"], 22);
+        assert_eq!(chat["confirmed_stream_successes"], 20);
+        assert_eq!(chat["confirmed_stream_failures"], 1);
+        assert_eq!(chat["observed_successes"], 20);
+        assert_eq!(chat["observed_provider_failures"], 11);
+        assert_eq!(chat["observed_samples"], 31);
+        assert_eq!(chat["excluded_attempts"], 1);
+        assert_eq!(chat["qualified"], true);
+        assert!((chat["observed_success_rate"].as_f64().unwrap() - 20.0 / 31.0).abs() < 1e-9);
+        assert_eq!(chat["downstream_sample_count"], 0);
+        assert_eq!(chat["stream_header_sample_count"], 22);
+    }
+
+    #[test]
+    fn endpointless_legacy_aggregates_are_not_qualified_for_auto_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("telemetry")).unwrap();
+        let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE hourly_stats(
+                hour_ts INTEGER,provider TEXT,model TEXT,request_count INTEGER,
+                failure_count INTEGER,total_elapsed_ms INTEGER,max_elapsed_ms INTEGER,
+                failure_type TEXT
+             );
+             CREATE TABLE request_events(ts INTEGER,provider TEXT,model TEXT,
+                 elapsed_ms INTEGER,sse_headers INTEGER);",
+        )
+        .unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        db.execute(
+            "INSERT INTO hourly_stats VALUES(?1,'p','m',100,0,100,100,'success')",
+            [now - now.rem_euclid(3600)],
+        )
+        .unwrap();
+        let result = read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(result["candidate_count"], 0);
+    }
+
 }

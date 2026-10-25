@@ -107,6 +107,30 @@ pub(super) async fn dispatch(
     response
 }
 
+/// Decider advice can reorder only within the current health penalty tier.
+/// Recheck after any asynchronous selector call, before sending an upstream request.
+fn preserve_auto_health_priority(
+    config: &crate::config::Config,
+    steps: &mut [routing::ResolvedStep],
+    penalties: &[u8],
+) {
+    if !config.auto.health_aware || !penalties.iter().any(|value| *value > 0) {
+        return;
+    }
+    steps.sort_by_key(|step| {
+        let provider = config.providers.get(step.provider_index).map(|p| p.name.as_str());
+        config
+            .auto
+            .candidates
+            .iter()
+            .position(|candidate| {
+                Some(candidate.provider.as_str()) == provider && candidate.model == step.model
+            })
+            .and_then(|index| penalties.get(index).copied())
+            .unwrap_or(u8::MAX)
+    });
+}
+
 fn attach_telemetry_context(mut response: Response, context: Option<TelemetryContext>) -> Response {
     if let Some(context) = context {
         response.extensions_mut().insert(context);
@@ -536,6 +560,10 @@ async fn dispatch_inner(
         {
             steps = ranked;
         }
+    }
+
+    if auto_enabled && let Some(health) = &state.auto_health {
+        preserve_auto_health_priority(&state.config, &mut steps, &health.penalties());
     }
 
     let mut permit = Some(admission);
@@ -1238,4 +1266,43 @@ mod tests {
         );
         assert!(nonstream_walk_budget(Duration::from_secs(3600)) < Duration::from_secs(120));
     }
+    #[test]
+    fn remote_decider_cannot_promote_demoted_auto_candidate() {
+        let yaml = r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://upstream.example
+    key_env: K
+auto:
+  enabled: true
+  health_aware: true
+  candidates:
+    - provider: p
+      model: degraded
+    - provider: p
+      model: healthy
+    - provider: p
+      model: equally_healthy
+"#;
+        let mut config: crate::config::Config = serde_yaml::from_str(yaml).unwrap();
+        config.validate().unwrap();
+        let step = |model: &str| routing::ResolvedStep {
+            provider_index: 0,
+            model: model.to_owned(),
+            params: Default::default(),
+        };
+        // Malicious Decider ranks the demoted model first. Healthy models
+        // retain the Decider's relative preference within their own tier.
+        let mut steps = vec![step("degraded"), step("equally_healthy"), step("healthy")];
+        preserve_auto_health_priority(&config, &mut steps, &[100, 0, 0]);
+        assert_eq!(steps.iter().map(|s| s.model.as_str()).collect::<Vec<_>>(),
+            vec!["equally_healthy", "healthy", "degraded"]);
+        // When health awareness is off, opt-in Decider order is unchanged.
+        config.auto.health_aware = false;
+        let mut steps = vec![step("degraded"), step("healthy")];
+        preserve_auto_health_priority(&config, &mut steps, &[100, 0, 0]);
+        assert_eq!(steps[0].model, "degraded");
+    }
+
 }

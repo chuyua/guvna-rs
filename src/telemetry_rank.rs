@@ -109,6 +109,8 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
     let path = data_dir.join("telemetry").join("requests.sqlite3");
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
     conn.busy_timeout(Duration::from_millis(50)).ok()?;
+    // Old endpoint-less rows can mix Chat and Embeddings; never auto-rank them.
+    conn.prepare("SELECT endpoint FROM request_events LIMIT 0").ok()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
     let since = now.saturating_sub(options.max_snapshot_age_secs as i64);
     let mut scores = Vec::with_capacity(config.auto.candidates.len());
@@ -137,13 +139,30 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
             .query_row(
                 "SELECT MAX(ts) FROM request_events
              WHERE provider=?1 AND model=?2 AND ts BETWEEN ?3 AND ?4
+             AND endpoint='chat'
              AND failure_type IN ('success','provider_5xx','transport_error',
                  'invalid_response','timeout','upstream_unavailable')",
                 params![candidate.provider, candidate.model, since, now],
                 |row| row.get(0),
             )
             .ok()?;
-        recent?;
+        // Confirmed stream terminals also qualify as recent Chat outcomes.
+        let recent_stream: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(t.ts) FROM stream_terminals t
+                 JOIN request_events r
+                   ON r.request_id=t.request_id AND r.attempt_index=t.attempt_index
+                 WHERE t.provider=?1 AND t.model=?2 AND t.ts BETWEEN ?3 AND ?4
+                   AND r.endpoint='chat' AND r.stream_requested=1
+                   AND r.failure_type='stream_started'
+                   AND r.provider=t.provider AND r.model=t.model
+                   AND t.outcome IN ('success','transport_error')",
+                params![candidate.provider, candidate.model, since, now],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        recent.max(recent_stream)?;
         scores.push((index, score));
     }
     scores.sort_by(|(index_a, score_a), (index_b, score_b)| {
@@ -223,7 +242,7 @@ auto:
               model TEXT,failure_type TEXT,request_count INTEGER,failure_count INTEGER,
               total_elapsed_ms INTEGER,max_elapsed_ms INTEGER);
              CREATE TABLE request_events (ts INTEGER,provider TEXT,model TEXT,
-              elapsed_ms INTEGER,sse_headers INTEGER,failure_type TEXT);",
+              elapsed_ms INTEGER,sse_headers INTEGER,failure_type TEXT,endpoint TEXT);",
         )
         .unwrap();
         let now = SystemTime::now()
@@ -248,7 +267,7 @@ auto:
                 .unwrap();
             }
             conn.execute(
-                "INSERT INTO request_events VALUES (?1,'p',?2,10,0,'success')",
+                "INSERT INTO request_events VALUES (?1,'p',?2,10,0,'success','chat')",
                 params![now, model],
             )
             .unwrap();
