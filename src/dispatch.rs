@@ -118,7 +118,10 @@ fn preserve_auto_health_priority(
         return;
     }
     steps.sort_by_key(|step| {
-        let provider = config.providers.get(step.provider_index).map(|p| p.name.as_str());
+        let provider = config
+            .providers
+            .get(step.provider_index)
+            .map(|p| p.name.as_str());
         config
             .auto
             .candidates
@@ -1296,13 +1299,14 @@ auto:
         // retain the Decider's relative preference within their own tier.
         let mut steps = vec![step("degraded"), step("equally_healthy"), step("healthy")];
         preserve_auto_health_priority(&config, &mut steps, &[100, 0, 0]);
-        assert_eq!(steps.iter().map(|s| s.model.as_str()).collect::<Vec<_>>(),
-            vec!["equally_healthy", "healthy", "degraded"]);
+        assert_eq!(
+            steps.iter().map(|s| s.model.as_str()).collect::<Vec<_>>(),
+            vec!["equally_healthy", "healthy", "degraded"]
+        );
         // When health awareness is off, opt-in Decider order is unchanged.
         config.auto.health_aware = false;
         let mut steps = vec![step("degraded"), step("healthy")];
         preserve_auto_health_priority(&config, &mut steps, &[100, 0, 0]);
         assert_eq!(steps[0].model, "degraded");
     }
-
 }

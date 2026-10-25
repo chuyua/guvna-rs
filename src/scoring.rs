@@ -59,8 +59,7 @@ fn confirmed_chat_stream_outcomes(
         })
         .map_err(|_| "cannot read confirmed Chat stream outcomes")?;
     for row in rows {
-        let (provider, model, outcome, count) =
-            row.map_err(|_| "malformed Chat stream outcome")?;
+        let (provider, model, outcome, count) = row.map_err(|_| "malformed Chat stream outcome")?;
         let entry = outcomes.entry((provider, model)).or_insert((0_i64, 0_i64));
         if outcome == "success" {
             entry.0 += count.max(0);
@@ -272,7 +271,10 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
     let start_hour = since - since.rem_euclid(3600);
     // Legacy aggregates without endpoint labels cannot safely rank Chat.
     // Continue to show request/shadow diagnostics, but fail closed for scores.
-    let chat_filter = if conn.prepare("SELECT endpoint FROM hourly_stats LIMIT 0").is_ok() {
+    let chat_filter = if conn
+        .prepare("SELECT endpoint FROM hourly_stats LIMIT 0")
+        .is_ok()
+    {
         "AND endpoint='chat'"
     } else {
         "AND 1=0"
@@ -339,7 +341,10 @@ pub fn read_scoring(data_dir: &Path, hours: u32) -> Result<Value, String> {
             .min(attempts - confirmed_successes);
         let observed = confirmed_successes + provider_failures;
         let eligible = observed >= MIN_SCORE_SAMPLES;
-        let latency_filter = if conn.prepare("SELECT endpoint FROM request_events LIMIT 0").is_ok() {
+        let latency_filter = if conn
+            .prepare("SELECT endpoint FROM request_events LIMIT 0")
+            .is_ok()
+        {
             "AND endpoint='chat'"
         } else {
             "AND 1=0"
@@ -886,7 +891,10 @@ mod tests {
              );",
         )
         .unwrap();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         let hour = now - now.rem_euclid(3600);
         for (endpoint, outcome, requests, failures) in [
             ("chat", "stream_started", 22, 0),
@@ -967,7 +975,10 @@ mod tests {
                  elapsed_ms INTEGER,sse_headers INTEGER);",
         )
         .unwrap();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         db.execute(
             "INSERT INTO hourly_stats VALUES(?1,'p','m',100,0,100,100,'success')",
             [now - now.rem_euclid(3600)],
@@ -976,5 +987,4 @@ mod tests {
         let result = read_scoring(dir.path(), 1).unwrap();
         assert_eq!(result["candidate_count"], 0);
     }
-
 }

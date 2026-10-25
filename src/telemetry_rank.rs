@@ -110,7 +110,8 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
     conn.busy_timeout(Duration::from_millis(50)).ok()?;
     // Old endpoint-less rows can mix Chat and Embeddings; never auto-rank them.
-    conn.prepare("SELECT endpoint FROM request_events LIMIT 0").ok()?;
+    conn.prepare("SELECT endpoint FROM request_events LIMIT 0")
+        .ok()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
     let since = now.saturating_sub(options.max_snapshot_age_secs as i64);
     let mut scores = Vec::with_capacity(config.auto.candidates.len());
