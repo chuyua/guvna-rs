@@ -175,6 +175,7 @@ fn stream_response(state: ChatStreamState) -> Response {
             match tokio::time::timeout(Duration::from_secs(15), state.upstream.chunk()).await {
                 Ok(Ok(Some(bytes))) => {
                     if bytes.len() > MAX_STREAM_CHUNK_BYTES {
+                        state.failure_type = "local_error";
                         state.terminated = true;
                     } else {
                         match state.parser.push(&bytes) {
@@ -222,9 +223,19 @@ fn stream_response(state: ChatStreamState) -> Response {
                 } else if state.failure_type == "invalid_response" {
                     Metrics::inc(&state.owner.metrics.upstream_invalid_responses);
                 }
-                state
-                    .owner
-                    .mark_auto_failure_in(&state.live, state.provider_index, &state.model);
+                // A local output policy (large frame or a long idle pause)
+                // must not teach the breaker/AutoHealth that a healthy
+                // provider is down. Protocol violations and actual I/O
+                // failures still count against the provider.
+                let blame_provider =
+                    matches!(state.failure_type, "transport_error" | "invalid_response");
+                if blame_provider {
+                    state.owner.mark_auto_failure_in(
+                        &state.live,
+                        state.provider_index,
+                        &state.model,
+                    );
+                }
 
                 if let Some(telemetry) = &state.owner.telemetry {
                     let provider = &state.owner.config.providers[state.provider_index].name;
@@ -237,7 +248,9 @@ fn stream_response(state: ChatStreamState) -> Response {
                         &state.owner.metrics,
                     );
                 }
-                record_circuit_failure(&mut state.circuit_ticket, &state.owner.metrics);
+                if blame_provider {
+                    record_circuit_failure(&mut state.circuit_ticket, &state.owner.metrics);
+                }
                 state.terminal_reported = true;
                 return Some((Ok(stream_error()), state));
             }

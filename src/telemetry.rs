@@ -257,6 +257,12 @@ impl Telemetry {
     ) {
         let mut context = TelemetryContext::new(provider, model, failure_type);
         context.set_trace(trace.0, trace.1, true);
+        if matches!(failure_type, "timeout" | "local_error") {
+            // Stream idle/size policy is local admission control, not proof
+            // of supplier degradation. Preserve diagnostics but avoid
+            // poisoning persistent provider health and Auto rankings.
+            context.set_health_observation(false);
+        }
         let status = match failure_type {
             "success" => 200,
             "client_cancelled" => 499,
@@ -1110,6 +1116,48 @@ mod tests {
             stream_requested: false,
             shadow: None,
         }
+    }
+
+    #[test]
+    fn local_stream_timeouts_and_size_limits_do_not_poison_persisted_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let telemetry = Telemetry::start(dir.path(), Arc::clone(&metrics)).unwrap();
+        for (trace, kind) in [
+            ("trace-stream-idle", "timeout"),
+            ("trace-stream-size", "local_error"),
+        ] {
+            let mut started = TelemetryContext::new("p", "model", "stream_started");
+            started.set_trace(trace, 1, true);
+            telemetry.submit(
+                "chat",
+                200,
+                Duration::from_millis(1),
+                true,
+                Some(started),
+                &metrics,
+            );
+            telemetry.observe_stream_health(
+                "p",
+                "model",
+                kind,
+                Duration::from_secs(15),
+                (trace, 1),
+                &metrics,
+            );
+        }
+        assert!(telemetry.flush(Duration::from_secs(3)));
+        let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        let health: i64 = db
+            .query_row("SELECT COUNT(*) FROM provider_health", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(health, 0, "local policy must not demote provider health");
+        let terminals: i64 = db
+            .query_row("SELECT COUNT(*) FROM stream_terminals", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(terminals, 2, "diagnostic terminal outcomes were lost");
     }
 
     #[test]
