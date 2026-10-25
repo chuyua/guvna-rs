@@ -223,11 +223,11 @@ it. All existing aggregate scoring fields remain compatible.
 Request-level metrics deduplicate by random request ID: a request with two
 failed attempts followed by a successful third attempt counts as one traced
 request and one request with fallback, not three separate requests. The
-nonstream first-attempt success rate uses only index-one nonstream attempts
-as its denominator; a later fallback success cannot retroactively count as
-a first-attempt success. In-window request attempts without a known terminal
-outcome may still appear in traced requests, so these metrics must not be
-confused with completed-request success rates.
+nonstream first-attempt success rate includes each nonstream request once
+in its denominator (even when its first attempt failed); only a successful
+index-one attempt counts in the numerator. In-window requests without a
+known terminal outcome may still appear in traced requests, so these metrics
+must not be confused with completed-request success rates.
 
 ## Shadow comparison persistence
 

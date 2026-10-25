@@ -449,8 +449,7 @@ fn read_scoring_inner(
             .query_row(
                 "SELECT COUNT(DISTINCT request_id),
                         COUNT(DISTINCT CASE WHEN attempt_index > 1 THEN request_id END),
-                        COUNT(DISTINCT CASE WHEN attempt_index = 1 AND stream_requested = 0
-                                            THEN request_id END),
+                        COUNT(DISTINCT CASE WHEN stream_requested = 0 THEN request_id END),
                         COUNT(DISTINCT CASE WHEN attempt_index = 1 AND stream_requested = 0
                                             AND failure_type = 'success' THEN request_id END)
                  FROM request_events
