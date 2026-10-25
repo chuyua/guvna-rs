@@ -19,6 +19,10 @@ pub(super) fn valid_result_with_params(
 ) -> bool {
     match endpoint {
         Endpoint::Chat => validate_chat_with_params(request, params, response),
+        Endpoint::Responses => {
+            validate_chat_with_params(request, params, response)
+                && super::responses::translatable_chat_result(response)
+        }
         Endpoint::Embeddings => validate_embeddings_with_params(request, params, response),
     }
 }
