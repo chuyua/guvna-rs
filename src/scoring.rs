@@ -1021,9 +1021,12 @@ mod tests {
             .unwrap();
         }
         let outcomes =
-            confirmed_chat_stream_outcomes(&db, now - 3600, &[("p".into(), "m".into())])
-                .unwrap();
-        assert_eq!(outcomes.len(), 1, "unrelated stream outcomes must not be retained");
+            confirmed_chat_stream_outcomes(&db, now - 3600, &[("p".into(), "m".into())]).unwrap();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "unrelated stream outcomes must not be retained"
+        );
         assert_eq!(outcomes.get(&("p".into(), "m".into())), Some(&(20, 1)));
         let scoped =
             read_scoring_for_candidates(dir.path(), 1, &[("p".into(), "m".into())]).unwrap();
