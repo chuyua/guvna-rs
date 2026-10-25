@@ -576,6 +576,20 @@ mod response_contract_tests {
             assert!(validate_chat(&request, &chat(r#"{"ok":true}"#, "stop")));
             assert!(!validate_chat(&request, &chat("ordinary prose", "stop")));
             assert!(!validate_chat(&request, &chat("{broken", "stop")));
+            // An explicit refusal is not a JSON-format compliance failure.
+            assert!(validate_chat(
+                &request,
+                &json!({"choices":[{"index":0,
+                "message":{"role":"assistant","content":null,"refusal":"I cannot help with that"},
+                "finish_reason":"stop"}]})
+            ));
+            // A missing/empty refusal must not bypass JSON validation.
+            assert!(!validate_chat(
+                &request,
+                &json!({"choices":[{"index":0,
+                "message":{"role":"assistant","content":"ordinary prose","refusal":""},
+                "finish_reason":"stop"}]})
+            ));
             // The original meaning of length is incomplete output, not
             // a validation failure requiring replay of truncated tokens.
             assert!(validate_chat(&request, &chat("{", "length")));
