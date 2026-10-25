@@ -28,10 +28,12 @@ fn p95(samples: &mut [i64]) -> Option<i64> {
 /// Match confirmed stream outcomes to the exact downstream Chat attempt.
 /// SSE headers, unverified terminals and caller cancellations are not quality
 /// evidence. The terminal primary key prevents duplicate completion samples.
+type StreamOutcomeCounts = HashMap<(String, String), (i64, i64)>;
+
 fn confirmed_chat_stream_outcomes(
     conn: &Connection,
     since: i64,
-) -> Result<HashMap<(String, String), (i64, i64)>, String> {
+) -> Result<StreamOutcomeCounts, String> {
     let mut outcomes = HashMap::new();
     // Pre-migration databases may not have the terminal or trace columns.
     // In that case we conservatively exclude stream starts from scoring.
