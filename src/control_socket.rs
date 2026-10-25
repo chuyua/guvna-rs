@@ -685,6 +685,27 @@ mod tests {
         drop(listener);
     }
 
+    #[tokio::test]
+    async fn stale_socket_symlink_is_never_followed_or_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.sock");
+        drop(UnixListener::bind(&target).unwrap());
+        let alias = dir.path().join(SOCKET_NAME);
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let error = ensure_socket_available(&alias).await.unwrap_err();
+        assert!(error.contains("not a socket"), "{error}");
+        assert!(fs::symlink_metadata(&alias).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(&target).unwrap().file_type().is_socket());
+    }
+
+    #[tokio::test]
+    async fn control_socket_refuses_directory_with_group_write_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o770)).unwrap();
+        let error = ensure_private_control_directory(dir.path()).unwrap_err();
+        assert!(error.contains("group/world writable"), "{error}");
+    }
+
     #[test]
     fn rejects_overlong_socket_paths_before_touching_the_directory() {
         let long_dir = PathBuf::from(format!(
