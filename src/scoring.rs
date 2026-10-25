@@ -475,19 +475,19 @@ mod tests {
             )
             .unwrap();
         }
-        for (id, model, attempt, stream, outcome) in [
-            ("direct", "a", 1, 0, "success"),
-            ("fallback", "b", 2, 0, "success"),
-            ("cancelled", "a", 1, 1, "stream_started"),
-            ("stream_ok", "a", 1, 1, "stream_started"),
-            ("wrong_terminal", "a", 1, 1, "stream_started"),
-            ("failed", "a", 1, 1, "stream_started"),
-            ("preheader_failure", "a", 1, 1, "provider_5xx"),
-            ("unverified_success", "a", 1, 1, "success"),
+        for (id, model, attempt, headers, stream, outcome) in [
+            ("direct", "a", 1, 0, 0, "success"),
+            ("fallback", "b", 2, 0, 0, "success"),
+            ("cancelled", "a", 1, 1, 1, "stream_started"),
+            ("stream_ok", "a", 1, 1, 1, "stream_started"),
+            ("wrong_terminal", "a", 1, 1, 1, "stream_started"),
+            ("failed", "a", 1, 1, 1, "stream_started"),
+            ("preheader_failure", "a", 1, 0, 1, "provider_5xx"),
+            ("unverified_success", "a", 1, 0, 1, "success"),
         ] {
             db.execute(
-                "INSERT INTO request_events VALUES(?1,'p',?2,15,?3,?4,?5,?3,?6)",
-                params![now, model, stream, id, attempt, outcome],
+                "INSERT INTO request_events VALUES(?1,'p',?2,15,?3,?4,?5,?6,?7)",
+                params![now, model, headers, id, attempt, stream, outcome],
             )
             .unwrap();
         }
