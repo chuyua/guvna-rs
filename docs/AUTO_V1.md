@@ -129,6 +129,15 @@ health evidence, while local SSE-to-JSON aggregation policy failures (such as
 unsupported delta formats, size caps, or local idle/lifetime limits) remain
 visible in failure telemetry without demoting a provider after a restart.
 This distinction is verified by an end-to-end Auto fallback/restart test.
+Provider-health identity must also be exact: names truncated or sanitized for
+diagnostic labels, and the generic passthrough label, never update or restore
+SQLite Auto penalties. When migrating an older SQLite database, existing
+provider-health rows lack proof of their original identities and are ignored
+for Auto ordering; the first new trusted observation resets that row's
+penalty/streak rather than inheriting potentially colliding history. Request,
+failure, and hourly telemetry remains intact. This intentionally allows
+unknown historical health to recover neutrally rather than demoting the wrong
+provider/model after an upgrade.
 ## Issue #129: optional dynamic chain discovery
 
 When auto.enabled: true, auto.discover_from_chains: true can add
