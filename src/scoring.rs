@@ -447,11 +447,12 @@ fn read_scoring_inner(
     {
         let (traced, fallback, first_nonstream, first_success): (i64, i64, i64, i64) = conn
             .query_row(
-                "SELECT COUNT(*),
-                        COALESCE(SUM(CASE WHEN attempt_index > 1 THEN 1 ELSE 0 END),0),
-                        COALESCE(SUM(CASE WHEN stream_requested = 0 THEN 1 ELSE 0 END),0),
-                        COALESCE(SUM(CASE WHEN attempt_index = 1 AND stream_requested = 0
-                                            AND failure_type = 'success' THEN 1 ELSE 0 END),0)
+                "SELECT COUNT(DISTINCT request_id),
+                        COUNT(DISTINCT CASE WHEN attempt_index > 1 THEN request_id END),
+                        COUNT(DISTINCT CASE WHEN attempt_index = 1 AND stream_requested = 0
+                                            THEN request_id END),
+                        COUNT(DISTINCT CASE WHEN attempt_index = 1 AND stream_requested = 0
+                                            AND failure_type = 'success' THEN request_id END)
                  FROM request_events
                  WHERE ts >= ?1 AND request_id IS NOT NULL AND attempt_index IS NOT NULL",
                 params![since],
@@ -763,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn request_rates_use_terminal_rows_and_exclude_unverified_sse_success() {
+    fn request_rates_count_unique_requests_across_multiple_fallback_attempts() {
         let dir = tempfile::tempdir().unwrap();
         let directory = dir.path().join("telemetry");
         std::fs::create_dir_all(&directory).unwrap();
@@ -785,12 +786,15 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        // One direct success, one fallback success, one direct failure, and
-        // one SSE header-only start. Only one of three completed nonstreams
-        // succeeded on the first attempt.
+        // Four requests produce six attempt rows: b fails on two candidates
+        // before its third attempt succeeds. It is still just ONE request
+        // with fallback; first-attempt success counts only a, not b.
+        // A header-only SSE start must not count as a nonstream success.
         for (id, attempt, stream, outcome) in [
             ("a", 1, 0, "success"),
-            ("b", 2, 0, "success"),
+            ("b", 1, 0, "provider_5xx"),
+            ("b", 2, 0, "transport_error"),
+            ("b", 3, 0, "success"),
             ("c", 1, 0, "provider_5xx"),
             ("d", 1, 1, "stream_started"),
         ] {
