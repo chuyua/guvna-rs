@@ -148,6 +148,24 @@ struct CacheState {
     entries: VecDeque<CacheEntry>,
 }
 
+impl CacheState {
+    fn retain_valid(&mut self, generation: u64, now: Instant) {
+        if self.generation != Some(generation) {
+            self.entries.clear();
+            self.generation = Some(generation);
+        }
+        self.entries.retain(|entry| entry.expires_at > now);
+    }
+
+    /// Both cache-hit paths must update LRU order without inserting duplicates.
+    fn touch(&mut self, key: &CacheKey) -> Option<&CacheEntry> {
+        let index = self.entries.iter().position(|entry| &entry.key == key)?;
+        let entry = self.entries.remove(index).expect("located cache entry");
+        self.entries.push_back(entry);
+        self.entries.back()
+    }
+}
+
 /// Small process-local route cache. It stores route metadata only, never request content.
 #[derive(Default)]
 pub struct AutoRouteCache {
@@ -186,16 +204,9 @@ impl AutoRouteCache {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.generation != Some(generation) {
-                state.entries.clear();
-                state.generation = Some(generation);
-            }
-            state.entries.retain(|entry| entry.expires_at > now);
-            if let Some(index) = state.entries.iter().position(|entry| entry.key == key) {
-                let entry = state.entries.remove(index).expect("located cache entry");
-                let steps = entry.steps.clone();
-                state.entries.push_back(entry);
-                return Ok(steps);
+            state.retain_valid(generation, now);
+            if let Some(entry) = state.touch(&key) {
+                return Ok(entry.steps.clone());
             }
         }
 
@@ -210,17 +221,9 @@ impl AutoRouteCache {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.generation != Some(generation) {
-            state.entries.clear();
-            state.generation = Some(generation);
-        }
-        state
-            .entries
-            .retain(|entry| entry.expires_at > Instant::now());
+        state.retain_valid(generation, Instant::now());
         // Concurrent cold misses for the same key must not evict other entries.
-        if let Some(index) = state.entries.iter().position(|entry| entry.key == key) {
-            let entry = state.entries.remove(index).expect("located cache entry");
-            state.entries.push_back(entry);
+        if state.touch(&key).is_some() {
             return Ok(steps);
         }
         if state.entries.len() >= AUTO_CACHE_CAPACITY {
@@ -276,33 +279,33 @@ pub fn auto_input_bytes(messages: Option<&Value>) -> usize {
     encoded_json_bytes(messages)
 }
 
+/// Shared legacy and request-aware safety margin; keep overflow behavior stable.
+fn with_context_safety_margin(bytes: usize) -> usize {
+    bytes.saturating_add(
+        bytes
+            .saturating_mul(CONTEXT_SAFETY_MARGIN_PERCENT)
+            .div_ceil(100),
+    )
+}
+
 /// Estimate the full serialized request budget, output allowance and 20% safety reserve.
 /// This deliberately overestimates tokens (one byte per token) rather than
 /// depending on a remote tokenizer or underestimating multilingual input.
 pub fn auto_context_estimate(request: &Value) -> usize {
     let bytes = encoded_json_bytes(Some(request));
-    let safety_margin = bytes
-        .saturating_mul(CONTEXT_SAFETY_MARGIN_PERCENT)
-        .div_ceil(100);
     let output_budget = request
         .get("max_completion_tokens")
         .or_else(|| request.get("max_tokens"))
         .and_then(Value::as_u64)
         .map(|tokens| tokens.min(usize::MAX as u64) as usize)
         .unwrap_or(1024);
-    bytes
-        .saturating_add(safety_margin)
-        .saturating_add(output_budget)
+    with_context_safety_margin(bytes).saturating_add(output_budget)
 }
 /// A small, transparent Auto V1: fixed configured priorities and a bounded
 /// length heuristic, not a black-box performance claim or remote-model ranking.
 /// The returned candidates use the SAME dispatch/failover loop as named chains.
 pub fn resolve_auto(config: &Config, input_bytes: usize) -> Result<Vec<ResolvedStep>, String> {
-    let context_estimate = input_bytes.saturating_add(
-        input_bytes
-            .saturating_mul(CONTEXT_SAFETY_MARGIN_PERCENT)
-            .div_ceil(100),
-    );
+    let context_estimate = with_context_safety_margin(input_bytes);
     resolve_auto_with_estimate(config, input_bytes, context_estimate, &[])
 }
 
@@ -312,11 +315,7 @@ pub fn resolve_auto_with_health(
     input_bytes: usize,
     penalties: &[u8],
 ) -> Result<Vec<ResolvedStep>, String> {
-    let context_estimate = input_bytes.saturating_add(
-        input_bytes
-            .saturating_mul(CONTEXT_SAFETY_MARGIN_PERCENT)
-            .div_ceil(100),
-    );
+    let context_estimate = with_context_safety_margin(input_bytes);
     resolve_auto_with_estimate(config, input_bytes, context_estimate, penalties)
 }
 
@@ -700,6 +699,57 @@ auto:
     }
 
     #[test]
+    fn legacy_and_request_aware_context_margin_preserve_boundary_behavior() {
+        for bytes in [0, 1, 4, 5, 99, 100, 101, usize::MAX / 20, usize::MAX] {
+            let original = bytes.saturating_add(
+                bytes
+                    .saturating_mul(CONTEXT_SAFETY_MARGIN_PERCENT)
+                    .div_ceil(100),
+            );
+            assert_eq!(with_context_safety_margin(bytes), original, "{bytes}");
+        }
+        let request =
+            serde_json::json!({"messages":[{"role":"user","content":"你好"}], "max_tokens":256});
+        let bytes = request.to_string().len();
+        assert_eq!(
+            auto_context_estimate(&request),
+            with_context_safety_margin(bytes) + 256,
+        );
+        let cfg: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://p.example
+    key_env: P
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: m
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        for bytes in [0, 1, 99, 100, 101, usize::MAX] {
+            let legacy = resolve_auto(&cfg, bytes).unwrap();
+            let health = resolve_auto_with_health(&cfg, bytes, &[]).unwrap();
+            let explicit =
+                resolve_auto_with_estimate(&cfg, bytes, with_context_safety_margin(bytes), &[])
+                    .unwrap();
+            let names = |steps: Vec<ResolvedStep>| {
+                steps.into_iter().map(|step| step.model).collect::<Vec<_>>()
+            };
+            assert_eq!(names(legacy), names(health), "{bytes}");
+            assert_eq!(
+                names(explicit),
+                names(resolve_auto(&cfg, bytes).unwrap()),
+                "{bytes}"
+            );
+        }
+    }
+
+    #[test]
     fn auto_boundary_and_priority_are_deterministic() {
         let cfg: Config = serde_yaml::from_str(
             r#"
@@ -1040,6 +1090,84 @@ auto:
         let state = cache.state.lock().unwrap();
         assert_eq!(state.entries.len(), 1);
         assert!(state.entries[0].expires_at > Instant::now());
+    }
+
+    #[test]
+    fn auto_cache_concurrent_cold_misses_and_lru_hits_do_not_duplicate_entries() {
+        use std::sync::{Arc, Barrier};
+        let cfg: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://p.example
+    key_env: P
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: m
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let cache = Arc::new(AutoRouteCache::new());
+        let cfg = Arc::new(cfg);
+        const WORKERS: usize = 16;
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        std::thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                let barrier = Arc::clone(&barrier);
+                let cfg = Arc::clone(&cfg);
+                let cache = Arc::clone(&cache);
+                scope.spawn(move || {
+                    barrier.wait();
+                    assert_eq!(
+                        cache
+                            .resolve(&cfg, 7, 9, AutoRequirements::default(), &[], 77)
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                });
+            }
+        });
+        {
+            let state = cache.state.lock().unwrap();
+            assert_eq!(state.entries.len(), 1);
+            assert_eq!(state.generation, Some(77));
+        }
+        for size in 0..AUTO_CACHE_CAPACITY {
+            cache
+                .resolve(&cfg, size, size, AutoRequirements::default(), &[], 78)
+                .unwrap();
+        }
+        // Touch oldest key, then insert another: key zero survives, key one is evicted.
+        cache
+            .resolve(&cfg, 0, 0, AutoRequirements::default(), &[], 78)
+            .unwrap();
+        cache
+            .resolve(
+                &cfg,
+                AUTO_CACHE_CAPACITY,
+                AUTO_CACHE_CAPACITY,
+                AutoRequirements::default(),
+                &[],
+                78,
+            )
+            .unwrap();
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.entries.len(), AUTO_CACHE_CAPACITY);
+        assert_eq!(state.generation, Some(78));
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .filter(|entry| entry.key.input_bytes == 0)
+                .count(),
+            1
+        );
+        assert!(!state.entries.iter().any(|entry| entry.key.input_bytes == 1));
     }
     #[test]
     fn auto_fallback_limit_rejects_zero_and_oversized_values() {
