@@ -62,6 +62,106 @@ fn definition(path: &Path, name: &str, model: &str) {
 }
 
 #[test]
+fn auto_discovery_rejects_mutations_that_would_break_the_next_restart() {
+    use guvna::gateway::AppState;
+    use std::collections::HashMap;
+
+    let (dir, config, data) = setup();
+    fs::write(
+        &config,
+        "providers:\n  - name: p\n    type: openai\n    base_url: https://example.org\n    key_env: KEY\n    models: [working]\nauto:\n  enabled: true\n  discover_from_chains: true\n",
+    )
+    .unwrap();
+    let source = dir.path().join("candidate.yaml");
+    definition(&source, "only-auto-chain", "working");
+    let source_name = source.to_str().unwrap();
+    assert!(success(&run(&config, &data, &["set", "--file", source_name])).contains("created"));
+    let before = fs::read(data.join("chains.yaml")).unwrap();
+    let loaded = Config::load(&config)
+        .unwrap()
+        .with_runtime_chains(&data)
+        .unwrap();
+    assert!(
+        AppState::new(
+            loaded,
+            HashMap::from([("KEY".to_owned(), "secret".to_owned())]),
+            vec!["client".to_owned()]
+        )
+        .is_ok(),
+        "an Auto configuration with only runtime-discovered candidates must start"
+    );
+
+    // A successful delete used to persist zero candidates and make the next
+    // AppState::new fail. Abort before both the live file and backup change.
+    failure(
+        &run(&config, &data, &["delete", "--name", "only-auto-chain"]),
+        "without eligible candidates",
+    );
+    assert_eq!(fs::read(data.join("chains.yaml")).unwrap(), before);
+    assert!(!data.join("chains.yaml.bak").exists());
+
+    // Replacing the last chain with a model absent from the provider catalog
+    // is structurally valid YAML but no longer a discoverable Auto candidate.
+    definition(&source, "only-auto-chain", "not-catalogued");
+    failure(
+        &run(&config, &data, &["set", "--file", source_name]),
+        "without eligible candidates",
+    );
+    assert_eq!(fs::read(data.join("chains.yaml")).unwrap(), before);
+    assert!(!data.join("chains.yaml.bak").exists());
+
+    // Restoring a clean but Auto-unstartable backup must not replace a valid
+    // live file or create a misleading forensic copy.
+    let missing = dir.path().join("unstartable.yaml");
+    fs::write(&missing, "version: 1\nchains: []\n").unwrap();
+    failure(
+        &run(
+            &config,
+            &data,
+            &["recover", "--from", missing.to_str().unwrap()],
+        ),
+        "without eligible candidates",
+    );
+    assert_eq!(fs::read(data.join("chains.yaml")).unwrap(), before);
+    assert!(fs::read_dir(&data).unwrap().all(|file| {
+        !file
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("before-recovery")
+    }));
+
+    // A separate explicit Auto candidate is sufficient. With one configured,
+    // deleting the last runtime-discovered candidate remains legitimate.
+    let explicit = dir.path().join("explicit.yaml");
+    fs::write(
+        &explicit,
+        "providers:\n  - name: p\n    type: openai\n    base_url: https://example.org\n    key_env: KEY\nauto:\n  enabled: true\n  discover_from_chains: true\n  candidates:\n    - provider: p\n      model: fixed\n",
+    )
+    .unwrap();
+    assert!(
+        success(&run(
+            &explicit,
+            &data,
+            &["delete", "--name", "only-auto-chain"]
+        ))
+        .contains("deleted")
+    );
+    let reloaded = Config::load(&explicit)
+        .unwrap()
+        .with_runtime_chains(&data)
+        .unwrap();
+    assert!(
+        AppState::new(
+            reloaded,
+            HashMap::from([("KEY".to_owned(), "secret".to_owned())]),
+            vec!["client".to_owned()]
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn cli_set_replace_delete_and_corrupt_recovery_preserve_every_original_byte() {
     let (dir, config, data) = setup();
     let static_list = success(&run(&config, &data, &["list"]));

@@ -205,6 +205,27 @@ fn serialize(state: &RuntimeChains) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Guard the persistent restart contract before writing a changed chains.yaml.
+/// AppState rejects enabled Auto with zero materialized candidates at boot;
+/// allowing the last discoverable chain to be deleted would leave a running
+/// daemon apparently healthy but unable to restart. Explicit candidates
+/// remain valid even when no runtime chains are present.
+fn ensure_restartable_auto(config: &Config, runtime: &RuntimeChains) -> Result<(), String> {
+    if !config.auto.enabled {
+        return Ok(());
+    }
+    let mut effective = config.clone();
+    effective.chains.extend(runtime.chains.iter().cloned());
+    effective.discover_auto_candidates();
+    if effective.auto.candidates.is_empty() {
+        return Err(
+            "chain mutation would leave enabled Auto without eligible candidates; chains.yaml unchanged"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn preserve_original(dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -310,6 +331,7 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
                 state.chains.push(chain);
                 false
             };
+            ensure_restartable_auto(config, &state)?;
             let next = serialize(&state)?;
             if let Some(bytes) = &original {
                 atomic_write(&directory.join("chains.yaml.bak"), bytes)?;
@@ -335,6 +357,7 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
                     "runtime chain {name:?} not found; config.yaml chains are read-only"
                 ));
             }
+            ensure_restartable_auto(config, &state)?;
             let next = serialize(&state)?;
             if let Some(bytes) = &original {
                 atomic_write(&directory.join("chains.yaml.bak"), bytes)?;
@@ -351,6 +374,7 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
             let incoming = read_limited(&backup)?
                 .ok_or_else(|| format!("recovery source {} not found", backup.display()))?;
             let validated = validate_data(Some(&incoming), config)?;
+            ensure_restartable_auto(config, &validated)?;
             let next = serialize(&validated)?;
             // Preserve even a corrupt original byte-for-byte and report its
             // name. Never rewrite a failed recovery source or the live file.

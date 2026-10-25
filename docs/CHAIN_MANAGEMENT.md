@@ -111,6 +111,13 @@ with a restart warning, preserving existing behavior. No TCP control route
 or Web backend exists. Chain names from static config remain read-only.
 With `auto.discover_from_chains: true`, online chain additions and deletions
 also rebuild the bounded Auto candidate set in the same published generation.
+Before changing `chains.yaml` (offline or online), set/delete/recover verify
+that enabled Auto would still have at least one eligible discovered or explicit
+candidate on the next boot. Removing or replacing the **last** discoverable
+candidate is rejected *without changing the live file or its backup*. This
+prevents a successful runtime edit from silently making the daemon unable to
+restart. Explicit configured Auto candidates allow all runtime chains to be
+removed safely.
 Explicit Auto candidates remain unchanged. The Auto route cache uses that
 generation to discard obsolete entries; retained provider/model health scores
 follow their exact identities even when candidate indexes shift. In-flight
