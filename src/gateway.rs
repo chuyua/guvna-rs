@@ -271,6 +271,15 @@ impl AppState {
             for (index, candidate) in self.config.auto.candidates.iter().enumerate() {
                 let provider_label = Telemetry::normalize_label(&candidate.provider);
                 let model_label = Telemetry::normalize_label(&candidate.model);
+                // Sanitized/truncated labels are not injective. An unsafe
+                // candidate must never inherit another model's persisted
+                // health, even if its normalized key appears in SQLite.
+                if provider_label != candidate.provider
+                    || model_label != candidate.model
+                    || candidate.model == "passthrough"
+                {
+                    continue;
+                }
                 if let Some(snapshot) = restored
                     .iter()
                     .find(|item| item.provider == provider_label && item.model == model_label)
@@ -761,6 +770,68 @@ auto:
         state.mark_auto_success(0, "unstable");
         assert_eq!(health.penalties(), vec![80, 0]);
     }
+
+    #[test]
+    fn normalized_model_collision_cannot_restore_wrong_auto_candidate_health() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("telemetry")).unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE provider_health(
+                provider TEXT NOT NULL, model TEXT NOT NULL,
+                penalty INTEGER NOT NULL, consecutive_failures INTEGER NOT NULL,
+                demoted INTEGER NOT NULL, last_failure_ts INTEGER NOT NULL,
+                last_success_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL,
+                identity_verified INTEGER NOT NULL,
+                PRIMARY KEY(provider, model)
+             );",
+        )
+        .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        db.execute(
+            "INSERT INTO provider_health VALUES('p','model_a',100,3,1,?1,0,?1,1)",
+            [now],
+        )
+        .unwrap();
+        drop(db);
+        let config: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://example.test
+    key_env: K
+    models: ["model a", model_a]
+auto:
+  enabled: true
+  health_aware: true
+  candidates:
+    - provider: p
+      model: "model a"
+    - provider: p
+      model: model_a
+"#,
+        )
+        .unwrap();
+        let mut state = AppState::new(
+            config,
+            HashMap::from([("K".to_owned(), "test-key".to_owned())]),
+            vec!["client".to_owned()],
+        )
+        .unwrap();
+        state.enable_telemetry(dir.path()).unwrap();
+        assert_eq!(
+            state.auto_health.as_ref().unwrap().penalties(),
+            vec![0, 100],
+            "only the exact unmodified model_a may inherit verified health"
+        );
+    }
+
     #[test]
     fn retry_after_parser_caps_valid_hints_but_rejects_overflow() {
         let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
