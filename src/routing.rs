@@ -51,12 +51,23 @@ pub fn auto_requirements(request: &Value) -> AutoRequirements {
         .get("tools")
         .and_then(Value::as_array)
         .is_some_and(|tools| !tools.is_empty())
+        // A required/named tool choice is a hard capability constraint even
+        // if the caller supplied no usable tools array.
+        || request.get("tool_choice").is_some_and(|choice| match choice {
+            Value::String(value) => !matches!(value.as_str(), "auto" | "none"),
+            Value::Null => false,
+            _ => true,
+        })
         || request
             .get("messages")
             .and_then(Value::as_array)
             .is_some_and(|messages| {
                 messages.iter().any(|message| {
-                    message.get("tool_calls").is_some()
+                    message.get("tool_calls").is_some_and(|calls| match calls {
+                        Value::Array(calls) => !calls.is_empty(),
+                        Value::Null => false,
+                        _ => true,
+                    })
                         || message.get("role").and_then(Value::as_str) == Some("tool")
                 })
             });
@@ -1088,6 +1099,55 @@ auto:
             !auto_requirements(&serde_json::json!({"messages":[{"role":"user","content":"hi"}]}))
                 .tools
         );
+    }
+    #[test]
+    fn tool_choice_and_null_history_do_not_bypass_or_overconstrain_auto() {
+        let null_history = serde_json::json!({"messages":[{"role":"assistant","tool_calls":null}]});
+        let empty_history = serde_json::json!({"messages":[{"role":"assistant","tool_calls":[]}]});
+        assert!(!auto_requirements(&null_history).tools);
+        assert!(!auto_requirements(&empty_history).tools);
+
+        for choice in [
+            serde_json::json!("required"),
+            serde_json::json!({"type":"function","function":{"name":"lookup"}}),
+            serde_json::json!("unrecognized_choice"),
+        ] {
+            let request = serde_json::json!({"tool_choice":choice});
+            assert!(auto_requirements(&request).tools);
+        }
+        for choice in ["none", "auto"] {
+            assert!(!auto_requirements(&serde_json::json!({"tool_choice":choice})).tools);
+        }
+        let historical = serde_json::json!({"messages":[{"role":"assistant",
+            "tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}]});
+        assert!(auto_requirements(&historical).tools);
+        assert!(
+            auto_requirements(&serde_json::json!({
+                "messages":[{"role":"assistant","tool_calls":"malformed"}]
+            }))
+            .tools
+        );
+
+        let config: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: https://example.invalid\n    key_env: K\nauto:\n  enabled: true\n  candidates:\n    - provider: p\n      model: text\n      supports_tools: false\n    - provider: p\n      model: tool\n      supports_tools: true\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let selected = resolve_auto_with_requirements(
+            &config,
+            10,
+            100,
+            auto_requirements(&serde_json::json!({"tool_choice":"required"})),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].model, "tool");
+        let selected =
+            resolve_auto_with_requirements(&config, 10, 100, auto_requirements(&null_history), &[])
+                .unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].model, "text");
     }
     #[test]
     fn optional_go_capability_registry_and_local_overrides_filter_safely() {
