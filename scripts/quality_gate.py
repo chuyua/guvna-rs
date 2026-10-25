@@ -22,6 +22,13 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+# Eight simultaneous 7 MiB request bodies already exceed the standard 48 MiB
+# transient RSS budget before JSON parsing or transport buffers are counted.
+# Keep the ordinary 48 MiB pressure-wave gate unchanged; independently cap
+# this documented near-limit payload scenario, including retained idle RSS.
+LARGE_PAYLOAD_MAX_PEAK_RSS_MIB = 256
+LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB = 128
+
 
 class Stub(ThreadingHTTPServer):
     daemon_threads = True
@@ -1245,7 +1252,8 @@ def verify_release_large_payload_memory(binary: str, root: str, env: dict) -> di
     """Exercise the real release binary with eight concurrent near-limit JSON bodies.
 
     Keep this in a separate process from the normal 48 MiB RSS wave so the
-    large-payload peak has its own explicit, measured budget.
+    large-payload peak has its own explicit, measured budget. The ordinary
+    small-request 48 MiB limit remains enforced in the parent process.
     """
     upstream = Stub("healthy")
     upstream.response_delay = 0.5
@@ -1310,12 +1318,16 @@ chains:
         check(upstream.calls == 8,
               f"large-payload upstream attempts {upstream.calls} != 8")
         usage = proc_info(proc.pid)
-        check(usage["VmHWM"] <= 384 * 1024,
-              f"eight concurrent 7 MiB requests exceeded 384 MiB peak RSS: {usage['VmHWM'] / 1024:.1f} MiB")
+        check(usage["VmHWM"] <= LARGE_PAYLOAD_MAX_PEAK_RSS_MIB * 1024,
+              f"eight concurrent 7 MiB requests exceeded {LARGE_PAYLOAD_MAX_PEAK_RSS_MIB} MiB peak RSS: {usage['VmHWM'] / 1024:.1f} MiB")
+        check(usage["VmRSS"] <= LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB * 1024,
+              f"eight concurrent 7 MiB requests retained more than {LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB} MiB RSS: {usage['VmRSS'] / 1024:.1f} MiB")
         check(usage["fd"] <= 32, "large-payload gate leaked file descriptors")
         check(usage["Threads"] <= 32, "large-payload gate leaked threads")
         return {"passed": True, "payload_bytes": len(payload), "concurrent_requests": 8,
                 "successes": statuses.count(200), "peak_rss_mib": round(usage["VmHWM"] / 1024, 2),
+                "peak_limit_mib": LARGE_PAYLOAD_MAX_PEAK_RSS_MIB,
+                "retained_limit_mib": LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB,
                 "rss_after_kib": usage["VmRSS"], "fds": usage["fd"],
                 "threads": usage["Threads"]}
     finally:

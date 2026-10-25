@@ -9,7 +9,7 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 const MAX_CACHE: usize = 32;
 const MAX_REQUEST: usize = 8192;
@@ -32,6 +32,9 @@ pub struct AutoDecider {
     timeout: Duration,
     ttl: Duration,
     cache: Mutex<VecDeque<Cache>>,
+    // Never hold the cache mutex across an upstream request. One permit
+    // still bounds speculative and foreground selector traffic globally.
+    refresh: Semaphore,
 }
 
 impl AutoDecider {
@@ -67,12 +70,13 @@ impl AutoDecider {
             ttl: Duration::from_secs(settings.cache_ttl_secs),
             client,
             cache: Mutex::new(VecDeque::new()),
+            refresh: Semaphore::new(1),
         }))
     }
 
     /// SSE must never wait for a remote selector. Return a verified fresh or
     /// bounded stale ranking immediately, and signal whether background
-    /// refresh is needed. A busy cache lock means another refresh is running.
+    /// refresh is needed. A busy cache lock fails open without awaiting.
     pub fn cached_rank(
         &self,
         steps: &[ResolvedStep],
@@ -89,9 +93,13 @@ impl AutoDecider {
         let now = Instant::now();
         cache.retain(|entry| entry.stale > now);
         let key = ranking_key(steps, input_bytes, estimated_tokens, requirements);
+        let can_refresh = self.refresh.available_permits() != 0;
         match cache.iter().find(|entry| entry.key == key) {
-            Some(entry) => (apply_order(steps, &entry.order), entry.fresh <= now),
-            None => (None, true),
+            Some(entry) => (
+                apply_order(steps, &entry.order),
+                entry.fresh <= now && can_refresh,
+            ),
+            None => (None, can_refresh),
         }
     }
 
@@ -120,11 +128,35 @@ impl AutoDecider {
         {
             return apply_order(steps, &entry.order);
         }
-        let stale = previous.map(|entry| entry.order.clone());
+        let stale = previous.map(|entry| (entry.order.clone(), entry.stale));
+        drop(entries);
+        // Reject concurrent refreshes without queuing them. The cache remains
+        // readable while an upstream model is slow or unresponsive.
+        let Ok(_refresh) = self.refresh.try_acquire() else {
+            return stale
+                .filter(|(_, expiry)| *expiry > Instant::now())
+                .and_then(|(order, _)| apply_order(steps, &order));
+        };
+        // Another request may have populated this key after our first read.
+        let mut entries = self.cache.lock().await;
+        entries.retain(|entry| entry.stale > Instant::now());
+        if let Some(entry) = entries.iter().find(|entry| entry.key == key)
+            && entry.fresh > Instant::now()
+        {
+            return apply_order(steps, &entry.order);
+        }
+        let stale = entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| (entry.order.clone(), entry.stale))
+            .or(stale);
+        drop(entries);
         if let Some(order) = self
             .fetch(cfg, steps, input_bytes, estimated_tokens, requirements)
             .await
         {
+            let mut entries = self.cache.lock().await;
+            entries.retain(|entry| entry.stale > Instant::now());
             entries.retain(|entry| entry.key != key);
             if entries.len() >= MAX_CACHE {
                 entries.pop_front();
@@ -137,7 +169,9 @@ impl AutoDecider {
             });
             return apply_order(steps, &order);
         }
-        stale.and_then(|order| apply_order(steps, &order))
+        stale
+            .filter(|(_, expiry)| *expiry > Instant::now())
+            .and_then(|(order, _)| apply_order(steps, &order))
     }
 
     async fn fetch(
@@ -249,6 +283,145 @@ fn ranking_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn slow_refresh_does_not_hide_stale_rank_or_queue_network_fetches() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::sync::Notify;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let server = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post({
+                let calls = Arc::clone(&calls);
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                move || {
+                    let calls = Arc::clone(&calls);
+                    let entered = Arc::clone(&entered);
+                    let release = Arc::clone(&release);
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) != 0 {
+                            entered.notify_one();
+                            release.notified().await;
+                        }
+                        axum::Json(json!({"choices":[{"message":{"content":"{\"order\":[1,0]}"}}]}))
+                    }
+                }
+            }),
+        );
+        let server_task = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+        let mut config: Config = serde_yaml::from_str(&format!(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{address}
+    key_env: K
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: one
+    - provider: p
+      model: two
+  decider:
+    enabled: true
+    provider: p
+    model: ranker
+    timeout_ms: 2000
+    cache_ttl_secs: 30
+"#
+        ))
+        .unwrap();
+        config.validate().unwrap();
+        let config = Arc::new(config);
+        let decider = Arc::new(
+            AutoDecider::from_config(
+                &config,
+                &HashMap::from([("K".to_owned(), "fake-key".to_owned())]),
+                reqwest::Client::new(),
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        let steps = vec![
+            ResolvedStep {
+                provider_index: 0,
+                model: "one".into(),
+                params: Default::default(),
+            },
+            ResolvedStep {
+                provider_index: 0,
+                model: "two".into(),
+                params: Default::default(),
+            },
+        ];
+        let features = AutoRequirements::default();
+        assert_eq!(
+            decider
+                .rank(&config, &steps, 12, 23, features)
+                .await
+                .unwrap()[0]
+                .model,
+            "two"
+        );
+        {
+            let mut cache = decider.cache.lock().await;
+            cache.front_mut().unwrap().fresh = Instant::now() - Duration::from_millis(1);
+        }
+        let active_decider = Arc::clone(&decider);
+        let active_config = Arc::clone(&config);
+        let active_steps = steps.clone();
+        let task = tokio::spawn(async move {
+            active_decider
+                .rank(&active_config, &active_steps, 12, 23, features)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("second fetch should reach mock upstream");
+        let (cached, refresh) = decider.cached_rank(&steps, 12, 23, features);
+        assert_eq!(cached.unwrap()[0].model, "two");
+        assert!(!refresh, "in-flight request must not spawn duplicate fetch");
+        let (unknown, refresh) = decider.cached_rank(
+            &steps,
+            12,
+            23,
+            AutoRequirements::from_signals(false, true, false),
+        );
+        assert!(unknown.is_none());
+        assert!(!refresh, "another cache key must not queue a second fetch");
+        let duplicate = tokio::time::timeout(
+            Duration::from_millis(100),
+            decider.rank(&config, &steps, 12, 23, features),
+        )
+        .await
+        .expect("concurrent request should fail open using stale cache");
+        assert_eq!(duplicate.unwrap()[0].model, "two");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()[0]
+                .model,
+            "two",
+        );
+        let (fresh, refresh) = decider.cached_rank(&steps, 12, 23, features);
+        assert_eq!(fresh.unwrap()[0].model, "two");
+        assert!(!refresh);
+        server_task.abort();
+    }
+
     #[tokio::test]
     async fn direct_decider_network_rank_is_cached_without_sending_prompts() {
         use std::sync::{
