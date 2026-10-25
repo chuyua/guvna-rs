@@ -136,7 +136,8 @@ fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
         {
             proposed_matches_final += 1;
         }
-        let actual = if *stream == 1 {
+        let actual = if *stream == 1 && matches!(outcome.as_str(), "stream_started" | "success") {
+            // A 2xx response or SSE headers alone cannot certify completion.
             // Terminal for another candidate cannot certify this stream.
             attempt
                 .and_then(|index| terminals.get(&(id.clone(), index)))
@@ -145,6 +146,8 @@ fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
                         .then_some(terminal_outcome.as_str())
                 })
         } else {
+            // A stream request rejected before headers has a real failure
+            // outcome on its request row, even without an SSE terminal.
             Some(outcome.as_str())
         };
         match actual {
@@ -463,6 +466,8 @@ mod tests {
             ("stream_ok", Some("a"), 1, 0),
             ("wrong_terminal", Some("b"), 1, 1),
             ("failed", None, 0, 0),
+            ("preheader_failure", Some("b"), 1, 1),
+            ("unverified_success", Some("b"), 1, 1),
         ] {
             db.execute(
                 "INSERT INTO shadow_events VALUES(?1,?2,'p','a','p',?3,?4,?5)",
@@ -477,6 +482,8 @@ mod tests {
             ("stream_ok", "a", 1, 1, "stream_started"),
             ("wrong_terminal", "a", 1, 1, "stream_started"),
             ("failed", "a", 1, 1, "stream_started"),
+            ("preheader_failure", "a", 1, 1, "provider_5xx"),
+            ("unverified_success", "a", 1, 1, "success"),
         ] {
             db.execute(
                 "INSERT INTO request_events VALUES(?1,'p',?2,15,?3,?4,?5,?3,?6)",
@@ -499,13 +506,13 @@ mod tests {
         }
         let result = read_scoring(dir.path(), 1).unwrap();
         let observed = &result["shadow_metrics"]["observed_actual_sample"];
-        assert_eq!(observed["sampled_shadow_rows"], 7);
-        assert_eq!(observed["linked_actual_requests"], 6);
+        assert_eq!(observed["sampled_shadow_rows"], 9);
+        assert_eq!(observed["linked_actual_requests"], 8);
         assert_eq!(observed["unlinked_actual_requests"], 1);
         assert_eq!(observed["actual_completed"], 3);
-        assert_eq!(observed["actual_failed"], 1);
+        assert_eq!(observed["actual_failed"], 2);
         assert_eq!(observed["actual_client_cancelled"], 1);
-        assert_eq!(observed["actual_stream_pending_or_unobserved"], 1);
+        assert_eq!(observed["actual_stream_pending_or_unobserved"], 2);
         assert_eq!(observed["actual_fallbacks"], 1);
         assert_eq!(observed["baseline_first_choice_successes"], 2);
         assert_eq!(observed["proposed_top_matches_actual_final_route"], 2);
@@ -520,7 +527,7 @@ mod tests {
             .unwrap();
         }
         let bounded = read_scoring(dir.path(), 1).unwrap();
-        assert_eq!(bounded["shadow_metrics"]["evaluations"], 307);
+        assert_eq!(bounded["shadow_metrics"]["evaluations"], 309);
         assert_eq!(
             bounded["shadow_metrics"]["observed_actual_sample"]["sampled_shadow_rows"],
             256

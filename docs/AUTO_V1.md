@@ -334,7 +334,9 @@ Local guvna status --scoring includes shadow_metrics.observed_actual_sample:
 a maximum of 256 recent shadow rows correlated with up to 512 real terminal
 request rows and 512 SSE terminal observations. Only a matching SSE terminal
 success with matching request ID, attempt, provider and model counts as a
-completed stream; response headers alone do not.
+completed stream; response headers alone do not. A stream request rejected
+before headers retains its explicit request-row failure even without a terminal
+callback; an unverified success still remains pending.
 Completed, failed, cancelled, pending and unlinked actual requests, actual
 fallbacks and first-choice successes are separated. A proposed model
 matching the actual final route is NOT a counterfactual success claim:
