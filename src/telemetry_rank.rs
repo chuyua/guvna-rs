@@ -143,9 +143,7 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
                 |row| row.get(0),
             )
             .ok()?;
-        if recent.is_none() {
-            return None;
-        }
+        recent?;
         scores.push((index, score));
     }
     scores.sort_by(|(index_a, score_a), (index_b, score_b)| {
@@ -205,6 +203,13 @@ auto:
         cfg.auto.telemetry_ranking.window_hours = 1;
         cfg.auto.telemetry_ranking.max_snapshot_age_secs = 1;
         assert!(cfg.validate().is_err());
+        cfg.auto.telemetry_ranking.max_snapshot_age_secs = 300;
+        cfg.auto.decider.enabled = true;
+        cfg.auto.decider.provider = "p".into();
+        cfg.auto.decider.model = "ranker".into();
+        assert!(cfg.validate().is_err(), "two active rankers must not race");
+        cfg.auto.decider.shadow_only = true;
+        assert!(cfg.validate().is_ok(), "advisory shadow may coexist");
     }
 
     #[test]
@@ -269,6 +274,16 @@ auto:
         steps.reverse();
         assert!(!rank.rank(&cfg, &mut steps, true));
         assert_eq!(steps[0].model, "first");
+        // A refresh task that dies or stalls cannot leave old approval live.
+        {
+            let mut guard = rank.current.write().unwrap();
+            guard.as_mut().unwrap().loaded =
+                Instant::now() - MAX_SNAPSHOT_LIFETIME - Duration::from_secs(1);
+        }
+        assert!(!rank.active());
+        assert!(!rank.rank(&cfg, &mut steps, false));
+        rank.set(load(dir.path(), &cfg));
+        assert!(rank.active());
         conn.execute(
             "UPDATE request_events SET ts=?1 WHERE model='second'",
             params![now - 1000],
