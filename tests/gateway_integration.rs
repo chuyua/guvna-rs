@@ -96,6 +96,16 @@ async fn upstream(State(state): State<UpstreamState>, request: Request<Body>) ->
             "missingtoolcalls" => completion["choices"][0]["finish_reason"] = json!("tool_calls"),
             "wrongtoolcalls" => completion["choices"][0]["message"]["tool_calls"] = json!("bad"),
             "nulltoolcalls" => completion["choices"][0]["message"]["tool_calls"] = Value::Null,
+            "truncatedtool" | "filteredtool" => {
+                completion["choices"][0]["finish_reason"] = if mode == "truncatedtool" {
+                    json!("length")
+                } else {
+                    json!("content_filter")
+                };
+                completion["choices"][0]["message"] = json!({"role":"assistant","content":null,
+                    "tool_calls":[{"id":"call_partial","type":"function",
+                        "function":{"name":"lookup","arguments":"{\"partial\":"}}]});
+            }
             _ => unreachable!(),
         }
         return (StatusCode::OK, axum::Json(completion)).into_response();
@@ -2056,6 +2066,32 @@ fn responses_stream_req(payload: Value) -> Request<Body> {
         .header("content-type", "application/json")
         .body(Body::from(payload.to_string()))
         .unwrap()
+}
+
+#[tokio::test]
+async fn responses_incomplete_tool_arguments_survive_the_real_dispatch_path() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&url, &url);
+    for (marker, reason) in [
+        ("truncatedtool", "max_output_tokens"),
+        ("filteredtool", "content_filter"),
+    ] {
+        let (status, response) = call(
+            router.clone(),
+            responses_stream_req(json!({
+                "model":"demo",
+                "input":format!("invalidchat:{marker}")
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["incomplete_details"]["reason"], reason);
+        assert_eq!(response["output"][0]["type"], "function_call");
+        assert_eq!(response["output"][0]["status"], "incomplete");
+        assert_eq!(response["output"][0]["arguments"], r#"{"partial":"#);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
 const RESP_START_A: &[u8] = b"data: {\"id\":\"chat1\",\"created\":123,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",";
