@@ -553,9 +553,17 @@ auto:
             json!({"order":["0",1]}),
             json!({"order":[0,1,2]}),
             json!({"order":[]}),
+            json!({"order":[-1,0]}),
+            json!({"order":[0.5,1]}),
+            json!({"order":[null,1]}),
+            json!({"order":[true,1]}),
+            json!({"order":[18446744073709551615_u64,0]}),
         ] {
             assert!(validate_order(&bad, 2).is_none(), "{bad}");
         }
+        // Reject oversized permutations even if all indices are otherwise valid.
+        let oversized = json!({"order": (0..33).collect::<Vec<_>>()});
+        assert!(validate_order(&oversized, 33).is_none());
     }
     #[test]
     fn cache_key_fences_candidate_and_capability_changes() {
