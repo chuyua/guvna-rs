@@ -6,7 +6,7 @@ use std::{
     fs, io,
     os::unix::{
         ffi::OsStrExt,
-        fs::{FileTypeExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     sync::Arc,
@@ -45,15 +45,11 @@ impl ControlSocket {
         let newly_created = !data_dir.exists();
         fs::create_dir_all(data_dir)
             .map_err(|error| format!("create local control directory: {error}"))?;
-        let directory_metadata = fs::symlink_metadata(data_dir)
-            .map_err(|error| format!("inspect local control directory: {error}"))?;
-        if !directory_metadata.file_type().is_dir() {
-            return Err("GUVNA_DATA_DIR must be a real directory, not a symlink".into());
-        }
         if newly_created {
             fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700))
                 .map_err(|error| format!("secure local control directory: {error}"))?;
         }
+        ensure_private_control_directory(data_dir)?;
         ensure_socket_available(&path).await?;
         let listener = UnixListener::bind(&path)
             .map_err(|error| format!("bind local control socket {}: {error}", path.display()))?;
@@ -115,6 +111,24 @@ fn socket_path(data_dir: &Path) -> Result<PathBuf, String> {
         );
     }
     Ok(path)
+}
+
+fn ensure_private_control_directory(data_dir: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(data_dir)
+        .map_err(|error| format!("inspect local control directory: {error}"))?;
+    if !metadata.file_type().is_dir() {
+        return Err("GUVNA_DATA_DIR must be a real directory, not a symlink".into());
+    }
+    // A writable parent lets another local UID unlink/rebind even a 0600
+    // socket. A spoofed daemon could then capture CLI mutations or status
+    // responses. Preserve safe existing permissions; reject unsafe ones.
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+        return Err(
+            "local control directory must be owned by the service UID and not group/world writable"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 async fn ensure_socket_available(path: &Path) -> Result<(), String> {
@@ -331,6 +345,7 @@ async fn query_request(
         }
         Ok(_) => {}
     }
+    ensure_private_control_directory(data_dir)?;
     let mut stream = match timeout(CONTROL_TIMEOUT, UnixStream::connect(&path)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => {
@@ -459,6 +474,53 @@ mod tests {
         let _ = server.await;
         assert!(!socket.exists());
     }
+
+    #[tokio::test]
+    async fn insecure_existing_control_directory_rejects_daemon_and_spoofed_client() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(SOCKET_NAME);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let config: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: http://127.0.0.1:1\n    key_env: K\n",
+        )
+        .unwrap();
+        let state = Arc::new(
+            AppState::new(
+                config.clone(),
+                HashMap::from([("K".to_owned(), "test-key".to_owned())]),
+                vec!["client-key".to_owned()],
+            )
+            .unwrap(),
+        );
+        for mode in [0o777, 0o770] {
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
+            let error = query(dir.path()).await.unwrap_err();
+            assert!(error.contains("not group/world writable"), "{error}");
+            let error = spawn(dir.path(), Arc::clone(&state), Arc::new(config.clone()))
+                .await
+                .expect_err("daemon must reject an unsafe pre-existing control directory");
+            assert!(error.contains("not group/world writable"), "{error}");
+            assert!(socket.exists(), "must not unlink someone else's socket");
+        }
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_control_directory(dir.path()).unwrap();
+        drop(listener);
+    }
+
+    #[test]
+    fn symlinked_control_directory_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        assert!(
+            ensure_private_control_directory(&link)
+                .unwrap_err()
+                .contains("not a symlink")
+        );
+    }
+
     #[tokio::test]
     async fn online_chain_mutations_update_live_routes_without_touching_static_routes() {
         use guvna::{config::Config, routing};
