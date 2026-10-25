@@ -326,7 +326,17 @@ pub(super) async fn aggregate(
         let bytes = match tokio::time::timeout(STREAM_IDLE, upstream.chunk()).await {
             Err(_) => return Err(AggregateError::IdleTimeout),
             Ok(Err(_)) => return Err(AggregateError::UpstreamTransport),
-            Ok(Ok(None)) => return Err(AggregateError::InvalidStream),
+            Ok(Ok(None)) => {
+                // Some OpenAI-compatible SSE servers end cleanly at EOF
+                // after every choice's finish_reason without the optional
+                // [DONE] sentinel. Match direct Chat streaming behavior,
+                // but never accept a partial line, event or unfinished choice.
+                if parser.finalize_on_eof().is_none() {
+                    return Err(AggregateError::InvalidStream);
+                }
+                parser.finish().map_err(|_| ())?;
+                break;
+            }
             Ok(Ok(Some(bytes))) => bytes,
         };
         if bytes.len() > MAX_CHUNK_BYTES {

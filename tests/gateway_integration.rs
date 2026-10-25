@@ -4377,6 +4377,42 @@ async fn sse_only_large_usage_metadata_is_included_in_output_budget() {
 }
 
 #[tokio::test]
+async fn sse_only_complete_eof_without_done_matches_direct_streaming_but_rejects_partial() {
+    let (url, calls, forced_stream) =
+        start_strict_stream_only(vec![SSE_START.to_vec(), SSE_END.to_vec()]).await;
+    let (backup, backup_calls) = start_upstream(StatusCode::OK).await;
+    let router = app_with_stream_only_and_auto(&url, &backup, false);
+
+    let (status, answer) = call(router.clone(), request("ordered", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["choices"][0]["message"]["content"], "hi");
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+
+    let streamed = router
+        .oneshot(request("ordered", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(streamed.status(), StatusCode::OK);
+    let body = to_bytes(streamed.into_body(), 1 << 20).await.unwrap();
+    assert!(body.ends_with(b"data: [DONE]\n\n"), "{body:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(forced_stream.load(Ordering::SeqCst), 2);
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+
+    // A clean TCP EOF alone must never make a missing finish_reason a success.
+    let (partial_url, partial_calls, _) = start_strict_stream_only(vec![SSE_START.to_vec()]).await;
+    let (status, fallback) = call(
+        app_with_stream_only_and_auto(&partial_url, &backup, false),
+        request("ordered", "", "client"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fallback}");
+    assert_eq!(fallback["choices"][0]["message"]["content"], "success");
+    assert_eq!(partial_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn stream_only_provider_completes_nonstream_chat_with_fragmented_sse_and_tool_arguments() {
     let frames = vec![
         br#"data: {"id":"chat-123","model":"stream-model","created":45,"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}
