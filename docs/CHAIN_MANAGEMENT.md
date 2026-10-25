@@ -109,4 +109,13 @@ passthrough model names remain excluded from verified model-health evidence.
 CLI operations without a running control socket still update offline files,
 with a restart warning, preserving existing behavior. No TCP control route
 or Web backend exists. Chain names from static config remain read-only.
-Auto candidates discovered at startup are not live-updated until a restart.
+With `auto.discover_from_chains: true`, online chain additions and deletions
+also rebuild the bounded Auto candidate set in the same published generation.
+Explicit Auto candidates remain unchanged. The Auto route cache uses that
+generation to discard obsolete entries; retained provider/model health scores
+follow their exact identities even when candidate indexes shift. In-flight
+requests and SSE streams keep their admission-time health snapshot, while
+newly discovered candidates begin with neutral in-memory health. The optional
+SQLite telemetry ranker refuses stale candidate generations until its next
+background refresh; Decider's cache key includes the eligible candidate set.
+No restart, remote management endpoint, or second dispatch loop is required.

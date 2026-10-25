@@ -379,7 +379,8 @@ async fn dispatch_inner(
     }
     // A request owns the named-chain generation used for routing and
     // telemetry. Later local CLI mutations cannot relabel its outcome.
-    let route_snapshot = state.route_snapshot();
+    let live = state.live_snapshot();
+    let route_snapshot = Arc::clone(&live.config);
     // Keep byte-range eligibility and context-window budgeting separate.
     // The context estimate includes the full request, output allowance and safety reserve.
     let mut steps = match if auto_enabled {
@@ -388,23 +389,23 @@ async fn dispatch_inner(
         let (min_context, max_context) = auto_bounds.expect("Auto bounds validated");
         let requirements =
             routing::auto_requirements(&request).with_context_bounds(min_context, max_context);
-        let penalties = state
+        let penalties = live
             .auto_health
             .as_ref()
             .map(|health| health.penalties())
             .unwrap_or_default();
         let mut resolved = state.auto_route_cache.resolve(
-            &state.config,
+            &route_snapshot,
             input_bytes,
             context_estimate,
             requirements,
             &penalties,
-            state.auto_generation,
+            live.auto_generation,
         );
         if matches!(&resolved, Ok(steps) if steps.is_empty())
             && !caller_context_bound
             && routing::auto_operator_default_can_degrade(
-                &state.config,
+                &route_snapshot,
                 input_bytes,
                 context_estimate,
                 requirements,
@@ -413,12 +414,12 @@ async fn dispatch_inner(
             // Keep context-length budgeting and capability hard filters intact.
             // A second bounded cache lookup cannot issue network requests.
             resolved = state.auto_route_cache.resolve(
-                &state.config,
+                &route_snapshot,
                 input_bytes,
                 context_estimate,
                 requirements.with_context_bounds(0, None),
                 &penalties,
-                state.auto_generation,
+                live.auto_generation,
             );
             auto_bounds = Some((0, None));
         }
@@ -447,11 +448,11 @@ async fn dispatch_inner(
     if auto_enabled && let Some(rank) = &state.auto_telemetry_rank {
         // A live health demotion takes precedence over historical scoring.
         // Ranking only reorders the already-eligible bounded candidate walk.
-        let penalized = state
+        let penalized = live
             .auto_health
             .as_ref()
             .is_some_and(|health| health.penalties().iter().any(|value| *value > 0));
-        rank.rank(&state.config, &mut steps, penalized);
+        rank.rank(&route_snapshot, &mut steps, penalized, live.auto_generation);
     }
 
     if auto_enabled && let Some(decider) = &state.auto_decider {
@@ -568,8 +569,8 @@ async fn dispatch_inner(
         }
     }
 
-    if auto_enabled && let Some(health) = &state.auto_health {
-        preserve_auto_health_priority(&state.config, &mut steps, &health.penalties());
+    if auto_enabled && let Some(health) = &live.auto_health {
+        preserve_auto_health_priority(&route_snapshot, &mut steps, &health.penalties());
     }
 
     let mut permit = Some(admission);
@@ -835,7 +836,7 @@ async fn dispatch_inner(
                         Metrics::inc(&state.metrics.credential_quarantines);
                     }
                     record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                    state.mark_auto_failure(step.provider_index, &step.model);
+                    state.mark_auto_failure_in(&live, step.provider_index, &step.model);
                     if let Some(context) = telemetry_context.as_mut() {
                         context.set_failure_type("timeout");
                     }
@@ -851,7 +852,7 @@ async fn dispatch_inner(
                         Metrics::inc(&state.metrics.credential_quarantines);
                     }
                     record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                    state.mark_auto_failure(step.provider_index, &step.model);
+                    state.mark_auto_failure_in(&live, step.provider_index, &step.model);
                     if let Some(context) = telemetry_context.as_mut() {
                         context.set_failure_type("transport_error");
                     }
@@ -881,7 +882,7 @@ async fn dispatch_inner(
                 }
                 if outcome == Outcome::RateLimited && !rate_limit_health_recorded {
                     rate_limit_health_recorded = true;
-                    state.mark_auto_failure(step.provider_index, &step.model);
+                    state.mark_auto_failure_in(&live, step.provider_index, &step.model);
                 }
                 continue; // try a different key; each key is attempted once
             }
@@ -900,6 +901,7 @@ async fn dispatch_inner(
                         chat_stream::StreamRoute {
                             provider_index: step.provider_index,
                             model: step.model.clone(),
+                            live: Arc::clone(&live),
                             telemetry_model: state
                                 .telemetry_model_name_in(
                                     &route_snapshot,
@@ -929,7 +931,7 @@ async fn dispatch_inner(
                             Metrics::inc(&state.metrics.upstream_invalid_responses);
                             ops_log::warn("stream_preflight_failure");
                             record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                            state.mark_auto_failure(step.provider_index, &step.model);
+                            state.mark_auto_failure_in(&live, step.provider_index, &step.model);
                             if let Some(context) = telemetry_context.as_mut() {
                                 context.set_failure_type("invalid_response");
                             }
@@ -1003,7 +1005,7 @@ async fn dispatch_inner(
                     {
                         state.pools[step.provider_index].record_success(&lease);
                         record_circuit_success(&mut circuit_ticket, &state.metrics);
-                        state.mark_auto_success(step.provider_index, &step.model);
+                        state.mark_auto_success_in(&live, step.provider_index, &step.model);
                         Metrics::inc(&state.metrics.upstream_success);
                         if upstream_stream && !streaming {
                             Metrics::inc(&state.metrics.aggregation_completed);
@@ -1034,7 +1036,7 @@ async fn dispatch_inner(
                                 Metrics::inc(&state.metrics.credential_quarantines);
                             }
                             record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                            state.mark_auto_failure(step.provider_index, &step.model);
+                            state.mark_auto_failure_in(&live, step.provider_index, &step.model);
                         }
                         if let Some(context) = telemetry_context.as_mut() {
                             context.set_failure_type("timeout");
@@ -1072,7 +1074,7 @@ async fn dispatch_inner(
                         // service has failed. Avoid cascading breaker opens.
                         if !(upstream_stream && !streaming) || aggregation_upstream_transport {
                             record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                            state.mark_auto_failure(step.provider_index, &step.model);
+                            state.mark_auto_failure_in(&live, step.provider_index, &step.model);
                         }
                         if let Some(context) = telemetry_context.as_mut() {
                             context.set_failure_type(if aggregation_transient_failure {
@@ -1125,7 +1127,7 @@ async fn dispatch_inner(
                 if state.pools[step.provider_index].record(&lease, outcome) {
                     Metrics::inc(&state.metrics.credential_quarantines);
                 }
-                state.mark_auto_failure(step.provider_index, &step.model);
+                state.mark_auto_failure_in(&live, step.provider_index, &step.model);
             }
             if outcome.blame_provider() {
                 record_circuit_failure(&mut circuit_ticket, &state.metrics);
