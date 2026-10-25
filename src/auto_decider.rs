@@ -317,7 +317,7 @@ mod tests {
             }),
         );
         let server_task = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
-        let mut config: Config = serde_yaml::from_str(&format!(
+        let config: Config = serde_yaml::from_str(&format!(
             r#"
 providers:
   - name: p
