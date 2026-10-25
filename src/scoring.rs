@@ -33,11 +33,24 @@ type StreamOutcomeCounts = HashMap<(String, String), (i64, i64)>;
 fn confirmed_chat_stream_outcomes(
     conn: &Connection,
     since: i64,
+    targets: &[(String, String)],
 ) -> Result<StreamOutcomeCounts, String> {
     let mut outcomes = HashMap::new();
+    if targets.is_empty() {
+        return Ok(outcomes);
+    }
+    // Only the at-most-32 candidates selected by the hourly summary are
+    // needed. Grouping every historical provider/model into a HashMap made
+    // a local scoring read grow with unrelated telemetry cardinality.
+    let filter = vec!["(?,?)"; targets.len()].join(",");
+    let mut args = vec![rusqlite::types::Value::Integer(since)];
+    for (provider, model) in targets {
+        args.push(rusqlite::types::Value::Text(provider.clone()));
+        args.push(rusqlite::types::Value::Text(model.clone()));
+    }
     // Pre-migration databases may not have the terminal or trace columns.
     // In that case we conservatively exclude stream starts from scoring.
-    let Ok(mut stmt) = conn.prepare(
+    let Ok(mut stmt) = conn.prepare(&format!(
         "SELECT t.provider,t.model,t.outcome,COUNT(*)
          FROM request_events r
          JOIN stream_terminals t
@@ -46,12 +59,13 @@ fn confirmed_chat_stream_outcomes(
            AND r.stream_requested=1 AND r.failure_type='stream_started'
            AND r.provider=t.provider AND r.model=t.model
            AND t.outcome IN ('success','transport_error')
-         GROUP BY t.provider,t.model,t.outcome",
-    ) else {
+           AND (t.provider,t.model) IN ({filter})
+         GROUP BY t.provider,t.model,t.outcome"
+    )) else {
         return Ok(outcomes);
     };
     let rows = stmt
-        .query_map(params![since], |row| {
+        .query_map(rusqlite::params_from_iter(args.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -334,7 +348,6 @@ fn read_scoring_inner(
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|_| "cannot prepare telemetry summary")?;
-    let stream_outcomes = confirmed_chat_stream_outcomes(&conn, since)?;
     let rows = stmt
         .query_map(rusqlite::params_from_iter(args.iter()), |row| {
             Ok((
@@ -349,7 +362,14 @@ fn read_scoring_inner(
                 row.get::<_, i64>(8)?,
             ))
         })
-        .map_err(|_| "cannot read telemetry summary")?;
+        .map_err(|_| "cannot read telemetry summary")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| "malformed telemetry summary row")?;
+    let targets = rows
+        .iter()
+        .map(|row| (row.0.clone(), row.1.clone()))
+        .collect::<Vec<_>>();
+    let stream_outcomes = confirmed_chat_stream_outcomes(&conn, since, &targets)?;
     let mut candidates = Vec::new();
     for record in rows {
         let (
@@ -362,7 +382,7 @@ fn read_scoring_inner(
             confirmed_successes,
             provider_failures,
             stream_starts,
-        ) = record.map_err(|_| "malformed telemetry summary row")?;
+        ) = record;
         let attempts = attempts.max(0);
         let failures = failures.clamp(0, attempts);
         let (stream_successes, stream_failures) = stream_outcomes
@@ -984,6 +1004,34 @@ mod tests {
             [now],
         )
         .unwrap();
+        // Many unrelated streaming models must not inflate the memory used
+        // by a scoped scoring read or contaminate the selected model's score.
+        for i in 0..64 {
+            let model = format!("unrelated-{i}");
+            let id = format!("unrelated-trace-{i}");
+            db.execute(
+                "INSERT INTO request_events VALUES(?1,'chat','p',?2,10,1,?3,1,1,'stream_started')",
+                params![now, model, id],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO stream_terminals VALUES(?1,?2,1,'p',?3,'success')",
+                params![now, id, model],
+            )
+            .unwrap();
+        }
+        let outcomes =
+            confirmed_chat_stream_outcomes(&db, now - 3600, &[("p".into(), "m".into())]).unwrap();
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "unrelated stream outcomes must not be retained"
+        );
+        assert_eq!(outcomes.get(&("p".into(), "m".into())), Some(&(20, 1)));
+        let scoped =
+            read_scoring_for_candidates(dir.path(), 1, &[("p".into(), "m".into())]).unwrap();
+        assert_eq!(scoped["candidate_count"], 1);
+        assert_eq!(scoped["candidates"][0]["confirmed_stream_successes"], 20);
         let result = read_scoring(dir.path(), 1).unwrap();
         assert_eq!(result["candidate_count"], 1);
         let chat = &result["candidates"][0];
