@@ -46,7 +46,10 @@ fn read_limited(path: &Path) -> Result<Option<Vec<u8>>, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        // A regular file can be replaced with a FIFO after the pathname
+        // check. O_NONBLOCK makes that swap fail without hanging the daemon.
+        // It has no effect on normal regular-file reads.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = match options.open(path) {
         Ok(file) => file,
@@ -168,7 +171,11 @@ fn lock_directory(data_dir: &Path) -> Result<(PathBuf, File), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+        // O_NONBLOCK also prevents a FIFO swapped into the lock pathname
+        // from stalling a writer before the inode type can be verified.
+        options
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .mode(0o600);
     }
     let lock = options
         .open(&path)
@@ -424,6 +431,42 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
 mod lock_security_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn fifo_is_rejected_without_waiting_for_a_writer() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("chains.yaml");
+        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(
+            read_limited(&fifo)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+        // Simulate the result of an attacker replacing a regular file with
+        // this FIFO between lstat and open. The open must not block.
+        let mut opts = OpenOptions::new();
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let opened = opts.open(&fifo).unwrap();
+        assert!(!opened.metadata().unwrap().file_type().is_file());
+        let lock = dir.path().join(".chains.yaml.lock");
+        let lock_name = CString::new(lock.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(lock_name.as_ptr(), 0o600) }, 0);
+        assert!(
+            lock_directory(dir.path())
+                .unwrap_err()
+                .contains("non-regular")
+        );
+        let mut opts = OpenOptions::new();
+        opts.read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let opened = opts.open(&lock).unwrap();
+        assert!(!opened.metadata().unwrap().file_type().is_file());
+    }
 
     #[test]
     fn shared_writable_lock_file_is_rejected() {

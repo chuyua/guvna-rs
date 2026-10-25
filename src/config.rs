@@ -473,11 +473,14 @@ impl Config {
             if !self.auto.enabled
                 || d.model.is_empty()
                 || d.model == "auto"
-                || !self.providers.iter().any(|p| p.name == d.provider)
+                || !self
+                    .providers
+                    .iter()
+                    .any(|p| p.name == d.provider && !p.stream_only)
                 || !(100..=2_000).contains(&d.timeout_ms)
                 || !(1..=120).contains(&d.cache_ttl_secs)
             {
-                return Err("auto decider requires enabled Auto, a valid provider/model, timeout_ms 100..2000, cache_ttl_secs 1..120".into());
+                return Err("auto decider requires enabled Auto, a non-stream-only provider, valid model, timeout_ms 100..2000, cache_ttl_secs 1..120".into());
             }
         }
         if self.auto.health_aware && !self.auto.enabled {
@@ -758,6 +761,7 @@ auto:
                 "provider: missing\n    model: ranker",
             ),
             base.replace("model: ranker", "model: auto"),
+            base.replace("key_env: K", "key_env: K\n    stream_only: true"),
             base.replace("model: ranker", "model: ranker\n    timeout_ms: 5"),
             base.replace(
                 "enabled: true\n  candidates:",

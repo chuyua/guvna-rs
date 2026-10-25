@@ -231,6 +231,9 @@ impl AppState {
             .map_err(|e| format!("building HTTP client: {e}"))?;
         let auto_decider =
             AutoDecider::from_config(&config, &credentials, client.clone())?.map(Arc::new);
+        if config.auto.decider.enabled && auto_decider.is_none() {
+            crate::ops_log::warn("auto_decider_disabled_no_key");
+        }
         let auto_route_cache = AutoRouteCache::new();
         let live = Arc::new(LiveRouteSnapshot::new(config.clone(), None));
         Ok(Self {

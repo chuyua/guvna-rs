@@ -4495,6 +4495,54 @@ auto:
 }
 
 #[tokio::test]
+async fn missing_optional_decider_key_does_not_block_auto_or_gateway_boot() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: business
+    type: openai
+    base_url: {url}
+    key_env: BUSINESS_KEY
+  - name: selector
+    type: openai
+    base_url: http://127.0.0.1:1
+    key_env: MISSING_SELECTOR_KEY
+auto:
+  enabled: true
+  candidates:
+    - provider: business
+      model: primary
+    - provider: business
+      model: secondary
+  decider:
+    enabled: true
+    provider: selector
+    model: ranker
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("BUSINESS_KEY".into(), "business-secret".into())]),
+        vec!["client".into()],
+    )
+    .expect("optional selector key must not prevent gateway startup"));
+    let (status, response) = call(
+        router,
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({"model":"auto","messages":[{"role":"user","content":"hello"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["choices"][0]["message"]["content"], "success");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn streaming_auto_never_waits_for_a_cold_llm_decider() {
     let (live, hits, _) = start_strict_stream_only(vec![
         SSE_START.to_vec(),

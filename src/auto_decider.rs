@@ -52,16 +52,17 @@ impl AutoDecider {
             .iter()
             .find(|p| p.name == settings.provider)
             .ok_or("Auto Decider provider is not configured")?;
-        let key = provider
-            .key_names()
-            .into_iter()
-            .find_map(|name| {
-                credentials
-                    .get(&name)
-                    .filter(|secret| !secret.is_empty())
-                    .cloned()
-            })
-            .ok_or("Auto Decider provider has no available key")?;
+        // The selector is optional. A temporarily missing selector key must
+        // not prevent the otherwise healthy gateway from starting; ordinary
+        // Auto routing continues with the deterministic candidate order.
+        let Some(key) = provider.key_names().into_iter().find_map(|name| {
+            credentials
+                .get(&name)
+                .filter(|secret| !secret.is_empty())
+                .cloned()
+        }) else {
+            return Ok(None);
+        };
         Ok(Some(Self {
             endpoint: provider.endpoint("/chat/completions"),
             model: settings.model.clone(),
@@ -207,13 +208,16 @@ impl AutoDecider {
                 {"role":"user","content":summary}
             ]
         });
+        // The summary is not the wire payload: system instructions and JSON
+        // escaping add bytes. Enforce the cap on the final encoded request.
+        let encoded = bounded_selector_body(&body)?;
         let req = self
             .client
             .post(&self.endpoint)
             .bearer_auth(&self.key)
             .timeout(self.timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(serde_json::to_vec(&body).ok()?);
+            .body(encoded);
         tokio::time::timeout(self.timeout, async {
             let mut response = req.send().await.ok()?;
             if !response.status().is_success()
@@ -238,6 +242,11 @@ impl AutoDecider {
         .ok()
         .flatten()
     }
+}
+
+fn bounded_selector_body(body: &Value) -> Option<Vec<u8>> {
+    let encoded = serde_json::to_vec(body).ok()?;
+    (encoded.len() <= MAX_REQUEST).then_some(encoded)
 }
 
 fn validate_order(value: &Value, count: usize) -> Option<Vec<usize>> {
@@ -284,6 +293,24 @@ fn ranking_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selector_request_cap_applies_to_complete_wire_json() {
+        assert!(bounded_selector_body(&json!({"model":"ranker"})).is_some());
+        // The inner summary fits but the complete wire request must not.
+        let summary = "x".repeat(MAX_REQUEST - 40);
+        assert!(summary.len() < MAX_REQUEST);
+        assert!(
+            bounded_selector_body(&json!({
+                "model":"ranker", "messages":[
+                    {"role":"system","content":"selector instructions"},
+                    {"role":"user","content":summary}
+                ]
+            }))
+            .is_none()
+        );
+        assert!(bounded_selector_body(&json!({"content":"\\".repeat(MAX_REQUEST / 2)})).is_none());
+    }
+
     #[tokio::test]
     async fn slow_refresh_does_not_hide_stale_rank_or_queue_network_fetches() {
         use std::sync::{
