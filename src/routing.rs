@@ -304,11 +304,11 @@ fn with_context_safety_margin(bytes: usize) -> usize {
 /// depending on a remote tokenizer or underestimating multilingual input.
 pub fn auto_context_estimate(request: &Value) -> usize {
     let bytes = encoded_json_bytes(Some(request));
-    let output_budget = request
-        .get("max_completion_tokens")
-        .or_else(|| request.get("max_tokens"))
-        .and_then(Value::as_u64)
+    let output_budget = ["max_completion_tokens", "max_tokens"]
+        .iter()
+        .filter_map(|name| request.get(name).and_then(Value::as_u64))
         .map(|tokens| tokens.min(usize::MAX as u64) as usize)
+        .max()
         .unwrap_or(1024);
     with_context_safety_margin(bytes).saturating_add(output_budget)
 }
@@ -441,11 +441,15 @@ fn auto_candidate_eligible_for_request(
             field_count += 1;
         }
     }
-    let output_budget = effective("max_completion_tokens")
-        .or_else(|| effective("max_tokens"))
-        .and_then(Value::as_u64)
-        .map(|tokens| tokens.min(usize::MAX as u64) as usize)
-        .unwrap_or(1024);
+    // Both aliases can be present when the caller uses one and a candidate
+    // default supplies the other. They are sent upstream as distinct fields;
+    // take the larger bound rather than assuming one silently overrides the
+    // other, which could admit a candidate far beyond its context window.
+    let budgets = ["max_completion_tokens", "max_tokens"]
+        .iter()
+        .filter_map(|name| effective(name).and_then(Value::as_u64))
+        .map(|tokens| tokens.min(usize::MAX as u64) as usize);
+    let output_budget = budgets.max().unwrap_or(1024);
     let context_estimate =
         with_context_safety_margin(effective_request_bytes).saturating_add(output_budget);
     let tools = requirements.tools
@@ -692,6 +696,16 @@ mod tests {
     use crate::config::Config;
     use serde_json::json;
     #[test]
+    fn dual_output_budget_fields_use_the_conservative_ceiling() {
+        let request = json!({"messages":[{"role":"user","content":"hi"}],
+            "max_tokens":10000,"max_completion_tokens":16});
+        let bytes = encoded_json_bytes(Some(&request));
+        assert_eq!(
+            auto_context_estimate(&request),
+            with_context_safety_margin(bytes).saturating_add(10000)
+        );
+    }
+    #[test]
     fn auto_candidate_defaults_respect_actual_wire_budget_and_caller_precedence() {
         let yaml = r#"
 providers:
@@ -733,6 +747,10 @@ auto:
         let caller_budget =
             json!({"model":"auto","messages":[{"role":"user","content":"hi"}],"max_tokens":64});
         assert_eq!(choose(&cfg, &caller_budget)[0].model, "default-large");
+        // An explicit *other* alias does not replace the candidate's
+        // max_tokens default on the wire; conservative eligibility counts both.
+        let other_alias = json!({"model":"auto","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":64});
+        assert_eq!(choose(&cfg, &other_alias)[0].model, "fallback");
 
         cfg.auto.candidates[0].params.remove("max_tokens");
         cfg.auto.candidates[0].supports_tools = Some(false);
