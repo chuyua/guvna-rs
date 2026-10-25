@@ -680,7 +680,10 @@ mod tests {
             Err("request_too_large")
         );
         let mut empty = std::io::Cursor::new(Vec::<u8>::new());
-        assert_eq!(read_line_bounded(&mut empty, 4096).await, Err("empty_request"));
+        assert_eq!(
+            read_line_bounded(&mut empty, 4096).await,
+            Err("empty_request")
+        );
     }
 
     #[tokio::test]
