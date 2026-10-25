@@ -320,7 +320,11 @@ async fn dispatch_inner(
     }
     let auto_enabled = model == "auto" && state.config.auto.enabled;
     let auto_bounds = if auto_enabled {
-        match routing::auto_context_bounds(&request, state.config.auto.use_model_registry) {
+        match routing::auto_context_bounds_with_default(
+            &request,
+            state.config.auto.use_model_registry,
+            state.config.auto.default_min_context,
+        ) {
             Ok(bounds) => Some(bounds),
             Err(message) => {
                 return error(StatusCode::BAD_REQUEST, "invalid_auto_context", message);

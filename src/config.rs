@@ -73,6 +73,8 @@ pub struct AutoConfig {
     pub decider: AutoDeciderConfig,
     /// Opt-in Go-compatible conservative context/vision capability estimates.
     pub use_model_registry: bool,
+    /// Optional Go-style service default; request min_context still takes precedence.
+    pub default_min_context: Option<usize>,
     pub capability_overrides: BTreeMap<String, ModelCapabilityOverride>,
     /// Opt-in, operator-approved SQLite-derived routing; never reads SQL per request.
     pub telemetry_ranking: TelemetryRankingConfig,
@@ -340,13 +342,26 @@ impl Provider {
     }
 }
 
+fn parse_auto_min_context_env(value: Option<&str>) -> Option<usize> {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0 && *value <= 16_777_216)
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self, String> {
         // Gate G01: explicit path only, with no HOME fallback.
         let src =
             fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-        let cfg: Self =
+        let mut cfg: Self =
             serde_yaml::from_str(&src).map_err(|e| format!("parsing {}: {e}", path.display()))?;
+        // Match Go's GUVNA_AUTO_MIN_CONTEXT operator override, captured once
+        // at configuration load rather than read on every request. Explicit
+        // YAML wins; invalid/zero environment values preserve old defaults.
+        if cfg.auto.default_min_context.is_none() {
+            cfg.auto.default_min_context =
+                parse_auto_min_context_env(std::env::var("GUVNA_AUTO_MIN_CONTEXT").ok().as_deref());
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -411,6 +426,13 @@ impl Config {
             .is_some_and(|limit| !(1..=32).contains(&limit))
         {
             return Err("auto max_candidates must be 1..=32".into());
+        }
+        if self
+            .auto
+            .default_min_context
+            .is_some_and(|value| value == 0 || value > 16_777_216)
+        {
+            return Err("auto default_min_context must be 1..=16777216".into());
         }
         if self
             .auto
@@ -789,6 +811,29 @@ chains:
         value["model"] = Value::String("physical".into());
         assert_eq!(value["seed"].as_u64(), Some(12_345_678_901_234_567_890));
         assert!(value.to_string().contains("12345678901234567890"));
+    }
+
+    #[test]
+    fn go_auto_min_context_environment_override_is_bounded_and_nonfatal() {
+        for invalid in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-9"),
+            Some("invalid"),
+            Some("16777217"),
+            Some("184467440737095516160"),
+        ] {
+            assert_eq!(parse_auto_min_context_env(invalid), None);
+        }
+        assert_eq!(parse_auto_min_context_env(Some(" 262144 ")), Some(262_144));
+        let config: Config = serde_yaml::from_str("auto: {default_min_context: 0}").unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("default_min_context")
+        );
     }
 
     #[test]

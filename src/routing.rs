@@ -94,6 +94,16 @@ pub fn auto_context_bounds(
     request: &Value,
     use_model_registry: bool,
 ) -> Result<(usize, Option<usize>), &'static str> {
+    auto_context_bounds_with_default(request, use_model_registry, None)
+}
+
+/// Request bounds override the service default; the default is not sent
+/// upstream and cannot relax an explicit caller-specified lower bound.
+pub fn auto_context_bounds_with_default(
+    request: &Value,
+    use_model_registry: bool,
+    default_min_context: Option<usize>,
+) -> Result<(usize, Option<usize>), &'static str> {
     fn bound(value: Option<&Value>) -> Result<Option<usize>, &'static str> {
         match value {
             None => Ok(None),
@@ -110,8 +120,8 @@ pub fn auto_context_bounds(
             _ => Err("context bounds must be integers"),
         }
     }
-    let min_context =
-        bound(request.get("min_context"))?.unwrap_or(if use_model_registry { 512 } else { 0 });
+    let min_context = bound(request.get("min_context"))?
+        .unwrap_or(default_min_context.unwrap_or(if use_model_registry { 512 } else { 0 }));
     let max_context = bound(request.get("max_context"))?;
     if max_context.is_some_and(|max| max < min_context) {
         return Err("max_context must be >= min_context");
@@ -499,6 +509,39 @@ pub fn resolve(config: &Config, logical_model: &str) -> Result<Vec<ResolvedStep>
 mod tests {
     use super::*;
     use crate::config::Config;
+    #[test]
+    fn go_service_min_context_default_respects_request_override_and_max_filter() {
+        let request = serde_json::json!({});
+        assert_eq!(
+            auto_context_bounds_with_default(&request, true, Some(262_144)),
+            Ok((262_144, None))
+        );
+        assert_eq!(
+            auto_context_bounds_with_default(
+                &serde_json::json!({"min_context": 8_192, "max_context": 16_384}),
+                true,
+                Some(262_144)
+            ),
+            Ok((8_192, Some(16_384)))
+        );
+        assert!(
+            auto_context_bounds_with_default(
+                &serde_json::json!({"max_context": 16_384}),
+                true,
+                Some(262_144)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            auto_context_bounds_with_default(
+                &serde_json::json!({"min_context": 0}),
+                false,
+                Some(2048)
+            ),
+            Ok((2048, None))
+        );
+    }
+
     #[test]
     fn go_auto_context_bound_parser_is_bounded_and_registry_opt_in() {
         assert_eq!(

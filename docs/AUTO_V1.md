@@ -294,3 +294,18 @@ SSE refresh is skipped when the slot is occupied; the next request may
 retry. This prevents speculative tasks from growing without bound under
 concurrency or a stalled selector. Direct non-streaming Decider requests
 continue to use the existing singleflight cache and bounded timeout.
+
+### Go-compatible operator default for min_context
+
+GUVNA_AUTO_MIN_CONTEXT sets a service-level minimum context window at
+configuration load (for example 262144), matching the Go operator knob.
+Alternatively set auto.default_min_context: 262144 in config.yaml; explicit
+YAML wins over the environment. The value must be 1..16777216; malformed,
+zero, negative or out-of-range environment values are ignored. A positive
+request min_context always overrides the service default, and max_context
+smaller than the effective minimum is rejected before dispatch. A request
+min_context of zero/negative means use the service default. Without either
+override, the existing Rust default remains unrestricted when the registry
+is disabled, or 512 with the registry enabled. Changes take effect on the
+next configuration load, not in-flight requests. No environment values are
+forwarded to the upstream.

@@ -3369,6 +3369,79 @@ auto:
 }
 
 #[tokio::test]
+async fn go_auto_operator_context_floor_can_be_overridden_per_request_without_upstream_leak() {
+    let (small, small_calls) = start_strict_auto_upstream().await;
+    let (large, large_calls) = start_strict_auto_upstream().await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: small
+    type: openai
+    base_url: {small}
+    key_env: SMALL_KEY
+    models: [short]
+  - name: large
+    type: openai
+    base_url: {large}
+    key_env: LARGE_KEY
+    models: [long]
+auto:
+  enabled: true
+  default_min_context: 8192
+  candidates:
+    - provider: small
+      model: short
+      max_context_tokens: 4096
+    - provider: large
+      model: long
+      max_context_tokens: 32768
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("SMALL_KEY".into(), "small-secret".into()),
+            ("LARGE_KEY".into(), "large-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let messages = json!([{"role":"user","content":"hello"}]);
+    for (path, bounds, expected) in [
+        ("/v1/auto", json!({}), "long"),
+        ("/v1/chat/completions", json!({"min_context":1024}), "short"),
+        ("/v1/auto", json!({"min_context":0}), "long"),
+        ("/v1/chat/completions", json!({"min_context":-1}), "long"),
+    ] {
+        let mut request = json!({"model":"auto","messages":messages});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(bounds.as_object().unwrap().clone());
+        let (status, response) = call(router.clone(), auto_request(path, "client", request)).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {response}");
+        assert_eq!(response["model"], expected, "{path}: {response}");
+    }
+    for bounds in [
+        json!({"max_context":4096}),
+        json!({"min_context":8192,"max_context":4096}),
+    ] {
+        let mut request = json!({"model":"auto","messages":messages});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(bounds.as_object().unwrap().clone());
+        let (status, response) =
+            call(router.clone(), auto_request("/v1/auto", "client", request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bounds}: {response}");
+        assert_eq!(response["error"]["code"], "invalid_auto_context");
+    }
+    assert_eq!(small_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(large_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
 async fn auto_without_eligible_candidate_returns_422_without_network_attempt() {
     let (url, hits) = start_upstream(StatusCode::OK).await;
     let config: Config = serde_yaml::from_str(&format!(
