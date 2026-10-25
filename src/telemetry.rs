@@ -466,6 +466,7 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
             status INTEGER NOT NULL,
             elapsed_ms INTEGER NOT NULL,
             sse_headers INTEGER NOT NULL CHECK (sse_headers IN (0,1)),
+            identity_verified INTEGER NOT NULL DEFAULT 0 CHECK (identity_verified IN (0,1)),
             failure_type TEXT NOT NULL CHECK (failure_type IN (
                 'success','stream_started','rate_limited','credential_error',
                 'caller_error','provider_4xx','provider_5xx','transport_error','invalid_response',
@@ -494,6 +495,7 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
             failure_count INTEGER NOT NULL,
             total_elapsed_ms INTEGER NOT NULL,
             max_elapsed_ms INTEGER NOT NULL,
+            identity_verified INTEGER NOT NULL DEFAULT 0 CHECK (identity_verified IN (0,1)),
             PRIMARY KEY (hour_ts, endpoint, provider, model, failure_type)
         );
         CREATE INDEX IF NOT EXISTS hourly_stats_ts ON hourly_stats(hour_ts);
@@ -546,6 +548,15 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
                     "ALTER TABLE {table} ADD COLUMN {column} {definition}"
                 ))?;
             }
+        }
+    }
+    // Older request and hourly aggregates contain only lossy labels.
+    // Fail closed for Auto ranking instead of treating them as exact IDs.
+    for table in ["request_events", "hourly_stats"] {
+        if !has_column(&conn, table, "identity_verified")? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 0"
+            ))?;
         }
     }
     // Old databases stored only lossy labels in provider_health. A migration
@@ -616,8 +627,8 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
     {
         let mut request = tx.prepare_cached(
             "INSERT INTO request_events
-             (ts,endpoint,provider,model,status,elapsed_ms,sse_headers,failure_type,request_id,attempt_index,stream_requested)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+             (ts,endpoint,provider,model,status,elapsed_ms,sse_headers,failure_type,request_id,attempt_index,stream_requested,identity_verified)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         )?;
         let mut failure = tx.prepare_cached(
             "INSERT INTO failure_events
@@ -626,13 +637,14 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
         )?;
         let mut hourly = tx.prepare_cached(
             "INSERT INTO hourly_stats
-             (hour_ts,endpoint,provider,model,failure_type,request_count,failure_count,total_elapsed_ms,max_elapsed_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8)
+             (hour_ts,endpoint,provider,model,failure_type,request_count,failure_count,total_elapsed_ms,max_elapsed_ms,identity_verified)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)
              ON CONFLICT(hour_ts,endpoint,provider,model,failure_type) DO UPDATE SET
              request_count=request_count+excluded.request_count,
              failure_count=failure_count+excluded.failure_count,
              total_elapsed_ms=total_elapsed_ms+excluded.total_elapsed_ms,
-             max_elapsed_ms=MAX(max_elapsed_ms,excluded.max_elapsed_ms)",
+             max_elapsed_ms=MAX(max_elapsed_ms,excluded.max_elapsed_ms),
+             identity_verified=MIN(hourly_stats.identity_verified,excluded.identity_verified)",
         )?;
         let mut shadow = tx.prepare_cached(
             "INSERT INTO shadow_events
@@ -708,6 +720,7 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                     event.request_id,
                     event.attempt_index,
                     i64::from(event.stream_requested),
+                    i64::from(event.health_observation),
                 ])?;
                 if is_failure(event) {
                     failure.execute(params![
@@ -733,6 +746,7 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                     i64::from(event.count_attempt),
                     i64::from(is_failure(event)),
                     event.elapsed_ms,
+                    i64::from(event.health_observation),
                 ])?;
             } else if is_failure(event) {
                 // Streaming starts are counted once at response creation. Record the
@@ -759,6 +773,7 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                     i64::from(event.count_attempt),
                     1_i64,
                     event.elapsed_ms,
+                    i64::from(event.health_observation),
                 ])?;
             }
             // Only actual SSE terminal callbacks enter this table. The initial
@@ -1642,6 +1657,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!((penalty, verified), (35, 1));
+    }
+
+    #[test]
+    fn colliding_hourly_scoring_evidence_fails_closed_without_losing_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.sqlite3");
+        let mut conn = open_database(&path).unwrap();
+        let now = now_secs();
+        let mut events = (0..20)
+            .map(|_| event(now, "p", "model_a", 200, 10, "success"))
+            .collect::<Vec<_>>();
+        let mut collision = event(now, "p", "model a", 200, 10, "success");
+        collision.health_observation = false;
+        events.push(collision);
+        write_batch(&mut conn, &events).unwrap();
+        let (total, verified): (i64, i64) = conn
+            .query_row(
+                "SELECT request_count,identity_verified FROM hourly_stats
+                 WHERE provider='p' AND model='model_a' AND failure_type='success'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((total, verified), (21, 0));
+        let (trusted, untrusted): (i64, i64) = conn
+            .query_row(
+                "SELECT SUM(identity_verified),SUM(1-identity_verified)
+                 FROM request_events WHERE provider='p' AND model='model_a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((trusted, untrusted), (20, 1));
+        // The 20 valid samples cannot override one ambiguous aggregate;
+        // the CLI still sees all 21 diagnostic requests.
+        drop(conn);
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(data_dir.path().join("telemetry")).unwrap();
+        std::fs::copy(&path, data_dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        let scoped = crate::scoring::read_scoring_for_candidates(
+            data_dir.path(),
+            1,
+            &[("p".into(), "model_a".into())],
+        )
+        .unwrap();
+        assert_eq!(scoped["candidate_count"], 0);
+        let diagnostic = crate::scoring::read_scoring(data_dir.path(), 1).unwrap();
+        assert_eq!(diagnostic["candidates"][0]["attempts"], 21);
+    }
+
+    #[test]
+    fn old_hourly_evidence_stays_unverified_after_new_exact_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-hourly.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        let now = now_secs();
+        let hour = now - now.rem_euclid(3600);
+        db.execute_batch(
+            "CREATE TABLE hourly_stats(
+                hour_ts INTEGER,endpoint TEXT,provider TEXT,model TEXT,
+                failure_type TEXT,request_count INTEGER,failure_count INTEGER,
+                total_elapsed_ms INTEGER,max_elapsed_ms INTEGER,
+                PRIMARY KEY(hour_ts,endpoint,provider,model,failure_type)
+            );",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO hourly_stats VALUES (?1,'chat','p','model_a','success',200,0,2000,10)",
+            [hour],
+        )
+        .unwrap();
+        drop(db);
+        let mut conn = open_database(&path).unwrap();
+        write_batch(&mut conn, &[event(now, "p", "model_a", 200, 10, "success")]).unwrap();
+        let (total, verified): (i64, i64) = conn
+            .query_row(
+                "SELECT request_count,identity_verified FROM hourly_stats
+                 WHERE provider='p' AND model='model_a' AND failure_type='success'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((total, verified), (201, 0));
     }
 
     #[test]

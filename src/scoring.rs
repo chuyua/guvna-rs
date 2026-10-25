@@ -34,6 +34,7 @@ fn confirmed_chat_stream_outcomes(
     conn: &Connection,
     since: i64,
     targets: &[(String, String)],
+    verified_only: bool,
 ) -> Result<StreamOutcomeCounts, String> {
     let mut outcomes = HashMap::new();
     if targets.is_empty() {
@@ -43,6 +44,11 @@ fn confirmed_chat_stream_outcomes(
     // needed. Grouping every historical provider/model into a HashMap made
     // a local scoring read grow with unrelated telemetry cardinality.
     let filter = vec!["(?,?)"; targets.len()].join(",");
+    let verified_filter = if verified_only {
+        "AND r.identity_verified=1"
+    } else {
+        ""
+    };
     let mut args = vec![rusqlite::types::Value::Integer(since)];
     for (provider, model) in targets {
         args.push(rusqlite::types::Value::Text(provider.clone()));
@@ -59,7 +65,7 @@ fn confirmed_chat_stream_outcomes(
            AND r.stream_requested=1 AND r.failure_type='stream_started'
            AND r.provider=t.provider AND r.model=t.model
            AND t.outcome IN ('success','transport_error')
-           AND (t.provider,t.model) IN ({filter})
+           AND (t.provider,t.model) IN ({filter}) {verified_filter}
          GROUP BY t.provider,t.model,t.outcome"
     )) else {
         return Ok(outcomes);
@@ -324,6 +330,13 @@ fn read_scoring_inner(
     } else {
         "AND 1=0"
     };
+    // Historical and colliding diagnostic labels cannot establish an
+    // operator-approved automatic routing score.
+    let verified_filter = if candidates.is_some() {
+        "AND identity_verified=1"
+    } else {
+        ""
+    };
     let candidate_filter = match candidates {
         Some([]) => "AND 1=0".to_owned(),
         Some(candidates) => format!(
@@ -348,7 +361,7 @@ fn read_scoring_inner(
                     THEN MIN(request_count,failure_count) ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN failure_type='stream_started' THEN request_count ELSE 0 END),0)
          FROM hourly_stats
-         WHERE hour_ts >= ?1 AND provider != 'unknown' {chat_filter} {candidate_filter}
+         WHERE hour_ts >= ?1 AND provider != 'unknown' {chat_filter} {candidate_filter} {verified_filter}
          GROUP BY provider,model
          ORDER BY COALESCE(SUM(request_count),0) DESC,provider,model
          LIMIT 32"
@@ -377,7 +390,8 @@ fn read_scoring_inner(
         .iter()
         .map(|row| (row.0.clone(), row.1.clone()))
         .collect::<Vec<_>>();
-    let stream_outcomes = confirmed_chat_stream_outcomes(&conn, since, &targets)?;
+    let stream_outcomes =
+        confirmed_chat_stream_outcomes(&conn, since, &targets, candidates.is_some())?;
     let mut candidates = Vec::new();
     for record in rows {
         let (
@@ -417,7 +431,7 @@ fn read_scoring_inner(
         };
         let latency_sql = format!(
             "SELECT elapsed_ms,sse_headers FROM request_events
-             WHERE provider=?1 AND model=?2 AND ts >= ?3 {latency_filter}
+             WHERE provider=?1 AND model=?2 AND ts >= ?3 {latency_filter} {verified_filter}
              ORDER BY ts DESC LIMIT 512"
         );
         let mut sample_stmt = conn
@@ -478,14 +492,16 @@ fn read_scoring_inner(
     {
         let (traced, fallback, first_nonstream, first_success): (i64, i64, i64, i64) = conn
             .query_row(
-                "SELECT COUNT(DISTINCT request_id),
+                &format!(
+                    "SELECT COUNT(DISTINCT request_id),
                         COUNT(DISTINCT CASE WHEN attempt_index > 1 THEN request_id END),
                         COUNT(DISTINCT CASE WHEN stream_requested = 0 THEN request_id END),
                         COUNT(DISTINCT CASE WHEN attempt_index = 1 AND stream_requested = 0
                                             AND failure_type = 'success' THEN request_id END)
                  FROM request_events
                  WHERE ts >= ?1 AND endpoint='chat'
-                   AND request_id IS NOT NULL AND attempt_index IS NOT NULL",
+                   AND request_id IS NOT NULL AND attempt_index IS NOT NULL {verified_filter}"
+                ),
                 params![since],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -1120,13 +1136,22 @@ mod tests {
             .unwrap();
         }
         let outcomes =
-            confirmed_chat_stream_outcomes(&db, now - 3600, &[("p".into(), "m".into())]).unwrap();
+            confirmed_chat_stream_outcomes(&db, now - 3600, &[("p".into(), "m".into())], false)
+                .unwrap();
         assert_eq!(
             outcomes.len(),
             1,
             "unrelated stream outcomes must not be retained"
         );
         assert_eq!(outcomes.get(&("p".into(), "m".into())), Some(&(20, 1)));
+        // A legacy database remains readable for diagnostics, but cannot
+        // supply trusted candidate scores without provenance markers.
+        assert!(read_scoring_for_candidates(dir.path(), 1, &[("p".into(), "m".into())]).is_err());
+        db.execute_batch(
+            "ALTER TABLE hourly_stats ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 1;
+             ALTER TABLE request_events ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 1;",
+        )
+        .unwrap();
         let scoped =
             read_scoring_for_candidates(dir.path(), 1, &[("p".into(), "m".into())]).unwrap();
         assert_eq!(scoped["candidate_count"], 1);

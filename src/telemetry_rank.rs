@@ -131,6 +131,7 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
         // cannot be trusted as an identity for automatic routing.
         if Telemetry::normalize_label(&candidate.provider) != candidate.provider
             || Telemetry::normalize_label(&candidate.model) != candidate.model
+            || candidate.model == "passthrough"
         {
             return None;
         }
@@ -151,7 +152,7 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
             .query_row(
                 "SELECT MAX(ts) FROM request_events
              WHERE provider=?1 AND model=?2 AND ts BETWEEN ?3 AND ?4
-             AND endpoint='chat'
+             AND endpoint='chat' AND identity_verified=1
              AND failure_type IN ('success','provider_5xx','transport_error',
                  'invalid_response','timeout','upstream_unavailable')",
                 params![candidate.provider, candidate.model, since, now],
@@ -166,6 +167,7 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
                    ON r.request_id=t.request_id AND r.attempt_index=t.attempt_index
                  WHERE t.provider=?1 AND t.model=?2 AND t.ts BETWEEN ?3 AND ?4
                    AND r.endpoint='chat' AND r.stream_requested=1
+                   AND r.identity_verified=1
                    AND r.failure_type='stream_started'
                    AND r.provider=t.provider AND r.model=t.model
                    AND t.outcome IN ('success','transport_error')",
@@ -294,6 +296,28 @@ auto:
             .unwrap();
         }
         let cfg = config();
+        // Pre-migration aggregates have no identity proof. Even 40+ apparent
+        // successes and a recent request must not authorize Auto reordering.
+        assert!(load(dir.path(), &cfg).is_none());
+        conn.execute_batch(
+            "ALTER TABLE hourly_stats ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 1;
+             ALTER TABLE request_events ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 1;",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE request_events SET identity_verified=0 WHERE model='second'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            load(dir.path(), &cfg).is_none(),
+            "an unverified recent request must not satisfy the freshness gate"
+        );
+        conn.execute(
+            "UPDATE request_events SET identity_verified=1 WHERE model='second'",
+            [],
+        )
+        .unwrap();
         let order = load(dir.path(), &cfg).unwrap();
         assert_eq!(order[0].1, "second");
         let rank = TelemetryRank::new(Some(order));
