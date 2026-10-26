@@ -679,23 +679,27 @@ async fn dispatch_inner(
             // slow selector use up all the time reserved for business
             // candidates. Leave up to 250ms (or half a tiny budget) to make
             // the first real upstream attempt after falling back.
-            let selection = decider.rank(
-                &route_snapshot,
-                &steps,
-                input_bytes,
-                context_estimate,
-                requirements,
-                live.auto_generation,
-            );
-            let proposed = if let Some(deadline) = walk_deadline {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                let reserve = (remaining / 2).min(Duration::from_millis(250));
-                tokio::time::timeout_at(deadline - reserve, selection)
-                    .await
-                    .ok()
-                    .flatten()
-            } else {
-                None
+            let proposed = {
+                // Drop the future (and its immutable borrow of steps) before
+                // moving the owned candidate list according to its result.
+                let selection = decider.rank(
+                    &route_snapshot,
+                    &steps,
+                    input_bytes,
+                    context_estimate,
+                    requirements,
+                    live.auto_generation,
+                );
+                if let Some(deadline) = walk_deadline {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let reserve = (remaining / 2).min(Duration::from_millis(250));
+                    tokio::time::timeout_at(deadline - reserve, selection)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                }
             };
             if let Some(order) = proposed {
                 auto_decider::apply_cached_order(&mut steps, &order);
