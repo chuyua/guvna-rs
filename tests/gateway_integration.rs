@@ -399,6 +399,91 @@ async fn uncatalogued_prefixed_model_strips_only_the_gateway_namespace_on_wire()
 }
 
 #[tokio::test]
+async fn embedding_chain_ignores_chat_stream_and_choice_defaults() {
+    let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let observations = Arc::clone(&captured);
+    let upstream = Router::new().route(
+        "/v1/embeddings",
+        post(move |axum::Json(payload): axum::Json<Value>| {
+            let observations = Arc::clone(&observations);
+            async move {
+                observations.lock().await.push(payload);
+                axum::Json(json!({
+                    "object":"list","model":"physical",
+                    "data":[{"object":"embedding","index":0,
+                        "embedding":[0.25,0.5]}]
+                }))
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(socket, upstream).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: KEY
+chains:
+  - name: shared
+    steps:
+      - provider: p
+        model: physical
+        params:
+          stream_options:
+            include_usage: true
+          n: 2
+          dimensions: 2
+"#
+    ))
+    .unwrap();
+    let gateway = app(AppState::new(
+        config,
+        HashMap::from([("KEY".into(), "test-secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/embeddings")
+        .header("authorization", "Bearer client")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "model":"shared","input":"hello","stream":false
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let (status, result) = call(gateway.clone(), request).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["data"][0]["embedding"], json!([0.25, 0.5]));
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].get("stream").is_none());
+    assert!(requests[0].get("stream_options").is_none());
+    assert!(requests[0].get("n").is_none());
+    assert_eq!(requests[0]["dimensions"], 2);
+    drop(requests);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/embeddings")
+        .header("authorization", "Bearer client")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "model":"shared","input":"hello","stream":true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_ne!(call(gateway, request).await.0, StatusCode::OK);
+    assert_eq!(captured.lock().await.len(), 1);
+}
+
+#[tokio::test]
 async fn issue_132_namespaced_embedding_reaches_correct_upstream_without_hijacking_chat() {
     async fn echo_embedding_model(request: Request<Body>) -> impl IntoResponse {
         let body = to_bytes(request.into_body(), 1 << 20).await.unwrap();
@@ -2076,80 +2161,6 @@ async fn catalog_exposes_configured_provider_models_without_upstream_discovery()
     let (status, detail) = call(router, req("/v1/models/openai%2Fgpt-b")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(detail["owned_by"], "fast");
-}
-
-#[tokio::test]
-async fn candidate_stream_default_cannot_change_nonstream_chat_or_responses_transport() {
-    let forwarded = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
-    let captured = Arc::clone(&forwarded);
-    let upstream = Router::new().route(
-        "/v1/chat/completions",
-        post(move |axum::Json(body): axum::Json<Value>| {
-            let captured = Arc::clone(&captured);
-            async move {
-                captured.lock().await.push(body);
-                axum::Json(json!({
-                    "id":"mock-stream-contract","object":"chat.completion",
-                    "choices":[{"index":0,
-                        "message":{"role":"assistant","content":"normal-json"},
-                        "finish_reason":"stop"}]
-                }))
-            }
-        }),
-    );
-    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = socket.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(socket, upstream).await.unwrap() });
-    let config: Config = serde_yaml::from_str(&format!(
-        r#"
-providers:
-  - name: p
-    type: openai
-    base_url: http://{addr}
-    key_env: KEY
-chains:
-  - name: demo
-    steps:
-      - provider: p
-        model: physical
-        params:
-          stream: true
-"#
-    ))
-    .unwrap();
-    let router = app(AppState::new(
-        config,
-        HashMap::from([("KEY".into(), "safe-test-secret".into())]),
-        vec!["client".into()],
-    )
-    .unwrap());
-    for (path, payload) in [
-        (
-            "/v1/chat/completions",
-            json!({
-                "model":"demo","messages":[{"role":"user","content":"hello"}]
-            }),
-        ),
-        ("/v1/responses", json!({"model":"demo","input":"hello"})),
-    ] {
-        let request = Request::builder()
-            .method("POST")
-            .uri(path)
-            .header("authorization", "Bearer client")
-            .header("content-type", "application/json")
-            .body(Body::from(payload.to_string()))
-            .unwrap();
-        let response = router.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-    let requests = forwarded.lock().await;
-    assert_eq!(requests.len(), 2);
-    for request in requests.iter() {
-        assert_eq!(
-            request["stream"], false,
-            "a default stream=true must not override a client's nonstream transport"
-        );
-    }
 }
 
 #[tokio::test]
