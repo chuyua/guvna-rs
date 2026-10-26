@@ -684,9 +684,15 @@ auto:
         );
         assert!(different_capability.is_none());
         assert!(refresh);
+        let selected_key = ranking_key(&steps, 123, 234, AutoRequirements::default());
         {
             let mut cache = decider.cache.lock().await;
-            let entry = cache.front_mut().unwrap();
+            // Touching keys now updates LRU order. Never assume the oldest
+            // deque slot still contains this request's ranking.
+            let entry = cache
+                .iter_mut()
+                .find(|entry| entry.key == selected_key)
+                .unwrap();
             entry.fresh = Instant::now() - Duration::from_millis(1);
             let (blocked, refresh) =
                 decider.cached_rank(&steps, 123, 234, AutoRequirements::default());
@@ -698,7 +704,11 @@ auto:
         assert!(refresh, "stale ranking must schedule a background refresh");
         {
             let mut cache = decider.cache.lock().await;
-            cache.front_mut().unwrap().stale = Instant::now() - Duration::from_millis(1);
+            cache
+                .iter_mut()
+                .find(|entry| entry.key == selected_key)
+                .unwrap()
+                .stale = Instant::now() - Duration::from_millis(1);
         }
         let (expired, refresh) = decider.cached_rank(&steps, 123, 234, AutoRequirements::default());
         assert!(expired.is_none());
