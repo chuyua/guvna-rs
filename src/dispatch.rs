@@ -6,6 +6,7 @@ use super::{
     record_circuit_success, response_validation, retry_after_delay,
 };
 use crate::{
+    auto_decider,
     metrics::Metrics,
     ops_log,
     outcome::{Outcome, classify},
@@ -662,8 +663,10 @@ async fn dispatch_inner(
                         .await;
                 });
             }
-            if let Some(ranked) = cached {
-                steps = ranked;
+            if let Some(order) = cached {
+                // Move the existing payload-owning candidates: do not clone
+                // large tool schemas on every warm SSE selector cache hit.
+                auto_decider::apply_cached_order(&mut steps, &order);
             }
         } else if let Some(ranked) = decider
             .rank(

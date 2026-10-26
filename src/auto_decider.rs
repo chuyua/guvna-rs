@@ -85,9 +85,10 @@ impl AutoDecider {
         }))
     }
 
-    /// SSE must never wait for a remote selector. Return a verified fresh or
-    /// bounded stale ranking immediately, and signal whether background
-    /// refresh is needed. A busy cache lock fails open without awaiting.
+    /// SSE must never wait for a remote selector. Return only the cached
+    /// permutation (at most 32 indexes), not a deep copy of every candidate's
+    /// potentially multi-megabyte forwarded tool/schema defaults. The caller
+    /// moves the existing steps in place. Busy locks still fail open.
     pub fn cached_rank(
         &self,
         steps: &[ResolvedStep],
@@ -95,7 +96,7 @@ impl AutoDecider {
         estimated_tokens: usize,
         requirements: AutoRequirements,
         generation: u64,
-    ) -> (Option<Vec<ResolvedStep>>, bool) {
+    ) -> (Option<Vec<usize>>, bool) {
         if !(2..=32).contains(&steps.len()) {
             return (None, false);
         }
@@ -119,7 +120,10 @@ impl AutoDecider {
             touch_cache(&mut cache, key).map(|entry| (entry.order.clone(), entry.fresh <= now));
         drop(cache);
         match cached {
-            Some((order, expired)) => (apply_order(steps, &order), expired && can_refresh),
+            Some((order, expired)) => (
+                valid_permutation(&order, steps.len()).then_some(order),
+                expired && can_refresh,
+            ),
             None => (None, can_refresh),
         }
     }
@@ -316,6 +320,21 @@ fn apply_order(steps: &[ResolvedStep], order: &[usize]) -> Option<Vec<ResolvedSt
     Some(order.iter().map(|index| steps[*index].clone()).collect())
 }
 
+/// SSE hot-path: reorder metadata and JSON default ownership, never cloning
+/// large per-candidate tool schemas. Invalid cached order leaves steps intact.
+pub(crate) fn apply_cached_order(steps: &mut Vec<ResolvedStep>, order: &[usize]) -> bool {
+    if !valid_permutation(order, steps.len()) {
+        return false;
+    }
+    let mut originals: Vec<_> = std::mem::take(steps).into_iter().map(Some).collect();
+    steps.extend(
+        order
+            .iter()
+            .map(|&index| originals[index].take().expect("validated permutation")),
+    );
+    true
+}
+
 fn ranking_key(
     steps: &[ResolvedStep],
     bytes: usize,
@@ -363,11 +382,69 @@ mod tests {
         };
         let steps = [step("one"), step("two")];
         assert_eq!(apply_order(&steps, &[1, 0]).unwrap()[0].model, "two");
+        let mut moving = steps.to_vec();
+        assert!(apply_cached_order(&mut moving, &[1, 0]));
+        assert_eq!(moving[0].model, "two");
+        assert_eq!(moving[1].model, "one");
+        let previous = moving.iter().map(|s| s.model.clone()).collect::<Vec<_>>();
+        assert!(!apply_cached_order(&mut moving, &[0, 0]));
+        assert_eq!(
+            moving.iter().map(|s| s.model.clone()).collect::<Vec<_>>(),
+            previous,
+            "invalid order must leave all owned candidate data untouched"
+        );
         for bad in [&[0, 0][..], &[0, 9][..], &[1][..]] {
             assert!(apply_order(&steps, bad).is_none(), "{bad:?}");
         }
         assert_eq!(validate_order(&json!({"order":[1,0]}), 2), Some(vec![1, 0]));
         assert!(validate_order(&json!({"order":[1,1]}), 2).is_none());
+    }
+
+    #[test]
+    fn cached_permutation_moves_large_schema_without_reallocating_payload() {
+        let mut large = ResolvedStep {
+            provider_index: 0,
+            model: "large".into(),
+            params: Default::default(),
+        };
+        large.params.insert(
+            "tools".into(),
+            json!([{"type":"function","function":{"description":"X".repeat(950_000)}}]),
+        );
+        let small = ResolvedStep {
+            provider_index: 1,
+            model: "small".into(),
+            params: Default::default(),
+        };
+        let mut steps = vec![large, small];
+        let address = steps[0].params["tools"][0]["function"]["description"]
+            .as_str()
+            .unwrap()
+            .as_ptr();
+        assert!(apply_cached_order(&mut steps, &[1, 0]));
+        assert_eq!(steps[0].model, "small");
+        assert_eq!(steps[1].model, "large");
+        assert_eq!(
+            address,
+            steps[1].params["tools"][0]["function"]["description"]
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            "the 950 KiB schema buffer must move, not be copied"
+        );
+        // Maximal supported candidate count remains a real permutation,
+        // regardless of the relative insertion positions.
+        let mut full: Vec<_> = (0..32)
+            .map(|i| ResolvedStep {
+                provider_index: i,
+                model: format!("model-{i}"),
+                params: Default::default(),
+            })
+            .collect();
+        let reverse: Vec<_> = (0..32).rev().collect();
+        assert!(apply_cached_order(&mut full, &reverse));
+        assert_eq!(full[0].model, "model-31");
+        assert_eq!(full[31].model, "model-0");
     }
 
     #[test]
@@ -442,7 +519,7 @@ mod tests {
         drop(locked);
         let (hit, refresh) =
             decider.cached_rank(&steps, 12, 2000, requirements, SELECTOR_GENERATION);
-        assert_eq!(hit.unwrap()[0].model, "second");
+        assert_eq!(hit.unwrap(), vec![1, 0]);
         assert!(!refresh);
         // A different schema key must not inherit the cached result.
         let (miss, refresh) =
@@ -497,9 +574,8 @@ mod tests {
                 let (ranked, refresh) =
                     decider.cached_rank(&steps, 20, 30, requirements, SELECTOR_GENERATION);
                 if let Some(ranked) = ranked {
-                    assert_eq!(ranked[0].model, "second");
-                    assert_eq!(ranked[1].model, "first");
-                    assert_eq!(ranked[1].params, steps[0].params);
+                    assert_eq!(ranked, vec![1, 0]);
+                    assert_eq!(steps[0].model, "first");
                     assert!(!refresh);
                 } else {
                     assert!(!refresh, "busy lock must fail open, not queue a refresh");
@@ -646,7 +722,7 @@ auto:
             .await
             .expect("second fetch should reach mock upstream");
         let (cached, refresh) = decider.cached_rank(&steps, 12, 23, features, SELECTOR_GENERATION);
-        assert_eq!(cached.unwrap()[0].model, "two");
+        assert_eq!(cached.unwrap(), vec![1, 0]);
         assert!(!refresh, "in-flight request must not spawn duplicate fetch");
         let (unknown, refresh) = decider.cached_rank(
             &steps,
@@ -676,7 +752,7 @@ auto:
             "two",
         );
         let (fresh, refresh) = decider.cached_rank(&steps, 12, 23, features, SELECTOR_GENERATION);
-        assert_eq!(fresh.unwrap()[0].model, "two");
+        assert_eq!(fresh.unwrap(), vec![1, 0]);
         assert!(!refresh);
         server_task.abort();
     }
@@ -847,7 +923,7 @@ auto:
             AutoRequirements::default(),
             SELECTOR_GENERATION,
         );
-        assert_eq!(warm.unwrap()[0].model, "two");
+        assert_eq!(warm.unwrap(), vec![1, 0]);
         assert!(!needs_refresh);
         let (different_capability, refresh) = decider.cached_rank(
             &steps,
@@ -891,7 +967,7 @@ auto:
             AutoRequirements::default(),
             SELECTOR_GENERATION,
         );
-        assert_eq!(stale.unwrap()[0].model, "two");
+        assert_eq!(stale.unwrap(), vec![1, 0]);
         assert!(refresh, "stale ranking must schedule a background refresh");
         {
             let mut cache = decider.cache.lock().await;
