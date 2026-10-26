@@ -5,7 +5,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     hash::{DefaultHasher, Hash, Hasher},
     time::{Duration, Instant},
 };
@@ -280,20 +280,39 @@ fn validate_order(value: &Value, count: usize) -> Option<Vec<usize>> {
     if values.len() != count || count > 32 {
         return None;
     }
-    let mut used = HashSet::new();
     let mut result = Vec::with_capacity(count);
     for value in values {
         let index = usize::try_from(value.as_u64()?).ok()?;
-        if index >= count || !used.insert(index) {
-            return None;
-        }
         result.push(index);
     }
-    Some(result)
+    valid_permutation(&result, count).then_some(result)
+}
+
+/// The selector has at most 32 candidates. A bitset validates both remote
+/// proposals and cached rankings without allocating a JSON object or hash
+/// table on every streaming request.
+fn valid_permutation(order: &[usize], count: usize) -> bool {
+    if order.len() != count || count == 0 || count > 32 {
+        return false;
+    }
+    let mut seen = 0u32;
+    for &index in order {
+        if index >= count {
+            return false;
+        }
+        let bit = 1u32 << index;
+        if seen & bit != 0 {
+            return false;
+        }
+        seen |= bit;
+    }
+    true
 }
 
 fn apply_order(steps: &[ResolvedStep], order: &[usize]) -> Option<Vec<ResolvedStep>> {
-    validate_order(&json!({"order":order}), steps.len())?;
+    if !valid_permutation(order, steps.len()) {
+        return None;
+    }
     Some(order.iter().map(|index| steps[*index].clone()).collect())
 }
 
@@ -327,6 +346,29 @@ fn ranking_key(
 mod tests {
     use super::*;
     const SELECTOR_GENERATION: u64 = 7;
+
+    #[test]
+    fn selector_permutation_bitset_rejects_duplicates_and_out_of_bounds() {
+        assert!(valid_permutation(&[1, 0], 2));
+        assert!(valid_permutation(&(0..32).rev().collect::<Vec<_>>(), 32));
+        assert!(!valid_permutation(&[], 0));
+        assert!(!valid_permutation(&[0, 0], 2));
+        assert!(!valid_permutation(&[0, 2], 2));
+        assert!(!valid_permutation(&[0], 2));
+        assert!(!valid_permutation(&(0..33).collect::<Vec<_>>(), 33));
+        let step = |name: &str| ResolvedStep {
+            provider_index: 0,
+            model: name.into(),
+            params: Default::default(),
+        };
+        let steps = [step("one"), step("two")];
+        assert_eq!(apply_order(&steps, &[1, 0]).unwrap()[0].model, "two");
+        for bad in [&[0, 0][..], &[0, 9][..], &[1][..]] {
+            assert!(apply_order(&steps, bad).is_none(), "{bad:?}");
+        }
+        assert_eq!(validate_order(&json!({"order":[1,0]}), 2), Some(vec![1, 0]));
+        assert!(validate_order(&json!({"order":[1,1]}), 2).is_none());
+    }
 
     #[test]
     fn selector_cache_hit_updates_recency_and_prevents_hot_key_eviction() {
