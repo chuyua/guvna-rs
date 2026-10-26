@@ -6,7 +6,7 @@ use crate::{
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, VecDeque},
-    hash::{DefaultHasher, Hash, Hasher},
+    hash::{DefaultHasher, Hasher},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -252,8 +252,21 @@ impl AutoRouteCache {
 /// The fingerprint is computed when AppState is created. Replacing that state
 /// resets the cache; passing a different generation clears old entries immediately.
 pub fn config_generation(config: &Config) -> u64 {
+    struct HashFmt<'a>(&'a mut DefaultHasher);
+    impl std::fmt::Write for HashFmt<'_> {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            self.0.write(value.as_bytes());
+            Ok(())
+        }
+    }
     let mut hasher = DefaultHasher::new();
-    format!("{config:?}").hash(&mut hasher);
+    // The version changes when ANY route/config field changes. Streaming the
+    // debug representation into the hasher avoids allocating a second full
+    // config string during runtime chain changes with large tool schemas.
+    std::fmt::write(&mut HashFmt(&mut hasher), format_args!("{config:?}"))
+        .expect("in-memory hash sink cannot fail");
+    // Preserve std::hash::Hash's str boundary terminator for stable keys.
+    hasher.write_u8(0xff);
     hasher.finish()
 }
 #[derive(Clone, Debug)]
@@ -695,6 +708,50 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use serde_json::json;
+    use std::hash::Hash;
+
+    #[test]
+    fn allocation_free_config_generation_matches_original_fingerprint_contract() {
+        let mut config: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://example.invalid
+    key_env: K
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: one
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let baseline = config_generation(&config);
+        for with_large_params in [false, true] {
+            if with_large_params {
+                config.auto.candidates[0].params.insert(
+                    "tools".into(),
+                    json!([{"type":"function","function":{"name":"search",
+                        "description":"x".repeat(900_000)}}]),
+                );
+            }
+            let mut original = DefaultHasher::new();
+            format!("{config:?}").hash(&mut original);
+            assert_eq!(
+                config_generation(&config),
+                original.finish(),
+                "streaming generation changed the existing cache fingerprint"
+            );
+        }
+        assert_ne!(baseline, config_generation(&config));
+        let before = config_generation(&config);
+        config.auto.candidates[0]
+            .params
+            .insert("temperature".into(), json!(0.7));
+        assert_ne!(before, config_generation(&config));
+    }
     #[test]
     fn dual_output_budget_fields_use_the_conservative_ceiling() {
         let request = json!({"messages":[{"role":"user","content":"hi"}],
