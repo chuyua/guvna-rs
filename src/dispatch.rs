@@ -492,17 +492,20 @@ async fn dispatch_inner(
             routing::auto_requirements(&request),
         )
     });
+    let initial_auto_penalties = if auto_enabled {
+        live.auto_health
+            .as_ref()
+            .map(|health| health.penalties())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     // Keep byte-range eligibility and context-window budgeting separate.
     // The context estimate includes the full request, output allowance and safety reserve.
     let mut steps = match if auto_enabled {
         let (input_bytes, context_estimate, signals) = auto_signals.expect("Auto signals present");
         let (min_context, max_context) = auto_bounds.expect("Auto bounds validated");
         let requirements = signals.with_context_bounds(min_context, max_context);
-        let penalties = live
-            .auto_health
-            .as_ref()
-            .map(|health| health.penalties())
-            .unwrap_or_default();
         // Request-specific candidate defaults are not covered by the shared
         // cache key. Resolve them directly, avoiding a large request clone and
         // filtering BEFORE max_candidates truncates the candidate walk.
@@ -518,7 +521,7 @@ async fn dispatch_inner(
                     input_bytes,
                     &request,
                     features,
-                    &penalties,
+                    &initial_auto_penalties,
                 )
             } else {
                 state.auto_route_cache.resolve(
@@ -526,7 +529,7 @@ async fn dispatch_inner(
                     input_bytes,
                     context_estimate,
                     features,
-                    &penalties,
+                    &initial_auto_penalties,
                     live.auto_generation,
                 )
             }
@@ -580,10 +583,10 @@ async fn dispatch_inner(
     if auto_enabled && let Some(rank) = &state.auto_telemetry_rank {
         // A live health demotion takes precedence over historical scoring.
         // Ranking only reorders the already-eligible bounded candidate walk.
-        let penalized = live
-            .auto_health
-            .as_ref()
-            .is_some_and(|health| health.penalties().iter().any(|value| *value > 0));
+        // Resolve and telemetry ordering see the same pre-Decider health
+        // snapshot. A fresh snapshot is still taken after any async ranking
+        // below to prevent promotions of newly demoted candidates.
+        let penalized = initial_auto_penalties.iter().any(|value| *value > 0);
         rank.rank(&route_snapshot, &mut steps, penalized, live.auto_generation);
     }
 
