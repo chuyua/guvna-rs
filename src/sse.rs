@@ -12,6 +12,7 @@ const MAX_STREAM_TOOL_ARGUMENTS: usize = 1024 * 1024;
 const MAX_TOOL_IDENTIFIER_BYTES: usize = 256;
 // JSON-mode streams retain only a bounded aggregate across all choices.
 const MAX_STREAM_JSON_VALIDATION_BYTES: usize = 1024 * 1024;
+const MAX_STREAM_METADATA_BYTES: usize = 1024;
 
 #[derive(Debug)]
 struct StreamToolCall {
@@ -38,6 +39,12 @@ enum ToolChoice {
 pub struct ChatSse {
     line: Vec<u8>,
     data: Vec<u8>,
+    // Streaming and SSE->JSON aggregation must agree on event identity.
+    // An upstream cannot splice frames from another generation/model into
+    // one successful Chat Completion. Retain only small metadata strings.
+    stream_id: Option<String>,
+    stream_model: Option<String>,
+    stream_created: Option<u64>,
     progress_since_push: bool,
     finished_mask: u64,
     tool_calls_mask: u64,
@@ -170,6 +177,37 @@ impl ChatSse {
 
     fn process_event(&mut self, data: Vec<u8>, emitted: &mut Vec<Bytes>) -> Result<(), SseError> {
         let event: Value = serde_json::from_slice(&data).map_err(|_| SseError)?;
+        if event.get("error").is_some_and(|error| !error.is_null()) {
+            return Err(SseError);
+        }
+        for (key, cached) in [
+            ("id", &mut self.stream_id),
+            ("model", &mut self.stream_model),
+        ] {
+            if let Some(value) = event.get(key) {
+                let value = value.as_str().filter(|s| !s.is_empty()).ok_or(SseError)?;
+                if value.len() > MAX_STREAM_METADATA_BYTES {
+                    self.resource_limit = true;
+                    return Err(SseError);
+                }
+                if cached.as_deref().is_some_and(|previous| previous != value) {
+                    return Err(SseError);
+                }
+                if cached.is_none() {
+                    *cached = Some(value.to_owned());
+                }
+            }
+        }
+        if let Some(value) = event.get("created") {
+            let value = value.as_u64().ok_or(SseError)?;
+            if self
+                .stream_created
+                .is_some_and(|previous| previous != value)
+            {
+                return Err(SseError);
+            }
+            self.stream_created = Some(value);
+        }
         let choices = event
             .get("choices")
             .and_then(Value::as_array)
@@ -253,6 +291,23 @@ impl ChatSse {
                         .get(*field)
                         .is_some_and(|value| !value.is_null() && !value.is_string())
                 })
+            // The JSON aggregation path rejects unsupported non-null
+            // extensions rather than silently losing them. Direct SSE must
+            // enforce the same contract: a legacy function_call, multimodal
+            // audio or vendor-specific output cannot become a reported
+            // successful Chat Completion simply because it arrived as SSE.
+            || delta.iter().any(|(field, value)| {
+                !value.is_null()
+                    && !matches!(
+                        field.as_str(),
+                        "role"
+                            | "content"
+                            | "reasoning"
+                            | "reasoning_content"
+                            | "refusal"
+                            | "tool_calls"
+                    )
+            })
         {
             return Err(SseError);
         }
@@ -709,6 +764,90 @@ mod tests {
             );
             assert!(parser.push(frame.as_bytes()).is_err(), "accepted {delta}");
         }
+    }
+
+    #[test]
+    fn direct_sse_rejects_unsupported_extensions_before_forwarding_them() {
+        for delta in [
+            json!({"function_call":{"name":"legacy","arguments":"{}"}}),
+            json!({"audio":{"id":"audio-1","data":"b64"}}),
+            json!({"image":{"url":"https://example.test/image"}}),
+            json!({"reasoning_details":[{"text":"secret"}]}),
+            json!({"content":"hello","function_call":{"name":"legacy","arguments":"{}"}}),
+        ] {
+            let mut parser = ChatSse::new(1).unwrap();
+            let frame = format!(
+                "data: {}\n\n",
+                json!({
+                    "choices":[{"index":0,"delta":delta,"finish_reason":null}]
+                })
+            );
+            assert!(parser.push(frame.as_bytes()).is_err(), "accepted {delta}");
+        }
+        // Optional null extensions contain no information to silently lose.
+        let mut parser = ChatSse::new(1).unwrap();
+        let frame = format!(
+            "data: {}\n\n",
+            json!({
+                "choices":[{"index":0,"delta":{
+                    "content":"supported","function_call":null,"audio":null
+                },"finish_reason":"stop"}]
+            })
+        );
+        assert!(parser.push(frame.as_bytes()).is_ok());
+        assert!(parser.push(b"data: [DONE]\n\n").is_ok());
+    }
+
+    #[test]
+    fn sse_model_id_created_and_error_are_bounded_and_consistent() {
+        let first = json!({
+            "id":"chatcmpl-original","model":"physical-model","created":100,
+            "choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]
+        });
+        let terminal = json!({
+            "id":"chatcmpl-original","model":"physical-model","created":100,
+            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]
+        });
+        let mut healthy = ChatSse::new(1).unwrap();
+        for event in [first.clone(), terminal] {
+            assert!(
+                healthy
+                    .push(format!("data: {event}\n\n").as_bytes())
+                    .is_ok()
+            );
+        }
+        assert!(healthy.push(b"data: [DONE]\n\n").is_ok());
+        for replacement in [
+            json!({"id":"another-generation"}),
+            json!({"model":"different-physical-model"}),
+            json!({"created":101}),
+            json!({"error":{"code":"model_failed"}}),
+            json!({"id":null}),
+            json!({"model":"m".repeat(MAX_STREAM_METADATA_BYTES + 1)}),
+        ] {
+            let mut parser = ChatSse::new(1).unwrap();
+            parser
+                .push(format!("data: {first}\n\n").as_bytes())
+                .unwrap();
+            let mut changed = first.clone();
+            for (key, value) in replacement.as_object().unwrap() {
+                changed[key] = value.clone();
+            }
+            assert!(
+                parser
+                    .push(format!("data: {changed}\n\n").as_bytes())
+                    .is_err(),
+                "accepted changed metadata {replacement}"
+            );
+            assert!(!parser.is_done());
+        }
+        // Providers may omit metadata from subsequent chunks or usage trailers.
+        let mut parser = ChatSse::new(1).unwrap();
+        parser
+            .push(format!("data: {first}\n\n").as_bytes())
+            .unwrap();
+        parser.push(END).unwrap();
+        parser.push(b"data: [DONE]\n\n").unwrap();
     }
 
     #[test]

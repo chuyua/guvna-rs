@@ -746,12 +746,19 @@ impl ResponsesSse {
                     tool.arguments.clone(),
                     tool.output_index,
                 );
-                pending.push_back(self.emit(
-                    "response.function_call_arguments.done",
-                    json!({
-                        "item_id":id,"output_index":output_index,"arguments":arguments
-                    }),
-                ));
+                // A max-token/content-filter truncation can leave JSON
+                // arguments unfinished. An arguments.done event tells a
+                // consumer it may execute this call; do not emit it for
+                // incomplete calls even though the output item itself must
+                // terminate with an incomplete status.
+                if status == "completed" {
+                    pending.push_back(self.emit(
+                        "response.function_call_arguments.done",
+                        json!({
+                            "item_id":id,"output_index":output_index,"arguments":arguments
+                        }),
+                    ));
+                }
                 pending.push_back(self.emit(
                     "response.output_item.done",
                     json!({
@@ -1232,6 +1239,16 @@ mod tests {
                 .iter()
                 .map(|frame| String::from_utf8_lossy(frame).into_owned())
                 .collect::<Vec<_>>();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |frame| frame.starts_with("event: response.function_call_arguments.done\n")
+                    )
+                    .count(),
+                usize::from(expected_status == "completed"),
+                "{finish}: incomplete function arguments must never be signaled ready"
+            );
             let done = events
                 .iter()
                 .find(|frame| {

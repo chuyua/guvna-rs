@@ -1219,6 +1219,69 @@ async fn sse_truncated_finish_event_never_claims_success() {
 }
 
 #[tokio::test]
+async fn unsupported_legacy_sse_delta_fails_over_before_client_sees_output() {
+    for delta in [
+        json!({"function_call":{"name":"legacy","arguments":"{}"}}),
+        json!({"audio":{"id":"audio-1","data":"x"}}),
+    ] {
+        let frame = format!(
+            "data: {}\n\n",
+            json!({
+                "choices":[{"index":0,"delta":delta,"finish_reason":null}]
+            })
+        );
+        let (bad, bad_hits) = start_sse(vec![frame.as_bytes()]).await;
+        let (good, good_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+        let response = make_app(&bad, &good)
+            .oneshot(request("demo", r#","stream":true"#, "client"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        assert!(!text.contains("function_call"), "{text}");
+        assert!(!text.contains("audio-1"), "{text}");
+        assert_eq!(bad_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(good_hits.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn changed_sse_generation_after_first_chunk_is_incomplete_without_replay() {
+    let first = br#"data: {"id":"generation-one","model":"m1","created":100,"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}
+
+"#;
+    let second = br#"data: {"id":"generation-two","model":"m1","created":100,"choices":[{"index":0,"delta":{"content":"poisoned"},"finish_reason":"stop"}]}
+
+"#;
+    let (bad, bad_hits) = start_sse(vec![first, second, SSE_DONE]).await;
+    let (good, good_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let response = make_app(&bad, &good)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(text.contains("partial"), "{text}");
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("poisoned"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(bad_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        good_hits.load(Ordering::SeqCst),
+        0,
+        "never replay visible text"
+    );
+}
+
+#[tokio::test]
 async fn duplicate_choice_index_fails_over_before_first_event() {
     let duplicate = b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null},{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n";
     let (a, bad_hits) = start_sse(vec![duplicate]).await;
