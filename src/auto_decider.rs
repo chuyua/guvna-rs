@@ -136,7 +136,7 @@ impl AutoDecider {
         estimated_tokens: usize,
         requirements: AutoRequirements,
         generation: u64,
-    ) -> Option<Vec<ResolvedStep>> {
+    ) -> Option<Vec<usize>> {
         if !(2..=32).contains(&steps.len()) {
             return None;
         }
@@ -160,7 +160,7 @@ impl AutoDecider {
         if let Some((order, fresh, _)) = &previous
             && *fresh > now
         {
-            return apply_order(steps, order);
+            return valid_permutation(order, steps.len()).then(|| order.clone());
         }
         let stale = previous.map(|(order, _, stale)| (order, stale));
         // Reject concurrent refreshes without queuing them. The cache remains
@@ -168,7 +168,7 @@ impl AutoDecider {
         let Ok(_refresh) = self.refresh.try_acquire() else {
             return stale
                 .filter(|(_, expiry)| *expiry > Instant::now())
-                .and_then(|(order, _)| apply_order(steps, &order));
+                .and_then(|(order, _)| valid_permutation(&order, steps.len()).then_some(order));
         };
         // Another request may have populated this key after our first read.
         let mut entries = self.cache.lock().await;
@@ -179,7 +179,7 @@ impl AutoDecider {
         if let Some((order, fresh, _)) = &cached
             && *fresh > Instant::now()
         {
-            return apply_order(steps, order);
+            return valid_permutation(order, steps.len()).then(|| order.clone());
         }
         let stale = cached.map(|(order, _, stale)| (order, stale)).or(stale);
         if let Some(order) = self
@@ -198,11 +198,11 @@ impl AutoDecider {
                 fresh: Instant::now() + self.ttl,
                 stale: Instant::now() + self.ttl + Duration::from_secs(STALE_SECS),
             });
-            return apply_order(steps, &order);
+            return Some(order);
         }
         stale
             .filter(|(_, expiry)| *expiry > Instant::now())
-            .and_then(|(order, _)| apply_order(steps, &order))
+            .and_then(|(order, _)| valid_permutation(&order, steps.len()).then_some(order))
     }
 
     async fn fetch(
@@ -313,13 +313,6 @@ fn valid_permutation(order: &[usize], count: usize) -> bool {
     true
 }
 
-fn apply_order(steps: &[ResolvedStep], order: &[usize]) -> Option<Vec<ResolvedStep>> {
-    if !valid_permutation(order, steps.len()) {
-        return None;
-    }
-    Some(order.iter().map(|index| steps[*index].clone()).collect())
-}
-
 /// SSE hot-path: reorder metadata and JSON default ownership, never cloning
 /// large per-candidate tool schemas. Invalid cached order leaves steps intact.
 pub(crate) fn apply_cached_order(steps: &mut Vec<ResolvedStep>, order: &[usize]) -> bool {
@@ -381,7 +374,6 @@ mod tests {
             params: Default::default(),
         };
         let steps = [step("one"), step("two")];
-        assert_eq!(apply_order(&steps, &[1, 0]).unwrap()[0].model, "two");
         let mut moving = steps.to_vec();
         assert!(apply_cached_order(&mut moving, &[1, 0]));
         assert_eq!(moving[0].model, "two");
@@ -394,7 +386,8 @@ mod tests {
             "invalid order must leave all owned candidate data untouched"
         );
         for bad in [&[0, 0][..], &[0, 9][..], &[1][..]] {
-            assert!(apply_order(&steps, bad).is_none(), "{bad:?}");
+            let mut candidate = steps.to_vec();
+            assert!(!apply_cached_order(&mut candidate, bad), "{bad:?}");
         }
         assert_eq!(validate_order(&json!({"order":[1,0]}), 2), Some(vec![1, 0]));
         assert!(validate_order(&json!({"order":[1,1]}), 2).is_none());
@@ -695,9 +688,8 @@ auto:
             decider
                 .rank(&config, &steps, 12, 23, features, SELECTOR_GENERATION)
                 .await
-                .unwrap()[0]
-                .model,
-            "two"
+                .unwrap(),
+            vec![1, 0]
         );
         {
             let mut cache = decider.cache.lock().await;
@@ -739,7 +731,7 @@ auto:
         )
         .await
         .expect("concurrent request should fail open using stale cache");
-        assert_eq!(duplicate.unwrap()[0].model, "two");
+        assert_eq!(duplicate.unwrap(), vec![1, 0]);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         release.notify_one();
         assert_eq!(
@@ -747,9 +739,8 @@ auto:
                 .await
                 .unwrap()
                 .unwrap()
-                .unwrap()[0]
-                .model,
-            "two",
+                .unwrap(),
+            vec![1, 0],
         );
         let (fresh, refresh) = decider.cached_rank(&steps, 12, 23, features, SELECTOR_GENERATION);
         assert_eq!(fresh.unwrap(), vec![1, 0]);
@@ -849,7 +840,7 @@ auto:
             )
             .await
             .unwrap();
-        assert_eq!(reordered[0].model, "two");
+        assert_eq!(reordered, vec![1, 0]);
         let cached = decider
             .rank(
                 &config,
@@ -861,7 +852,7 @@ auto:
             )
             .await
             .unwrap();
-        assert_eq!(cached[0].model, "two");
+        assert_eq!(cached, vec![1, 0]);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // Previously both estimates rounded to the same 1-KiB bucket,
         // reusing a selector decision that was made for another request.

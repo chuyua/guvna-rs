@@ -149,17 +149,20 @@ fn record_shadow_observation(
     config: &crate::config::Config,
     request_id: &str,
     baseline: &[routing::ResolvedStep],
-    proposal: Option<&[routing::ResolvedStep]>,
+    proposal: Option<&[usize]>,
 ) {
     if let (Some(telemetry), Some(expected)) = (&state.telemetry, baseline.first())
         && let Some(provider) = config.providers.get(expected.provider_index)
     {
-        let suggested = proposal.and_then(|steps| steps.first()).and_then(|step| {
-            config
-                .providers
-                .get(step.provider_index)
-                .map(|provider| (provider.name.as_str(), step.model.as_str()))
-        });
+        let suggested = proposal
+            .and_then(|order| order.first())
+            .and_then(|&index| baseline.get(index))
+            .and_then(|step| {
+                config
+                    .providers
+                    .get(step.provider_index)
+                    .map(|provider| (provider.name.as_str(), step.model.as_str()))
+            });
         telemetry.observe_shadow(
             request_id,
             (provider.name.as_str(), expected.model.as_str()),
@@ -168,11 +171,13 @@ fn record_shadow_observation(
         );
     }
     match proposal {
-        Some(steps) => {
+        Some(order) => {
             state.shadow_total.fetch_add(1, Ordering::Relaxed);
-            if let (Some(expected), Some(actual)) = (baseline.first(), steps.first())
-                && (expected.provider_index != actual.provider_index
-                    || expected.model != actual.model)
+            if let (Some(expected), Some(actual)) = (
+                baseline.first(),
+                order.first().and_then(|&index| baseline.get(index)),
+            ) && (expected.provider_index != actual.provider_index
+                || expected.model != actual.model)
             {
                 state.shadow_disagreements.fetch_add(1, Ordering::Relaxed);
             }
@@ -692,8 +697,8 @@ async fn dispatch_inner(
             } else {
                 None
             };
-            if let Some(ranked) = proposed {
-                steps = ranked;
+            if let Some(order) = proposed {
+                auto_decider::apply_cached_order(&mut steps, &order);
             }
         }
     }
@@ -1569,9 +1574,8 @@ auto:
             params: Default::default(),
         };
         let baseline = [step("first"), step("second")];
-        let proposal = [step("second"), step("first")];
-        record_shadow_observation(&state, &config, "trace1", &baseline, Some(&proposal));
-        record_shadow_observation(&state, &config, "trace2", &baseline, Some(&baseline));
+        record_shadow_observation(&state, &config, "trace1", &baseline, Some(&[1, 0]));
+        record_shadow_observation(&state, &config, "trace2", &baseline, Some(&[0, 1]));
         record_shadow_observation(&state, &config, "trace3", &baseline, None);
         let status = state.runtime_status();
         assert_eq!(status["auto_shadow_total"], 2);
