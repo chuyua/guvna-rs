@@ -2079,6 +2079,64 @@ async fn catalog_exposes_configured_provider_models_without_upstream_discovery()
 }
 
 #[tokio::test]
+async fn responses_force_one_choice_even_when_chain_defaults_request_multiple() {
+    let (json_url, json_hits) = start_upstream(StatusCode::OK).await;
+    let (sse_url, sse_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    for (streaming, url) in [(false, json_url), (true, sse_url)] {
+        let config: Config = serde_yaml::from_str(&format!(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {url}
+    key_env: KEY
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: physical
+        params:
+          n: 2
+"#
+        ))
+        .unwrap();
+        let router = app(AppState::new(
+            config,
+            HashMap::from([("KEY".into(), "safe-test-secret".into())]),
+            vec!["client".into()],
+        )
+        .unwrap());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"demo","input":"hello","stream":streaming
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        if streaming {
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(body.contains("event: response.completed"), "{body}");
+            assert!(!body.contains("response.failed"), "{body}");
+        } else {
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["status"], "completed", "{body}");
+            assert_eq!(body["output_text"], "success");
+            assert!(body["created_at"].is_number());
+        }
+    }
+    assert_eq!(json_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(sse_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn responses_text_bridge_and_unsupported_modes() {
     let (url, hits) = start_upstream(StatusCode::OK).await;
     let router = make_app(&url, &url);

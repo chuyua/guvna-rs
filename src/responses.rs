@@ -373,6 +373,12 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
         object.remove("stream");
     }
     object.insert("messages".into(), messages);
+    // Responses has exactly one output choice. A configured Chat chain may
+    // specify params.n=2 or more as a default; caller-wins dispatch merges
+    // would otherwise forward that default and then reject the upstream's
+    // multi-choice success as an invalid Responses result. Send n=1
+    // explicitly so every fallback candidate honors this endpoint contract.
+    object.insert("n".into(), json!(1));
     if let Some(tokens) = object.remove("max_output_tokens") {
         object.insert("max_tokens".into(), tokens);
     }
