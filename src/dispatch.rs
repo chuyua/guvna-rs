@@ -505,6 +505,7 @@ async fn dispatch_inner(
             let baseline = steps.clone();
             let trace_id = request_id.to_owned();
             let selector_config = Arc::clone(&route_snapshot);
+            let selector_generation = live.auto_generation;
             if let Ok(permit) = state.auto_background_slots.clone().try_acquire_owned() {
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -515,6 +516,7 @@ async fn dispatch_inner(
                             input_bytes,
                             context_estimate,
                             requirements,
+                            selector_generation,
                         )
                         .await;
                     if let (Some(telemetry), Some(expected)) = (&owner.telemetry, baseline.first())
@@ -572,14 +574,20 @@ async fn dispatch_inner(
             // response headers or its first token. Cold/stale rankings are
             // refreshed in the background, with one in-flight fetch per cache.
             let baseline = steps.clone();
-            let (cached, refresh) =
-                decider.cached_rank(&baseline, input_bytes, context_estimate, requirements);
+            let (cached, refresh) = decider.cached_rank(
+                &baseline,
+                input_bytes,
+                context_estimate,
+                requirements,
+                live.auto_generation,
+            );
             if let Some(ranked) = cached {
                 steps = ranked;
             }
             if refresh && let Ok(permit) = state.auto_background_slots.clone().try_acquire_owned() {
                 let selector = Arc::clone(decider);
                 let selector_config = Arc::clone(&route_snapshot);
+                let selector_generation = live.auto_generation;
                 tokio::spawn(async move {
                     let _permit = permit;
                     let _ = selector
@@ -589,6 +597,7 @@ async fn dispatch_inner(
                             input_bytes,
                             context_estimate,
                             requirements,
+                            selector_generation,
                         )
                         .await;
                 });
@@ -600,6 +609,7 @@ async fn dispatch_inner(
                 input_bytes,
                 context_estimate,
                 requirements,
+                live.auto_generation,
             )
             .await
         {

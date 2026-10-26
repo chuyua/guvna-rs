@@ -94,15 +94,21 @@ impl AutoDecider {
         input_bytes: usize,
         estimated_tokens: usize,
         requirements: AutoRequirements,
+        generation: u64,
     ) -> (Option<Vec<ResolvedStep>>, bool) {
         if !(2..=32).contains(&steps.len()) {
             return (None, false);
         }
-        // Candidate defaults can contain large tool schemas. Computing the
-        // fingerprint under the cache mutex serialized request threads and
-        // made the "nonblocking" SSE fast path arbitrarily slow. Hash before
-        // attempting the lock, as rank() already does.
-        let key = ranking_key(steps, input_bytes, estimated_tokens, requirements);
+        // The immutable route snapshot already hashes all candidate defaults
+        // ONCE when published. Do not re-serialize huge JSON tool schemas on
+        // every live SSE request merely to look up a short selector ranking.
+        let key = ranking_key(
+            steps,
+            input_bytes,
+            estimated_tokens,
+            requirements,
+            generation,
+        );
         let Ok(mut cache) = self.cache.try_lock() else {
             return (None, false);
         };
@@ -125,11 +131,18 @@ impl AutoDecider {
         input_bytes: usize,
         estimated_tokens: usize,
         requirements: AutoRequirements,
+        generation: u64,
     ) -> Option<Vec<ResolvedStep>> {
         if !(2..=32).contains(&steps.len()) {
             return None;
         }
-        let key = ranking_key(steps, input_bytes, estimated_tokens, requirements);
+        let key = ranking_key(
+            steps,
+            input_bytes,
+            estimated_tokens,
+            requirements,
+            generation,
+        );
         // A concurrent cold lookup fails open: it does not queue dozens of
         // requests behind a slow or inaccessible external model.
         let Ok(mut entries) = self.cache.try_lock() else {
@@ -289,27 +302,17 @@ fn ranking_key(
     bytes: usize,
     tokens: usize,
     features: AutoRequirements,
+    generation: u64,
 ) -> u64 {
-    struct HashWriter<'a>(&'a mut DefaultHasher);
-    impl std::io::Write for HashWriter<'_> {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.write(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
     let mut h = DefaultHasher::new();
+    // A generation is the full Config fingerprint computed by
+    // LiveRouteSnapshot::new, including every candidate's forwarded params.
+    // A changed tool schema or chain param necessarily produces a new key.
+    generation.hash(&mut h);
     steps.len().hash(&mut h);
     for step in steps {
         step.provider_index.hash(&mut h);
         step.model.hash(&mut h);
-        // Candidate defaults can include large tool JSON schemas. Hash the
-        // canonical serialized fields directly instead of allocating a
-        // potentially megabyte-sized Debug String on every request.
-        serde_json::to_writer(HashWriter(&mut h), &step.params)
-            .expect("validated JSON candidate params can be serialized");
     }
     // The selector receives exact estimates. Do not reuse a cached rank for
     // different context pressure just because both sizes share a KiB bucket.
@@ -323,6 +326,7 @@ fn ranking_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    const SELECTOR_GENERATION: u64 = 7;
 
     #[test]
     fn selector_cache_hit_updates_recency_and_prevents_hot_key_eviction() {
@@ -339,7 +343,7 @@ mod tests {
         assert_eq!(touch_cache(&mut entries, 0).unwrap().order, vec![1, 0]);
         assert_eq!(entries.back().unwrap().key, 0);
         // Under new cache pressure the oldest untouched key (1) goes, not
-        // the most frequently requested baseline rank (0).
+        // the most frequently requested baseline rank (0, SELECTOR_GENERATION).
         entries.pop_front();
         entries.push_back(Cache {
             key: MAX_CACHE as u64,
@@ -378,7 +382,7 @@ mod tests {
         };
         let steps = [a, b];
         let requirements = AutoRequirements::default();
-        let key = ranking_key(&steps, 12, 2000, requirements);
+        let key = ranking_key(&steps, 12, 2000, requirements, SELECTOR_GENERATION);
         let mut locked = decider.cache.lock().await;
         locked.push_back(Cache {
             key,
@@ -386,18 +390,21 @@ mod tests {
             fresh: Instant::now() + Duration::from_secs(20),
             stale: Instant::now() + Duration::from_secs(60),
         });
-        let (unavailable, refresh) = decider.cached_rank(&steps, 12, 2000, requirements);
+        let (unavailable, refresh) =
+            decider.cached_rank(&steps, 12, 2000, requirements, SELECTOR_GENERATION);
         assert!(
             unavailable.is_none(),
             "busy mutex must not await on the SSE path"
         );
         assert!(!refresh, "busy mutex cannot schedule speculative ranking");
         drop(locked);
-        let (hit, refresh) = decider.cached_rank(&steps, 12, 2000, requirements);
+        let (hit, refresh) =
+            decider.cached_rank(&steps, 12, 2000, requirements, SELECTOR_GENERATION);
         assert_eq!(hit.unwrap()[0].model, "second");
         assert!(!refresh);
         // A different schema key must not inherit the cached result.
-        let (miss, refresh) = decider.cached_rank(&steps, 13, 2000, requirements);
+        let (miss, refresh) =
+            decider.cached_rank(&steps, 13, 2000, requirements, SELECTOR_GENERATION);
         assert!(miss.is_none());
         assert!(refresh);
     }
@@ -433,7 +440,7 @@ mod tests {
             },
         ]);
         let requirements = AutoRequirements::default();
-        let key = ranking_key(&steps, 20, 30, requirements);
+        let key = ranking_key(&steps, 20, 30, requirements, SELECTOR_GENERATION);
         decider.cache.lock().await.push_back(Cache {
             key,
             order: vec![1, 0],
@@ -445,7 +452,8 @@ mod tests {
             let decider = Arc::clone(&decider);
             let steps = Arc::clone(&steps);
             tasks.push(tokio::task::spawn_blocking(move || {
-                let (ranked, refresh) = decider.cached_rank(&steps, 20, 30, requirements);
+                let (ranked, refresh) =
+                    decider.cached_rank(&steps, 20, 30, requirements, SELECTOR_GENERATION);
                 if let Some(ranked) = ranked {
                     assert_eq!(ranked[0].model, "second");
                     assert_eq!(ranked[1].model, "first");
@@ -567,7 +575,7 @@ auto:
         let features = AutoRequirements::default();
         assert_eq!(
             decider
-                .rank(&config, &steps, 12, 23, features)
+                .rank(&config, &steps, 12, 23, features, SELECTOR_GENERATION)
                 .await
                 .unwrap()[0]
                 .model,
@@ -582,13 +590,20 @@ auto:
         let active_steps = steps.clone();
         let task = tokio::spawn(async move {
             active_decider
-                .rank(&active_config, &active_steps, 12, 23, features)
+                .rank(
+                    &active_config,
+                    &active_steps,
+                    12,
+                    23,
+                    features,
+                    SELECTOR_GENERATION,
+                )
                 .await
         });
         tokio::time::timeout(Duration::from_secs(1), entered.notified())
             .await
             .expect("second fetch should reach mock upstream");
-        let (cached, refresh) = decider.cached_rank(&steps, 12, 23, features);
+        let (cached, refresh) = decider.cached_rank(&steps, 12, 23, features, SELECTOR_GENERATION);
         assert_eq!(cached.unwrap()[0].model, "two");
         assert!(!refresh, "in-flight request must not spawn duplicate fetch");
         let (unknown, refresh) = decider.cached_rank(
@@ -596,12 +611,13 @@ auto:
             12,
             23,
             AutoRequirements::from_signals(false, true, false),
+            SELECTOR_GENERATION,
         );
         assert!(unknown.is_none());
         assert!(!refresh, "another cache key must not queue a second fetch");
         let duplicate = tokio::time::timeout(
             Duration::from_millis(100),
-            decider.rank(&config, &steps, 12, 23, features),
+            decider.rank(&config, &steps, 12, 23, features, SELECTOR_GENERATION),
         )
         .await
         .expect("concurrent request should fail open using stale cache");
@@ -617,7 +633,7 @@ auto:
                 .model,
             "two",
         );
-        let (fresh, refresh) = decider.cached_rank(&steps, 12, 23, features);
+        let (fresh, refresh) = decider.cached_rank(&steps, 12, 23, features, SELECTOR_GENERATION);
         assert_eq!(fresh.unwrap()[0].model, "two");
         assert!(!refresh);
         server_task.abort();
@@ -695,17 +711,36 @@ auto:
                 params: Default::default(),
             },
         ];
-        let (cold, needs_refresh) =
-            decider.cached_rank(&steps, 123, 234, AutoRequirements::default());
+        let (cold, needs_refresh) = decider.cached_rank(
+            &steps,
+            123,
+            234,
+            AutoRequirements::default(),
+            SELECTOR_GENERATION,
+        );
         assert!(cold.is_none());
         assert!(needs_refresh);
         let reordered = decider
-            .rank(&config, &steps, 123, 234, AutoRequirements::default())
+            .rank(
+                &config,
+                &steps,
+                123,
+                234,
+                AutoRequirements::default(),
+                SELECTOR_GENERATION,
+            )
             .await
             .unwrap();
         assert_eq!(reordered[0].model, "two");
         let cached = decider
-            .rank(&config, &steps, 123, 234, AutoRequirements::default())
+            .rank(
+                &config,
+                &steps,
+                123,
+                234,
+                AutoRequirements::default(),
+                SELECTOR_GENERATION,
+            )
             .await
             .unwrap();
         assert_eq!(cached[0].model, "two");
@@ -714,31 +749,62 @@ auto:
         // reusing a selector decision that was made for another request.
         assert!(
             decider
-                .cached_rank(&steps, 124, 234, AutoRequirements::default())
+                .cached_rank(
+                    &steps,
+                    124,
+                    234,
+                    AutoRequirements::default(),
+                    SELECTOR_GENERATION
+                )
                 .0
                 .is_none()
         );
         assert!(
             decider
-                .cached_rank(&steps, 123, 235, AutoRequirements::default())
+                .cached_rank(
+                    &steps,
+                    123,
+                    235,
+                    AutoRequirements::default(),
+                    SELECTOR_GENERATION
+                )
                 .0
                 .is_none()
         );
         assert!(
             decider
-                .rank(&config, &steps, 124, 234, AutoRequirements::default())
+                .rank(
+                    &config,
+                    &steps,
+                    124,
+                    234,
+                    AutoRequirements::default(),
+                    SELECTOR_GENERATION
+                )
                 .await
                 .is_some()
         );
         assert!(
             decider
-                .rank(&config, &steps, 123, 235, AutoRequirements::default())
+                .rank(
+                    &config,
+                    &steps,
+                    123,
+                    235,
+                    AutoRequirements::default(),
+                    SELECTOR_GENERATION
+                )
                 .await
                 .is_some()
         );
         assert_eq!(calls.load(Ordering::SeqCst), 3);
-        let (warm, needs_refresh) =
-            decider.cached_rank(&steps, 123, 234, AutoRequirements::default());
+        let (warm, needs_refresh) = decider.cached_rank(
+            &steps,
+            123,
+            234,
+            AutoRequirements::default(),
+            SELECTOR_GENERATION,
+        );
         assert_eq!(warm.unwrap()[0].model, "two");
         assert!(!needs_refresh);
         let (different_capability, refresh) = decider.cached_rank(
@@ -746,10 +812,17 @@ auto:
             123,
             234,
             AutoRequirements::from_signals(false, true, false),
+            SELECTOR_GENERATION,
         );
         assert!(different_capability.is_none());
         assert!(refresh);
-        let selected_key = ranking_key(&steps, 123, 234, AutoRequirements::default());
+        let selected_key = ranking_key(
+            &steps,
+            123,
+            234,
+            AutoRequirements::default(),
+            SELECTOR_GENERATION,
+        );
         {
             let mut cache = decider.cache.lock().await;
             // Touching keys now updates LRU order. Never assume the oldest
@@ -759,12 +832,23 @@ auto:
                 .find(|entry| entry.key == selected_key)
                 .unwrap();
             entry.fresh = Instant::now() - Duration::from_millis(1);
-            let (blocked, refresh) =
-                decider.cached_rank(&steps, 123, 234, AutoRequirements::default());
+            let (blocked, refresh) = decider.cached_rank(
+                &steps,
+                123,
+                234,
+                AutoRequirements::default(),
+                SELECTOR_GENERATION,
+            );
             assert!(blocked.is_none());
             assert!(!refresh, "in-flight refresh must not create a convoy");
         }
-        let (stale, refresh) = decider.cached_rank(&steps, 123, 234, AutoRequirements::default());
+        let (stale, refresh) = decider.cached_rank(
+            &steps,
+            123,
+            234,
+            AutoRequirements::default(),
+            SELECTOR_GENERATION,
+        );
         assert_eq!(stale.unwrap()[0].model, "two");
         assert!(refresh, "stale ranking must schedule a background refresh");
         {
@@ -775,7 +859,13 @@ auto:
                 .unwrap()
                 .stale = Instant::now() - Duration::from_millis(1);
         }
-        let (expired, refresh) = decider.cached_rank(&steps, 123, 234, AutoRequirements::default());
+        let (expired, refresh) = decider.cached_rank(
+            &steps,
+            123,
+            234,
+            AutoRequirements::default(),
+            SELECTOR_GENERATION,
+        );
         assert!(expired.is_none());
         assert!(refresh);
         task.abort();
@@ -817,36 +907,74 @@ auto:
         };
         let plain = AutoRequirements::default();
         let image = AutoRequirements::from_signals(false, true, false);
-        let original = ranking_key(&[a.clone(), b.clone()], 2000, 3000, plain);
-        assert_ne!(
-            original,
-            ranking_key(&[b.clone(), a.clone()], 2000, 3000, plain)
+        let original = ranking_key(
+            &[a.clone(), b.clone()],
+            2000,
+            3000,
+            plain,
+            SELECTOR_GENERATION,
         );
         assert_ne!(
             original,
-            ranking_key(&[a.clone(), b.clone()], 2000, 3000, image)
+            ranking_key(
+                &[b.clone(), a.clone()],
+                2000,
+                3000,
+                plain,
+                SELECTOR_GENERATION
+            )
         );
         assert_ne!(
             original,
-            ranking_key(&[a.clone(), b.clone()], 4000, 3000, plain)
+            ranking_key(
+                &[a.clone(), b.clone()],
+                2000,
+                3000,
+                image,
+                SELECTOR_GENERATION
+            )
         );
         assert_ne!(
             original,
-            ranking_key(&[a.clone(), b.clone()], 2001, 3000, plain),
+            ranking_key(
+                &[a.clone(), b.clone()],
+                4000,
+                3000,
+                plain,
+                SELECTOR_GENERATION
+            )
+        );
+        assert_ne!(
+            original,
+            ranking_key(
+                &[a.clone(), b.clone()],
+                2001,
+                3000,
+                plain,
+                SELECTOR_GENERATION
+            ),
             "distinct byte estimates within the old bucket must not share a rank"
         );
         assert_ne!(
             original,
-            ranking_key(&[a.clone(), b.clone()], 2000, 3001, plain),
+            ranking_key(
+                &[a.clone(), b.clone()],
+                2000,
+                3001,
+                plain,
+                SELECTOR_GENERATION
+            ),
             "distinct token estimates within the old bucket must not share a rank"
         );
-        // A live chain edit can change the forwarded parameters without
-        // changing the candidate order. Never reuse the old selector ranking.
+        // A live chain edit changes the route snapshot's precomputed
+        // generation even when the ordered physical candidates stay equal.
+        // The caller passes that generation, so no hot-path schema hash is
+        // required for invalidation.
         let mut changed = a.clone();
         changed.params.insert("temperature".into(), json!(0.75));
         assert_ne!(
             original,
-            ranking_key(&[changed, b], 2000, 3000, plain),
+            ranking_key(&[changed, b], 2000, 3000, plain, SELECTOR_GENERATION + 1),
             "changed chain parameters must invalidate the selector cache"
         );
         let mut large = a.clone();
@@ -855,17 +983,47 @@ auto:
             json!([{"type":"function","function":{"name":"search",
                 "description":"x".repeat(900_000)}}]),
         );
-        let large_key = ranking_key(&[large.clone()], 2000, 3000, plain);
+        let large_key = ranking_key(&[large.clone()], 2000, 3000, plain, SELECTOR_GENERATION);
         assert_eq!(
             large_key,
-            ranking_key(&[large.clone()], 2000, 3000, plain),
-            "streaming hash must be deterministic for large schemas"
+            ranking_key(&[large.clone()], 2000, 3000, plain, SELECTOR_GENERATION),
+            "candidate identity and published generation must be stable"
         );
         large.params.insert("temperature".into(), json!(0.75));
         assert_ne!(
             large_key,
-            ranking_key(&[large], 2000, 3000, plain),
+            ranking_key(&[large], 2000, 3000, plain, SELECTOR_GENERATION + 1),
             "even an additional small field must invalidate a large schema key"
+        );
+        let cfg: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://example.test
+    key_env: KEY
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: a
+"#,
+        )
+        .unwrap();
+        let before = crate::routing::config_generation(&cfg);
+        let mut updated = cfg.clone();
+        updated.auto.candidates[0]
+            .params
+            .insert("tools".into(), json!([{"description":"x".repeat(900_000)}]));
+        let after = crate::routing::config_generation(&updated);
+        assert_ne!(
+            before, after,
+            "published schema changes must invalidate rankings"
+        );
+        assert_ne!(
+            ranking_key(&[a.clone()], 100, 200, plain, before),
+            ranking_key(&[a], 100, 200, plain, after),
+            "identical candidate names cannot reuse a ranking from another config"
         );
     }
 }
