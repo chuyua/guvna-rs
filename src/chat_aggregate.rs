@@ -204,7 +204,11 @@ fn apply_event(
                 }
                 append_bounded(slot.get_or_insert_with(String::new), fragment, used)?;
                 if matches!(field, "reasoning" | "reasoning_content") {
-                    choice.reasoning_ordered.push_str(fragment);
+                    // The same bytes are retained twice: once in the
+                    // upstream-specific field, again in ordered reasoning
+                    // used by Responses conversion. Account for BOTH copies
+                    // or long reasoning streams exceed the 2 MiB memory cap.
+                    append_bounded(&mut choice.reasoning_ordered, fragment, used)?;
                 }
             }
         }
@@ -507,6 +511,24 @@ mod output_budget_tests {
             .unwrap();
         }
         assert_eq!(choices[0].reasoning_ordered, "thinking continues mirror");
+        assert_eq!(used, 2 * "thinking continues mirror".len());
+    }
+
+    #[test]
+    fn ordered_reasoning_duplicate_retention_respects_global_output_budget() {
+        let event = json!({
+            "choices":[{"index":0,"delta":{
+                "reasoning_content":"r".repeat(100)
+            },"finish_reason":null}]
+        });
+        let mut used = 0;
+        with_event(event.clone(), &mut used).unwrap();
+        assert_eq!(used, 200, "both retained reasoning copies consume memory");
+        let mut near_limit = MAX_AGGREGATED_OUTPUT_BYTES - 150;
+        assert!(matches!(
+            with_event(event, &mut near_limit),
+            Err(AggregateError::OutputLimit)
+        ));
     }
 
     #[test]
