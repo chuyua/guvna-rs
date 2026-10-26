@@ -5151,7 +5151,8 @@ chains:
             .contains("restart")
     );
     let mut changed_auto = base.clone();
-    changed_auto.auto.health_aware = true;
+    // A valid, inactive selector setting is still startup-only state.
+    changed_auto.auto.decider.timeout_ms = 1200;
     assert!(
         state
             .replace_route_snapshot(changed_auto)
@@ -5176,6 +5177,90 @@ chains:
     let (status, body) = call(router, request("first-route", "", "client")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(first_hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn live_provider_reorder_keeps_cancelled_stream_telemetry_on_original_identity() {
+    use guvna::gateway::app_with_state;
+    use http_body_util::BodyExt;
+    use rusqlite::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (first, first_hits) = start_upstream(StatusCode::OK).await;
+    let (second, upstream_drops) = start_stalled_sse().await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: first
+    type: openai
+    base_url: {first}
+    key_env: FIRST
+  - name: second
+    type: openai
+    base_url: {second}
+    key_env: SECOND
+chains:
+  - name: slow-second
+    steps:
+      - provider: second
+        model: isolated
+"#
+    ))
+    .unwrap();
+    let mut state = AppState::new(
+        config.clone(),
+        HashMap::from([
+            ("FIRST".into(), "first-secret".into()),
+            ("SECOND".into(), "second-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, shared) = app_with_state(state);
+    let mut reordered = config.clone();
+    reordered.providers.swap(0, 1);
+    shared.replace_route_snapshot(reordered).unwrap();
+    let response = router
+        .oneshot(request("slow-second", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let first_frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(first_frame.into_data().unwrap().starts_with(b"data: "));
+    // Mutation after stream admission must not change its telemetry name.
+    shared.replace_route_snapshot(config).unwrap();
+    drop(body);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while upstream_drops.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(shared.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let outcome: (String, String, String) = db
+        .query_row(
+            "SELECT provider,model,outcome FROM stream_terminals LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        (
+            "second".into(),
+            "isolated".into(),
+            "client_cancelled".into()
+        )
+    );
+    assert_eq!(first_hits.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
