@@ -438,14 +438,23 @@ async fn dispatch_inner(
     // telemetry. Later local CLI mutations cannot relabel its outcome.
     let live = state.live_snapshot();
     let route_snapshot = Arc::clone(&live.config);
+    // #129 audit: the initial candidate walk and the optional Decider used
+    // to serialize the same (potentially multi-megabyte) messages/request
+    // independently. Analyze request features once; every ordering policy
+    // consumes the exact same already-validated signals and candidate list.
+    let auto_signals = auto_enabled.then(|| {
+        (
+            routing::auto_input_bytes(request.get("messages")),
+            routing::auto_context_estimate(&request),
+            routing::auto_requirements(&request),
+        )
+    });
     // Keep byte-range eligibility and context-window budgeting separate.
     // The context estimate includes the full request, output allowance and safety reserve.
     let mut steps = match if auto_enabled {
-        let input_bytes = routing::auto_input_bytes(request.get("messages"));
-        let context_estimate = routing::auto_context_estimate(&request);
+        let (input_bytes, context_estimate, signals) = auto_signals.expect("Auto signals present");
         let (min_context, max_context) = auto_bounds.expect("Auto bounds validated");
-        let requirements =
-            routing::auto_requirements(&request).with_context_bounds(min_context, max_context);
+        let requirements = signals.with_context_bounds(min_context, max_context);
         let penalties = live
             .auto_health
             .as_ref()
@@ -459,24 +468,27 @@ async fn dispatch_inner(
             .candidates
             .iter()
             .any(|candidate| !candidate.params.is_empty());
-        let mut resolved = if has_candidate_defaults {
-            routing::resolve_auto_for_request(
-                &route_snapshot,
-                input_bytes,
-                &request,
-                requirements,
-                &penalties,
-            )
-        } else {
-            state.auto_route_cache.resolve(
-                &route_snapshot,
-                input_bytes,
-                context_estimate,
-                requirements,
-                &penalties,
-                live.auto_generation,
-            )
+        let choose = |features| {
+            if has_candidate_defaults {
+                routing::resolve_auto_for_request(
+                    &route_snapshot,
+                    input_bytes,
+                    &request,
+                    features,
+                    &penalties,
+                )
+            } else {
+                state.auto_route_cache.resolve(
+                    &route_snapshot,
+                    input_bytes,
+                    context_estimate,
+                    features,
+                    &penalties,
+                    live.auto_generation,
+                )
+            }
         };
+        let mut resolved = choose(requirements);
         if matches!(&resolved, Ok(steps) if steps.is_empty())
             && !caller_context_bound
             && if has_candidate_defaults {
@@ -497,24 +509,7 @@ async fn dispatch_inner(
         {
             // Keep context-length budgeting and capability hard filters intact.
             // A second bounded cache lookup cannot issue network requests.
-            resolved = if has_candidate_defaults {
-                routing::resolve_auto_for_request(
-                    &route_snapshot,
-                    input_bytes,
-                    &request,
-                    requirements.with_context_bounds(0, None),
-                    &penalties,
-                )
-            } else {
-                state.auto_route_cache.resolve(
-                    &route_snapshot,
-                    input_bytes,
-                    context_estimate,
-                    requirements.with_context_bounds(0, None),
-                    &penalties,
-                    live.auto_generation,
-                )
-            };
+            resolved = choose(requirements.with_context_bounds(0, None));
             auto_bounds = Some((0, None));
         }
         resolved
@@ -550,11 +545,9 @@ async fn dispatch_inner(
     }
 
     if auto_enabled && let Some(decider) = &state.auto_decider {
-        let input_bytes = routing::auto_input_bytes(request.get("messages"));
-        let context_estimate = routing::auto_context_estimate(&request);
+        let (input_bytes, context_estimate, signals) = auto_signals.expect("Auto signals present");
         let (min_context, max_context) = auto_bounds.expect("Auto bounds validated");
-        let requirements =
-            routing::auto_requirements(&request).with_context_bounds(min_context, max_context);
+        let requirements = signals.with_context_bounds(min_context, max_context);
         if state.config.auto.decider.shadow_only {
             // Shadow adds zero selector latency to actual response selection.
             let owner = Arc::clone(&state);
