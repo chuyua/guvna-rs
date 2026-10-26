@@ -2,7 +2,7 @@
 //! Request validation, request translation, chat-result translation and
 //! Responses SSE wrapping live here. Dispatch still uses one shared
 //! candidate/failover loop in dispatch.rs; this module never retries upstream.
-use super::dispatch::{Endpoint, dispatch};
+use super::dispatch::{BufferedResponseLease, Endpoint, dispatch, hold_buffered_response};
 use super::responses_format;
 use super::{AppState, MAX_BODY_BYTES, authenticated_body, error};
 use axum::{
@@ -414,6 +414,10 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             json_mode,
         );
     }
+    let memory_lease = response
+        .extensions()
+        .get::<BufferedResponseLease>()
+        .cloned();
     let bytes = match to_bytes(response.into_body(), MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -434,7 +438,13 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             );
         }
     };
-    translate_chat_result(chat, logical_model, metadata)
+    // The original Chat body may have been drained, but its converted
+    // Responses body can still be large and held by a slow TCP consumer.
+    // Reuse that same lease rather than releasing it between translations.
+    hold_buffered_response(
+        translate_chat_result(chat, logical_model, metadata),
+        memory_lease,
+    )
 }
 
 // Match Chat Completions' function name contract. Byte-based validation

@@ -15,7 +15,7 @@ use crate::{
 };
 use axum::{
     Json,
-    body::Bytes,
+    body::{Body, Bytes},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -144,6 +144,39 @@ fn attach_telemetry_context(mut response: Response, context: Option<TelemetryCon
         response.extensions_mut().insert(context);
     }
     response
+}
+
+/// Bound large JSON response memory until the body is drained or dropped.
+/// A cloned Arc also spans the non-streaming Responses bridge conversion.
+#[derive(Clone)]
+pub(super) struct BufferedResponseLease(Arc<OwnedSemaphorePermit>);
+
+pub(super) fn hold_buffered_response(
+    response: Response,
+    reservation: Option<BufferedResponseLease>,
+) -> Response {
+    let Some(reservation) = reservation else {
+        return response;
+    };
+    let (mut parts, body) = response.into_parts();
+    parts.extensions.insert(reservation.clone());
+    let source = Box::pin(body.into_data_stream());
+    let guarded = futures_util::stream::unfold(
+        (source, reservation),
+        |(mut source, reservation)| async move {
+            source
+                .next()
+                .await
+                .map(|chunk| (chunk, (source, reservation)))
+        },
+    );
+    Response::from_parts(parts, Body::from_stream(guarded))
+}
+
+#[derive(Debug)]
+enum JsonReadFailure {
+    Invalid,
+    MemoryBusy,
 }
 
 fn outcome_failure_type(outcome: Outcome) -> &'static str {
@@ -667,6 +700,7 @@ async fn dispatch_inner(
     let mut last_upstream_client_error: Option<(StatusCode, Value)> = None;
     let mut bypassed_circuit = false;
     let mut aggregation_busy = false;
+    let mut buffered_response_busy = false;
     let mut unsupported_aggregate_logprobs = false;
     let mut unsupported_aggregate_n = false;
     // Propagate a useful downstream Retry-After only when *all* eligible
@@ -1101,7 +1135,7 @@ async fn dispatch_inner(
                         ops_log::warn("aggregation_lifetime_timeout");
                     }
                     aggregated.map(|value| {
-                        value.map_err(|error| {
+                        value.map(|json| (json, None)).map_err(|error| {
                             if matches!(
                                 error,
                                 chat_aggregate::AggregateError::IdleTimeout
@@ -1112,10 +1146,15 @@ async fn dispatch_inner(
                             aggregation_upstream_transport =
                                 matches!(error, chat_aggregate::AggregateError::UpstreamTransport);
                             ops_log::warn(error.log_event());
+                            JsonReadFailure::Invalid
                         })
                     })
                 } else {
-                    tokio::time::timeout_at(deadline, bounded_json(upstream)).await
+                    tokio::time::timeout_at(
+                        deadline,
+                        bounded_json(upstream, Arc::clone(&state.large_response_slots)),
+                    )
+                    .await
                 };
                 if walk_expired(walk_deadline) {
                     if upstream_stream && !streaming {
@@ -1129,7 +1168,7 @@ async fn dispatch_inner(
                     return attach_telemetry_context(walk_timeout(&state.metrics), context);
                 }
                 match result {
-                    Ok(Ok(value))
+                    Ok(Ok((value, response_reservation)))
                         if response_validation::valid_result_with_params(
                             endpoint,
                             &request,
@@ -1149,9 +1188,23 @@ async fn dispatch_inner(
                             context.set_failure_type("success");
                         }
                         return attach_telemetry_context(
-                            (StatusCode::OK, Json(value)).into_response(),
+                            hold_buffered_response(
+                                (StatusCode::OK, Json(value)).into_response(),
+                                response_reservation,
+                            ),
                             telemetry_context.take(),
                         );
+                    }
+                    Ok(Err(JsonReadFailure::MemoryBusy)) => {
+                        // Client-side backpressure cannot be charged to a
+                        // healthy upstream's key, circuit or Auto score.
+                        buffered_response_busy = true;
+                        Metrics::inc(&state.metrics.admission_rejections);
+                        if let Some(context) = telemetry_context.as_mut() {
+                            context.set_failure_type("local_error");
+                            context.set_health_observation(false);
+                        }
+                        break;
                     }
                     Err(_) => {
                         if upstream_stream && !streaming {
@@ -1331,6 +1384,18 @@ async fn dispatch_inner(
         ops_log::warn("rate_limit_exhausted");
         return attach_telemetry_context(response, telemetry_context.take());
     }
+    if buffered_response_busy {
+        let mut response = error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "large_response_busy",
+            "Large buffered response capacity is temporarily exhausted",
+        );
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+        return attach_telemetry_context(response, telemetry_context.take());
+    }
     if unsupported_aggregate_n && !attempted_network {
         let response = error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1417,17 +1482,37 @@ async fn bounded_error_json(mut upstream: reqwest::Response) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-async fn bounded_json(response: reqwest::Response) -> Result<Value, ()> {
+async fn bounded_json(
+    response: reqwest::Response,
+    large_slots: Arc<tokio::sync::Semaphore>,
+) -> Result<(Value, Option<BufferedResponseLease>), JsonReadFailure> {
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
+    let mut reservation = None;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| ())?;
+        let chunk = chunk.map_err(|_| JsonReadFailure::Invalid)?;
         if chunk.len() > MAX_BODY_BYTES.saturating_sub(bytes.len()) {
-            return Err(());
+            return Err(JsonReadFailure::Invalid);
+        }
+        if reservation.is_none()
+            && bytes.len().saturating_add(chunk.len()) > super::LARGE_RESPONSE_BODY_BYTES
+        {
+            // Each of the 128 admitted requests may read a small JSON answer.
+            // Once a reply would become large, acquire one of only two
+            // 32 MiB body slots BEFORE extending the buffer. The slot is
+            // carried into the downstream Body, including a paused reader.
+            let permit =
+                tokio::time::timeout(Duration::from_secs(1), large_slots.clone().acquire_owned())
+                    .await
+                    .map_err(|_| JsonReadFailure::MemoryBusy)?
+                    .map_err(|_| JsonReadFailure::MemoryBusy)?;
+            reservation = Some(BufferedResponseLease(Arc::new(permit)));
         }
         bytes.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&bytes).map_err(|_| ())
+    serde_json::from_slice(&bytes)
+        .map(|value| (value, reservation))
+        .map_err(|_| JsonReadFailure::Invalid)
 }
 
 #[cfg(test)]

@@ -53,6 +53,11 @@ const MAX_INFLIGHT_REQUESTS: usize = 128;
 // Bound concurrent request-body buffers and JSON trees independently from
 // long-lived SSE responses, which may remain admitted after parsing is done.
 const MAX_INFLIGHT_PAYLOADS: usize = 8;
+// #137/F03: a buffered 32 MiB upstream JSON reply can outlive dispatch while
+// a downstream TCP client reads slowly. Bound those large retained bodies
+// separately from the 128 lightweight in-flight requests.
+const MAX_LARGE_RESPONSE_BODIES: usize = 2;
+const LARGE_RESPONSE_BODY_BYTES: usize = 128 * 1024;
 // Each of the 128 admitted requests may retain a small JSON tree without
 // exhausting a single-user gateway. Large trees need one of the eight
 // payload reservations for their full parsed lifetime, not just the initial
@@ -72,6 +77,7 @@ pub struct AppState {
     client_keys: Vec<String>,
     inflight: Arc<Semaphore>,
     payload_slots: Arc<Semaphore>,
+    large_response_slots: Arc<Semaphore>,
     aggregation_slots: Arc<Semaphore>,
     auto_background_slots: Arc<Semaphore>,
     metrics: Arc<Metrics>,
@@ -250,6 +256,7 @@ impl AppState {
             client_keys,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             payload_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_PAYLOADS)),
+            large_response_slots: Arc::new(Semaphore::new(MAX_LARGE_RESPONSE_BODIES)),
             aggregation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_AGGREGATIONS)),
             auto_background_slots: Arc::new(Semaphore::new(MAX_BACKGROUND_DECIDERS)),
             metrics: Arc::new(Metrics::default()),

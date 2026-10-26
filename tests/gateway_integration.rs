@@ -2046,6 +2046,115 @@ async fn oversized_later_sse_chunk_returns_incomplete_without_failover() {
 }
 
 #[tokio::test]
+async fn issue137_f03_slow_downstream_large_json_bodies_hold_bounded_capacity() {
+    use std::time::Duration;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream_hits = Arc::clone(&hits);
+    let output = "R".repeat(256 * 1024);
+    let fake = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let hits = Arc::clone(&upstream_hits);
+            let output = output.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({
+                    "id":"large-chat","created":123,"model":"physical",
+                    "choices":[{"index":0,"message":{
+                        "role":"assistant","content":output
+                    },"finish_reason":"stop"}]
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+    let cfg: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: K
+chains:
+  - name: bulk
+    steps:
+      - provider: p
+        model: physical
+"#
+    ))
+    .unwrap();
+    let (router, state) = app_with_state(
+        AppState::new(
+            cfg,
+            HashMap::from([("K".into(), "test-secret".into())]),
+            vec!["client".into()],
+        )
+        .unwrap(),
+    );
+    let response = |path: &'static str| {
+        let payload = if path == "/v1/responses" {
+            json!({"model":"bulk","input":"hello"})
+        } else {
+            json!({"model":"bulk","messages":[{"role":"user","content":"hello"}]})
+        };
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    };
+    // Hold both outbound bodies without reading a byte. A non-streaming
+    // Responses translation must preserve the same reservation as Chat.
+    let first = router
+        .clone()
+        .oneshot(response("/v1/chat/completions"))
+        .await
+        .unwrap();
+    let second = router
+        .clone()
+        .oneshot(response("/v1/responses"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(3),
+        router.clone().oneshot(response("/v1/chat/completions")),
+    )
+    .await
+    .expect("large response backpressure must be bounded")
+    .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(rejected.headers()["retry-after"], "1");
+    let rejected_body: Value =
+        serde_json::from_slice(&to_bytes(rejected.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(rejected_body["error"]["code"], "large_response_busy");
+    assert_eq!(state.runtime_status()["upstream_success"], 2);
+    assert_eq!(state.runtime_status()["upstream_transport_failures"], 0);
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    drop(first);
+    let recovered = router
+        .clone()
+        .oneshot(response("/v1/chat/completions"))
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+    drop(second);
+    drop(recovered);
+    let next = router
+        .oneshot(response("/v1/chat/completions"))
+        .await
+        .unwrap();
+    assert_eq!(next.status(), StatusCode::OK);
+    let bytes = to_bytes(next.into_body(), 1 << 20).await.unwrap();
+    assert!(bytes.len() > 200 * 1024);
+}
+
+#[tokio::test]
 async fn issue137_f02_large_parsed_requests_hold_memory_slots_through_upstream_wait() {
     use std::time::Duration;
     let (upstream, calls) = start_slow_walk_provider(Duration::from_secs(4), StatusCode::OK).await;
