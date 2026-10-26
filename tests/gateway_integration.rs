@@ -4231,6 +4231,96 @@ fn auto_request(path: &str, bearer: &str, payload: Value) -> Request<Body> {
 }
 
 #[tokio::test]
+async fn issue129_slow_foreground_decider_reserves_walk_budget_for_real_upstream() {
+    use std::time::{Duration, Instant};
+    let (good, hits) = start_upstream(StatusCode::OK).await;
+    let selector_calls = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&selector_calls);
+    let selector = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let count = Arc::clone(&count);
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                axum::Json(json!({
+                    "choices":[{"message":{"content":r#"{"order":[1,0]}"#}}]
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let selector_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, selector).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+timeout:
+  walk: 900ms
+providers:
+  - name: business
+    type: openai
+    base_url: {good}
+    key_env: BUSINESS
+  - name: selector
+    type: openai
+    base_url: http://{selector_addr}
+    key_env: SELECTOR
+auto:
+  enabled: true
+  candidates:
+    - provider: business
+      model: first
+    - provider: business
+      model: second
+  decider:
+    enabled: true
+    provider: selector
+    model: chooser
+    timeout_ms: 4000
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("BUSINESS".into(), "business-secret".into()),
+            ("SELECTOR".into(), "selector-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let start = Instant::now();
+    let (status, response) = tokio::time::timeout(
+        Duration::from_secs(2),
+        call(
+            router.clone(),
+            auto_request(
+                "/v1/auto",
+                "client",
+                json!({"messages":[{"role":"user","content":"hi"}]}),
+            ),
+        ),
+    )
+    .await
+    .expect("slow selector must not hold the business request for 3 seconds");
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["model"], "first", "fallback uses static priority");
+    assert!(
+        start.elapsed() < Duration::from_millis(1500),
+        "foreground selector overran the configured 900ms walk budget"
+    );
+    assert_eq!(selector_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(
+        metric_value(&metrics, "walk_deadline_exhaustions_total"),
+        0,
+        "only real upstream requests can exhaust the candidate walk"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn issue129_llm_decider_changes_order_but_reuses_one_business_failover_walker() {
     let (good, good_calls) = start_upstream(StatusCode::OK).await;
     let (failed, failed_calls) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;

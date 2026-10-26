@@ -668,18 +668,33 @@ async fn dispatch_inner(
                 // large tool schemas on every warm SSE selector cache hit.
                 auto_decider::apply_cached_order(&mut steps, &order);
             }
-        } else if let Some(ranked) = decider
-            .rank(
+        } else {
+            // #129: a non-streaming Decider is advisory. Its own configured
+            // timeout may exceed a small request walk budget; never let a
+            // slow selector use up all the time reserved for business
+            // candidates. Leave up to 250ms (or half a tiny budget) to make
+            // the first real upstream attempt after falling back.
+            let selection = decider.rank(
                 &route_snapshot,
                 &steps,
                 input_bytes,
                 context_estimate,
                 requirements,
                 live.auto_generation,
-            )
-            .await
-        {
-            steps = ranked;
+            );
+            let proposed = if let Some(deadline) = walk_deadline {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let reserve = (remaining / 2).min(Duration::from_millis(250));
+                tokio::time::timeout_at(deadline - reserve, selection)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            if let Some(ranked) = proposed {
+                steps = ranked;
+            }
         }
     }
 
