@@ -23,6 +23,16 @@ struct Cache {
     stale: Instant,
 }
 
+/// A frequently used ranking should not be discarded before an older,
+/// unreferenced cache key. The bounded cache is tiny (32 entries), so a
+/// VecDeque splice needs no map or second cache state machine.
+fn touch_cache(entries: &mut VecDeque<Cache>, key: u64) -> Option<&Cache> {
+    let position = entries.iter().position(|entry| entry.key == key)?;
+    let entry = entries.remove(position)?;
+    entries.push_back(entry);
+    entries.back()
+}
+
 /// One opt-in ranking service. No second routing/fallback state machine.
 pub struct AutoDecider {
     client: reqwest::Client,
@@ -88,14 +98,18 @@ impl AutoDecider {
         if !(2..=32).contains(&steps.len()) {
             return (None, false);
         }
+        // Candidate defaults can contain large tool schemas. Computing the
+        // fingerprint under the cache mutex serialized request threads and
+        // made the "nonblocking" SSE fast path arbitrarily slow. Hash before
+        // attempting the lock, as rank() already does.
+        let key = ranking_key(steps, input_bytes, estimated_tokens, requirements);
         let Ok(mut cache) = self.cache.try_lock() else {
             return (None, false);
         };
         let now = Instant::now();
         cache.retain(|entry| entry.stale > now);
-        let key = ranking_key(steps, input_bytes, estimated_tokens, requirements);
         let can_refresh = self.refresh.available_permits() != 0;
-        match cache.iter().find(|entry| entry.key == key) {
+        match touch_cache(&mut cache, key) {
             Some(entry) => (
                 apply_order(steps, &entry.order),
                 entry.fresh <= now && can_refresh,
@@ -123,7 +137,7 @@ impl AutoDecider {
         };
         let now = Instant::now();
         entries.retain(|entry| entry.stale > now);
-        let previous = entries.iter().find(|entry| entry.key == key);
+        let previous = touch_cache(&mut entries, key);
         if let Some(entry) = previous
             && entry.fresh > now
         {
@@ -141,14 +155,12 @@ impl AutoDecider {
         // Another request may have populated this key after our first read.
         let mut entries = self.cache.lock().await;
         entries.retain(|entry| entry.stale > Instant::now());
-        if let Some(entry) = entries.iter().find(|entry| entry.key == key)
+        if let Some(entry) = touch_cache(&mut entries, key)
             && entry.fresh > Instant::now()
         {
             return apply_order(steps, &entry.order);
         }
-        let stale = entries
-            .iter()
-            .find(|entry| entry.key == key)
+        let stale = touch_cache(&mut entries, key)
             .map(|entry| (entry.order.clone(), entry.stale))
             .or(stale);
         drop(entries);
@@ -310,6 +322,85 @@ fn ranking_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selector_cache_hit_updates_recency_and_prevents_hot_key_eviction() {
+        let now = Instant::now();
+        let mut entries = VecDeque::new();
+        for key in 0..MAX_CACHE as u64 {
+            entries.push_back(Cache {
+                key,
+                order: vec![1, 0],
+                fresh: now + Duration::from_secs(5),
+                stale: now + Duration::from_secs(15),
+            });
+        }
+        assert_eq!(touch_cache(&mut entries, 0).unwrap().order, vec![1, 0]);
+        assert_eq!(entries.back().unwrap().key, 0);
+        // Under new cache pressure the oldest untouched key (1) goes, not
+        // the most frequently requested baseline rank (0).
+        entries.pop_front();
+        entries.push_back(Cache {
+            key: MAX_CACHE as u64,
+            order: vec![0, 1],
+            fresh: now + Duration::from_secs(5),
+            stale: now + Duration::from_secs(15),
+        });
+        assert!(entries.iter().any(|entry| entry.key == 0));
+        assert!(!entries.iter().any(|entry| entry.key == 1));
+        assert_eq!(entries.len(), MAX_CACHE);
+    }
+
+    #[tokio::test]
+    async fn selector_cache_large_schema_hit_and_busy_mutex_fail_open() {
+        let decider = AutoDecider {
+            client: reqwest::Client::new(),
+            endpoint: String::new(),
+            model: "ranker".into(),
+            key: String::new(),
+            timeout: Duration::from_secs(1),
+            ttl: Duration::from_secs(20),
+            cache: Mutex::new(VecDeque::new()),
+            refresh: Semaphore::new(1),
+        };
+        let mut a = ResolvedStep {
+            provider_index: 0,
+            model: "first".into(),
+            params: Default::default(),
+        };
+        a.params
+            .insert("schema".into(), json!({"description":"x".repeat(900_000)}));
+        let b = ResolvedStep {
+            provider_index: 0,
+            model: "second".into(),
+            params: Default::default(),
+        };
+        let steps = [a, b];
+        let requirements = AutoRequirements::default();
+        let key = ranking_key(&steps, 12, 2000, requirements);
+        let mut locked = decider.cache.lock().await;
+        locked.push_back(Cache {
+            key,
+            order: vec![1, 0],
+            fresh: Instant::now() + Duration::from_secs(20),
+            stale: Instant::now() + Duration::from_secs(60),
+        });
+        let (unavailable, refresh) = decider.cached_rank(&steps, 12, 2000, requirements);
+        assert!(
+            unavailable.is_none(),
+            "busy mutex must not await on the SSE path"
+        );
+        assert!(!refresh, "busy mutex cannot schedule speculative ranking");
+        drop(locked);
+        let (hit, refresh) = decider.cached_rank(&steps, 12, 2000, requirements);
+        assert_eq!(hit.unwrap()[0].model, "second");
+        assert!(!refresh);
+        // A different schema key must not inherit the cached result.
+        let (miss, refresh) = decider.cached_rank(&steps, 13, 2000, requirements);
+        assert!(miss.is_none());
+        assert!(refresh);
+    }
+
     #[test]
     fn selector_request_cap_applies_to_complete_wire_json() {
         assert!(bounded_selector_body(&json!({"model":"ranker"})).is_some());
