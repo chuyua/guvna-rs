@@ -149,7 +149,9 @@ fn attach_telemetry_context(mut response: Response, context: Option<TelemetryCon
 /// Bound large JSON response memory until the body is drained or dropped.
 /// A cloned Arc also spans the non-streaming Responses bridge conversion.
 #[derive(Clone)]
-pub(super) struct BufferedResponseLease(Arc<OwnedSemaphorePermit>);
+pub(super) struct BufferedResponseLease {
+    _permit: Arc<OwnedSemaphorePermit>,
+}
 
 pub(super) fn hold_buffered_response(
     response: Response,
@@ -1506,7 +1508,9 @@ async fn bounded_json(
                     .await
                     .map_err(|_| JsonReadFailure::MemoryBusy)?
                     .map_err(|_| JsonReadFailure::MemoryBusy)?;
-            reservation = Some(BufferedResponseLease(Arc::new(permit)));
+            reservation = Some(BufferedResponseLease {
+                _permit: Arc::new(permit),
+            });
         }
         bytes.extend_from_slice(&chunk);
     }
