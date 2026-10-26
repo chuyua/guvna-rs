@@ -319,9 +319,34 @@ impl AppState {
             );
         }
         next.validate()?;
-        let mut guard = self.live_routes.write().unwrap_or_else(|e| e.into_inner());
-        *guard = Arc::new(LiveRouteSnapshot::new(next, Some(&guard)));
-        Ok(())
+        // Building catalogs and hashing potentially large candidate schemas
+        // can be expensive. Do it ONCE without the global route write lock;
+        // request admissions must not wait while we serialize route metadata.
+        let mut prepared = LiveRouteSnapshot::new(next, None);
+        loop {
+            let previous = self.live_snapshot();
+            // Preserve health state against the last *published* generation,
+            // not a snapshot that may have been superseded while preparing.
+            if prepared.config.auto.health_aware {
+                prepared.auto_health = Some(previous.auto_health.as_ref().map_or_else(
+                    || AutoHealth::new(prepared.config.auto.candidates.len()),
+                    |health| {
+                        AutoHealth::remap(
+                            health,
+                            &previous.config.auto.candidates,
+                            &prepared.config.auto.candidates,
+                        )
+                    },
+                ));
+            }
+            let mut guard = self.live_routes.write().unwrap_or_else(|e| e.into_inner());
+            if Arc::ptr_eq(&previous, &guard) {
+                *guard = Arc::new(prepared);
+                return Ok(());
+            }
+            // Another writer published first. Retry the inexpensive health
+            // remap; catalogs, generation hash and config stay immutable.
+        }
     }
 
     #[cfg(test)]
@@ -1011,6 +1036,78 @@ auto:
             deleted.auto_health.as_ref().unwrap().penalties(),
             vec![0, 80]
         );
+    }
+
+    #[test]
+    fn concurrent_hot_route_publishes_keep_candidate_health_and_catalog_consistent() {
+        use std::sync::Barrier;
+        let base: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://example.invalid
+    key_env: KEY
+auto:
+  enabled: true
+  health_aware: true
+  discover_from_chains: true
+  candidates:
+    - provider: p
+      model: durable
+"#,
+        )
+        .unwrap();
+        let state = Arc::new(
+            AppState::new(
+                base.clone(),
+                HashMap::from([("KEY".into(), "secret".into())]),
+                vec!["client".into()],
+            )
+            .unwrap(),
+        );
+        for _ in 0..3 {
+            state.mark_auto_failure(0, "durable");
+        }
+        assert_eq!(
+            state
+                .live_snapshot()
+                .auto_health
+                .as_ref()
+                .unwrap()
+                .penalties(),
+            vec![100]
+        );
+        let barrier = Arc::new(Barrier::new(5));
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let state = Arc::clone(&state);
+                let barrier = Arc::clone(&barrier);
+                let base = base.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    for revision in 0..60 {
+                        let mut config = base.clone();
+                        config.chains.push(
+                            serde_yaml::from_str::<crate::config::Chain>(&format!(
+                                "name: chain-{worker}-{revision}\nsteps:\n  - provider: p\n    model: transient-{worker}-{revision}\n"
+                            ))
+                            .unwrap(),
+                        );
+                        state.replace_route_snapshot(config).unwrap();
+                        let snapshot = state.live_snapshot();
+                        assert_eq!(snapshot.config.chains.len(), 1);
+                        let chain_name = &snapshot.config.chains[0].name;
+                        assert_eq!(snapshot.model_details[chain_name]["id"].as_str(), Some(chain_name.as_str()));
+                        assert_eq!(snapshot.auto_health.as_ref().unwrap().penalties()[0], 100);
+                    }
+                });
+            }
+            barrier.wait();
+        });
+        let latest = state.live_snapshot();
+        assert_eq!(latest.config.chains.len(), 1);
+        assert_eq!(latest.auto_health.as_ref().unwrap().penalties()[0], 100);
     }
 
     #[test]
