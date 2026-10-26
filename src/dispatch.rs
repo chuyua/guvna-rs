@@ -595,11 +595,13 @@ async fn dispatch_inner(
             // Shadow adds zero selector latency to actual response selection.
             let owner = Arc::clone(&state);
             let selector = Arc::clone(decider);
-            let baseline = steps.clone();
-            let trace_id = request_id.to_owned();
-            let selector_config = Arc::clone(&route_snapshot);
-            let selector_generation = live.auto_generation;
             if let Ok(permit) = state.auto_background_slots.clone().try_acquire_owned() {
+                // Under pressure, skip any deep copy of default tool schemas
+                // when a background selector cannot be scheduled.
+                let baseline = steps.clone();
+                let trace_id = request_id.to_owned();
+                let selector_config = Arc::clone(&route_snapshot);
+                let selector_generation = live.auto_generation;
                 tokio::spawn(async move {
                     let _permit = permit;
                     let choice = selector
@@ -629,18 +631,17 @@ async fn dispatch_inner(
             // A selector can take up to 2s; never add that delay to SSE
             // response headers or its first token. Cold/stale rankings are
             // refreshed in the background, with one in-flight fetch per cache.
-            let baseline = steps.clone();
             let (cached, refresh) = decider.cached_rank(
-                &baseline,
+                &steps,
                 input_bytes,
                 context_estimate,
                 requirements,
                 live.auto_generation,
             );
-            if let Some(ranked) = cached {
-                steps = ranked;
-            }
             if refresh && let Ok(permit) = state.auto_background_slots.clone().try_acquire_owned() {
+                // A non-refreshing cache hit never clones another candidate
+                // list with potentially large JSON tool defaults.
+                let baseline = steps.clone();
                 let selector = Arc::clone(decider);
                 let selector_config = Arc::clone(&route_snapshot);
                 let selector_generation = live.auto_generation;
@@ -657,6 +658,9 @@ async fn dispatch_inner(
                         )
                         .await;
                 });
+            }
+            if let Some(ranked) = cached {
+                steps = ranked;
             }
         } else if let Some(ranked) = decider
             .rank(
