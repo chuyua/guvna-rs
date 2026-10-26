@@ -5142,6 +5142,22 @@ chains:
             .unwrap_err()
             .contains("restart")
     );
+    let mut changed_timeout = base.clone();
+    changed_timeout.timeout.walk = "7m".into();
+    assert!(
+        state
+            .replace_route_snapshot(changed_timeout)
+            .unwrap_err()
+            .contains("restart")
+    );
+    let mut changed_auto = base.clone();
+    changed_auto.auto.health_aware = true;
+    assert!(
+        state
+            .replace_route_snapshot(changed_auto)
+            .unwrap_err()
+            .contains("restart")
+    );
     let mut removed_provider = base.clone();
     removed_provider.providers.pop();
     removed_provider

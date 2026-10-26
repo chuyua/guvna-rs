@@ -292,6 +292,18 @@ impl AppState {
             physical_order.push(original.clone());
         }
         next.providers = physical_order;
+        // Runtime control mutates route metadata, not the listeners, HTTP
+        // timeout, optional selector, or telemetry approval. Those runtime
+        // objects are constructed once and are still read from self.config.
+        // Refuse a half-applied live config rather than advertise settings
+        // the running gateway cannot actually honor. The candidate set can
+        // change explicitly or via chain discovery below.
+        let mut immutable_view = next.clone();
+        immutable_view.chains = self.config.chains.clone();
+        immutable_view.auto.candidates = self.config.auto.candidates.clone();
+        if format!("{immutable_view:?}") != format!("{:?}", self.config) {
+            return Err("live service settings changes require a gateway restart".into());
+        }
         // The local control socket supplies the unmaterialized base config
         // plus current runtime chains. Re-discover after every mutation,
         // including deletions; never inherit stale discovered candidates.
