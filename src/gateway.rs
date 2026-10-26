@@ -271,6 +271,27 @@ impl AppState {
     /// snapshot. Requests already underway retain the old Arc snapshot.
     pub fn replace_route_snapshot(&self, mut next: Config) -> Result<(), String> {
         next.validate()?;
+        // Pools, circuit breakers, selector credentials, and request permits
+        // are built once at startup and indexed by the ORIGINAL provider
+        // positions. A live config can reorder provider definitions, but
+        // publishing those reordered indices directly would send provider
+        // A's traffic using provider B's credentials and health state.
+        // Normalize harmless permutations; reject additions, removals, and
+        // physical setting changes that require a full gateway restart.
+        if next.providers.len() != self.config.providers.len() {
+            return Err("live provider additions/removals require a gateway restart".into());
+        }
+        let mut physical_order = Vec::with_capacity(self.config.providers.len());
+        for original in &self.config.providers {
+            let Some(incoming) = next.providers.iter().find(|p| p.name == original.name) else {
+                return Err("live provider additions/removals require a gateway restart".into());
+            };
+            if format!("{incoming:?}") != format!("{original:?}") {
+                return Err("live provider configuration changes require a gateway restart".into());
+            }
+            physical_order.push(original.clone());
+        }
+        next.providers = physical_order;
         // The local control socket supplies the unmaterialized base config
         // plus current runtime chains. Re-discover after every mutation,
         // including deletions; never inherit stale discovered candidates.

@@ -5026,6 +5026,143 @@ auto:
 }
 
 #[tokio::test]
+async fn live_provider_reorder_keeps_physical_credentials_and_circuits_bound_to_identity() {
+    use guvna::gateway::app_with_state;
+
+    async fn auth_upstream(expected: &'static str, calls: Arc<AtomicUsize>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let service =
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move |request: Request<Body>| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        if request
+                            .headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            != Some(expected)
+                        {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                axum::Json(json!({"error":"wrong key"})),
+                            )
+                                .into_response();
+                        }
+                        let body = to_bytes(request.into_body(), 1 << 20).await.unwrap();
+                        let payload: Value = serde_json::from_slice(&body).unwrap();
+                        (StatusCode::OK, axum::Json(json!({
+                        "id":"keyed","object":"chat.completion","model":payload["model"],
+                        "choices":[{"index":0,"message":{"role":"assistant","content":expected},
+                            "finish_reason":"stop"}]
+                    }))).into_response()
+                    }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    let first_hits = Arc::new(AtomicUsize::new(0));
+    let second_hits = Arc::new(AtomicUsize::new(0));
+    let first = auth_upstream("Bearer first-secret", Arc::clone(&first_hits)).await;
+    let second = auth_upstream("Bearer second-secret", Arc::clone(&second_hits)).await;
+    let base: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: first
+    type: openai
+    base_url: {first}
+    key_env: FIRST
+    circuit_breaker:
+      enabled: true
+  - name: second
+    type: openai
+    base_url: {second}
+    key_env: SECOND
+    circuit_breaker:
+      enabled: true
+chains:
+  - name: first-route
+    steps:
+      - provider: first
+        model: first-model
+  - name: second-route
+    steps:
+      - provider: second
+        model: second-model
+"#
+    ))
+    .unwrap();
+    let (router, state) = app_with_state(
+        AppState::new(
+            base.clone(),
+            HashMap::from([
+                ("FIRST".into(), "first-secret".into()),
+                ("SECOND".into(), "second-secret".into()),
+            ]),
+            vec!["client".into()],
+        )
+        .unwrap(),
+    );
+    let mut reordered = base.clone();
+    reordered.providers.swap(0, 1);
+    state.replace_route_snapshot(reordered).unwrap();
+    assert_eq!(state.route_snapshot().providers[0].name, "first");
+    assert_eq!(state.route_snapshot().providers[1].name, "second");
+    for (route, expected) in [
+        ("first-route", "Bearer first-secret"),
+        ("second-route", "Bearer second-secret"),
+    ] {
+        let (status, body) = call(router.clone(), request(route, "", "client")).await;
+        assert_eq!(status, StatusCode::OK, "{route}: {body}");
+        assert_eq!(body["choices"][0]["message"]["content"], expected);
+    }
+    assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+
+    // Changes to the physical pool/endpoint contract cannot be activated by
+    // swapping an Arc of route metadata. Failed replacement is atomic.
+    let baseline = state.route_snapshot();
+    let mut changed_url = base.clone();
+    changed_url.providers[0].base_url = "http://127.0.0.1:1".into();
+    assert!(
+        state
+            .replace_route_snapshot(changed_url)
+            .unwrap_err()
+            .contains("restart")
+    );
+    let mut changed_key = base.clone();
+    changed_key.providers[0].key_env = "SECOND".into();
+    assert!(
+        state
+            .replace_route_snapshot(changed_key)
+            .unwrap_err()
+            .contains("restart")
+    );
+    let mut removed_provider = base.clone();
+    removed_provider.providers.pop();
+    removed_provider
+        .chains
+        .retain(|chain| chain.name == "first-route");
+    assert!(
+        state
+            .replace_route_snapshot(removed_provider)
+            .unwrap_err()
+            .contains("restart")
+    );
+    assert_eq!(
+        state.route_snapshot().providers[0].base_url,
+        baseline.providers[0].base_url
+    );
+    let (status, body) = call(router, request("first-route", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(first_hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn missing_optional_decider_key_does_not_block_auto_or_gateway_boot() {
     let (url, hits) = start_upstream(StatusCode::OK).await;
     let config: Config = serde_yaml::from_str(&format!(
