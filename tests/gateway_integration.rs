@@ -4276,7 +4276,7 @@ auto:
     enabled: true
     provider: selector
     model: chooser
-    timeout_ms: 4000
+    timeout_ms: 2000
 "#
     ))
     .unwrap();
