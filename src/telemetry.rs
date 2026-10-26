@@ -635,14 +635,38 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
 // writer has created it, not only the main database file.
 #[cfg(unix)]
 fn secure_sidecars(path: &Path) {
-    use std::{ffi::OsString, os::unix::fs::PermissionsExt};
+    use std::{
+        ffi::OsString,
+        fs::{OpenOptions, Permissions},
+        os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
     for suffix in ["-wal", "-shm"] {
         let mut name = OsString::from(path.as_os_str());
         name.push(suffix);
         let sidecar = PathBuf::from(name);
-        if std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600))
-            .is_err_and(|error| error.kind() != std::io::ErrorKind::NotFound)
+        // Open an FD with O_NOFOLLOW and fchmod THAT FD, so a concurrent
+        // rename/symlink replacement can never redirect chmod elsewhere.
+        // O_NONBLOCK prevents a substituted FIFO from blocking the writer.
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&sidecar)
         {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                crate::ops_log::warn("telemetry_sidecar_not_regular");
+                continue;
+            }
+        };
+        if !file
+            .metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            crate::ops_log::warn("telemetry_sidecar_not_regular");
+            continue;
+        }
+        if file.set_permissions(Permissions::from_mode(0o600)).is_err() {
             crate::ops_log::warn("telemetry_permissions_failed");
         }
     }
@@ -1581,6 +1605,50 @@ mod tests {
             Err(rusqlite::Error::InvalidPath(_))
         ));
         assert_eq!(std::fs::read(target).unwrap(), b"keep external bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_shm_permission_hardening_never_chmods_a_symlink_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.sqlite3");
+        let target = dir.path().join("unrelated-file");
+        std::fs::write(&target, b"do not touch").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let link = dir.path().join(format!("requests.sqlite3{suffix}"));
+            symlink(&target, &link).unwrap();
+        }
+        secure_sidecars(&path);
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not touch");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "WAL permission protection unexpectedly changed an unrelated file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_shm_permission_hardening_uses_the_opened_regular_inode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.sqlite3");
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = dir.path().join(format!("requests.sqlite3{suffix}"));
+            std::fs::write(&sidecar, b"sqlite sidecar fixture").unwrap();
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        secure_sidecars(&path);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = dir.path().join(format!("requests.sqlite3{suffix}"));
+            assert_eq!(
+                std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(std::fs::read(sidecar).unwrap(), b"sqlite sidecar fixture");
+        }
     }
 
     #[test]
