@@ -308,6 +308,17 @@ impl AppState {
         // plus current runtime chains. Re-discover after every mutation,
         // including deletions; never inherit stale discovered candidates.
         next.discover_auto_candidates();
+        // Config::validate allows an initially empty Auto candidate list
+        // when chain discovery is enabled, because discovery happens later.
+        // A live deletion must meet the same post-discovery invariant as
+        // AppState::new: never publish Auto enabled with zero actual routes
+        // when the next process restart would refuse to boot.
+        if next.auto.enabled && next.auto.candidates.is_empty() {
+            return Err(
+                "live Auto discovery produced no candidates; keep at least one candidate".into(),
+            );
+        }
+        next.validate()?;
         let mut guard = self.live_routes.write().unwrap_or_else(|e| e.into_inner());
         *guard = Arc::new(LiveRouteSnapshot::new(next, Some(&guard)));
         Ok(())
@@ -799,6 +810,64 @@ async fn embeddings(State(state): State<Arc<AppState>>, request: Request<Body>) 
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn live_auto_candidate_deletion_requires_restart_viable_discovery_result() {
+        let base: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://example.invalid
+    key_env: K
+auto:
+  enabled: true
+  discover_from_chains: true
+  candidates:
+    - provider: p
+      model: fixed
+chains:
+  - name: existing
+    steps:
+      - provider: p
+        model: discovered
+"#,
+        )
+        .unwrap();
+        let state = AppState::new(
+            base.clone(),
+            HashMap::from([("K".into(), "test-key".into())]),
+            vec!["client".into()],
+        )
+        .unwrap();
+        let before = state.route_snapshot();
+        assert_eq!(before.auto.candidates.len(), 2);
+        let mut delete_all = base.clone();
+        delete_all.auto.candidates.clear();
+        delete_all.chains.clear();
+        assert!(
+            delete_all.validate().is_ok(),
+            "pre-discovery config allows this"
+        );
+        assert!(
+            state
+                .replace_route_snapshot(delete_all)
+                .unwrap_err()
+                .contains("no candidates")
+        );
+        assert_eq!(state.route_snapshot().auto.candidates.len(), 2);
+        assert_eq!(state.route_snapshot().chains.len(), 1);
+        // Clearing explicit candidates remains supported as long as chain
+        // discovery can materialize at least one valid route.
+        let mut discovered_only = base;
+        discovered_only.auto.candidates.clear();
+        state.replace_route_snapshot(discovered_only).unwrap();
+        assert_eq!(state.route_snapshot().auto.candidates.len(), 1);
+        assert_eq!(
+            state.route_snapshot().auto.candidates[0].model,
+            "discovered"
+        );
+    }
 
     #[test]
     fn dynamic_passthrough_model_names_never_enter_telemetry_labels() {
