@@ -49,6 +49,7 @@ pub struct ChatSse {
     json_text: Vec<String>,
     json_text_bytes: usize,
     refusal_mask: u64,
+    resource_limit: bool,
     expected: u64,
     done: bool,
 }
@@ -70,6 +71,11 @@ impl ChatSse {
     /// Only validated content/tool deltas count as useful upstream progress.
     pub fn take_progress(&mut self) -> bool {
         std::mem::take(&mut self.progress_since_push)
+    }
+    /// Distinguish local bounded-memory protection from malformed upstream
+    /// semantics without changing the shared low-allocation error type.
+    pub fn hit_resource_limit(&self) -> bool {
+        self.resource_limit
     }
     /// Some OpenAI-compatible SSE providers close at EOF after every choice's
     /// finish_reason without sending the optional [DONE] sentinel. Only
@@ -131,6 +137,7 @@ impl ChatSse {
                 self.process_line(line.strip_suffix(b"\r").unwrap_or(&line), &mut emitted)?;
             } else {
                 if self.line.len() >= MAX_EVENT_BYTES {
+                    self.resource_limit = true;
                     return Err(SseError);
                 }
                 self.line.push(byte);
@@ -263,6 +270,7 @@ impl ChatSse {
             if fragment.len()
                 > MAX_STREAM_JSON_VALIDATION_BYTES.saturating_sub(self.json_text_bytes)
             {
+                self.resource_limit = true;
                 return Err(SseError);
             }
             self.json_text[index as usize].push_str(fragment);
@@ -474,6 +482,7 @@ impl ChatSse {
         if let Some(value) = line.strip_prefix(b"data:") {
             let value = value.strip_prefix(b" ").unwrap_or(value);
             if self.data.len() + value.len() + 1 > MAX_EVENT_BYTES {
+                self.resource_limit = true;
                 return Err(SseError);
             }
             if !self.data.is_empty() {
@@ -566,6 +575,20 @@ mod tests {
         );
         assert!(parser.push(event.as_bytes()).is_ok());
         assert!(parser.push(event.as_bytes()).is_err());
+        assert!(parser.hit_resource_limit());
+    }
+
+    #[test]
+    fn oversized_fragmented_sse_frame_is_local_limit_not_malformed_protocol() {
+        let mut oversized = ChatSse::new(1).unwrap();
+        let half = vec![b'x'; MAX_EVENT_BYTES / 2 + 1];
+        assert!(oversized.push(&half).is_ok());
+        assert!(oversized.push(&half).is_err());
+        assert!(oversized.hit_resource_limit());
+
+        let mut malformed = ChatSse::new(1).unwrap();
+        assert!(malformed.push(b"data: not-json\n\n").is_err());
+        assert!(!malformed.hit_resource_limit());
     }
 
     #[test]

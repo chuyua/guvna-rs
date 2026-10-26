@@ -277,12 +277,26 @@ fn ranking_key(
     tokens: usize,
     features: AutoRequirements,
 ) -> u64 {
+    struct HashWriter<'a>(&'a mut DefaultHasher);
+    impl std::io::Write for HashWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.write(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     let mut h = DefaultHasher::new();
     steps.len().hash(&mut h);
     for step in steps {
         step.provider_index.hash(&mut h);
         step.model.hash(&mut h);
-        format!("{:?}", step.params).hash(&mut h);
+        // Candidate defaults can include large tool JSON schemas. Hash the
+        // canonical serialized fields directly instead of allocating a
+        // potentially megabyte-sized Debug String on every request.
+        serde_json::to_writer(HashWriter(&mut h), &step.params)
+            .expect("validated JSON candidate params can be serialized");
     }
     // The selector receives exact estimates. Do not reuse a cached rank for
     // different context pressure just because both sizes share a KiB bucket.
@@ -668,6 +682,24 @@ auto:
             original,
             ranking_key(&[changed, b], 2000, 3000, plain),
             "changed chain parameters must invalidate the selector cache"
+        );
+        let mut large = a.clone();
+        large.params.insert(
+            "tools".into(),
+            json!([{"type":"function","function":{"name":"search",
+                "description":"x".repeat(900_000)}}]),
+        );
+        let large_key = ranking_key(&[large.clone()], 2000, 3000, plain);
+        assert_eq!(
+            large_key,
+            ranking_key(&[large.clone()], 2000, 3000, plain),
+            "streaming hash must be deterministic for large schemas"
+        );
+        large.params.insert("temperature".into(), json!(0.75));
+        assert_ne!(
+            large_key,
+            ranking_key(&[large], 2000, 3000, plain),
+            "even an additional small field must invalidate a large schema key"
         );
     }
 }

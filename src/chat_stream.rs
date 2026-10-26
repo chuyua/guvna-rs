@@ -151,10 +151,13 @@ async fn preflight_stream(state: &mut ChatStreamState) -> Result<(), PreflightEr
             if chunk.len() > MAX_STREAM_CHUNK_BYTES {
                 return Err(PreflightError::LocalLimit);
             }
-            let events = state
-                .parser
-                .push(&chunk)
-                .map_err(|_| PreflightError::InvalidStream)?;
+            let events = state.parser.push(&chunk).map_err(|_| {
+                if state.parser.hit_resource_limit() {
+                    PreflightError::LocalLimit
+                } else {
+                    PreflightError::InvalidStream
+                }
+            })?;
             state.pending.extend(events);
             if !state.pending.is_empty() {
                 return Ok(());
@@ -217,7 +220,12 @@ fn stream_response(state: ChatStreamState) -> Response {
                                 }
                                 state.pending.extend(events);
                             }
-                            Err(_) => state.terminated = true,
+                            Err(_) => {
+                                if state.parser.hit_resource_limit() {
+                                    state.failure_type = "local_error";
+                                }
+                                state.terminated = true;
+                            }
                         }
                     }
                 }

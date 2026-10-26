@@ -348,7 +348,14 @@ pub(super) async fn aggregate(
         if total_received > MAX_TOTAL_STREAM_BYTES {
             return Err(AggregateError::InputLimit);
         }
-        for frame in parser.push(&bytes).map_err(|_| ())? {
+        let frames = parser.push(&bytes).map_err(|_| {
+            if parser.hit_resource_limit() {
+                AggregateError::InputLimit
+            } else {
+                AggregateError::InvalidStream
+            }
+        })?;
+        for frame in frames {
             account_event(&mut event_count)?;
             if let Some(event) = event_payload(&frame)? {
                 apply_event(
