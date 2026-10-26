@@ -298,6 +298,18 @@ async fn dispatch_inner(
     }
     Metrics::inc(&state.metrics.requests_dispatched);
     let streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
+    // The downstream streaming mode is a client-facing transport contract,
+    // never a candidate default. Without an explicit false, a chain's
+    // params.stream=true can silently turn a nonstream Chat/Responses request
+    // into upstream SSE while this dispatcher still expects a JSON body.
+    // Stream-only suppliers override this flag only for their local bounded
+    // SSE-to-JSON adapter, then restore the original request.
+    if matches!(endpoint, Endpoint::Chat) && request.get("stream").is_none() {
+        request
+            .as_object_mut()
+            .expect("validated request object")
+            .insert("stream".into(), Value::Bool(false));
+    }
     // One monotonic deadline across ALL candidates, key attempts, 429
     // retries, aggregation permit waits and response bodies. Client-facing
     // SSE is intentionally exempt: only its header preflight is time-bounded.

@@ -2079,9 +2079,87 @@ async fn catalog_exposes_configured_provider_models_without_upstream_discovery()
 }
 
 #[tokio::test]
+async fn candidate_stream_default_cannot_change_nonstream_chat_or_responses_transport() {
+    let forwarded = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&forwarded);
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(body): axum::Json<Value>| {
+            let captured = Arc::clone(&captured);
+            async move {
+                captured.lock().await.push(body);
+                axum::Json(json!({
+                    "id":"mock-stream-contract","object":"chat.completion",
+                    "choices":[{"index":0,
+                        "message":{"role":"assistant","content":"normal-json"},
+                        "finish_reason":"stop"}]
+                }))
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(socket, upstream).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: KEY
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: physical
+        params:
+          stream: true
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("KEY".into(), "safe-test-secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for (path, payload) in [
+        (
+            "/v1/chat/completions",
+            json!({
+                "model":"demo","messages":[{"role":"user","content":"hello"}]
+            }),
+        ),
+        ("/v1/responses", json!({"model":"demo","input":"hello"})),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let requests = forwarded.lock().await;
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert_eq!(
+            request["stream"], false,
+            "a default stream=true must not override a client's nonstream transport"
+        );
+    }
+}
+
+#[tokio::test]
 async fn responses_force_one_choice_even_when_chain_defaults_request_multiple() {
     let (json_url, json_hits) = start_upstream(StatusCode::OK).await;
-    let (sse_url, sse_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let (sse_url, sse_hits) = start_sse(vec![
+        b"data: {\"id\":\"chatcmpl-one\",\"created\":123,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+        SSE_END,
+        SSE_DONE,
+    ]).await;
     for (streaming, url) in [(false, json_url), (true, sse_url)] {
         let config: Config = serde_yaml::from_str(&format!(
             r#"
