@@ -949,11 +949,24 @@ fn recover_page_capacity(conn: &mut Connection, now: i64) -> rusqlite::Result<bo
          (SELECT rowid FROM hourly_stats ORDER BY hour_ts LIMIT 2048)",
         [],
     )?;
+    // A stream of distinct named models can exhaust the database with
+    // provider_health rows alone. Even after event and aggregate pruning,
+    // that table is otherwise never reclaimed until the 30-day retention
+    // timer expires. Prefer dropping the oldest advisory penalties over
+    // losing every future telemetry write.
+    let removed_health = tx.execute(
+        "DELETE FROM provider_health WHERE rowid IN
+         (SELECT rowid FROM provider_health ORDER BY updated_ts LIMIT 512)",
+        [],
+    )?;
     tx.commit()?;
-    Ok(
-        removed_requests + removed_failures + removed_shadows + removed_terminals + removed_hourly
-            > 0,
-    )
+    Ok(removed_requests
+        + removed_failures
+        + removed_shadows
+        + removed_terminals
+        + removed_hourly
+        + removed_health
+        > 0)
 }
 
 fn now_secs() -> i64 {
@@ -1472,6 +1485,52 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM hourly_stats", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 0, "aggregate-only pressure must be reclaimable");
+    }
+
+    #[test]
+    fn provider_health_only_page_pressure_reclaims_oldest_advisory_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health-capacity.sqlite3");
+        let mut conn = open_database(&path).unwrap();
+        let now = now_secs();
+        for index in 0..520_i64 {
+            conn.execute(
+                "INSERT INTO provider_health
+                (provider,model,penalty,consecutive_failures,demoted,
+                 last_failure_ts,last_success_ts,updated_ts,identity_verified)
+                 VALUES('p',?1,35,1,0,?2,0,?2,1)",
+                rusqlite::params![format!("model-{index}"), now - 1000 + index],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA max_page_count=1").unwrap();
+        assert!(recover_page_capacity(&mut conn, now).unwrap());
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM provider_health", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 8);
+        let first: String = conn
+            .query_row(
+                "SELECT model FROM provider_health ORDER BY updated_ts LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first, "model-512");
+        for table in [
+            "request_events",
+            "failure_events",
+            "hourly_stats",
+            "shadow_events",
+            "stream_terminals",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must not be needed for recovery");
+        }
     }
 
     #[test]
