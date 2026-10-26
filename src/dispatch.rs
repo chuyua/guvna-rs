@@ -139,6 +139,49 @@ fn preserve_auto_health_priority(
     });
 }
 
+/// Shadow is advisory only: every available proposal or unavailable attempt
+/// must be counted once, without independently replaying the business
+/// candidate loop. Share this one outcome path across successful selector
+/// calls, semaphore saturation and missing selector credentials.
+fn record_shadow_observation(
+    state: &AppState,
+    config: &crate::config::Config,
+    request_id: &str,
+    baseline: &[routing::ResolvedStep],
+    proposal: Option<&[routing::ResolvedStep]>,
+) {
+    if let (Some(telemetry), Some(expected)) = (&state.telemetry, baseline.first())
+        && let Some(provider) = config.providers.get(expected.provider_index)
+    {
+        let suggested = proposal.and_then(|steps| steps.first()).and_then(|step| {
+            config
+                .providers
+                .get(step.provider_index)
+                .map(|provider| (provider.name.as_str(), step.model.as_str()))
+        });
+        telemetry.observe_shadow(
+            request_id,
+            (provider.name.as_str(), expected.model.as_str()),
+            suggested,
+            &state.metrics,
+        );
+    }
+    match proposal {
+        Some(steps) => {
+            state.shadow_total.fetch_add(1, Ordering::Relaxed);
+            if let (Some(expected), Some(actual)) = (baseline.first(), steps.first())
+                && (expected.provider_index != actual.provider_index
+                    || expected.model != actual.model)
+            {
+                state.shadow_disagreements.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        None => {
+            state.shadow_unavailable.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 fn attach_telemetry_context(mut response: Response, context: Option<TelemetryContext>) -> Response {
     if let Some(context) = context {
         response.extensions_mut().insert(context);
@@ -569,55 +612,18 @@ async fn dispatch_inner(
                             selector_generation,
                         )
                         .await;
-                    if let (Some(telemetry), Some(expected)) = (&owner.telemetry, baseline.first())
-                    {
-                        let expected_provider =
-                            &selector_config.providers[expected.provider_index].name;
-                        let suggested =
-                            choice
-                                .as_ref()
-                                .and_then(|ranked| ranked.first())
-                                .and_then(|step| {
-                                    selector_config.providers.get(step.provider_index).map(
-                                        |provider| (provider.name.as_str(), step.model.as_str()),
-                                    )
-                                });
-                        telemetry.observe_shadow(
-                            &trace_id,
-                            (expected_provider, expected.model.as_str()),
-                            suggested,
-                            &owner.metrics,
-                        );
-                    }
-                    match choice {
-                        Some(proposal) => {
-                            owner.shadow_total.fetch_add(1, Ordering::Relaxed);
-                            if let (Some(expected), Some(actual)) =
-                                (baseline.first(), proposal.first())
-                                && (expected.provider_index != actual.provider_index
-                                    || expected.model != actual.model)
-                            {
-                                owner.shadow_disagreements.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        None => {
-                            owner.shadow_unavailable.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                    record_shadow_observation(
+                        &owner,
+                        &selector_config,
+                        &trace_id,
+                        &baseline,
+                        choice.as_deref(),
+                    );
                 });
             } else {
                 // Under load, skip speculative ranking instead of queuing
                 // unbounded background tasks or delaying live traffic.
-                state.shadow_unavailable.fetch_add(1, Ordering::Relaxed);
-                if let (Some(telemetry), Some(expected)) = (&state.telemetry, steps.first()) {
-                    let provider = &route_snapshot.providers[expected.provider_index].name;
-                    telemetry.observe_shadow(
-                        request_id,
-                        (provider, expected.model.as_str()),
-                        None,
-                        &state.metrics,
-                    );
-                }
+                record_shadow_observation(&state, &route_snapshot, request_id, &steps, None);
             }
         } else if streaming {
             // A selector can take up to 2s; never add that delay to SSE
@@ -671,16 +677,7 @@ async fn dispatch_inner(
     // silently absent. Preserve the baseline and account for every real
     // request without sending any selector traffic or changing routing.
     if auto_enabled && state.config.auto.decider.shadow_only && state.auto_decider.is_none() {
-        state.shadow_unavailable.fetch_add(1, Ordering::Relaxed);
-        if let (Some(telemetry), Some(expected)) = (&state.telemetry, steps.first()) {
-            let provider = &route_snapshot.providers[expected.provider_index].name;
-            telemetry.observe_shadow(
-                request_id,
-                (provider, expected.model.as_str()),
-                None,
-                &state.metrics,
-            );
-        }
+        record_shadow_observation(&state, &route_snapshot, request_id, &steps, None);
     }
 
     if auto_enabled && let Some(health) = &live.auto_health {
@@ -1515,6 +1512,51 @@ async fn bounded_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shadow_accounting_is_identical_for_cached_proposal_and_unavailable_fallback() {
+        let config: crate::config::Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://example.invalid
+    key_env: K
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: first
+    - provider: p
+      model: second
+"#,
+        )
+        .unwrap();
+        let state = AppState::new(
+            config.clone(),
+            std::collections::HashMap::from([("K".to_owned(), "test-secret".to_owned())]),
+            vec!["client".into()],
+        )
+        .unwrap();
+        let step = |model: &str| routing::ResolvedStep {
+            provider_index: 0,
+            model: model.into(),
+            params: Default::default(),
+        };
+        let baseline = [step("first"), step("second")];
+        let proposal = [step("second"), step("first")];
+        record_shadow_observation(&state, &config, "trace1", &baseline, Some(&proposal));
+        record_shadow_observation(&state, &config, "trace2", &baseline, Some(&baseline));
+        record_shadow_observation(&state, &config, "trace3", &baseline, None);
+        let status = state.runtime_status();
+        assert_eq!(status["auto_shadow_total"], 2);
+        assert_eq!(status["auto_shadow_disagreements"], 1);
+        assert_eq!(status["auto_shadow_unavailable"], 1);
+        // Invalid candidates do not cause a panic or a mismatched telemetry
+        // label to enter the gateway; the counters remain independent.
+        record_shadow_observation(&state, &config, "trace4", &[], None);
+        assert_eq!(state.runtime_status()["auto_shadow_unavailable"], 2);
+    }
 
     #[test]
     fn nonstream_walk_cannot_cross_the_120_second_front_proxy_window() {
