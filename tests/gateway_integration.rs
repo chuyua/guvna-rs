@@ -1324,6 +1324,68 @@ async fn malformed_sse_after_first_event_does_not_fail_over_or_claim_success() {
 }
 
 #[tokio::test]
+async fn streamed_json_mode_detects_non_json_completion_without_false_success() {
+    let (invalid_url, invalid_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let (backup_url, backup_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let router = make_app(&invalid_url, &backup_url);
+    let response = router
+        .clone()
+        .oneshot(request(
+            "demo",
+            r#","stream":true,"response_format":{"type":"json_object"}"#,
+            "client",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(invalid_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "upstream_success_total"), 0);
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        1
+    );
+
+    let start = format!(
+        "data: {}\n\n",
+        json!({"choices":[{"index":0,
+        "delta":{"content":"{\"ok\":"},"finish_reason":null}]})
+    );
+    let end = format!(
+        "data: {}\n\n",
+        json!({"choices":[{"index":0,
+        "delta":{"content":"true}"},"finish_reason":"stop"}]})
+    );
+    let (valid_url, valid_hits, _) = start_strict_stream_only(vec![
+        start.into_bytes(),
+        end.into_bytes(),
+        SSE_DONE.to_vec(),
+    ])
+    .await;
+    let valid_router = make_app(&valid_url, &valid_url);
+    let response = valid_router
+        .clone()
+        .oneshot(request(
+            "demo",
+            r#","stream":true,"response_format":{"type":"json_object"}"#,
+            "client",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert!(body.ends_with(b"data: [DONE]\n\n"), "{body:?}");
+    assert_eq!(valid_hits.load(Ordering::SeqCst), 1);
+    let (_, metrics) = get_metrics(valid_router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "upstream_success_total"), 1);
+}
+
+#[tokio::test]
 async fn malformed_or_truncated_sse_never_quarantines_a_healthy_credential() {
     for frames in [
         vec![SSE_START, b"data: not-json\n\n".as_slice()],

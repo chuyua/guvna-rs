@@ -956,6 +956,11 @@ async fn dispatch_inner(
                                 request
                                     .get("tool_choice")
                                     .or_else(|| step.params.get("tool_choice")),
+                            )
+                            .with_json_format(
+                                request
+                                    .get("response_format")
+                                    .or_else(|| step.params.get("response_format")),
                             ),
                         state.clone(),
                         chat_stream::StreamRoute {

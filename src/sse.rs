@@ -10,6 +10,8 @@ const MAX_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_TOOL_CALLS: usize = 64 * 32;
 const MAX_STREAM_TOOL_ARGUMENTS: usize = 1024 * 1024;
 const MAX_TOOL_IDENTIFIER_BYTES: usize = 256;
+// JSON-mode streams retain only a bounded aggregate across all choices.
+const MAX_STREAM_JSON_VALIDATION_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 struct StreamToolCall {
@@ -43,6 +45,10 @@ pub struct ChatSse {
     tool_argument_bytes: usize,
     usage_seen: bool,
     tool_choice: Option<ToolChoice>,
+    json_mode: Option<bool>,
+    json_text: Vec<String>,
+    json_text_bytes: usize,
+    refusal_mask: u64,
     expected: u64,
     done: bool,
 }
@@ -92,6 +98,22 @@ impl ChatSse {
                 .map(|name| ToolChoice::Named(name.to_owned())),
             _ => None,
         };
+        self
+    }
+
+    /// Direct SSE JSON mode is an actual provider output contract.
+    pub fn with_json_format(mut self, format: Option<&Value>) -> Self {
+        self.json_mode = format
+            .and_then(|format| format.get("type"))
+            .and_then(Value::as_str)
+            .and_then(|kind| match kind {
+                "json_object" => Some(true),
+                "json_schema" => Some(false),
+                _ => None,
+            });
+        if self.json_mode.is_some() {
+            self.json_text = vec![String::new(); self.expected as usize];
+        }
         self
     }
 
@@ -217,8 +239,34 @@ impl ChatSse {
             || delta
                 .get("content")
                 .is_some_and(|content| !content.is_null() && !content.is_string())
+            || ["reasoning", "reasoning_content", "refusal"]
+                .iter()
+                .any(|field| {
+                    delta
+                        .get(*field)
+                        .is_some_and(|value| !value.is_null() && !value.is_string())
+                })
         {
             return Err(SseError);
+        }
+        let choice_bit = 1u64 << index;
+        if delta
+            .get("refusal")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+        {
+            self.refusal_mask |= choice_bit;
+        }
+        if self.json_mode.is_some()
+            && let Some(fragment) = delta.get("content").and_then(Value::as_str)
+        {
+            if fragment.len()
+                > MAX_STREAM_JSON_VALIDATION_BYTES.saturating_sub(self.json_text_bytes)
+            {
+                return Err(SseError);
+            }
+            self.json_text[index as usize].push_str(fragment);
+            self.json_text_bytes += fragment.len();
         }
         let mut has_tool_delta = false;
         if let Some(calls) = delta.get("tool_calls") {
@@ -263,6 +311,15 @@ impl ChatSse {
             // completed function invocation. Legacy function_call deltas
             // are unsupported, so only tool_calls may terminate tool data.
             if (reason == "tool_calls" && !has_tools) || (reason == "stop" && has_tools) {
+                return Err(SseError);
+            }
+            if reason == "stop"
+                && !has_tools
+                && self.refusal_mask & choice_bit == 0
+                && let Some(object_only) = self.json_mode
+                && !serde_json::from_str::<Value>(&self.json_text[index as usize])
+                    .is_ok_and(|value| !object_only || value.is_object())
+            {
                 return Err(SseError);
             }
             match &self.tool_choice {
@@ -440,6 +497,7 @@ impl ChatSse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     const START: &[u8] =
         br#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
 
@@ -447,6 +505,91 @@ mod tests {
     const END: &[u8] = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 "#;
+    #[test]
+    fn direct_json_mode_validates_each_choice_at_completion() {
+        for (format, fragments, finish, accepted) in [
+            ("json_object", vec!["{\"ok\":", "true}"], "stop", true),
+            ("json_object", vec!["plain prose"], "stop", false),
+            ("json_object", vec!["[1]"], "stop", false),
+            ("json_schema", vec!["[1]"], "stop", true),
+            ("json_schema", vec!["not JSON"], "stop", false),
+            ("json_object", vec!["{\"unfinished\":"], "length", true),
+        ] {
+            let mut parser = ChatSse::new(1)
+                .unwrap()
+                .with_json_format(Some(&json!({"type":format})));
+            let mut failed = false;
+            for (i, part) in fragments.iter().enumerate() {
+                let reason = if i + 1 == fragments.len() {
+                    json!(finish)
+                } else {
+                    Value::Null
+                };
+                let event = format!(
+                    "data: {}\n\n",
+                    json!({"choices":[{"index":0,"delta":{"content":part},"finish_reason":reason}]})
+                );
+                if parser.push(event.as_bytes()).is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            assert_eq!(!failed, accepted, "{format} {fragments:?} {finish}");
+            if accepted {
+                assert!(parser.push(b"data: [DONE]\n\n").is_ok());
+            }
+        }
+        // A legitimate provider refusal is not an ordinary JSON answer.
+        let mut refusal = ChatSse::new(1)
+            .unwrap()
+            .with_json_format(Some(&json!({"type":"json_object"})));
+        let event = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"index":0,
+            "delta":{"content":"cannot assist","refusal":"cannot assist"},
+            "finish_reason":"stop"}]})
+        );
+        refusal.push(event.as_bytes()).unwrap();
+        refusal.push(b"data: [DONE]\n\n").unwrap();
+    }
+
+    #[test]
+    fn json_mode_stream_retain_limit_is_bounded_across_deltas() {
+        let mut parser = ChatSse::new(1)
+            .unwrap()
+            .with_json_format(Some(&json!({"type":"json_object"})));
+        let large = "a".repeat(MAX_STREAM_JSON_VALIDATION_BYTES / 2 + 1);
+        let event = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"index":0,
+            "delta":{"content":large},"finish_reason":null}]})
+        );
+        assert!(parser.push(event.as_bytes()).is_ok());
+        assert!(parser.push(event.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn known_reasoning_and_refusal_fields_must_be_text_or_null() {
+        for field in ["reasoning", "reasoning_content", "refusal"] {
+            let mut parser = ChatSse::new(1).unwrap();
+            let mut delta = serde_json::Map::new();
+            delta.insert(field.to_owned(), json!({"bad":"object"}));
+            let malformed = format!(
+                "data: {}\n\n",
+                json!({"choices":[{"index":0,"delta":delta,"finish_reason":null}]})
+            );
+            assert!(parser.push(malformed.as_bytes()).is_err(), "{field}");
+            assert!(
+                !parser.take_progress(),
+                "{field}: malformed data renewed probe"
+            );
+        }
+        let mut parser = ChatSse::new(1).unwrap();
+        let valid = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null},\"finish_reason\":null}]}\n\n";
+        assert!(parser.push(valid).is_ok());
+        assert!(!parser.take_progress());
+    }
+
     #[test]
     fn only_valid_content_or_tool_deltas_refresh_probe_progress() {
         let mut parser = ChatSse::new(1).unwrap();

@@ -558,14 +558,18 @@ impl ResponsesSse {
         }
         for field in ["content", "refusal"] {
             if let Some(content) = delta.get(field).filter(|part| !part.is_null()) {
+                let part = content.as_str().ok_or(())?;
+                if field == "refusal" && !part.is_empty() {
+                    // Several providers mirror refusal text in content.
+                    // Even when we omit the duplicate output delta, this is
+                    // still an explicit refusal and JSON mode must not try
+                    // parsing it as a structured answer.
+                    self.has_refusal = true;
+                }
                 if field == "refusal" && delta.get("content") == Some(content) {
                     continue; // Do not duplicate mirrored text.
                 }
-                let part = content.as_str().ok_or(())?;
                 if !part.is_empty() {
-                    if field == "refusal" {
-                        self.has_refusal = true;
-                    }
                     if !self.tools.is_empty() {
                         return Err(());
                     }
@@ -944,6 +948,39 @@ mod tests {
                 &mut output,
             )
             .is_err());
+    }
+
+    #[test]
+    fn mirrored_refusal_is_not_duplicated_or_rejected_by_json_mode() {
+        for delta in [
+            json!({"content":"I cannot assist","refusal":"I cannot assist"}),
+            json!({"refusal":"I cannot assist"}),
+        ] {
+            let mut translator = ResponsesSse::new("logical".into(), Value::Null);
+            translator.json_mode = Some(true);
+            let mut pending = VecDeque::new();
+            translator
+                .feed(
+                    &frame(json!({"id":"refusal","created":123,
+                        "choices":[{"index":0,"delta":delta,"finish_reason":"stop"}]})),
+                    &mut pending,
+                )
+                .unwrap();
+            translator.feed(b"data: [DONE]\n\n", &mut pending).unwrap();
+            assert!(translator.done);
+            assert!(translator.has_refusal);
+            assert_eq!(translator.text, "I cannot assist");
+            let emitted = pending
+                .iter()
+                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                .collect::<Vec<_>>()
+                .join("");
+            assert_eq!(
+                emitted.matches("event: response.output_text.delta").count(),
+                1
+            );
+            assert!(emitted.contains("event: response.completed"));
+        }
     }
 
     #[test]
