@@ -1,6 +1,5 @@
 //! Bounded opt-in Auto candidate health hints, no network requests, user data or timers.
 use std::{
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -10,16 +9,21 @@ const RECOVER_AT: u8 = 30;
 const MIN_SAMPLES: u16 = 3;
 const FRESH_SECS: u64 = 300;
 
+// All four fields participate in one hysteresis transition. Four atomics
+// behind another mutex were redundant and obscured whether a reader could
+// observe a mixed old/new state. A single small lock also works across live
+// route generations: the Arc is remapped by the physical candidate identity.
 #[derive(Default)]
 struct ProviderScore {
-    // Mutations to the failure window and the demotion latch must be atomic
-    // as one transition; independent relaxed atomics allow stale resets to
-    // undo a concurrent demotion.
-    transition: Mutex<()>,
-    penalty: AtomicU8,
-    consecutive_failures: AtomicU16,
-    demoted: AtomicBool,
-    last_failure_secs: AtomicU64,
+    state: Mutex<ProviderState>,
+}
+
+#[derive(Default)]
+struct ProviderState {
+    penalty: u8,
+    consecutive_failures: u16,
+    demoted: bool,
+    last_failure_secs: u64,
 }
 
 fn now_unix_secs() -> u64 {
@@ -28,28 +32,6 @@ fn now_unix_secs() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-fn update_penalty(counter: &AtomicU8, transform: impl Fn(u8) -> u8) -> u8 {
-    let mut current = counter.load(Ordering::Relaxed);
-    loop {
-        let next = transform(current);
-        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return next,
-            Err(actual) => current = actual,
-        }
-    }
-}
-
-fn count_observation(counter: &AtomicU16) -> u16 {
-    let mut current = counter.load(Ordering::Relaxed);
-    loop {
-        let next = current.saturating_add(1);
-        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return next,
-            Err(actual) => current = actual,
-        }
-    }
-}
-
 pub struct AutoHealth {
     providers: Vec<Arc<ProviderScore>>,
 }
@@ -92,12 +74,12 @@ impl AutoHealth {
 
     pub fn mark_success(&self, index: usize) {
         if let Some(score) = self.providers.get(index) {
-            let _transition = score.transition.lock().unwrap_or_else(|e| e.into_inner());
-            let updated = update_penalty(&score.penalty, |value| value.saturating_sub(20));
-            if updated <= RECOVER_AT {
-                score.demoted.store(false, Ordering::Relaxed);
+            let mut state = score.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.penalty = state.penalty.saturating_sub(20);
+            if state.penalty <= RECOVER_AT {
+                state.demoted = false;
             }
-            score.consecutive_failures.store(0, Ordering::Relaxed);
+            state.consecutive_failures = 0;
         }
     }
 
@@ -130,22 +112,13 @@ impl AutoHealth {
         now_secs: u64,
     ) {
         if let Some(score) = self.providers.get(index) {
-            let _transition = score.transition.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = score.state.lock().unwrap_or_else(|e| e.into_inner());
             let fresh = last_failure_secs <= now_secs
                 && now_secs.saturating_sub(last_failure_secs) <= FRESH_SECS;
-            score
-                .penalty
-                .store(if fresh { penalty.min(100) } else { 0 }, Ordering::Relaxed);
-            score.consecutive_failures.store(
-                if fresh { consecutive_failures } else { 0 },
-                Ordering::Relaxed,
-            );
-            score
-                .demoted
-                .store(fresh && demoted && penalty > RECOVER_AT, Ordering::Relaxed);
-            score
-                .last_failure_secs
-                .store(last_failure_secs, Ordering::Relaxed);
+            state.penalty = if fresh { penalty.min(100) } else { 0 };
+            state.consecutive_failures = if fresh { consecutive_failures } else { 0 };
+            state.demoted = fresh && demoted && penalty > RECOVER_AT;
+            state.last_failure_secs = last_failure_secs;
         }
     }
     pub fn penalties(&self) -> Vec<u8> {
@@ -154,19 +127,19 @@ impl AutoHealth {
 
     fn failure_at(&self, index: usize, now_secs: u64) {
         if let Some(score) = self.providers.get(index) {
-            let _transition = score.transition.lock().unwrap_or_else(|e| e.into_inner());
-            let previous = score.last_failure_secs.swap(now_secs, Ordering::Relaxed);
+            let mut state = score.state.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::mem::replace(&mut state.last_failure_secs, now_secs);
             if now_secs.saturating_sub(previous) > FRESH_SECS || now_secs < previous {
                 // A stale outage is not fresh evidence. Serialize window
                 // rollover with the full demotion transition.
-                score.penalty.store(0, Ordering::Relaxed);
-                score.consecutive_failures.store(0, Ordering::Relaxed);
-                score.demoted.store(false, Ordering::Relaxed);
+                state.penalty = 0;
+                state.consecutive_failures = 0;
+                state.demoted = false;
             }
-            let updated = update_penalty(&score.penalty, |value| value.saturating_add(35).min(100));
-            let failures = count_observation(&score.consecutive_failures);
-            if failures >= MIN_SAMPLES && updated >= DEMOTE_AT {
-                score.demoted.store(true, Ordering::Relaxed);
+            state.penalty = state.penalty.saturating_add(35).min(100);
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            if state.consecutive_failures >= MIN_SAMPLES && state.penalty >= DEMOTE_AT {
+                state.demoted = true;
             }
         }
     }
@@ -175,12 +148,12 @@ impl AutoHealth {
         self.providers
             .iter()
             .map(|score| {
-                let last_failure = score.last_failure_secs.load(Ordering::Relaxed);
-                if score.demoted.load(Ordering::Relaxed)
-                    && now_secs >= last_failure
-                    && now_secs.saturating_sub(last_failure) <= FRESH_SECS
+                let state = score.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.demoted
+                    && now_secs >= state.last_failure_secs
+                    && now_secs.saturating_sub(state.last_failure_secs) <= FRESH_SECS
                 {
-                    score.penalty.load(Ordering::Relaxed)
+                    state.penalty
                 } else {
                     0
                 }
@@ -287,13 +260,51 @@ mod tests {
             barrier.wait();
         });
         assert_eq!(health.penalties_at(1001), vec![100]);
-        assert!(health.providers[0].demoted.load(Ordering::Relaxed));
+        assert!(health.providers[0].state.lock().unwrap().demoted);
     }
 
     #[test]
     fn failure_streak_counter_never_wraps() {
-        let counter = AtomicU16::new(u16::MAX);
-        assert_eq!(count_observation(&counter), u16::MAX);
-        assert_eq!(counter.load(Ordering::Relaxed), u16::MAX);
+        let health = AutoHealth::new(1);
+        health.restore_at(0, 100, u16::MAX, true, 1000, 1000);
+        health.failure_at(0, 1001);
+        let state = health.providers[0].state.lock().unwrap();
+        assert_eq!(state.consecutive_failures, u16::MAX);
+        assert_eq!(state.penalty, 100);
+        assert!(state.demoted);
+    }
+
+    #[test]
+    fn remap_keeps_shared_health_identity_while_old_generation_is_still_in_flight() {
+        use crate::config::AutoCandidate;
+        let make = |model: &str| AutoCandidate {
+            provider: "provider".into(),
+            model: model.into(),
+            priority: 100,
+            min_input_bytes: 0,
+            max_input_bytes: None,
+            max_context_tokens: None,
+            supports_tools: None,
+            supports_images: None,
+            supports_json_schema: None,
+            params: Default::default(),
+        };
+        let old = vec![make("a"), make("b")];
+        let next = vec![make("b"), make("a"), make("new")];
+        let current = AutoHealth::new(2);
+        for _ in 0..3 {
+            current.failure_at(0, 100);
+        }
+        let remapped = AutoHealth::remap(&current, &old, &next);
+        assert_eq!(remapped.penalties_at(100), vec![0, 100, 0]);
+        // A response admitted under the previous snapshot still updates
+        // the same physical candidate score after the route reorder.
+        current.mark_success(0);
+        assert_eq!(remapped.penalties_at(100), vec![0, 80, 0]);
+        for _ in 0..4 {
+            remapped.mark_success(1);
+        }
+        assert_eq!(current.penalties_at(100), vec![0, 0]);
+        assert_eq!(remapped.penalties_at(100), vec![0, 0, 0]);
     }
 }
