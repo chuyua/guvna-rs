@@ -118,6 +118,9 @@ struct ResponsesSse {
     text: String,
     text_index: Option<usize>,
     text_closed: bool,
+    text_part_index: Option<usize>,
+    refusal: String,
+    refusal_part_index: Option<usize>,
     reasoning_text: String,
     reasoning_index: Option<usize>,
     next_output_index: usize,
@@ -142,6 +145,9 @@ impl ResponsesSse {
             text: String::new(),
             text_index: None,
             text_closed: false,
+            text_part_index: None,
+            refusal: String::new(),
+            refusal_part_index: None,
             reasoning_text: String::new(),
             reasoning_index: None,
             next_output_index: 0,
@@ -165,11 +171,23 @@ impl ResponsesSse {
     fn reasoning_id(&self) -> String {
         format!("rs_{}", self.id.as_deref().unwrap_or_default())
     }
+    fn message_parts(&self) -> Vec<Value> {
+        let count = usize::from(self.text_part_index.is_some())
+            + usize::from(self.refusal_part_index.is_some());
+        let mut parts = vec![Value::Null; count];
+        if let Some(index) = self.text_part_index {
+            parts[index] = json!({"type":"output_text","text":self.text,"annotations":[]});
+        }
+        if let Some(index) = self.refusal_part_index {
+            parts[index] = json!({"type":"refusal","refusal":self.refusal});
+        }
+        parts
+    }
     fn response(&self, status: &str) -> Value {
         let mut output = vec![Value::Null; self.next_output_index];
         if let Some(index) = self.text_index {
             output[index] = json!({"id":self.message_id(),"type":"message","status":status,
-                "role":"assistant","content":[{"type":"output_text","text":self.text,"annotations":[]}]});
+                "role":"assistant","content":self.message_parts()});
         }
         if let Some(index) = self.reasoning_index {
             output[index] = json!({"id":self.reasoning_id(),"type":"reasoning","status":status,
@@ -232,7 +250,7 @@ impl ResponsesSse {
         Ok(())
     }
 
-    fn begin_text(&mut self, pending: &mut VecDeque<Bytes>) {
+    fn begin_message(&mut self, pending: &mut VecDeque<Bytes>) {
         if self.text_index.is_some() {
             return;
         }
@@ -247,12 +265,38 @@ impl ResponsesSse {
                     "status":"in_progress","role":"assistant","content":[]}
             }),
         ));
+    }
+
+    fn begin_text(&mut self, pending: &mut VecDeque<Bytes>) {
+        self.begin_message(pending);
+        if self.text_part_index.is_some() {
+            return;
+        }
+        let content_index = usize::from(self.refusal_part_index.is_some());
+        self.text_part_index = Some(content_index);
         let message_id = self.message_id();
         pending.push_back(self.emit(
             "response.content_part.added",
             json!({
-                "item_id":message_id,"output_index":index,"content_index":0,
+                "item_id":message_id,"output_index":self.text_index,"content_index":content_index,
                 "part":{"type":"output_text","text":"","annotations":[]}
+            }),
+        ));
+    }
+
+    fn begin_refusal(&mut self, pending: &mut VecDeque<Bytes>) {
+        self.begin_message(pending);
+        if self.refusal_part_index.is_some() {
+            return;
+        }
+        let content_index = usize::from(self.text_part_index.is_some());
+        self.refusal_part_index = Some(content_index);
+        let message_id = self.message_id();
+        pending.push_back(self.emit(
+            "response.content_part.added",
+            json!({
+                "item_id":message_id,"output_index":self.text_index,"content_index":content_index,
+                "part":{"type":"refusal","refusal":""}
             }),
         ));
     }
@@ -538,6 +582,7 @@ impl ResponsesSse {
                 > MAX_TEXT.saturating_sub(
                     self.text
                         .len()
+                        .saturating_add(self.refusal.len())
                         .saturating_add(self.reasoning_text.len())
                         .saturating_add(used),
                 )
@@ -560,14 +605,12 @@ impl ResponsesSse {
             if let Some(content) = delta.get(field).filter(|part| !part.is_null()) {
                 let part = content.as_str().ok_or(())?;
                 if field == "refusal" && !part.is_empty() {
-                    // Several providers mirror refusal text in content.
-                    // Even when we omit the duplicate output delta, this is
-                    // still an explicit refusal and JSON mode must not try
-                    // parsing it as a structured answer.
                     self.has_refusal = true;
                 }
-                if field == "refusal" && delta.get("content") == Some(content) {
-                    continue; // Do not duplicate mirrored text.
+                // Some upstreams mirror the refusal in content in the SAME
+                // delta. Emit only the typed refusal, never a duplicate text.
+                if field == "content" && delta.get("refusal") == Some(content) && !part.is_empty() {
+                    continue;
                 }
                 if !part.is_empty() {
                     if !self.tools.is_empty() {
@@ -582,22 +625,39 @@ impl ResponsesSse {
                         > MAX_TEXT.saturating_sub(
                             self.text
                                 .len()
+                                .saturating_add(self.refusal.len())
                                 .saturating_add(self.reasoning_text.len())
                                 .saturating_add(used),
                         )
                     {
                         return Err(());
                     }
-                    self.begin_text(pending);
-                    self.text.push_str(part);
                     let item_id = self.message_id();
-                    pending.push_back(self.emit(
-                        "response.output_text.delta",
-                        json!({
-                            "item_id":item_id,"output_index":self.text_index,"content_index":0,
-                            "delta":part,"logprobs":[]
-                        }),
-                    ));
+                    if field == "refusal" {
+                        self.begin_refusal(pending);
+                        self.refusal.push_str(part);
+                        pending.push_back(self.emit(
+                            "response.refusal.delta",
+                            json!({
+                                "item_id":item_id,
+                                "output_index":self.text_index,
+                                "content_index":self.refusal_part_index,
+                                "delta":part
+                            }),
+                        ));
+                    } else {
+                        self.begin_text(pending);
+                        self.text.push_str(part);
+                        pending.push_back(self.emit(
+                            "response.output_text.delta",
+                            json!({
+                                "item_id":item_id,
+                                "output_index":self.text_index,
+                                "content_index":self.text_part_index,
+                                "delta":part,"logprobs":[]
+                            }),
+                        ));
+                    }
                 }
             }
         } // content/refusal parts
@@ -716,29 +776,41 @@ impl ResponsesSse {
             return;
         }
         if let Some(index) = self.text_index {
-            let item_id = self.message_id();
-            pending.push_back(self.emit(
-                "response.output_text.done",
-                json!({
-                    "item_id":item_id,"output_index":index,"content_index":0,
-                    "text":self.text,"logprobs":[]
-                }),
-            ));
-            let item_id = self.message_id();
-            pending.push_back(self.emit(
-                "response.content_part.done",
-                json!({
-                    "item_id":item_id,"output_index":index,"content_index":0,
-                    "part":{"type":"output_text","text":self.text,"annotations":[]}
-                }),
-            ));
+            let parts = self.message_parts();
+            for content_index in 0..parts.len() {
+                if self.text_part_index == Some(content_index) {
+                    let item_id = self.message_id();
+                    pending.push_back(self.emit(
+                        "response.output_text.done",
+                        json!({
+                            "item_id":item_id,"output_index":index,"content_index":content_index,
+                            "text":self.text,"logprobs":[]
+                        }),
+                    ));
+                } else if self.refusal_part_index == Some(content_index) {
+                    let item_id = self.message_id();
+                    pending.push_back(self.emit(
+                        "response.refusal.done",
+                        json!({
+                            "item_id":item_id,"output_index":index,"content_index":content_index,
+                            "refusal":self.refusal
+                        }),
+                    ));
+                }
+                let item_id = self.message_id();
+                pending.push_back(self.emit(
+                    "response.content_part.done",
+                    json!({
+                        "item_id":item_id,"output_index":index,"content_index":content_index,
+                        "part":parts[content_index]
+                    }),
+                ));
+            }
             let item = json!({"id":self.message_id(),"type":"message","status":status,
-                "role":"assistant","content":[{"type":"output_text","text":self.text,"annotations":[]}]});
+                "role":"assistant","content":parts});
             pending.push_back(self.emit(
                 "response.output_item.done",
-                json!({
-                    "output_index":index,"item":item
-                }),
+                json!({"output_index":index,"item":item}),
             ));
             self.text_closed = true;
         }
@@ -969,18 +1041,86 @@ mod tests {
             translator.feed(b"data: [DONE]\n\n", &mut pending).unwrap();
             assert!(translator.done);
             assert!(translator.has_refusal);
-            assert_eq!(translator.text, "I cannot assist");
+            assert_eq!(translator.text, "");
+            assert_eq!(translator.refusal, "I cannot assist");
             let emitted = pending
                 .iter()
                 .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
                 .collect::<Vec<_>>()
                 .join("");
-            assert_eq!(
-                emitted.matches("event: response.output_text.delta").count(),
-                1
-            );
+            assert_eq!(emitted.matches("event: response.refusal.delta").count(), 1);
+            assert_eq!(emitted.matches("event: response.refusal.done").count(), 1);
+            assert!(!emitted.contains("event: response.output_text.delta"));
             assert!(emitted.contains("event: response.completed"));
+            let last: Value = serde_json::from_str(
+                emitted
+                    .split("event: response.completed\ndata: ")
+                    .nth(1)
+                    .unwrap()
+                    .trim(),
+            )
+            .unwrap();
+            assert_eq!(last["response"]["output_text"], "");
+            assert_eq!(
+                last["response"]["output"][0]["content"][0],
+                json!({"type":"refusal","refusal":"I cannot assist"})
+            );
         }
+    }
+
+    #[test]
+    fn mixed_text_and_refusal_stream_keep_distinct_content_part_indexes() {
+        let mut translator = ResponsesSse::new("logical".into(), Value::Null);
+        let mut pending = VecDeque::new();
+        translator
+            .feed(
+                &frame(json!({"id":"mixed-refusal","created":123,
+                "choices":[{"index":0,"delta":{"content":"I can discuss safety."},
+                    "finish_reason":null}]})),
+                &mut pending,
+            )
+            .unwrap();
+        translator
+            .feed(
+                &frame(json!({"id":"mixed-refusal",
+                "choices":[{"index":0,"delta":{"refusal":"But I cannot do that."},
+                    "finish_reason":"stop"}]})),
+                &mut pending,
+            )
+            .unwrap();
+        translator.feed(b"data: [DONE]\n\n", &mut pending).unwrap();
+        let emitted = pending
+            .iter()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .collect::<Vec<_>>();
+        let final_event = emitted.last().unwrap();
+        let result: Value =
+            serde_json::from_str(final_event.split_once("data: ").unwrap().1.trim()).unwrap();
+        assert_eq!(result["response"]["output_text"], "I can discuss safety.");
+        assert_eq!(
+            result["response"]["output"][0]["content"],
+            json!([
+                {"type":"output_text","text":"I can discuss safety.","annotations":[]},
+                {"type":"refusal","refusal":"But I cannot do that."}
+            ])
+        );
+        let refusal_delta = emitted
+            .iter()
+            .find(|chunk| chunk.starts_with("event: response.refusal.delta"))
+            .unwrap();
+        let refusal_json: Value =
+            serde_json::from_str(refusal_delta.split_once("data: ").unwrap().1.trim()).unwrap();
+        assert_eq!(refusal_json["content_index"], 1);
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(
+                    |chunk| chunk.starts_with("event: response.output_item.done")
+                        && chunk.contains("\"type\":\"message\"")
+                )
+                .count(),
+            1
+        );
     }
 
     #[test]

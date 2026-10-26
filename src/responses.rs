@@ -614,6 +614,34 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                     }
                     let mut text = String::new();
                     for part in parts {
+                        if part.get("type").and_then(Value::as_str) == Some("refusal") {
+                            if role != "assistant" {
+                                return Err(Box::new(error(
+                                    StatusCode::BAD_REQUEST,
+                                    "invalid_refusal_role",
+                                    "refusal parts require assistant role",
+                                )));
+                            }
+                            if part.as_object().is_none_or(|obj| {
+                                obj.keys()
+                                    .any(|key| !["type", "refusal"].contains(&key.as_str()))
+                            }) {
+                                return Err(Box::new(error(
+                                    StatusCode::NOT_IMPLEMENTED,
+                                    "responses_input_unsupported",
+                                    "Unsupported refusal part fields",
+                                )));
+                            }
+                            let Some(fragment) = part.get("refusal").and_then(Value::as_str) else {
+                                return Err(Box::new(error(
+                                    StatusCode::BAD_REQUEST,
+                                    "unsupported_input",
+                                    "refusal parts require refusal text",
+                                )));
+                            };
+                            text.push_str(fragment);
+                            continue;
+                        }
                         if !matches!(
                             part.get("type").and_then(Value::as_str),
                             Some("input_text") | Some("output_text")
@@ -883,14 +911,13 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
         }))).into_response();
     }
     let content_value = &message["content"];
+    let refusal = message
+        .get("refusal")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
     let content = match content_value.as_str() {
         Some(content) => content,
-        None if content_value.is_null() && reasoning.is_some() => {
-            message["refusal"].as_str().unwrap_or("")
-        }
-        None if content_value.is_null() && message["refusal"].as_str().is_some() => {
-            message["refusal"].as_str().unwrap_or("")
-        }
+        None if content_value.is_null() && (reasoning.is_some() || refusal.is_some()) => "",
         _ => {
             return error(
                 StatusCode::BAD_GATEWAY,
@@ -918,14 +945,25 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
     if let Some(reasoning) = reasoning.as_deref() {
         output.push(reasoning_item(response_id, reasoning, output_status));
     }
-    if !content.is_empty() || reasoning.is_none() {
-        output.push(json!({"id":format!("msg_{response_id}"), "type":"message", "status":output_status,
-            "role":"assistant", "content":[{"type":"output_text","text":content,"annotations":[]}]}));
+    let mirrored_refusal = refusal.is_some_and(|value| value == content);
+    let output_text = if mirrored_refusal { "" } else { content };
+    let mut parts = Vec::with_capacity(2);
+    if !output_text.is_empty() || (refusal.is_none() && reasoning.is_none()) {
+        parts.push(json!({"type":"output_text","text":output_text,"annotations":[]}));
+    }
+    if let Some(refusal) = refusal {
+        parts.push(json!({"type":"refusal","refusal":refusal}));
+    }
+    if !parts.is_empty() {
+        output.push(
+            json!({"id":format!("msg_{response_id}"), "type":"message", "status":output_status,
+            "role":"assistant", "content":parts}),
+        );
     }
     (StatusCode::OK, Json(json!({
         "id":chat["id"], "object":"response", "status":response_status, "incomplete_details":incomplete_details, "created_at":created_at, "model":logical_model,
         "output":output,
-        "output_text":content,
+        "output_text":output_text,
         "usage": translated_usage, "metadata":metadata
     }))).into_response()
 }
@@ -933,6 +971,68 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
 #[cfg(test)]
 mod reasoning_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn standalone_mirrored_and_mixed_chat_refusals_are_typed_responses_parts() {
+        for (content, refusal, expected_text, expected_parts) in [
+            (
+                Value::Null,
+                "Cannot help",
+                "",
+                json!([{"type":"refusal","refusal":"Cannot help"}]),
+            ),
+            (
+                json!("Cannot help"),
+                "Cannot help",
+                "",
+                json!([{"type":"refusal","refusal":"Cannot help"}]),
+            ),
+            (
+                json!("Here is safe information"),
+                "Cannot do the unsafe request",
+                "Here is safe information",
+                json!([
+                    {"type":"output_text","text":"Here is safe information","annotations":[]},
+                    {"type":"refusal","refusal":"Cannot do the unsafe request"}
+                ]),
+            ),
+        ] {
+            let response = translate_chat_result(
+                json!({
+                    "id":"chatcmpl-refusal",
+                    "choices":[{"index":0,
+                        "message":{"role":"assistant","content":content,"refusal":refusal},
+                        "finish_reason":"stop"}]
+                }),
+                "logical".into(),
+                Value::Null,
+            );
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let result: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(result["output_text"], expected_text);
+            assert_eq!(result["output"][0]["content"], expected_parts);
+            let replayed = translate_input(json!([result["output"][0].clone()])).unwrap();
+            let expected_replay = format!("{expected_text}{refusal}");
+            assert_eq!(replayed[0]["content"], expected_replay);
+        }
+        for role in ["user", "system"] {
+            assert!(
+                translate_input(json!([{
+                    "type":"message","role":role,
+                    "content":[{"type":"refusal","refusal":"no"}]
+                }]))
+                .is_err()
+            );
+        }
+        assert!(
+            translate_input(json!([{
+                "type":"message","role":"assistant",
+                "content":[{"type":"refusal","refusal":42}]
+            }]))
+            .is_err()
+        );
+    }
 
     #[test]
     fn nonstream_reasoning_prefers_arrival_order_and_deduplicates_mirrors() {
