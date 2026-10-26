@@ -21,6 +21,7 @@ struct State {
     probing: bool,
     probe_deadline: Option<Instant>,
     probe_hard_deadline: Option<Instant>,
+    probe_idle_lease: Duration,
     next_cooldown: Duration,
 }
 
@@ -52,6 +53,7 @@ impl Circuit {
                 probing: false,
                 probe_deadline: None,
                 probe_hard_deadline: None,
+                probe_idle_lease: PROBE_IDLE_LEASE,
                 next_cooldown: base,
             }),
             threshold: config.failure_threshold,
@@ -76,6 +78,7 @@ impl Circuit {
             state.probing = true;
             state.probe_deadline = now.checked_add(PROBE_IDLE_LEASE);
             state.probe_hard_deadline = now.checked_add(PROBE_MAX_LIFETIME);
+            state.probe_idle_lease = PROBE_IDLE_LEASE;
             true
         } else {
             false
@@ -141,6 +144,37 @@ impl Circuit {
         true
     }
 
+    fn configure_probe_idle_timeout(&self, ticket: &Ticket, timeout: Duration, now: Instant) {
+        if !ticket.probe {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.generation != ticket.generation || !state.probing {
+            return;
+        }
+        let (Some(deadline), Some(hard_deadline)) =
+            (state.probe_deadline, state.probe_hard_deadline)
+        else {
+            return;
+        };
+        if now >= deadline || now >= hard_deadline {
+            return;
+        }
+        // The idle lease cannot expire while the upstream read is still
+        // allowed to wait for the first/next valid chunk. Keep the 120s
+        // absolute cap authoritative even under progressive output.
+        let lease = timeout
+            .saturating_add(Duration::from_secs(5))
+            .max(PROBE_IDLE_LEASE)
+            .min(PROBE_MAX_LIFETIME);
+        state.probe_idle_lease = lease;
+        state.probe_deadline = Some(
+            now.checked_add(lease)
+                .unwrap_or(hard_deadline)
+                .min(hard_deadline),
+        );
+    }
+
     fn probe_progress(&self, ticket: &Ticket, now: Instant) {
         if !ticket.probe {
             return;
@@ -158,7 +192,7 @@ impl Circuit {
             return;
         }
         state.probe_deadline = Some(
-            now.checked_add(PROBE_IDLE_LEASE)
+            now.checked_add(state.probe_idle_lease)
                 .unwrap_or(hard_deadline)
                 .min(hard_deadline),
         );
@@ -183,6 +217,14 @@ impl Circuit {
 impl Ticket {
     pub fn is_probe(&self) -> bool {
         self.probe
+    }
+    /// Route-specific read timeouts are known only after admission, so
+    /// increase this probe's idle lease without allocating a background task.
+    pub fn configure_stream_idle_timeout(&mut self, timeout: Duration) {
+        if !self.settled {
+            self.circuit
+                .configure_probe_idle_timeout(self, timeout, Instant::now());
+        }
     }
     /// Renew the idle lease without counting a partial stream as success.
     pub fn progress(&mut self) {
@@ -406,6 +448,59 @@ mod tests {
         assert!(breaker.admit_at(opened + Duration::from_secs(16)).is_none());
         assert!(probe.success_at(opened + Duration::from_secs(17)));
         assert!(breaker.admit_at(opened + Duration::from_secs(18)).is_some());
+    }
+
+    #[test]
+    fn aggregation_probe_uses_actual_sixty_second_read_idle_with_hard_cap() {
+        let breaker = circuit();
+        let now = Instant::now();
+        for _ in 0..3 {
+            let mut ticket = breaker.admit_at(now).unwrap();
+            ticket.failure_at(now);
+        }
+        let opened = now + Duration::from_millis(100);
+        let mut probe = breaker.admit_at(opened).unwrap();
+        breaker.configure_probe_idle_timeout(&probe, Duration::from_secs(60), opened);
+        // The aggregation reader permits 60 seconds of silence. A healthy
+        // model emitting once every 50 seconds must retain its sole probe.
+        assert!(breaker.admit_at(opened + Duration::from_secs(50)).is_none());
+        probe.progress_at(opened + Duration::from_secs(50));
+        assert!(breaker.admit_at(opened + Duration::from_secs(95)).is_none());
+        assert!(probe.success_at(opened + Duration::from_secs(95)));
+        assert!(breaker.admit_at(opened + Duration::from_secs(96)).is_some());
+
+        // A new probe still uses the shorter direct-stream lease unless
+        // its route explicitly requests the longer aggregation policy.
+        let second_start = opened + Duration::from_secs(100);
+        for _ in 0..3 {
+            let mut ticket = breaker.admit_at(second_start).unwrap();
+            ticket.failure_at(second_start);
+        }
+        let second_open = second_start + Duration::from_millis(100);
+        let mut direct = breaker.admit_at(second_open).unwrap();
+        assert!(breaker.admit_at(second_open + PROBE_IDLE_LEASE).is_none());
+        assert!(!direct.success_at(second_open + PROBE_IDLE_LEASE));
+    }
+
+    #[test]
+    fn aggregation_long_idle_policy_cannot_extend_absolute_probe_lifetime() {
+        let breaker = circuit();
+        let start = Instant::now();
+        for _ in 0..3 {
+            let mut ticket = breaker.admit_at(start).unwrap();
+            ticket.failure_at(start);
+        }
+        let opened = start + Duration::from_millis(100);
+        let mut probe = breaker.admit_at(opened).unwrap();
+        breaker.configure_probe_idle_timeout(&probe, Duration::from_secs(120), opened);
+        probe.progress_at(opened + Duration::from_secs(110));
+        assert!(!probe.success_at(opened + PROBE_MAX_LIFETIME));
+        assert!(breaker.admit_at(opened + PROBE_MAX_LIFETIME).is_none());
+        assert!(
+            breaker
+                .admit_at(opened + PROBE_MAX_LIFETIME + Duration::from_millis(100))
+                .is_some()
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ const MAX_EVENTS: usize = 262_144;
 // A long prompt can leave a reasoning model silent for more than 15 seconds.
 // The separate 100-second absolute lifetime and shared walk budget still bound
 // resource use and total request latency.
-const STREAM_IDLE: Duration = Duration::from_secs(60);
+pub(super) const STREAM_IDLE: Duration = Duration::from_secs(60);
 // Long generations from SSE-only providers must not inherit the ordinary
 // 90-second JSON-body deadline. The idle timer still rejects stalled streams,
 // and this separate hard cap prevents indefinite drip-fed connections.

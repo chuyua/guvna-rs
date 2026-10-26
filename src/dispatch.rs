@@ -774,6 +774,12 @@ async fn dispatch_inner(
         };
         let upstream_stream =
             streaming || (provider.stream_only && matches!(endpoint, Endpoint::Chat));
+        if upstream_stream
+            && !streaming
+            && let Some(ticket) = circuit_ticket.as_mut()
+        {
+            ticket.configure_stream_idle_timeout(chat_aggregate::STREAM_IDLE);
+        }
         // Chain defaults are applied per candidate. An injected n must drive
         // the SSE parser and SSE-to-JSON aggregator just like a caller n;
         // otherwise valid multi-choice streams are rejected as malformed.
