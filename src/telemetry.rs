@@ -490,7 +490,16 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
     if std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.file_type().is_file()) {
         return Err(rusqlite::Error::InvalidPath(path.to_path_buf()));
     }
-    let mut conn = Connection::open(path)?;
+    // The pre-open symlink_metadata guard is subject to a rename race.
+    // Enforce NOFOLLOW at the actual SQLite file-open boundary as well:
+    // telemetry is a local writable database, never an arbitrary symlink
+    // target supplied by another process.
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
     conn.busy_timeout(Duration::from_secs(1))?;
     migrate_legacy_request_events(&conn)?;
     conn.execute_batch(
