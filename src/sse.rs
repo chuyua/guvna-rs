@@ -277,6 +277,7 @@ impl ChatSse {
             self.json_text_bytes += fragment.len();
         }
         let mut has_tool_delta = false;
+        let mut tool_progress = false;
         if let Some(calls) = delta.get("tool_calls") {
             // Reject before forwarding: consumers may act on tool deltas
             // before an eventual finish event arrives.
@@ -290,10 +291,10 @@ impl ChatSse {
             has_tool_delta = true;
             for call in calls {
                 let call = call.as_object().ok_or(SseError)?;
-                self.process_tool_call(index, call)?;
+                tool_progress |= self.process_tool_call(index, call)?;
             }
         }
-        if has_tool_delta
+        if tool_progress
             || delta
                 .get("content")
                 .and_then(Value::as_str)
@@ -370,7 +371,7 @@ impl ChatSse {
         &mut self,
         choice: u64,
         call: &serde_json::Map<String, Value>,
-    ) -> Result<(), SseError> {
+    ) -> Result<bool, SseError> {
         let index = call.get("index").and_then(Value::as_u64).ok_or(SseError)?;
         if index >= 32 || call.get("type").is_some_and(|kind| kind != "function") {
             return Err(SseError);
@@ -456,6 +457,12 @@ impl ChatSse {
             self.resource_limit = true;
             return Err(SseError);
         }
+        // Identical ID/name echoes and empty argument fragments are legal
+        // but carry no meaningful model progress. They must not renew an SSE
+        // lease indefinitely when a provider is stalled.
+        let progressed = (id.is_some() && tool.id.is_none())
+            || (name.is_some() && tool.name.is_none())
+            || fragment.is_some_and(|part| !part.is_empty());
         let tool = &mut self.tool_calls[position];
         if let Some(id) = id {
             tool.id.get_or_insert_with(|| id.to_owned());
@@ -469,7 +476,7 @@ impl ChatSse {
             tool.arguments.push_str(part);
             self.tool_argument_bytes += part.len();
         }
-        Ok(())
+        Ok(progressed)
     }
 
     fn process_field(&mut self, line: &[u8]) -> Result<(), SseError> {
@@ -799,6 +806,42 @@ mod tests {
             .unwrap();
         tools.push(b"data: [DONE]\n\n").unwrap();
         tools.finish().unwrap();
+    }
+
+    #[test]
+    fn repeated_empty_tool_call_deltas_cannot_refresh_stream_progress_forever() {
+        let mut parser = ChatSse::new(1).unwrap();
+        let initial = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_1","type":"function",
+             "function":{"name":"lookup","arguments":""}}
+        ]},"finish_reason":null}]});
+        parser
+            .push(format!("data: {initial}\n\n").as_bytes())
+            .unwrap();
+        assert!(parser.take_progress(), "new tool identity is real progress");
+        let repeated = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_1","type":"function",
+             "function":{"name":"lookup","arguments":""}}
+        ]},"finish_reason":null}]});
+        for _ in 0..4 {
+            parser
+                .push(format!("data: {repeated}\n\n").as_bytes())
+                .unwrap();
+            assert!(
+                !parser.take_progress(),
+                "identical empty tool fragments bypassed meaningful-progress timeout"
+            );
+        }
+        let meaningful = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":"{\"query\":\"hi\"}"}}
+        ]},"finish_reason":null}]});
+        parser
+            .push(format!("data: {meaningful}\n\n").as_bytes())
+            .unwrap();
+        assert!(
+            parser.take_progress(),
+            "new argument bytes were not counted"
+        );
     }
 
     #[test]
