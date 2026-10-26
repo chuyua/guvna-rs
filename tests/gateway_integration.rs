@@ -698,6 +698,53 @@ chains:
 }
 
 #[tokio::test]
+async fn duplicate_key_values_do_not_repeat_the_same_upstream_429_or_inflate_capacity() {
+    use guvna::gateway::app_with_state;
+    let (url, calls) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: only
+    type: openai
+    base_url: {url}
+    key_envs: [ALIAS_A, ALIAS_B]
+    rotation: sequential
+    quarantine:
+      rate_limit: 1h
+chains:
+  - name: demo
+    steps:
+      - provider: only
+        model: one
+"#
+    ))
+    .unwrap();
+    let (router, state) = app_with_state(
+        AppState::new(
+            config,
+            HashMap::from([
+                ("ALIAS_A".into(), "bad".into()),
+                ("ALIAS_B".into(), "bad".into()),
+            ]),
+            vec!["client".into()],
+        )
+        .unwrap(),
+    );
+    assert_eq!(state.runtime_status()["key_health"]["configured"], 1);
+    let (status, body) = call(router.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["code"], "providers_rate_limited");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let (status, _) = call(router, request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "cooldown must block both aliases"
+    );
+}
+
+#[tokio::test]
 async fn all_rate_limited_credentials_return_bounded_retry_after_without_network_retry() {
     let (url, calls) = start_upstream(StatusCode::OK).await;
     let config: Config = serde_yaml::from_str(&format!(

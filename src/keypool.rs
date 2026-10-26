@@ -62,12 +62,18 @@ pub struct KeyPool {
 
 impl KeyPool {
     pub fn new(provider: &Provider, keys: &HashMap<String, String>) -> Result<Self, String> {
+        // Different environment variable names can refer to the very same
+        // provider credential. Sending it a second time after an HTTP 429 or
+        // 401 is a guaranteed useless retry and overstates available quota.
+        // Deduplicate only WITHIN one physical provider. Preserve the first
+        // configured alias without ever logging or hashing keys externally.
+        let mut seen_secrets = HashSet::new();
         let credentials = provider
             .key_names()
             .into_iter()
             .filter_map(|env| {
                 let value = keys.get(&env)?;
-                if value.is_empty() {
+                if value.is_empty() || !seen_secrets.insert(value.as_str()) {
                     return None;
                 }
                 Some(Credential {
@@ -308,6 +314,38 @@ quarantine:
         assert_eq!(snapshot.configured, 0);
         assert_eq!(snapshot.available, 0);
         assert_eq!(snapshot.total_uses, 0);
+    }
+
+    #[test]
+    fn duplicate_environment_aliases_do_not_retry_one_physical_credential() {
+        let same_secret = "only-one-real-credential".to_owned();
+        let pool = KeyPool::new(
+            &provider(),
+            &HashMap::from([
+                ("A".into(), same_secret.clone()),
+                ("B".into(), same_secret.clone()),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(pool.health_snapshot().configured, 1);
+        let first = pool.acquire(&HashSet::new()).unwrap();
+        assert_eq!(first.env, "A");
+        assert!(pool.record(&first, Outcome::RateLimited));
+        assert!(
+            pool.acquire(&HashSet::from([first.env.clone()])).is_none(),
+            "another environment alias must not retry the same 429 credential"
+        );
+        assert!(pool.all_keys_rate_limited_for().is_some());
+        assert_eq!(pool.health_snapshot().rate_limited, 1);
+        let pool = KeyPool::new(
+            &provider(),
+            &HashMap::from([
+                ("A".into(), same_secret),
+                ("B".into(), "a-different-real-key".into()),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(pool.health_snapshot().configured, 2);
     }
 
     #[test]
