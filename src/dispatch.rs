@@ -1587,7 +1587,7 @@ auto:
         assert_eq!(status["auto_shadow_unavailable"], 1);
         // Invalid candidates do not cause a panic or a mismatched telemetry
         // label to enter the gateway; the counters remain independent.
-        record_shadow_observation(&state, &config, "trace4", &[], None);
+        record_shadow_observation::<routing::ResolvedStep>(&state, &config, "trace4", &[], None);
         assert_eq!(state.runtime_status()["auto_shadow_unavailable"], 2);
     }
 
