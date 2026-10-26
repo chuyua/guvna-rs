@@ -4231,6 +4231,110 @@ fn auto_request(path: &str, bearer: &str, payload: Value) -> Request<Body> {
 }
 
 #[tokio::test]
+async fn issue129_sixty_four_concurrent_bad_deciders_fail_open_without_selector_fanout() {
+    use std::time::Duration;
+    let (business, business_hits) = start_upstream(StatusCode::OK).await;
+    let selector_hits = Arc::new(AtomicUsize::new(0));
+    let selector_active = Arc::new(AtomicUsize::new(0));
+    let selector_max_active = Arc::new(AtomicUsize::new(0));
+    let selector = Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let hits = Arc::clone(&selector_hits);
+            let active = Arc::clone(&selector_active);
+            let peak = Arc::clone(&selector_max_active);
+            move || {
+                let hits = Arc::clone(&hits);
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    axum::Json(json!({
+                        "choices":[{"message":{"content":r#"{"order":[0,0]}"#}}]
+                    }))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, selector).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: business
+    type: openai
+    base_url: {business}
+    key_env: BUSINESS
+  - name: selector
+    type: openai
+    base_url: http://{addr}
+    key_env: SELECTOR
+auto:
+  enabled: true
+  candidates:
+    - provider: business
+      model: primary
+    - provider: business
+      model: backup
+  decider:
+    enabled: true
+    provider: selector
+    model: chooser
+    timeout_ms: 1000
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("BUSINESS".into(), "business-secret".into()),
+            ("SELECTOR".into(), "selector-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let results = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures_util::future::join_all((0..64).map(|_| {
+            let router = router.clone();
+            async move {
+                call(
+                    router,
+                    auto_request(
+                        "/v1/auto",
+                        "client",
+                        json!({"messages":[{"role":"user","content":"one request"}]}),
+                    ),
+                )
+                .await
+            }
+        })),
+    )
+    .await
+    .expect("64 concurrent business requests must not queue behind the selector");
+    for (status, result) in results {
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["model"], "primary");
+    }
+    assert_eq!(business_hits.load(Ordering::SeqCst), 64);
+    assert!(
+        selector_hits.load(Ordering::SeqCst) >= 1,
+        "the cold selector path should have been exercised"
+    );
+    assert_eq!(
+        selector_max_active.load(Ordering::SeqCst),
+        1,
+        "bad remote ranks must never cause concurrent selector network fanout"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn issue129_slow_foreground_decider_reserves_walk_budget_for_real_upstream() {
     use std::time::{Duration, Instant};
     let (good, hits) = start_upstream(StatusCode::OK).await;
