@@ -413,13 +413,16 @@ impl ChatSse {
         let position = match position {
             Some(position) => position,
             None => {
-                if self.tool_calls.len() >= MAX_STREAM_TOOL_CALLS
-                    || self
-                        .tool_calls
-                        .iter()
-                        .filter(|tool| tool.choice == choice)
-                        .count()
-                        != index as usize
+                if self.tool_calls.len() >= MAX_STREAM_TOOL_CALLS {
+                    self.resource_limit = true;
+                    return Err(SseError);
+                }
+                if self
+                    .tool_calls
+                    .iter()
+                    .filter(|tool| tool.choice == choice)
+                    .count()
+                    != index as usize
                 {
                     return Err(SseError);
                 }
@@ -450,6 +453,7 @@ impl ChatSse {
         if fragment.is_some_and(|part| {
             part.len() > MAX_STREAM_TOOL_ARGUMENTS.saturating_sub(self.tool_argument_bytes)
         }) {
+            self.resource_limit = true;
             return Err(SseError);
         }
         let tool = &mut self.tool_calls[position];
@@ -795,6 +799,31 @@ mod tests {
             .unwrap();
         tools.push(b"data: [DONE]\n\n").unwrap();
         tools.finish().unwrap();
+    }
+
+    #[test]
+    fn fragmented_tool_arguments_exceeding_cap_are_a_local_resource_limit() {
+        let mut parser = ChatSse::new(1).unwrap();
+        let part = "x".repeat(MAX_STREAM_TOOL_ARGUMENTS / 2 + 10);
+        let first = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_1","type":"function",
+             "function":{"name":"query","arguments":part}}
+        ]},"finish_reason":null}]});
+        let first = format!("data: {first}\n\n");
+        assert!(parser.push(first.as_bytes()).is_ok());
+        let second = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":part}}
+        ]},"finish_reason":null}]});
+        let second = format!("data: {second}\n\n");
+        assert!(parser.push(second.as_bytes()).is_err());
+        assert!(parser.hit_resource_limit());
+        // An invalid tool index is a protocol fault, not an OOM guard.
+        let mut invalid = ChatSse::new(1).unwrap();
+        let bad = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":1,"type":"function","function":{"name":"query","arguments":"{}"}}
+        ]},"finish_reason":null}]});
+        assert!(invalid.push(format!("data: {bad}\n\n").as_bytes()).is_err());
+        assert!(!invalid.hit_resource_limit());
     }
 
     #[test]
