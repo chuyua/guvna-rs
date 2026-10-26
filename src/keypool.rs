@@ -563,7 +563,9 @@ mod contention_tests {
         ).unwrap();
         let mut inputs = HashMap::new();
         for key in ["A", "B", "C", "D"] {
-            inputs.insert(key.to_string(), "fake".to_string());
+            // Round-robin fairness is measured over distinct credentials.
+            // Duplicate aliases are intentionally deduplicated on startup.
+            inputs.insert(key.to_string(), format!("test-secret-{key}"));
         }
         let pool = Arc::new(KeyPool::new(&p, &inputs).unwrap());
         let counts = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
