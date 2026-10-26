@@ -1203,6 +1203,41 @@ mod tests {
             2
         );
         assert_eq!(score["stream_terminal_metrics"]["upstream_failed"], 0);
+        assert!(
+            score["stream_terminal_metrics"]["provider_completion_rate_excluding_local_policy"]
+                .is_null(),
+            "two local-only failures must not be interpreted as 0% provider reliability"
+        );
+        let mut started = TelemetryContext::new("p", "model", "stream_started");
+        started.set_trace("trace-success", 1, true);
+        telemetry.submit(
+            "chat",
+            200,
+            Duration::from_millis(1),
+            true,
+            Some(started),
+            &metrics,
+        );
+        telemetry.observe_stream_health(
+            "p",
+            "model",
+            "success",
+            Duration::from_millis(100),
+            ("trace-success", 1),
+            &metrics,
+        );
+        assert!(telemetry.flush(Duration::from_secs(3)));
+        let score = crate::scoring::read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(
+            score["stream_terminal_metrics"]["provider_completion_rate_excluding_local_policy"],
+            1.0,
+            "local admission guards should not reduce verified provider success rate"
+        );
+        assert_eq!(
+            score["stream_terminal_metrics"]["completion_rate_excluding_client_cancellation"],
+            1.0 / 3.0,
+            "legacy metric must remain stable for existing dashboards"
+        );
     }
 
     #[test]

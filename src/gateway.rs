@@ -597,10 +597,11 @@ async fn authenticated_body(
 fn record_circuit_failure(ticket: &mut Option<Ticket>, metrics: &Metrics) {
     if let Some(ticket) = ticket {
         let probe = ticket.is_probe();
-        if ticket.failure() {
+        let opened = ticket.failure();
+        if opened {
             Metrics::inc(&metrics.circuit_openings);
         }
-        if probe {
+        if probe && opened {
             Metrics::inc(&metrics.circuit_probe_failures);
         }
     }
@@ -609,8 +610,8 @@ fn record_circuit_failure(ticket: &mut Option<Ticket>, metrics: &Metrics) {
 fn record_circuit_success(ticket: &mut Option<Ticket>, metrics: &Metrics) {
     if let Some(ticket) = ticket {
         let probe = ticket.is_probe();
-        ticket.success();
-        if probe {
+        let accepted = ticket.success();
+        if probe && accepted {
             Metrics::inc(&metrics.circuit_probe_success);
         }
     }

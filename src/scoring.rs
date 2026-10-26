@@ -581,6 +581,15 @@ fn read_scoring_inner(
                 if total > cancelled {
                     Some(completed as f64 / (total - cancelled) as f64)
                 } else {None},
+            // Retain the legacy all-noncancelled ratio for dashboards, but
+            // never interpret our own output-size/idle policy as evidence of
+            // provider reliability. The provider-only ratio omits both
+            // client cancellations and local policy terminations.
+            "provider_completion_rate_excluding_local_policy":
+                if total > cancelled.saturating_add(local_policy) {
+                    Some(completed as f64 /
+                        (total - cancelled - local_policy) as f64)
+                } else {None},
             "actual_terminal_only":true,
         }))
     } else {

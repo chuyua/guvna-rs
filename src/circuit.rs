@@ -9,7 +9,9 @@ use std::{
 };
 
 // Half-open probes have a renewable idle lease and a strict total lifetime.
-const PROBE_IDLE_LEASE: Duration = Duration::from_secs(10);
+// Direct SSE has a 15s upstream read deadline. A healthy but slow chunk gap
+// must not expire the only recovery probe before that read timeout fires.
+const PROBE_IDLE_LEASE: Duration = Duration::from_secs(20);
 const PROBE_MAX_LIFETIME: Duration = Duration::from_secs(120);
 
 struct State {
@@ -64,13 +66,7 @@ impl Circuit {
 
     pub fn admit_at(self: &Arc<Self>, now: Instant) -> Option<Ticket> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.probing && state.probe_deadline.is_some_and(|until| now >= until) {
-            // Fence off the outstanding long-lived SSE probe result.
-            state.probing = false;
-            state.probe_deadline = None;
-            state.probe_hard_deadline = None;
-            state.generation = state.generation.wrapping_add(1);
-            state.open_until = now.checked_add(self.base);
+        if self.expire_probe(&mut state, now) {
             return None;
         }
         let probe = if let Some(until) = state.open_until {
@@ -97,10 +93,15 @@ impl Circuit {
         state.open_until.is_some_and(|until| Instant::now() < until)
     }
 
-    fn report(&self, ticket: &Ticket, failure: bool, now: Instant) -> bool {
+    // (newly opened, accepted current-generation outcome); stale callbacks
+    // must never count as successful recovery probes in observability.
+    fn report(&self, ticket: &Ticket, failure: bool, now: Instant) -> (bool, bool) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // A long-lived probe may return after expiry without another arrival
+        // to fence it. It may not close the circuit after its lease expired.
+        self.expire_probe(&mut state, now);
         if state.generation != ticket.generation {
-            return false;
+            return (false, false);
         }
         if !failure {
             state.failures = 0;
@@ -109,11 +110,11 @@ impl Circuit {
             state.probe_hard_deadline = None;
             state.open_until = None;
             state.next_cooldown = self.base;
-            return false;
+            return (false, true);
         }
         state.failures = state.failures.saturating_add(1);
         if !ticket.probe && state.failures < self.threshold {
-            return false;
+            return (false, true);
         }
         let delay = state.next_cooldown;
         state.open_until = now.checked_add(delay);
@@ -123,6 +124,20 @@ impl Circuit {
         state.probe_hard_deadline = None;
         state.generation = state.generation.wrapping_add(1);
         state.failures = 0;
+        (true, true)
+    }
+
+    // Expiry is neutral: fence old callbacks and allow a new probe after
+    // a short backoff without doubling the failure penalty.
+    fn expire_probe(&self, state: &mut State, now: Instant) -> bool {
+        if !state.probing || !state.probe_deadline.is_some_and(|until| now >= until) {
+            return false;
+        }
+        state.probing = false;
+        state.probe_deadline = None;
+        state.probe_hard_deadline = None;
+        state.generation = state.generation.wrapping_add(1);
+        state.open_until = now.checked_add(self.base);
         true
     }
 
@@ -189,23 +204,19 @@ impl Ticket {
             return false;
         }
         self.settled = true;
-        self.circuit.report(self, true, now)
+        self.circuit.report(self, true, now).0
     }
 
-    pub fn success(&mut self) {
-        if self.settled {
-            return;
-        }
-        self.settled = true;
-        self.circuit.report(self, false, Instant::now());
+    pub fn success(&mut self) -> bool {
+        self.success_at(Instant::now())
     }
 
-    pub fn success_at(&mut self, now: Instant) {
+    pub fn success_at(&mut self, now: Instant) -> bool {
         if self.settled {
-            return;
+            return false;
         }
         self.settled = true;
-        self.circuit.report(self, false, now);
+        self.circuit.report(self, false, now).1
     }
 }
 
@@ -304,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_ten_second_probe_cannot_block_other_clients_forever() {
+    fn stale_probe_cannot_block_other_clients_forever() {
         let breaker = circuit();
         let start = Instant::now();
         for _ in 0..3 {
@@ -317,11 +328,84 @@ mod tests {
         assert!(stalled.is_probe());
         // The first arrival after expiry fences the stalled probe and
         // starts a short neutral backoff before another probe is permitted.
-        assert!(breaker.admit_at(start + Duration::from_secs(11)).is_none());
-        let retried = breaker.admit_at(start + Duration::from_secs(12));
+        assert!(
+            breaker
+                .admit_at(start + PROBE_IDLE_LEASE + Duration::from_secs(1))
+                .is_none()
+        );
+        let retried = breaker.admit_at(start + PROBE_IDLE_LEASE + Duration::from_secs(2));
         assert!(retried.is_some(), "expired probe did not unlock recovery");
-        stalled.success_at(start + Duration::from_secs(12));
-        assert!(breaker.admit_at(start + Duration::from_secs(12)).is_none());
+        stalled.success_at(start + PROBE_IDLE_LEASE + Duration::from_secs(2));
+        assert!(
+            breaker
+                .admit_at(start + PROBE_IDLE_LEASE + Duration::from_secs(2))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn expired_probe_cannot_close_circuit_without_an_intervening_admission() {
+        let breaker = circuit();
+        let start = Instant::now();
+        for _ in 0..3 {
+            let mut ticket = breaker.admit_at(start).unwrap();
+            ticket.failure_at(start);
+        }
+        let opened = start + Duration::from_millis(100);
+        let mut probe = breaker.admit_at(opened).unwrap();
+        assert!(
+            !probe.success_at(opened + PROBE_IDLE_LEASE + Duration::from_nanos(1)),
+            "expired probe must not count as a real recovery"
+        );
+        assert!(
+            breaker
+                .admit_at(opened + PROBE_IDLE_LEASE + Duration::from_millis(1))
+                .is_none(),
+            "a late success must not re-enable all callers before backoff"
+        );
+        assert!(
+            breaker
+                .admit_at(opened + PROBE_IDLE_LEASE + Duration::from_millis(101))
+                .is_some(),
+            "an expired callback must not permanently block recovery"
+        );
+    }
+
+    #[test]
+    fn expired_probe_failure_does_not_double_penalize_recovery() {
+        let breaker = circuit();
+        let start = Instant::now();
+        for _ in 0..3 {
+            let mut ticket = breaker.admit_at(start).unwrap();
+            ticket.failure_at(start);
+        }
+        let opened = start + Duration::from_millis(100);
+        let mut probe = breaker.admit_at(opened).unwrap();
+        assert!(!probe.failure_at(opened + PROBE_IDLE_LEASE));
+        assert!(breaker.admit_at(opened + PROBE_IDLE_LEASE).is_none());
+        assert!(
+            breaker
+                .admit_at(opened + PROBE_IDLE_LEASE + Duration::from_millis(100))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn probe_stays_eligible_through_a_healthy_fourteen_second_sse_gap() {
+        let breaker = circuit();
+        let now = Instant::now();
+        for _ in 0..3 {
+            let mut ticket = breaker.admit_at(now).unwrap();
+            ticket.failure_at(now);
+        }
+        let opened = now + Duration::from_millis(100);
+        let mut probe = breaker.admit_at(opened).unwrap();
+        // The gateway accepts a 14-second gap (its read timeout is 15s).
+        // A concurrent request must not fence a valid slow probe.
+        probe.progress_at(opened + Duration::from_secs(14));
+        assert!(breaker.admit_at(opened + Duration::from_secs(16)).is_none());
+        assert!(probe.success_at(opened + Duration::from_secs(17)));
+        assert!(breaker.admit_at(opened + Duration::from_secs(18)).is_some());
     }
 
     #[test]
