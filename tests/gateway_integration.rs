@@ -1006,10 +1006,14 @@ async fn serve_sse(State(state): State<SseUpstream>) -> impl IntoResponse {
 }
 
 async fn start_sse(chunks: Vec<&'static [u8]>) -> (String, Arc<AtomicUsize>) {
+    start_sse_owned(chunks.into_iter().map(Bytes::from_static).collect()).await
+}
+
+async fn start_sse_owned(chunks: Vec<Bytes>) -> (String, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let state = SseUpstream {
         hits: hits.clone(),
-        chunks: chunks.into_iter().map(Bytes::from_static).collect(),
+        chunks,
     };
     let router = Router::new()
         .route("/v1/chat/completions", post(serve_sse))
@@ -1230,7 +1234,7 @@ async fn unsupported_legacy_sse_delta_fails_over_before_client_sees_output() {
                 "choices":[{"index":0,"delta":delta,"finish_reason":null}]
             })
         );
-        let (bad, bad_hits) = start_sse(vec![frame.as_bytes()]).await;
+        let (bad, bad_hits) = start_sse_owned(vec![Bytes::from(frame)]).await;
         let (good, good_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
         let response = make_app(&bad, &good)
             .oneshot(request("demo", r#","stream":true"#, "client"))
@@ -1818,7 +1822,7 @@ async fn multi_event_chunk_preserves_order_and_one_terminal_marker() {
     combined.extend_from_slice(SSE_START);
     combined.extend_from_slice(SSE_END);
     combined.extend_from_slice(SSE_DONE);
-    let (upstream, hits) = start_sse(vec![Box::leak(combined.into_boxed_slice())]).await;
+    let (upstream, hits) = start_sse_owned(vec![Bytes::from(combined)]).await;
     let response = make_app(&upstream, &upstream)
         .oneshot(request("demo", r#","stream":true"#, "client"))
         .await
