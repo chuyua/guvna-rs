@@ -3322,6 +3322,32 @@ async fn transient_5xx_quarantines_only_the_used_credential_for_configured_durat
 }
 
 #[tokio::test]
+async fn upstream_408_timeout_feeds_circuit_and_fails_over_without_echoing_client_error() {
+    let (down, down_hits) = start_upstream(StatusCode::REQUEST_TIMEOUT).await;
+    let (fallback, good_hits) = start_upstream(StatusCode::OK).await;
+    let router = make_app_with_circuit(&down, &fallback, true);
+    for _ in 0..3 {
+        let (status, result) = call(router.clone(), request("demo", "", "client")).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+    }
+    assert_eq!(down_hits.load(Ordering::SeqCst), 3);
+    let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(metric_value(&metrics, "circuit_openings_total"), 1);
+    assert_eq!(metric_value(&metrics, "circuit_open_providers"), 1);
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 1);
+    let (status, result) = call(router.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(
+        down_hits.load(Ordering::SeqCst),
+        3,
+        "408 timeout must open circuit instead of hammering a slow upstream"
+    );
+    assert_eq!(good_hits.load(Ordering::SeqCst), 5);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "circuit_bypasses_total"), 1);
+}
+
+#[tokio::test]
 async fn client_errors_never_open_provider_circuit_or_quarantine_credential() {
     let (down, down_hits) = start_upstream(StatusCode::BAD_REQUEST).await;
     let (fallback, _) = start_upstream(StatusCode::OK).await;

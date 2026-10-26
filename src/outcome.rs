@@ -14,6 +14,10 @@ pub fn classify(status: Option<u16>) -> Outcome {
         Some(200..=299) => Outcome::Success,
         Some(401 | 403) => Outcome::CredentialAuth,
         Some(429) => Outcome::RateLimited,
+        // Upstream 408 means the *provider* timed out handling this HTTP
+        // request. Treat it like a transient 5xx, not a bad client prompt:
+        // fail over, feed the circuit breaker and avoid repeated slow calls.
+        Some(408) => Outcome::ProviderTransient,
         Some(500..=599) => Outcome::ProviderTransient,
         None => Outcome::TransportFailure,
         Some(_) => Outcome::CallerRejected,
@@ -42,6 +46,8 @@ mod tests {
             (Some(401), Outcome::CredentialAuth, true, false),
             (Some(403), Outcome::CredentialAuth, true, false),
             (Some(404), Outcome::CallerRejected, false, false),
+            (Some(408), Outcome::ProviderTransient, false, true),
+            (Some(409), Outcome::CallerRejected, false, false),
             (Some(422), Outcome::CallerRejected, false, false),
             (Some(429), Outcome::RateLimited, true, false),
             (Some(500), Outcome::ProviderTransient, false, true),

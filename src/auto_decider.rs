@@ -1021,7 +1021,7 @@ auto:
             "published schema changes must invalidate rankings"
         );
         assert_ne!(
-            ranking_key(&[a.clone()], 100, 200, plain, before),
+            ranking_key(std::slice::from_ref(&a), 100, 200, plain, before),
             ranking_key(&[a], 100, 200, plain, after),
             "identical candidate names cannot reuse a ranking from another config"
         );

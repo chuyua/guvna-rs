@@ -933,7 +933,11 @@ async fn dispatch_inner(
             let outcome = classify(Some(status));
             if let Some(context) = telemetry_context.as_mut() {
                 context.set_upstream_status(Some(status));
-                context.set_failure_type(outcome_failure_type(outcome));
+                context.set_failure_type(if matches!(status, 408 | 504) {
+                    "timeout"
+                } else {
+                    outcome_failure_type(outcome)
+                });
             }
             if outcome.quarantine_credential() {
                 Metrics::inc(&state.metrics.upstream_http_failures);
@@ -1193,7 +1197,7 @@ async fn dispatch_inner(
                     } // next step
                 }
             }
-            if (400..500).contains(&status) && !matches!(status, 401 | 403 | 429) {
+            if (400..500).contains(&status) && !matches!(status, 401 | 403 | 408 | 429) {
                 let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
                 // Never reflect arbitrary upstream messages: some providers
                 // include credential fragments or request text in them. Map
