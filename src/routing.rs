@@ -158,16 +158,15 @@ struct CacheEntry {
 }
 #[derive(Default)]
 struct CacheState {
-    generation: Option<u64>,
     entries: VecDeque<CacheEntry>,
 }
 
 impl CacheState {
-    fn retain_valid(&mut self, generation: u64, now: Instant) {
-        if self.generation != Some(generation) {
-            self.entries.clear();
-            self.generation = Some(generation);
-        }
+    fn retain_valid(&mut self, now: Instant) {
+        // Old in-flight requests may outlive a live config publish. Never
+        // let one of them roll back a global "current generation" and flush
+        // the new snapshot's hot entries. Keys already include generation;
+        // bound coexistence with the same 128-entry LRU and 30s TTL.
         self.entries.retain(|entry| entry.expires_at > now);
     }
 
@@ -218,7 +217,7 @@ impl AutoRouteCache {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.retain_valid(generation, now);
+            state.retain_valid(now);
             state.touch(&key).map(|entry| Arc::clone(&entry.steps))
         };
         if let Some(steps) = cached {
@@ -238,7 +237,7 @@ impl AutoRouteCache {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.retain_valid(generation, Instant::now());
+            state.retain_valid(Instant::now());
             // Concurrent cold misses for the same key must not evict others.
             if state.touch(&key).is_none() {
                 if state.entries.len() >= AUTO_CACHE_CAPACITY {
@@ -1517,23 +1516,82 @@ auto:
         {
             let state = cache.state.lock().unwrap();
             assert_eq!(state.entries.len(), AUTO_CACHE_CAPACITY);
-            assert_eq!(state.generation, Some(11));
+            assert!(state.entries.iter().all(|entry| entry.key.generation == 11));
         }
         cache
             .resolve(&cfg, 1, 1, AutoRequirements::default(), &[], 12)
             .unwrap();
         {
             let mut state = cache.state.lock().unwrap();
-            assert_eq!(state.generation, Some(12));
-            assert_eq!(state.entries.len(), 1);
-            state.entries[0].expires_at = Instant::now() - Duration::from_secs(1);
+            assert_eq!(state.entries.len(), AUTO_CACHE_CAPACITY);
+            assert_eq!(state.entries.back().unwrap().key.generation, 12);
+            state.entries.back_mut().unwrap().expires_at = Instant::now() - Duration::from_secs(1);
         }
         cache
             .resolve(&cfg, 1, 1, AutoRequirements::default(), &[], 12)
             .unwrap();
         let state = cache.state.lock().unwrap();
-        assert_eq!(state.entries.len(), 1);
-        assert!(state.entries[0].expires_at > Instant::now());
+        assert!(state.entries.len() <= AUTO_CACHE_CAPACITY);
+        assert!(
+            state
+                .entries
+                .iter()
+                .any(|entry| { entry.key.generation == 12 && entry.expires_at > Instant::now() })
+        );
+    }
+
+    #[test]
+    fn old_inflight_route_generation_cannot_evict_new_hot_generation() {
+        let old: Config = serde_yaml::from_str(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://p.example
+    key_env: P
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: old-model
+"#,
+        )
+        .unwrap();
+        let mut new = old.clone();
+        new.auto.candidates[0].model = "new-model".into();
+        let generation_old = config_generation(&old);
+        let generation_new = config_generation(&new);
+        assert_ne!(generation_old, generation_new);
+        let cache = AutoRouteCache::new();
+        let lookup = |config, generation| {
+            cache
+                .resolve(config, 25, 30, AutoRequirements::default(), &[], generation)
+                .unwrap()[0]
+                .model
+                .clone()
+        };
+        assert_eq!(lookup(&old, generation_old), "old-model");
+        assert_eq!(lookup(&new, generation_new), "new-model");
+        // An old in-flight request must not invalidate the new request's
+        // cached candidate merely because it resolved after publication.
+        for _ in 0..24 {
+            assert_eq!(lookup(&old, generation_old), "old-model");
+            assert_eq!(lookup(&new, generation_new), "new-model");
+        }
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.entries.len(), 2);
+        assert!(
+            state
+                .entries
+                .iter()
+                .any(|entry| entry.key.generation == generation_old)
+        );
+        assert!(
+            state
+                .entries
+                .iter()
+                .any(|entry| entry.key.generation == generation_new)
+        );
     }
 
     #[test]
@@ -1579,7 +1637,7 @@ auto:
         {
             let state = cache.state.lock().unwrap();
             assert_eq!(state.entries.len(), 1);
-            assert_eq!(state.generation, Some(77));
+            assert!(state.entries.iter().all(|entry| entry.key.generation == 77));
         }
         for size in 0..AUTO_CACHE_CAPACITY {
             cache
@@ -1602,7 +1660,7 @@ auto:
             .unwrap();
         let state = cache.state.lock().unwrap();
         assert_eq!(state.entries.len(), AUTO_CACHE_CAPACITY);
-        assert_eq!(state.generation, Some(78));
+        assert!(state.entries.iter().all(|entry| entry.key.generation == 78));
         assert_eq!(
             state
                 .entries
