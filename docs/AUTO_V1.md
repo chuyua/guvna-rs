@@ -45,8 +45,10 @@ controls remain conservatively tool-required rather than bypassing a declared
 supports_tools: false candidate. The cache key
 includes these capability requirements to prevent cross-request misrouting.
 The process-local cache stores route metadata only (max 128 entries, 30s TTL),
-keys results by request-size estimates and live health scores, and clears on a
-route-config generation change. It never stores prompts or request bodies.
+keys results by request-size estimates, live health scores and the immutable
+route-config generation. Old in-flight requests cannot erase the newly
+published generation's hot cache; both generations share the same 128-entry
+LRU and 30s TTL. It never stores prompts or request bodies.
 
 Interfaces:
 - POST /v1/auto accepts a Chat Completion body with model omitted or auto.
@@ -64,7 +66,9 @@ Interfaces:
 - Disabled Auto returns 404 auto_disabled; no eligible size-match candidate
   returns 422 auto_no_eligible_candidate before any network attempt.
 - Auto is disabled by default to preserve old configs. No HTTP management
-  endpoint, control socket or outbound model discovery is introduced.
+  endpoint or outbound model discovery is introduced. The newer `guvna`
+  local CLI uses a private Unix control socket for **local-only** status,
+  scoring and chain mutations; it is not an Auto admin HTTP endpoint.
 
 ## Optional local privacy-safe logs
 
