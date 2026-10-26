@@ -142,8 +142,11 @@ fn apply_event(
             *model = Some(current.to_owned());
         }
     }
+    // The shared ChatSse parser permits provisional usage on content
+    // choices, followed by one authoritative empty-choices usage trailer.
+    // ChatSse itself enforces that a second trailer is invalid.
     if let Some(value_usage) = value.get("usage").filter(|usage| !usage.is_null()) {
-        if !value_usage.is_object() || !usage.is_null() {
+        if !value_usage.is_object() {
             return Err(AggregateError::InvalidStream);
         }
         let prompt = value_usage
@@ -164,6 +167,13 @@ fn apply_event(
         // Usage extras are client-visible JSON as well. The original limit
         // only counted text and tool arguments, allowing a large usage object
         // to bypass the advertised bounded output budget.
+        // The final accounting replaces provisional usage, rather than
+        // accumulating stale copies against the output budget.
+        *used = used.saturating_sub(if usage.is_null() {
+            0
+        } else {
+            usage.to_string().len()
+        });
         account_bounded(used, value_usage.to_string().len())?;
         *usage = value_usage.clone();
     }

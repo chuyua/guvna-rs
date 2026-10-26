@@ -378,15 +378,17 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     // would otherwise forward that default and then reject the upstream's
     // multi-choice success as an invalid Responses result. Send n=1
     // explicitly so every fallback candidate honors this endpoint contract.
-    object.insert("n".into(), json!(1));
     if let Some(tokens) = object.remove("max_output_tokens") {
         object.insert("max_tokens".into(), tokens);
     }
+    // A Responses result is always a single assistant choice, even when a
+    // routing-chain default injects n > 1 for ordinary Chat requests.
+    object.insert("n".into(), Value::from(1));
     let response_metrics = state.metrics.clone();
     let response = dispatch(
         state,
         Bytes::from(value.to_string()),
-        Endpoint::Chat,
+        Endpoint::Responses,
         permit,
         None,
     )
@@ -741,6 +743,92 @@ fn reasoning_item(response_id: &str, text: &str, status: &str) -> Value {
         "id":format!("rs_{response_id}"),"type":"reasoning","status":status,
         "summary":[],"content":[{"type":"reasoning_text","text":text}]
     })
+}
+
+/// Validate the endpoint-specific conversion contract *before* the shared
+/// candidate walker commits its success, health and key-lease accounting.
+/// This does not route/retry; it only rejects unusable Chat responses.
+pub(super) fn translatable_chat_result(chat: &Value) -> bool {
+    let usage = &chat["usage"];
+    match (
+        usage["prompt_tokens"].as_u64(),
+        usage["completion_tokens"].as_u64(),
+        usage["total_tokens"].as_u64(),
+    ) {
+        (Some(input), Some(output), Some(total)) if input.checked_add(output) == Some(total) => {}
+        (None, None, None) => {}
+        _ => return false,
+    }
+    let Some(choices) = chat.get("choices").and_then(Value::as_array) else {
+        return false;
+    };
+    if choices.len() != 1
+        || choices[0]["index"].as_u64() != Some(0)
+        || choices[0]["message"]["role"] != "assistant"
+    {
+        return false;
+    }
+    if chat
+        .get("id")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+        || chat
+            .get("created")
+            .is_some_and(|created| created.as_i64().is_none_or(|timestamp| timestamp < 0))
+        || chat
+            .get("model")
+            .is_some_and(|model| model.as_str().is_none_or(str::is_empty))
+    {
+        return false;
+    }
+    let choice = &choices[0];
+    let message = &choice["message"];
+    if reasoning_text(message).is_err() {
+        return false;
+    }
+    let calls = message["tool_calls"].as_array();
+    if message
+        .get("tool_calls")
+        .is_some_and(|value| !value.is_array())
+    {
+        return false;
+    }
+    if let Some(calls) = calls.filter(|calls| !calls.is_empty()) {
+        let finish = choice["finish_reason"].as_str();
+        if !matches!(finish, Some("tool_calls" | "length" | "content_filter"))
+            || !(message["content"].is_null() || message["content"].as_str().is_some())
+        {
+            return false;
+        }
+        let mut seen_ids = std::collections::HashSet::new();
+        return calls.iter().all(|call| {
+            let Some(id) = call["id"].as_str().filter(|id| !id.is_empty()) else {
+                return false;
+            };
+            call["type"] == "function"
+                && seen_ids.insert(id)
+                && call["function"]["name"]
+                    .as_str()
+                    .is_some_and(|name| !name.is_empty())
+                && call["function"]["arguments"].as_str().is_some_and(|args| {
+                    finish != Some("tool_calls")
+                        || args.is_empty()
+                        || serde_json::from_str::<Value>(args).is_ok_and(|value| value.is_object())
+                })
+        });
+    }
+    if choice["finish_reason"] == "tool_calls" {
+        return false;
+    }
+    let supports_content = message["content"].as_str().is_some()
+        || (message["content"].is_null()
+            && (reasoning_text(message).ok().flatten().is_some()
+                || message["refusal"].as_str().is_some()));
+    supports_content
+        && matches!(
+            choice["finish_reason"].as_str(),
+            Some("stop" | "length" | "content_filter")
+        )
 }
 
 fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) -> Response {

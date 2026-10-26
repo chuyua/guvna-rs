@@ -298,6 +298,42 @@ fn cli_set_replace_delete_and_corrupt_recovery_preserve_every_original_byte() {
 }
 
 #[test]
+fn audit_f08_oversized_corrupt_chain_file_is_recoverable_from_valid_backup() {
+    let (_dir, config, data) = setup();
+    fs::create_dir_all(&data).unwrap();
+    let target = data.join("chains.yaml");
+    let invalid = vec![b'!'; 1024 * 1024 + 1];
+    fs::write(&target, &invalid).unwrap();
+    fs::write(data.join("chains.yaml.bak"), "version: 1\nchains: []\n").unwrap();
+    let result = success(&run(&config, &data, &["recover"]));
+    assert!(result.contains("recovered 0 runtime chains"), "{result}");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "version: 1\nchains: []\n"
+    );
+    let preserved = fs::read_dir(&data)
+        .unwrap()
+        .map(Result::unwrap)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("chains.yaml.before-recovery-")
+        })
+        .expect("missing forensic copy");
+    assert_eq!(fs::read(preserved).unwrap(), invalid);
+    assert!(success(&run(&config, &data, &["validate"])).contains("valid:"));
+    // A malformed backup must not replace or even move the live file.
+    fs::write(data.join("chains.yaml.bak"), "invalid\nyaml\n").unwrap();
+    failure(&run(&config, &data, &["recover"]), "guvna:");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "version: 1\nchains: []\n"
+    );
+}
+
+#[test]
 fn concurrent_separate_processes_cannot_lose_runtime_chain_updates() {
     let (dir, config, data) = setup();
     let barrier = Arc::new(Barrier::new(9));

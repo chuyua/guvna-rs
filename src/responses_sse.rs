@@ -844,6 +844,61 @@ mod tests {
         Bytes::from(format!("data: {event}\n\n"))
     }
     #[test]
+    fn audit_f01_truncated_function_call_item_never_reports_completed() {
+        for reason in ["length", "content_filter"] {
+            let mut translator = ResponsesSse::new("m".into(), Value::Null);
+            let mut frames = VecDeque::new();
+            translator
+                .feed(
+                    &frame(json!({"id":"chat","choices":[{
+                "index":0,"delta":{"tool_calls":[{"index":0,"id":"call1",
+                    "type":"function","function":{"name":"lookup","arguments":"{\"city\":"}}]},
+                "finish_reason":null}]})),
+                    &mut frames,
+                )
+                .unwrap();
+            translator
+                .feed(
+                    &frame(json!({"id":"chat","choices":[{
+                "index":0,"delta":{},"finish_reason":reason}]})),
+                    &mut frames,
+                )
+                .unwrap();
+            translator.feed(b"data: [DONE]\n\n", &mut frames).unwrap();
+            let events: Vec<Value> = frames
+                .iter()
+                .filter_map(|raw| {
+                    std::str::from_utf8(raw)
+                        .ok()?
+                        .lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .and_then(|data| serde_json::from_str(data).ok())
+                })
+                .collect();
+            let item = events
+                .iter()
+                .find(|v| {
+                    v["type"] == "response.output_item.done" && v["item"]["type"] == "function_call"
+                })
+                .unwrap();
+            assert_eq!(item["item"]["status"], "incomplete", "{reason}");
+            let terminal = events
+                .iter()
+                .find(|v| v["type"] == "response.incomplete")
+                .unwrap();
+            assert_eq!(terminal["response"]["status"], "incomplete");
+            assert_eq!(
+                terminal["response"]["output"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["type"] == "function_call")
+                    .unwrap()["status"],
+                "incomplete"
+            );
+        }
+    }
+    #[test]
     fn mixed_text_then_reasoning_completes_in_output_index_order() {
         let mut translator = ResponsesSse::new("logical".into(), Value::Null);
         let mut events = VecDeque::new();

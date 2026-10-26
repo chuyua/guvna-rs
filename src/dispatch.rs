@@ -31,14 +31,18 @@ use tokio::sync::OwnedSemaphorePermit;
 #[derive(Clone, Copy)]
 pub(super) enum Endpoint {
     Chat,
+    Responses,
     Embeddings,
 }
 impl Endpoint {
     fn path(self) -> &'static str {
         match self {
-            Self::Chat => "/chat/completions",
+            Self::Chat | Self::Responses => "/chat/completions",
             Self::Embeddings => "/embeddings",
         }
+    }
+    fn is_chat(self) -> bool {
+        matches!(self, Self::Chat | Self::Responses)
     }
 }
 
@@ -88,6 +92,7 @@ pub(super) async fn dispatch(
     if let Some(telemetry) = telemetry {
         let label = match endpoint {
             Endpoint::Chat => "chat",
+            Endpoint::Responses => "responses",
             Endpoint::Embeddings => "embeddings",
         };
         let mut context = telemetry_context
@@ -154,6 +159,7 @@ fn outcome_failure_type(outcome: Outcome) -> &'static str {
 fn telemetry_endpoint(endpoint: Endpoint) -> &'static str {
     match endpoint {
         Endpoint::Chat => "chat",
+        Endpoint::Responses => "responses",
         Endpoint::Embeddings => "embeddings",
     }
 }
@@ -314,7 +320,7 @@ async fn dispatch_inner(
                     .expect("config validated"),
             )
     });
-    if streaming && !matches!(endpoint, Endpoint::Chat) {
+    if streaming && !endpoint.is_chat() {
         return error(
             StatusCode::NOT_IMPLEMENTED,
             "migration_pending",
@@ -346,9 +352,7 @@ async fn dispatch_inner(
     // Reject malformed n for both JSON and SSE requests locally. The 64
     // choice bound is specific to the streaming parser; a JSON-only provider
     // may legitimately support larger positive n values.
-    if matches!(endpoint, Endpoint::Chat)
-        && (expected == 0 || (streaming && ChatSse::new(expected).is_err()))
-    {
+    if endpoint.is_chat() && (expected == 0 || (streaming && ChatSse::new(expected).is_err())) {
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_n",
@@ -693,14 +697,14 @@ async fn dispatch_inner(
         }
         let provider = &state.config.providers[step.provider_index];
         if !streaming
-            && matches!(endpoint, Endpoint::Chat)
+            && endpoint.is_chat()
             && provider.stream_only
             && failed_aggregation_routes.contains(&(step.provider_index, step.model.clone()))
         {
             all_candidates_rate_limited = false;
             continue;
         }
-        if provider.stream_only && !streaming && !matches!(endpoint, Endpoint::Chat) {
+        if provider.stream_only && !streaming && !endpoint.is_chat() {
             all_candidates_rate_limited = false;
             continue; // Only Chat has a validated SSE-to-JSON adapter.
         }
@@ -792,8 +796,7 @@ async fn dispatch_inner(
             },
             None => None, // Preserve existing routing behavior by default.
         };
-        let upstream_stream =
-            streaming || (provider.stream_only && matches!(endpoint, Endpoint::Chat));
+        let upstream_stream = streaming || (provider.stream_only && endpoint.is_chat());
         if upstream_stream
             && !streaming
             && let Some(ticket) = circuit_ticket.as_mut()
@@ -1222,11 +1225,23 @@ async fn dispatch_inner(
                 // Never reflect arbitrary upstream messages: some providers
                 // include credential fragments or request text in them. Map
                 // only recognized machine-readable error codes to fixed text.
-                let detail =
-                    tokio::time::timeout(Duration::from_secs(2), bounded_error_json(upstream))
-                        .await
-                        .ok()
-                        .flatten();
+                let error_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                let error_deadline =
+                    walk_deadline.map_or(error_deadline, |until| until.min(error_deadline));
+                let detail = tokio::time::timeout_at(error_deadline, bounded_error_json(upstream))
+                    .await
+                    .ok()
+                    .flatten();
+                if walk_expired(walk_deadline) {
+                    if let Some(context) = telemetry_context.as_mut() {
+                        context.set_failure_type("timeout");
+                        context.set_health_observation(false);
+                    }
+                    return attach_telemetry_context(
+                        walk_timeout(&state.metrics),
+                        telemetry_context.take(),
+                    );
+                }
                 let message = match detail
                     .as_ref()
                     .and_then(|body| body.pointer("/error/code").and_then(Value::as_str))

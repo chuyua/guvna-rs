@@ -259,7 +259,7 @@ fn ensure_restartable_auto(config: &Config, runtime: &RuntimeChains) -> Result<(
     Ok(())
 }
 
-fn preserve_original(dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+fn preserve_original(dir: &Path, source: &Path) -> Result<PathBuf, String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| format!("system clock: {e}"))?
@@ -268,19 +268,35 @@ fn preserve_original(dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
         "chains.yaml.before-recovery-{}-{now}.bak",
         std::process::id()
     ));
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
+    // Recovery is the one operation that must accept an oversized corrupt
+    // live file. Stream its bytes to a private file instead of materializing
+    // the whole file in RAM or using the 1 MiB validation reader.
+    let mut reader = OpenOptions::new();
+    reader.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        reader.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = opts
-        .open(&path)
-        .map_err(|e| format!("preserving {}: {e}", path.display()))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| format!("writing preserved original {}: {e}", path.display()))?;
+    let mut original = reader
+        .open(source)
+        .map_err(|e| format!("opening live file {} for recovery: {e}", source.display()))?;
+    if !original
+        .metadata()
+        .map_err(|e| format!("checking original file: {e}"))?
+        .is_file()
+    {
+        return Err("recovery original must be a regular file".into());
+    }
+    let mut temp =
+        tempfile::NamedTempFile::new_in(dir).map_err(|e| format!("creating forensic copy: {e}"))?;
+    std::io::copy(&mut original, temp.as_file_mut())
+        .map_err(|e| format!("copying original file: {e}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|e| format!("syncing forensic copy: {e}"))?;
+    temp.persist_noclobber(&path)
+        .map_err(|e| format!("preserving {}: {}", path.display(), e.error))?;
     #[cfg(unix)]
     File::open(dir)
         .and_then(|parent| parent.sync_all())
@@ -411,10 +427,13 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
             let next = serialize(&validated)?;
             // Preserve even a corrupt original byte-for-byte and report its
             // name. Never rewrite a failed recovery source or the live file.
-            let original = read_limited(&target)?;
-            let preserved = match original {
-                Some(ref original) => Some(preserve_original(&directory, original)?),
-                None => None,
+            let preserved = match fs::symlink_metadata(&target) {
+                Ok(meta) if meta.file_type().is_file() => {
+                    Some(preserve_original(&directory, &target)?)
+                }
+                Ok(_) => return Err("recovery live file is not a regular file".into()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => return Err(format!("checking live file before recovery: {err}")),
             };
             atomic_write(&target, &next)?;
             Ok(format!(
