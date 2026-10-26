@@ -777,7 +777,7 @@ impl ResponsesSse {
         }
         if let Some(index) = self.text_index {
             let parts = self.message_parts();
-            for content_index in 0..parts.len() {
+            for (content_index, part) in parts.iter().enumerate() {
                 if self.text_part_index == Some(content_index) {
                     let item_id = self.message_id();
                     pending.push_back(self.emit(
@@ -802,7 +802,7 @@ impl ResponsesSse {
                     "response.content_part.done",
                     json!({
                         "item_id":item_id,"output_index":index,"content_index":content_index,
-                        "part":parts[content_index]
+                        "part":part
                     }),
                 ));
             }
