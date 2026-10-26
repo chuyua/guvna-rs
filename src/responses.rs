@@ -806,7 +806,17 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
             "Upstream chat model must be a nonempty string",
         );
     }
-    let created_at = chat["created"].as_i64();
+    // OpenAI-compatible Chat providers may omit their optional timestamp.
+    // The Responses wire contract still requires a numeric created_at, just
+    // like our streaming adapter. Preserve a valid upstream value or stamp
+    // the conversion locally rather than emitting created_at:null.
+    let created_at = chat["created"].as_i64().unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .min(i64::MAX as u64) as i64
+    });
     let message = &chat["choices"][0]["message"];
     let reasoning = match reasoning_text(message) {
         Ok(reasoning) => reasoning,
@@ -971,6 +981,45 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
 #[cfg(test)]
 mod reasoning_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn responses_created_at_is_numeric_and_preserves_upstream_timestamps() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let template = json!({
+            "id":"chatcmpl-timestamp","model":"physical",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},
+                "finish_reason":"stop"}]
+        });
+        for (created, expected) in [(None, None), (Some(json!(123)), Some(123_i64))] {
+            let mut chat = template.clone();
+            if let Some(created) = created {
+                chat["created"] = created;
+            }
+            let response = translate_chat_result(chat, "logical".into(), Value::Null);
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let output: Value = serde_json::from_slice(&body).unwrap();
+            let created = output["created_at"].as_i64().expect("created_at integer");
+            if let Some(expected) = expected {
+                assert_eq!(created, expected);
+            } else {
+                let after = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                assert!((before..=after).contains(&created));
+            }
+        }
+        for bad in [json!(-1), json!("yesterday"), json!(null), json!(1.5)] {
+            let mut invalid = template.clone();
+            invalid["created"] = bad;
+            let response = translate_chat_result(invalid, "logical".into(), Value::Null);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        }
+    }
 
     #[tokio::test]
     async fn standalone_mirrored_and_mixed_chat_refusals_are_typed_responses_parts() {
