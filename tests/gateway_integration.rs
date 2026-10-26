@@ -8,7 +8,7 @@ use axum::{
 };
 use guvna::{
     config::Config,
-    gateway::{AppState, app},
+    gateway::{AppState, app, app_with_state},
 };
 use serde_json::{Value, json};
 use std::{
