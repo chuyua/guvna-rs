@@ -981,7 +981,7 @@ const SSE_END: &[u8] =
 const SSE_DONE: &[u8] = b"data: [DONE]\n\n";
 
 #[tokio::test(flavor = "current_thread")]
-async fn healthy_stream_survives_ninety_seconds_of_regular_progress() {
+async fn healthy_stream_survives_ninety_seconds_of_real_content_progress() {
     use std::time::Duration;
 
     let upstream = Router::new().route(
@@ -993,7 +993,13 @@ async fn healthy_stream_survives_ninety_seconds_of_regular_progress() {
                     1..=20 => {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         Some((
-                            Ok(Bytes::from_static(b": upstream heartbeat\n\n")),
+                            Ok(if index % 2 == 0 {
+                                Bytes::from_static(
+                                    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\".\"},\"finish_reason\":null}]}\n\n",
+                                )
+                            } else {
+                                Bytes::from_static(b": upstream heartbeat\n\n")
+                            }),
                             index + 1,
                         ))
                     }
@@ -1042,6 +1048,56 @@ async fn healthy_stream_survives_ninety_seconds_of_regular_progress() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
     assert!(!text.contains("upstream_stream_incomplete"), "{text}");
+}
+
+#[tokio::test]
+async fn heartbeat_only_chat_sse_cannot_hold_a_request_forever() {
+    use std::time::Duration;
+    let (url, hits) = start_progressing_aggregation().await;
+    let router = make_app(&url, &url);
+    let response = router
+        .clone()
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // First valid content has already passed the preflight. The provider
+    // now sends a never-ending heartbeat comment every five seconds.
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let task = tokio::spawn(async move { to_bytes(response.into_body(), 1 << 20).await });
+    for _ in 0..24 {
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        if task.is_finished() {
+            break;
+        }
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        task.is_finished(),
+        "heartbeats still held the SSE permit after {elapsed:?}"
+    );
+    assert!(
+        (Duration::from_secs(60)..Duration::from_secs(75)).contains(&elapsed),
+        "progress watchdog expired too early or too late: {elapsed:?}"
+    );
+    tokio::time::resume();
+    let bytes = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "chat_stream_failed_total"), 1);
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 0);
+    assert_eq!(metric_value(&metrics, "active_requests"), 0);
 }
 
 #[tokio::test]

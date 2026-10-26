@@ -12,6 +12,9 @@ use tokio::sync::OwnedSemaphorePermit;
 
 // Bound a single upstream read: even valid tiny events must not create an unbounded queue.
 const MAX_STREAM_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+// SSE heartbeat comments keep the socket alive but are not model progress.
+// Bound admission even if a provider sends one heartbeat every few seconds.
+const MAX_STREAM_PROGRESS_IDLE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PreflightError {
@@ -52,6 +55,7 @@ struct ChatStreamState {
     request_id: String,
     attempt_index: u16,
     started_at: tokio::time::Instant,
+    last_progress_at: tokio::time::Instant,
     lease: Lease,
     upstream: reqwest::Response,
     parser: ChatSse,
@@ -118,6 +122,7 @@ pub(super) async fn start(
         request_id: route.request_id,
         attempt_index: route.attempt_index,
         started_at: tokio::time::Instant::now(),
+        last_progress_at: tokio::time::Instant::now(),
         lease,
         upstream,
         parser,
@@ -129,6 +134,7 @@ pub(super) async fn start(
         circuit_ticket: None,
     };
     preflight_stream(&mut state).await?;
+    state.last_progress_at = tokio::time::Instant::now();
     if state.parser.take_progress()
         && let Some(ticket) = circuit_ticket.as_mut()
     {
@@ -204,8 +210,13 @@ fn stream_response(state: ChatStreamState) -> Response {
             if state.parser.is_done() {
                 return None;
             }
-            // Bound upstream stalls after the first event without buffering the response.
-            match tokio::time::timeout(Duration::from_secs(15), state.upstream.chunk()).await {
+            // Both the transport read and meaningful-content idle clocks are
+            // bounded. Frequent :heartbeats cannot indefinitely hold the
+            // request permit or an upstream half-open recovery ticket.
+            let now = tokio::time::Instant::now();
+            let deadline = (now + Duration::from_secs(15))
+                .min(state.last_progress_at + MAX_STREAM_PROGRESS_IDLE);
+            match tokio::time::timeout_at(deadline, state.upstream.chunk()).await {
                 Ok(Ok(Some(bytes))) => {
                     if bytes.len() > MAX_STREAM_CHUNK_BYTES {
                         state.failure_type = "local_error";
@@ -213,10 +224,11 @@ fn stream_response(state: ChatStreamState) -> Response {
                     } else {
                         match state.parser.push(&bytes) {
                             Ok(events) => {
-                                if state.parser.take_progress()
-                                    && let Some(ticket) = state.circuit_ticket.as_mut()
-                                {
-                                    ticket.progress();
+                                if state.parser.take_progress() {
+                                    state.last_progress_at = tokio::time::Instant::now();
+                                    if let Some(ticket) = state.circuit_ticket.as_mut() {
+                                        ticket.progress();
+                                    }
                                 }
                                 state.pending.extend(events);
                             }
