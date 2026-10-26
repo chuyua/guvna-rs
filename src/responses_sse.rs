@@ -697,7 +697,7 @@ impl ResponsesSse {
                     json!({
                         "output_index":output_index,
                         "item":{"id":id,"call_id":id,"name":name,"arguments":arguments,
-                            "type":"function_call","status":"completed"}
+                            "type":"function_call","status":status}
                     }),
                 ));
             }
@@ -1055,6 +1055,60 @@ mod tests {
         assert!(last.contains("event: response.incomplete"), "{last}");
         assert!(last.contains("\"reason\":\"content_filter\""), "{last}");
         assert!(!last.contains("response.failed"), "{last}");
+    }
+    #[test]
+    fn incomplete_stream_tool_item_never_claims_completed_arguments() {
+        for (finish, expected_status) in [
+            ("length", "incomplete"),
+            ("content_filter", "incomplete"),
+            ("tool_calls", "completed"),
+        ] {
+            let arguments = if finish == "tool_calls" {
+                "{}"
+            } else {
+                "{\"unfinished\":"
+            };
+            let mut t = ResponsesSse::new("logical".into(), Value::Null);
+            let mut pending = VecDeque::new();
+            t.feed(
+                &frame(json!({"id":"partial-call","created":123,
+                    "choices":[{"index":0,
+                        "delta":{"tool_calls":[{"index":0,"id":"call_partial",
+                            "type":"function",
+                            "function":{"name":"lookup","arguments":arguments}}]},
+                        "finish_reason":null}]})),
+                &mut pending,
+            )
+            .unwrap();
+            t.feed(
+                &frame(json!({"id":"partial-call",
+                    "choices":[{"index":0,"delta":{},"finish_reason":finish}]})),
+                &mut pending,
+            )
+            .unwrap();
+            t.feed(b"data: [DONE]\n\n", &mut pending).unwrap();
+            assert!(t.done);
+            let events = pending
+                .iter()
+                .map(|frame| String::from_utf8_lossy(frame).into_owned())
+                .collect::<Vec<_>>();
+            let done = events
+                .iter()
+                .find(|frame| {
+                    frame.starts_with("event: response.output_item.done\n")
+                        && frame.contains("\"type\":\"function_call\"")
+                })
+                .unwrap();
+            let item_done: Value =
+                serde_json::from_str(done.split_once("data: ").unwrap().1.trim()).unwrap();
+            assert_eq!(item_done["item"]["status"], expected_status, "{finish}");
+            assert_eq!(item_done["item"]["arguments"], arguments);
+            let final_event = events.last().unwrap();
+            let response: Value =
+                serde_json::from_str(final_event.split_once("data: ").unwrap().1.trim()).unwrap();
+            assert_eq!(response["response"]["status"], expected_status, "{finish}");
+            assert_eq!(response["response"]["output"][0]["status"], expected_status);
+        }
     }
     #[test]
     fn bounded_malformed_and_tools() {
