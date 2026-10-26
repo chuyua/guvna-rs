@@ -957,25 +957,37 @@ fn load_provider_health_from_path(path: &Path, now: i64) -> Vec<ProviderHealthSn
     }
     let Ok(mut statement) = conn.prepare(
         "SELECT provider,model,penalty,consecutive_failures,demoted,last_failure_ts
-         FROM provider_health WHERE model!='*' AND identity_verified=1 AND updated_ts >= ?1
+         FROM provider_health
+         WHERE model!='*' AND identity_verified=1
+           AND updated_ts BETWEEN ?1 AND ?2
+           AND last_failure_ts BETWEEN 0 AND ?2
          ORDER BY updated_ts DESC LIMIT 256",
     ) else {
         return Vec::new();
     };
-    let Ok(rows) = statement.query_map([now - HISTORY_RETENTION_SECS], |row| {
-        let penalty: i64 = row.get(2)?;
-        let failures: i64 = row.get(3)?;
-        let demoted: i64 = row.get(4)?;
-        let last_failure: i64 = row.get(5)?;
-        Ok(ProviderHealthSnapshot {
-            provider: row.get(0)?,
-            model: row.get(1)?,
-            penalty: penalty.clamp(0, 100) as u8,
-            consecutive_failures: failures.clamp(0, u16::MAX as i64) as u16,
-            demoted: demoted != 0,
-            last_failure_secs: last_failure.max(0) as u64,
-        })
-    }) else {
+    // Restore runs before the writer prunes skewed timestamps. If the system
+    // clock moved backwards after recording a failure, a future-dated
+    // demotion must not remain active through an otherwise healthy restart.
+    let Ok(rows) = statement.query_map(
+        [
+            now.saturating_sub(HISTORY_RETENTION_SECS),
+            now.saturating_add(300),
+        ],
+        |row| {
+            let penalty: i64 = row.get(2)?;
+            let failures: i64 = row.get(3)?;
+            let demoted: i64 = row.get(4)?;
+            let last_failure: i64 = row.get(5)?;
+            Ok(ProviderHealthSnapshot {
+                provider: row.get(0)?,
+                model: row.get(1)?,
+                penalty: penalty.clamp(0, 100) as u8,
+                consecutive_failures: failures.clamp(0, u16::MAX as i64) as u16,
+                demoted: demoted != 0,
+                last_failure_secs: last_failure.max(0) as u64,
+            })
+        },
+    ) else {
         return Vec::new();
     };
     rows.filter_map(Result::ok).collect()
@@ -1779,6 +1791,44 @@ mod tests {
 
         let stale = load_provider_health_from_path(&path, 7202 + HISTORY_RETENTION_SECS + 1);
         assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn startup_health_restore_rejects_future_clock_skew_without_erasing_valid_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health-skew.sqlite3");
+        let mut conn = open_database(&path).unwrap();
+        let now = 7201_i64;
+        write_batch(
+            &mut conn,
+            &[
+                event(now, "legit", "m", 503, 1, "provider_5xx"),
+                event(now + 3600, "future", "m", 503, 1, "provider_5xx"),
+            ],
+        )
+        .unwrap();
+        let restored = load_provider_health_from_path(&path, now);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].provider, "legit");
+        // Even a current updated_ts cannot validate a future failure from
+        // a damaged or partially migrated health snapshot.
+        conn.execute(
+            "UPDATE provider_health SET last_failure_ts=?1
+             WHERE provider='legit'",
+            [now + 3600],
+        )
+        .unwrap();
+        assert!(load_provider_health_from_path(&path, now).is_empty());
+        // The writer's eventual expiry cleanup remains independent from
+        // the read-only fail-open startup restore.
+        let future_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM provider_health WHERE provider='future'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(future_before, 1);
     }
 
     #[test]
