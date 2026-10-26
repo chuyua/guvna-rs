@@ -875,7 +875,7 @@ async fn dispatch_inner(
         // Several credentials can independently return 429 for one logical
         // candidate. Rate-limit the keys individually, but count one health
         // observation rather than demoting Auto from one client request.
-        let mut rate_limit_health_recorded = false;
+        let mut saw_new_rate_limit = false;
         while let Some(lease) = state.pools[step.provider_index].acquire(&tried) {
             if walk_expired(walk_deadline) {
                 let mut context = telemetry_context.take();
@@ -971,9 +971,12 @@ async fn dispatch_inner(
                 ) {
                     Metrics::inc(&state.metrics.credential_quarantines);
                 }
-                if outcome == Outcome::RateLimited && !rate_limit_health_recorded {
-                    rate_limit_health_recorded = true;
-                    state.mark_auto_failure_in(&live, step.provider_index, &step.model);
+                if outcome == Outcome::RateLimited {
+                    // A single key's quota exhaustion is not evidence that
+                    // the model is unavailable. Another key may succeed
+                    // immediately, and counting both failure then success
+                    // slowly demotes a perfectly usable Auto candidate.
+                    saw_new_rate_limit = true;
                 }
                 continue; // try a different key; each key is attempted once
             }
@@ -1255,6 +1258,12 @@ async fn dispatch_inner(
             break; // 4xx or 5xx: next chain step; no uncontrolled retries
         }
         let rate_limit_delay = state.pools[step.provider_index].all_keys_rate_limited_for();
+        if saw_new_rate_limit && rate_limit_delay.is_some() {
+            // Only a freshly observed *candidate-wide* 429 exhaustion
+            // teaches AutoHealth that this physical model is unavailable.
+            // Already-isolated keys cannot be counted again by each caller.
+            state.mark_auto_failure_in(&live, step.provider_index, &step.model);
+        }
         if !candidate_attempted_network && let Some(context) = telemetry_context.as_mut() {
             if rate_limit_delay.is_some() {
                 context.set_failure_type("rate_limited");

@@ -783,6 +783,81 @@ chains:
 }
 
 #[tokio::test]
+async fn auto_health_only_demotes_after_all_credentials_are_rate_limited() {
+    for healthy_peer_key in [true, false] {
+        let (primary, primary_hits) = start_upstream(StatusCode::OK).await;
+        let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+        let key_configuration = if healthy_peer_key {
+            "key_envs: [BAD, GOOD]"
+        } else {
+            "key_env: BAD"
+        };
+        let config: Config = serde_yaml::from_str(&format!(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {primary}
+    {key_configuration}
+    rotation: sequential
+    quarantine:
+      rate_limit: 10m
+  - name: q
+    type: openai
+    base_url: {backup}
+    key_env: ALT
+auto:
+  enabled: true
+  health_aware: true
+  candidates:
+    - provider: p
+      model: primary-model
+      priority: 1
+    - provider: q
+      model: backup-model
+      priority: 2
+"#
+        ))
+        .unwrap();
+        let gateway = app(AppState::new(
+            config,
+            HashMap::from([
+                ("BAD".into(), "bad".into()),
+                ("GOOD".into(), "good".into()),
+                ("ALT".into(), "alternate".into()),
+            ]),
+            vec!["client".into()],
+        )
+        .unwrap());
+        let payload = json!({"messages":[{"role":"user","content":"hello"}]});
+        let expected = if healthy_peer_key {
+            "primary-model"
+        } else {
+            "backup-model"
+        };
+        for _ in 0..2 {
+            let (status, result) = call(
+                gateway.clone(),
+                auto_request("/v1/auto", "client", payload.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(result["model"], expected);
+        }
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            if healthy_peer_key { 3 } else { 1 },
+            "a successful peer key cannot cause whole-model demotion"
+        );
+        assert_eq!(
+            backup_hits.load(Ordering::SeqCst),
+            if healthy_peer_key { 0 } else { 2 },
+            "all-429 exhaustion must still reroute Auto to the healthy model"
+        );
+    }
+}
+
+#[tokio::test]
 async fn duplicate_key_values_do_not_repeat_the_same_upstream_429_or_inflate_capacity() {
     use guvna::gateway::app_with_state;
     let (url, calls) = start_upstream(StatusCode::OK).await;
