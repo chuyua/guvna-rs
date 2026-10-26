@@ -23,6 +23,47 @@ struct Cache {
     stale: Instant,
 }
 
+/// The selector needs only physical candidate identity, never forwarded
+/// tool schemas or request defaults. Static Chat requests can borrow their
+/// resolved steps, while background tasks own just these tiny metadata views.
+pub(crate) trait SelectorIdentity {
+    fn provider_index(&self) -> usize;
+    fn model(&self) -> &str;
+}
+
+impl SelectorIdentity for ResolvedStep {
+    fn provider_index(&self) -> usize {
+        self.provider_index
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+pub(crate) struct SelectorCandidate {
+    provider_index: usize,
+    model: String,
+}
+
+impl SelectorIdentity for SelectorCandidate {
+    fn provider_index(&self) -> usize {
+        self.provider_index
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+pub(crate) fn selector_candidates(steps: &[ResolvedStep]) -> Vec<SelectorCandidate> {
+    steps
+        .iter()
+        .map(|step| SelectorCandidate {
+            provider_index: step.provider_index,
+            model: step.model.clone(),
+        })
+        .collect()
+}
+
 /// A frequently used ranking should not be discarded before an older,
 /// unreferenced cache key. The bounded cache is tiny (32 entries), so a
 /// VecDeque splice needs no map or second cache state machine.
@@ -128,10 +169,10 @@ impl AutoDecider {
         }
     }
 
-    pub async fn rank(
+    pub(crate) async fn rank<T: SelectorIdentity>(
         &self,
         cfg: &Config,
-        steps: &[ResolvedStep],
+        steps: &[T],
         input_bytes: usize,
         estimated_tokens: usize,
         requirements: AutoRequirements,
@@ -205,10 +246,10 @@ impl AutoDecider {
             .and_then(|(order, _)| valid_permutation(&order, steps.len()).then_some(order))
     }
 
-    async fn fetch(
+    async fn fetch<T: SelectorIdentity>(
         &self,
         cfg: &Config,
-        steps: &[ResolvedStep],
+        steps: &[T],
         input_bytes: usize,
         estimated_tokens: usize,
         requirements: AutoRequirements,
@@ -217,8 +258,8 @@ impl AutoDecider {
             .iter()
             .enumerate()
             .map(|(index, step)| {
-                let provider = cfg.providers.get(step.provider_index)?;
-                Some(json!({"index":index,"provider":provider.name,"model":step.model}))
+                let provider = cfg.providers.get(step.provider_index())?;
+                Some(json!({"index":index,"provider":provider.name,"model":step.model()}))
             })
             .collect::<Option<_>>()?;
         let summary = serde_json::to_string(&json!({
@@ -328,8 +369,8 @@ pub(crate) fn apply_cached_order(steps: &mut Vec<ResolvedStep>, order: &[usize])
     true
 }
 
-fn ranking_key(
-    steps: &[ResolvedStep],
+fn ranking_key<T: SelectorIdentity>(
+    steps: &[T],
     bytes: usize,
     tokens: usize,
     features: AutoRequirements,
@@ -342,8 +383,8 @@ fn ranking_key(
     generation.hash(&mut h);
     steps.len().hash(&mut h);
     for step in steps {
-        step.provider_index.hash(&mut h);
-        step.model.hash(&mut h);
+        step.provider_index().hash(&mut h);
+        step.model().hash(&mut h);
     }
     // The selector receives exact estimates. Do not reuse a cached rank for
     // different context pressure just because both sizes share a KiB bucket.
@@ -438,6 +479,45 @@ mod tests {
         assert!(apply_cached_order(&mut full, &reverse));
         assert_eq!(full[0].model, "model-31");
         assert_eq!(full[31].model, "model-0");
+    }
+
+    #[test]
+    fn background_selector_uses_tiny_identity_snapshot_without_schema_clones() {
+        let mut large = ResolvedStep {
+            provider_index: 3,
+            model: "model-with-default-tools".into(),
+            params: Default::default(),
+        };
+        large.params.insert(
+            "tools".into(),
+            json!([{"function":{"description":"S".repeat(900_000)}}]),
+        );
+        let steps = vec![
+            large,
+            ResolvedStep {
+                provider_index: 1,
+                model: "fallback".into(),
+                params: Default::default(),
+            },
+        ];
+        let snapshot = selector_candidates(&steps);
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].model(), "model-with-default-tools");
+        assert_eq!(snapshot[0].provider_index(), 3);
+        let features = AutoRequirements::default();
+        assert_eq!(
+            ranking_key(&steps, 42, 4096, features, SELECTOR_GENERATION),
+            ranking_key(&snapshot, 42, 4096, features, SELECTOR_GENERATION),
+            "compact background input must use the exact cache identity"
+        );
+        assert_eq!(
+            steps[0].params["tools"][0]["function"]["description"]
+                .as_str()
+                .unwrap()
+                .len(),
+            900_000,
+            "the original candidate owns its large schema unchanged"
+        );
     }
 
     #[test]

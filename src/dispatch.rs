@@ -144,15 +144,15 @@ fn preserve_auto_health_priority(
 /// must be counted once, without independently replaying the business
 /// candidate loop. Share this one outcome path across successful selector
 /// calls, semaphore saturation and missing selector credentials.
-fn record_shadow_observation(
+fn record_shadow_observation<T: auto_decider::SelectorIdentity>(
     state: &AppState,
     config: &crate::config::Config,
     request_id: &str,
-    baseline: &[routing::ResolvedStep],
+    baseline: &[T],
     proposal: Option<&[usize]>,
 ) {
     if let (Some(telemetry), Some(expected)) = (&state.telemetry, baseline.first())
-        && let Some(provider) = config.providers.get(expected.provider_index)
+        && let Some(provider) = config.providers.get(expected.provider_index())
     {
         let suggested = proposal
             .and_then(|order| order.first())
@@ -160,12 +160,12 @@ fn record_shadow_observation(
             .and_then(|step| {
                 config
                     .providers
-                    .get(step.provider_index)
-                    .map(|provider| (provider.name.as_str(), step.model.as_str()))
+                    .get(step.provider_index())
+                    .map(|provider| (provider.name.as_str(), step.model()))
             });
         telemetry.observe_shadow(
             request_id,
-            (provider.name.as_str(), expected.model.as_str()),
+            (provider.name.as_str(), expected.model()),
             suggested,
             &state.metrics,
         );
@@ -176,8 +176,8 @@ fn record_shadow_observation(
             if let (Some(expected), Some(actual)) = (
                 baseline.first(),
                 order.first().and_then(|&index| baseline.get(index)),
-            ) && (expected.provider_index != actual.provider_index
-                || expected.model != actual.model)
+            ) && (expected.provider_index() != actual.provider_index()
+                || expected.model() != actual.model())
             {
                 state.shadow_disagreements.fetch_add(1, Ordering::Relaxed);
             }
@@ -607,7 +607,7 @@ async fn dispatch_inner(
             if let Ok(permit) = state.auto_background_slots.clone().try_acquire_owned() {
                 // Under pressure, skip any deep copy of default tool schemas
                 // when a background selector cannot be scheduled.
-                let baseline = steps.clone();
+                let baseline = auto_decider::selector_candidates(&steps);
                 let trace_id = request_id.to_owned();
                 let selector_config = Arc::clone(&route_snapshot);
                 let selector_generation = live.auto_generation;
@@ -650,7 +650,7 @@ async fn dispatch_inner(
             if refresh && let Ok(permit) = state.auto_background_slots.clone().try_acquire_owned() {
                 // A non-refreshing cache hit never clones another candidate
                 // list with potentially large JSON tool defaults.
-                let baseline = steps.clone();
+                let baseline = auto_decider::selector_candidates(&steps);
                 let selector = Arc::clone(decider);
                 let selector_config = Arc::clone(&route_snapshot);
                 let selector_generation = live.auto_generation;
