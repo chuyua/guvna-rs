@@ -53,6 +53,11 @@ const MAX_INFLIGHT_REQUESTS: usize = 128;
 // Bound concurrent request-body buffers and JSON trees independently from
 // long-lived SSE responses, which may remain admitted after parsing is done.
 const MAX_INFLIGHT_PAYLOADS: usize = 8;
+// Each of the 128 admitted requests may retain a small JSON tree without
+// exhausting a single-user gateway. Large trees need one of the eight
+// payload reservations for their full parsed lifetime, not just the initial
+// Bytes-to-Value conversion; otherwise all 128 requests can retain 8 MiB.
+const LARGE_REQUEST_BODY_BYTES: usize = 128 * 1024;
 const PAYLOAD_SLOT_WAIT: Duration = Duration::from_secs(1);
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_AGGREGATIONS: usize = 4;

@@ -2046,6 +2046,68 @@ async fn oversized_later_sse_chunk_returns_incomplete_without_failover() {
 }
 
 #[tokio::test]
+async fn issue137_f02_large_parsed_requests_hold_memory_slots_through_upstream_wait() {
+    use std::time::Duration;
+    let (upstream, calls) = start_slow_walk_provider(Duration::from_secs(4), StatusCode::OK).await;
+    let router = walk_budget_router(&upstream, &upstream, "9s", false);
+    let big_request = json!({
+        "model":"budget",
+        "messages":[{"role":"user","content":"A".repeat(192 * 1024)}]
+    })
+    .to_string();
+    let send = |router: Router, body: String| async move {
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer client")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    };
+    let mut inflight = Vec::new();
+    for _ in 0..8 {
+        inflight.push(tokio::spawn(send(router.clone(), big_request.clone())));
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while calls.load(Ordering::SeqCst) < 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all eight large parsed trees should remain in flight");
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(2),
+        send(router.clone(), big_request.clone()),
+    )
+    .await
+    .expect("large payload memory must have bounded admission");
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(rejected.headers()["retry-after"], "1");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        8,
+        "ninth large request must not contact upstream with all slots held"
+    );
+    for task in inflight {
+        task.abort();
+        let _ = task.await;
+    }
+    let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(metric_value(&metrics, "active_requests"), 0);
+    // A freed payload slot must accept the next large request rather than
+    // leaking capacity across cancelled upstream calls.
+    let recovered = tokio::time::timeout(Duration::from_secs(7), send(router, big_request))
+        .await
+        .expect("cancelled large requests must release all payload reservations");
+    assert_eq!(recovered.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn mixed_endpoint_slow_uploads_share_payload_admission_telemetry_and_recover() {
     let (url, calls) = start_upstream(StatusCode::OK).await;
     let router = make_app(&url, &url);

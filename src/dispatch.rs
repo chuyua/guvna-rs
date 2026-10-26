@@ -235,6 +235,7 @@ async fn dispatch_inner(
     started: tokio::time::Instant,
     request_id: &str,
 ) -> Response {
+    let large_payload = body.len() >= super::LARGE_REQUEST_BODY_BYTES;
     let mut request: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
@@ -248,8 +249,15 @@ async fn dispatch_inner(
     // The parsed Value owns its strings; release the raw body buffer before
     // routing and candidate serialization to reduce the per-request peak.
     drop(body);
-    // Payload slots cover only receiving and parsing JSON, not upstream waits.
-    drop(payload_permit);
+    // F02: hold a reservation until the parsed, possibly multi-megabyte JSON
+    // Value is actually dropped. Small requests release their slot after
+    // parse so 128 normal Chat/SSE requests remain independently admitted.
+    let _large_payload_reservation = if large_payload {
+        payload_permit
+    } else {
+        drop(payload_permit);
+        None
+    };
     if !request.is_object() {
         return error(
             StatusCode::BAD_REQUEST,

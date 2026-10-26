@@ -33,8 +33,17 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     };
     // The translated Value owns its data; do not retain the original body
     // buffer while validating and dispatching the translated request.
+    let large_payload = body.len() >= super::LARGE_REQUEST_BODY_BYTES;
     drop(body);
-    drop(payload_permit);
+    // Responses rewrites the input tree and then awaits the shared candidate
+    // walker. Keep the original admission reservation for large requests
+    // through conversion and dispatch; do not retain it for tiny requests.
+    let _large_payload_reservation = if large_payload {
+        Some(payload_permit)
+    } else {
+        drop(payload_permit);
+        None
+    };
     let streaming = value.get("stream") == Some(&Value::Bool(true));
 
     if value.get("stream").is_some_and(|v| !v.is_boolean()) {
