@@ -109,11 +109,11 @@ impl AutoDecider {
         let now = Instant::now();
         cache.retain(|entry| entry.stale > now);
         let can_refresh = self.refresh.available_permits() != 0;
-        match touch_cache(&mut cache, key) {
-            Some(entry) => (
-                apply_order(steps, &entry.order),
-                entry.fresh <= now && can_refresh,
-            ),
+        let cached =
+            touch_cache(&mut cache, key).map(|entry| (entry.order.clone(), entry.fresh <= now));
+        drop(cache);
+        match cached {
+            Some((order, expired)) => (apply_order(steps, &order), expired && can_refresh),
             None => (None, can_refresh),
         }
     }
@@ -137,14 +137,15 @@ impl AutoDecider {
         };
         let now = Instant::now();
         entries.retain(|entry| entry.stale > now);
-        let previous = touch_cache(&mut entries, key);
-        if let Some(entry) = previous
-            && entry.fresh > now
-        {
-            return apply_order(steps, &entry.order);
-        }
-        let stale = previous.map(|entry| (entry.order.clone(), entry.stale));
+        let previous = touch_cache(&mut entries, key)
+            .map(|entry| (entry.order.clone(), entry.fresh, entry.stale));
         drop(entries);
+        if let Some((order, fresh, _)) = &previous
+            && *fresh > now
+        {
+            return apply_order(steps, order);
+        }
+        let stale = previous.map(|(order, _, stale)| (order, stale));
         // Reject concurrent refreshes without queuing them. The cache remains
         // readable while an upstream model is slow or unresponsive.
         let Ok(_refresh) = self.refresh.try_acquire() else {
@@ -155,15 +156,15 @@ impl AutoDecider {
         // Another request may have populated this key after our first read.
         let mut entries = self.cache.lock().await;
         entries.retain(|entry| entry.stale > Instant::now());
-        if let Some(entry) = touch_cache(&mut entries, key)
-            && entry.fresh > Instant::now()
-        {
-            return apply_order(steps, &entry.order);
-        }
-        let stale = touch_cache(&mut entries, key)
-            .map(|entry| (entry.order.clone(), entry.stale))
-            .or(stale);
+        let cached = touch_cache(&mut entries, key)
+            .map(|entry| (entry.order.clone(), entry.fresh, entry.stale));
         drop(entries);
+        if let Some((order, fresh, _)) = &cached
+            && *fresh > Instant::now()
+        {
+            return apply_order(steps, order);
+        }
+        let stale = cached.map(|(order, _, stale)| (order, stale)).or(stale);
         if let Some(order) = self
             .fetch(cfg, steps, input_bytes, estimated_tokens, requirements)
             .await
@@ -399,6 +400,70 @@ mod tests {
         let (miss, refresh) = decider.cached_rank(&steps, 13, 2000, requirements);
         assert!(miss.is_none());
         assert!(refresh);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_large_selector_cache_hits_keep_order_and_capacity() {
+        use std::sync::Arc;
+        let decider = Arc::new(AutoDecider {
+            client: reqwest::Client::new(),
+            endpoint: String::new(),
+            model: "ranker".into(),
+            key: String::new(),
+            timeout: Duration::from_secs(1),
+            ttl: Duration::from_secs(30),
+            cache: Mutex::new(VecDeque::new()),
+            refresh: Semaphore::new(1),
+        });
+        let mut a = ResolvedStep {
+            provider_index: 0,
+            model: "first".into(),
+            params: Default::default(),
+        };
+        a.params.insert(
+            "tools".into(),
+            json!([{"function":{"description":"p".repeat(800_000)}}]),
+        );
+        let steps = Arc::new(vec![
+            a,
+            ResolvedStep {
+                provider_index: 0,
+                model: "second".into(),
+                params: Default::default(),
+            },
+        ]);
+        let requirements = AutoRequirements::default();
+        let key = ranking_key(&steps, 20, 30, requirements);
+        decider.cache.lock().await.push_back(Cache {
+            key,
+            order: vec![1, 0],
+            fresh: Instant::now() + Duration::from_secs(20),
+            stale: Instant::now() + Duration::from_secs(60),
+        });
+        let mut tasks = Vec::new();
+        for _ in 0..12 {
+            let decider = Arc::clone(&decider);
+            let steps = Arc::clone(&steps);
+            tasks.push(tokio::task::spawn_blocking(move || {
+                let (ranked, refresh) = decider.cached_rank(&steps, 20, 30, requirements);
+                if let Some(ranked) = ranked {
+                    assert_eq!(ranked[0].model, "second");
+                    assert_eq!(ranked[1].model, "first");
+                    assert_eq!(ranked[1].params, steps[0].params);
+                    assert!(!refresh);
+                } else {
+                    assert!(!refresh, "busy lock must fail open, not queue a refresh");
+                }
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for task in tasks {
+                task.await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(decider.cache.lock().await.len(), 1);
     }
 
     #[test]

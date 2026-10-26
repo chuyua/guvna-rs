@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, VecDeque},
     hash::{DefaultHasher, Hasher},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -151,7 +151,10 @@ struct CacheKey {
 struct CacheEntry {
     key: CacheKey,
     expires_at: Instant,
-    steps: Vec<ResolvedStep>,
+    // A hit must not hold the routing cache mutex while cloning arbitrarily
+    // large candidate defaults (e.g. JSON-schema tools). Copy the Arc under
+    // lock, then clone the request-owned candidate list after releasing it.
+    steps: Arc<Vec<ResolvedStep>>,
 }
 #[derive(Default)]
 struct CacheState {
@@ -210,15 +213,16 @@ impl AutoRouteCache {
             },
         };
         let now = Instant::now();
-        {
+        let cached = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.retain_valid(generation, now);
-            if let Some(entry) = state.touch(&key) {
-                return Ok(entry.steps.clone());
-            }
+            state.touch(&key).map(|entry| Arc::clone(&entry.steps))
+        };
+        if let Some(steps) = cached {
+            return Ok((*steps).clone());
         }
 
         let steps = resolve_auto_with_requirements(
@@ -228,23 +232,25 @@ impl AutoRouteCache {
             requirements,
             penalties,
         )?;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.retain_valid(generation, Instant::now());
-        // Concurrent cold misses for the same key must not evict other entries.
-        if state.touch(&key).is_some() {
-            return Ok(steps);
+        let cached_copy = Arc::new(steps.clone());
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.retain_valid(generation, Instant::now());
+            // Concurrent cold misses for the same key must not evict others.
+            if state.touch(&key).is_none() {
+                if state.entries.len() >= AUTO_CACHE_CAPACITY {
+                    state.entries.pop_front();
+                }
+                state.entries.push_back(CacheEntry {
+                    key,
+                    expires_at: Instant::now() + AUTO_CACHE_TTL,
+                    steps: cached_copy,
+                });
+            }
         }
-        if state.entries.len() >= AUTO_CACHE_CAPACITY {
-            state.entries.pop_front();
-        }
-        state.entries.push_back(CacheEntry {
-            key,
-            expires_at: Instant::now() + AUTO_CACHE_TTL,
-            steps: steps.clone(),
-        });
         Ok(steps)
     }
 }
