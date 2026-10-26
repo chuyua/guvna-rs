@@ -992,13 +992,36 @@ async fn dispatch_inner(
                                 telemetry_context.take(),
                             );
                         }
-                        Err(_) => {
-                            Metrics::inc(&state.metrics.upstream_invalid_responses);
+                        Err(error) => {
+                            // HTTP headers can succeed while the *first*
+                            // upstream body read fails. Do not misclassify
+                            // that transport fault as malformed SSE or leave
+                            // its bad credential eligible on the next call.
+                            match error {
+                                chat_stream::PreflightError::TransportFailure => {
+                                    Metrics::inc(&state.metrics.upstream_transport_failures);
+                                    if state.pools[step.provider_index]
+                                        .record(&lease, Outcome::TransportFailure)
+                                    {
+                                        Metrics::inc(&state.metrics.credential_quarantines);
+                                    }
+                                }
+                                chat_stream::PreflightError::InvalidStream => {
+                                    Metrics::inc(&state.metrics.upstream_invalid_responses);
+                                }
+                                chat_stream::PreflightError::Timeout
+                                | chat_stream::PreflightError::LocalLimit => {}
+                            }
+                            if error.blame_provider() {
+                                record_circuit_failure(&mut circuit_ticket, &state.metrics);
+                                state.mark_auto_failure_in(&live, step.provider_index, &step.model);
+                            }
                             ops_log::warn("stream_preflight_failure");
-                            record_circuit_failure(&mut circuit_ticket, &state.metrics);
-                            state.mark_auto_failure_in(&live, step.provider_index, &step.model);
                             if let Some(context) = telemetry_context.as_mut() {
-                                context.set_failure_type("invalid_response");
+                                context.set_failure_type(error.failure_type());
+                                if !error.blame_provider() {
+                                    context.set_health_observation(false);
+                                }
                             }
                             break;
                         } // preflight rejected

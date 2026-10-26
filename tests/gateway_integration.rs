@@ -1444,6 +1444,118 @@ chains:
 }
 
 #[tokio::test]
+async fn first_sse_body_transport_failure_quarantines_key_but_bad_json_does_not() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let broken = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(|State(hits): State<Arc<AtomicUsize>>| async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let chunks = futures_util::stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+                    Err::<Bytes, std::io::Error>(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "injected first SSE body read failure",
+                    ))
+                });
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(chunks),
+                )
+            }),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, broken).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: K
+    quarantine:
+      transient: 30s
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: x
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "key".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let first = router
+        .clone()
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_ne!(first.status(), StatusCode::OK);
+    let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(
+        metric_value(&metrics, "upstream_transport_failures_total"),
+        1
+    );
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        0
+    );
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 1);
+    let again = router
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_ne!(again.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "quarantined key retried");
+
+    let (malformed_url, malformed_hits) = start_sse(vec![b"data: not-json\n\n"]).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {malformed_url}
+    key_env: K
+    quarantine:
+      transient: 30s
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: x
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "key".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for _ in 0..2 {
+        let response = router
+            .clone()
+            .oneshot(request("demo", r#","stream":true"#, "client"))
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(malformed_hits.load(Ordering::SeqCst), 2);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        2
+    );
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 0);
+}
+
+#[tokio::test]
 async fn midstream_tcp_error_quarantines_transient_key_without_replaying_stream() {
     let hits = Arc::new(AtomicUsize::new(0));
     let broken = Router::new()
@@ -1558,7 +1670,9 @@ async fn oversized_first_sse_chunk_fails_over_before_response_starts() {
     let oversized: &'static [u8] = Box::leak(vec![b'x'; 2 * 1024 * 1024 + 1].into_boxed_slice());
     let (a, bad_hits) = start_sse(vec![oversized]).await;
     let (b, good_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
-    let response = make_app(&a, &b)
+    let router = make_app(&a, &b);
+    let response = router
+        .clone()
         .oneshot(request("demo", r#","stream":true"#, "client"))
         .await
         .unwrap();
@@ -1567,6 +1681,16 @@ async fn oversized_first_sse_chunk_fails_over_before_response_starts() {
     assert!(bytes.ends_with(SSE_DONE));
     assert_eq!(bad_hits.load(Ordering::SeqCst), 1);
     assert_eq!(good_hits.load(Ordering::SeqCst), 1);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 0);
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        0
+    );
+    assert_eq!(
+        metric_value(&metrics, "upstream_transport_failures_total"),
+        0
+    );
 }
 
 #[tokio::test]
@@ -3419,7 +3543,7 @@ async fn invalid_json_stream_must_never_emit_a_completed_response_or_replay() {
         })))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let frames = String::from_utf8(
         to_bytes(response.into_body(), 2 << 20)
             .await
@@ -3427,28 +3551,40 @@ async fn invalid_json_stream_must_never_emit_a_completed_response_or_replay() {
             .to_vec(),
     )
     .unwrap();
-    assert_eq!(
-        frames.matches("event: response.failed").count(),
-        1,
-        "{frames}"
-    );
+    if status == StatusCode::OK {
+        // First validated delta committed the downstream SSE headers; later
+        // malformed JSON must produce an error without reusing another route.
+        assert_eq!(
+            frames.matches("event: response.failed").count(),
+            1,
+            "{frames}"
+        );
+        assert_eq!(
+            frames.matches("event: response.output_text.delta").count(),
+            1
+        );
+        assert_eq!(seen.lock().await.len(), 1);
+    } else {
+        // When all frames share one upstream chunk, the parser can reject
+        // the response before headers. Only then may the gateway fall back.
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{frames}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&frames).unwrap()["error"]["code"],
+            "upstream_unavailable"
+        );
+        assert_eq!(seen.lock().await.len(), 2);
+    }
     assert_eq!(
         frames.matches("event: response.completed").count(),
         0,
         "{frames}"
     );
-    assert_eq!(
-        frames.matches("event: response.output_text.delta").count(),
-        1
-    );
     assert!(!frames.contains("data: [DONE]"), "{frames}");
-    assert_eq!(
-        seen.lock().await.len(),
-        1,
-        "never retry after emitting deltas"
-    );
     let (_, metrics) = get_metrics(app, Some("client")).await;
-    assert_eq!(metric_value(&metrics, "responses_stream_failed_total"), 1);
+    assert_eq!(
+        metric_value(&metrics, "responses_stream_failed_total"),
+        u64::from(status == StatusCode::OK)
+    );
     assert_eq!(
         metric_value(&metrics, "responses_stream_completed_total"),
         0

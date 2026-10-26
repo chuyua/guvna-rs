@@ -13,6 +13,28 @@ use tokio::sync::OwnedSemaphorePermit;
 // Bound a single upstream read: even valid tiny events must not create an unbounded queue.
 const MAX_STREAM_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PreflightError {
+    InvalidStream,
+    TransportFailure,
+    Timeout,
+    LocalLimit,
+}
+impl PreflightError {
+    pub(super) fn failure_type(self) -> &'static str {
+        match self {
+            Self::InvalidStream => "invalid_response",
+            Self::TransportFailure => "transport_error",
+            Self::Timeout => "timeout",
+            Self::LocalLimit => "local_error",
+        }
+    }
+
+    pub(super) fn blame_provider(self) -> bool {
+        matches!(self, Self::InvalidStream | Self::TransportFailure)
+    }
+}
+
 pub(super) struct StreamRoute {
     pub(super) provider_index: usize,
     pub(super) model: String,
@@ -74,7 +96,7 @@ pub(super) async fn start(
     lease: Lease,
     permit: &mut Option<OwnedSemaphorePermit>,
     circuit_ticket: &mut Option<Ticket>,
-) -> Result<Response, ()> {
+) -> Result<Response, PreflightError> {
     let content_type = upstream
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -85,7 +107,7 @@ pub(super) async fn start(
         .next()
         .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
     {
-        return Err(());
+        return Err(PreflightError::InvalidStream);
     }
     let mut state = ChatStreamState {
         owner,
@@ -117,14 +139,22 @@ pub(super) async fn start(
     Ok(stream_response(state))
 }
 
-async fn preflight_stream(state: &mut ChatStreamState) -> Result<(), ()> {
+async fn preflight_stream(state: &mut ChatStreamState) -> Result<(), PreflightError> {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            let chunk = state.upstream.chunk().await.map_err(|_| ())?.ok_or(())?;
+            let chunk = state
+                .upstream
+                .chunk()
+                .await
+                .map_err(|_| PreflightError::TransportFailure)?
+                .ok_or(PreflightError::InvalidStream)?;
             if chunk.len() > MAX_STREAM_CHUNK_BYTES {
-                return Err(());
+                return Err(PreflightError::LocalLimit);
             }
-            let events = state.parser.push(&chunk).map_err(|_| ())?;
+            let events = state
+                .parser
+                .push(&chunk)
+                .map_err(|_| PreflightError::InvalidStream)?;
             state.pending.extend(events);
             if !state.pending.is_empty() {
                 return Ok(());
@@ -132,7 +162,7 @@ async fn preflight_stream(state: &mut ChatStreamState) -> Result<(), ()> {
         }
     })
     .await
-    .map_err(|_| ())?
+    .map_err(|_| PreflightError::Timeout)?
 }
 
 fn stream_response(state: ChatStreamState) -> Response {

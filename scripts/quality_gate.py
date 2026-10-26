@@ -1228,9 +1228,19 @@ def verify_structured_output_on_release(endpoint: str, healthy_stub: Stub) -> di
           f"ignored JSON mode was reported as completed: {code}, {raw}")
     code, raw = submit(dict(common, input="badjson", stream=True,
                             text={"format":{"type":"json_object"}}), streaming=True)
-    check(code == 200 and raw.count("event: response.failed") == 1
-          and "event: response.completed" not in raw,
-          f"ignored streaming JSON mode claimed completed: {code}, {raw[:1200]}")
+    if code == 200:
+        # If a valid first token was already emitted, later rejection must
+        # terminate the SSE with one truthful error and no success marker.
+        check(raw.count("event: response.failed") == 1
+              and "event: response.completed" not in raw,
+              f"ignored streaming JSON mode claimed completed: {code}, {raw[:1200]}")
+    else:
+        # If the full invalid upstream chunk arrived during preflight, fail
+        # safely *before* committing HTTP 200. This is preferable to a
+        # downstream stream that starts and then immediately fails.
+        check(code == 502
+              and json.loads(raw)["error"]["code"] == "upstream_unavailable",
+              f"invalid JSON was accepted or misclassified: {code}, {raw[:1200]}")
 
     with healthy_stub.lock:
         observed = list(healthy_stub.structured)
