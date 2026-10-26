@@ -44,3 +44,10 @@
 - [统一开发集成 PR #151](https://github.com/chuyua/guvna-rs/pull/151)
 - Rust CI 的 `fmt`、`clippy --all-targets --locked -- -D warnings`、`cargo test --locked`、Release 构建与 Adversarial Linux resource gate 在对应最新提交通过后才标记本轮完成。
 - 回归位置：`src/auto_health.rs`、`src/auto_decider.rs`、`src/dispatch.rs` 的 `#[cfg(test)]` 及 `tests/gateway_integration.rs` 的 Shadow/Auto/SSE/CLI 系列端到端测试。
+
+## 延伸复审：请求路径和跨策略行为
+
+- `6bf0914`：在后台名额获取失败时不提前拷贝大型 Shadow 候选；SSE Decider 的热缓存命中不产生第二份候选深拷贝。缓存刷新仍只使用健康重排之前的原始候选列表。
+- `7dff0a2`：Auto 资格过滤与 Telemetry 排序共用初始健康快照，消除重复多锁扫描；异步 Decider 返回之后仍重新采样实时健康并禁止晋升已降级模型。
+- 新增端到端 `issue129_llm_decider_changes_order_but_reuses_one_business_failover_walker`：远端选择器改变供应商顺序，所选模型真实 503、下一模型成功；`/v1/auto` 与 `/v1/chat/completions` 共用同一条 fallback，选择器排名复用缓存，无第二套业务执行逻辑。
+- 设计判断保持不变：应当去掉重复计算/重复状态维护，而不是额外抽象出一套“统一算法引擎”。可观察行为和 Linux 压力资源门禁必须保持一致。

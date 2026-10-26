@@ -4231,6 +4231,97 @@ fn auto_request(path: &str, bearer: &str, payload: Value) -> Request<Body> {
 }
 
 #[tokio::test]
+async fn issue129_llm_decider_changes_order_but_reuses_one_business_failover_walker() {
+    let (good, good_calls) = start_upstream(StatusCode::OK).await;
+    let (failed, failed_calls) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
+    let selector_calls = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::clone(&selector_calls);
+    let selector = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let captured = Arc::clone(&captured);
+            async move {
+                captured.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({
+                    "choices":[{"message":{"content":r#"{"order":[1,0]}"#}}]
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, selector).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: good
+    type: openai
+    base_url: {good}
+    key_env: GOOD
+  - name: bad
+    type: openai
+    base_url: {failed}
+    key_env: BAD
+  - name: selector
+    type: openai
+    base_url: http://{addr}
+    key_env: SELECTOR
+auto:
+  enabled: true
+  candidates:
+    - provider: good
+      model: working
+    - provider: bad
+      model: failing
+  decider:
+    enabled: true
+    provider: selector
+    model: chooser
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("GOOD".into(), "good-secret".into()),
+            ("BAD".into(), "bad-secret".into()),
+            ("SELECTOR".into(), "selector-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let payload = json!({
+        "model":"auto",
+        "messages":[{"role":"user","content":"same context"}]
+    });
+    for endpoint in ["/v1/auto", "/v1/chat/completions"] {
+        let (status, result) = call(
+            router.clone(),
+            auto_request(endpoint, "client", payload.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{endpoint}: {result}");
+        assert_eq!(result["model"], "working", "{endpoint}");
+    }
+    assert_eq!(
+        selector_calls.load(Ordering::SeqCst),
+        1,
+        "selector advice cached"
+    );
+    assert_eq!(
+        failed_calls.load(Ordering::SeqCst),
+        2,
+        "one 503 per real request"
+    );
+    assert_eq!(
+        good_calls.load(Ordering::SeqCst),
+        2,
+        "same fallback loop handles both"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn auto_chat_and_alias_share_fallback_with_priority_and_context_filter() {
     let (failed, failed_calls) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
     let (good, good_calls) = start_upstream(StatusCode::OK).await;
