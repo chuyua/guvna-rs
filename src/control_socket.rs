@@ -683,19 +683,20 @@ mod tests {
         let a = query_chain_mutation(dir.path(), "chains_set", first.to_str().unwrap());
         let b = query_chain_mutation(dir.path(), "chains_set", second.to_str().unwrap());
         let (a, b) = tokio::join!(a, b);
-        for (output, path) in [
-            (a.unwrap().unwrap(), &first),
-            (b.unwrap().unwrap(), &second),
-        ] {
+        for (output, path) in [(a, &first), (b, &second)] {
             // A busy mutation is rejected rather than queued behind a
-            // potentially blocked disk writer; CLI can retry explicitly.
-            let output = if output.contains("chain_update_busy") {
-                query_chain_mutation(dir.path(), "chains_set", path.to_str().unwrap())
-                    .await
-                    .unwrap()
-                    .unwrap()
-            } else {
-                output
+            // potentially blocked disk writer; the local client converts
+            // the JSON error into Result::Err before its caller can inspect
+            // it. The test must retry that error, never unwrap it as data.
+            let output = match output {
+                Ok(Some(result)) => result,
+                Err(error) if error.contains("chain_update_busy") => {
+                    query_chain_mutation(dir.path(), "chains_set", path.to_str().unwrap())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }
+                other => panic!("unexpected concurrent chain update result: {other:?}"),
             };
             assert!(
                 output.contains("\"online\": true") || output.contains("\"online\":true"),
