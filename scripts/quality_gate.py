@@ -1109,7 +1109,12 @@ auto:
         check(request_rows == 64, f"SQLite request rows={request_rows}, expected 64")
         check(failed_candidates == 64,
               f"fallback provider failures were not retained: {failed_candidates} / {failure_breakdown}")
-        check(failure_breakdown == [(200, "invalid_response", 8),
+        # A syntactically invalid complete HTTP 200 is a provider response
+        # error; a body terminated before its advertised Content-Length is
+        # a transport reset, not malformed model output. Keep the exact
+        # counts strict so neither regression can hide behind their sum.
+        check(failure_breakdown == [(200, "invalid_response", 4),
+                                    (200, "transport_error", 4),
                                     (503, "provider_5xx", 56)],
               f"adversarial 503/invalid/truncated fault classes mismatched: {failure_breakdown}")
         check(down_hourly == (64, 64),
