@@ -148,8 +148,53 @@ struct CacheKey {
     // Request-aware selection depends on the exact encoded body length, not
     // only on rounded context estimates. Legacy resolution uses None.
     request_bytes: Option<usize>,
+    request_shape: Option<AutoRequestShape>,
     requirements: AutoRequirements,
     penalties: Vec<u8>,
+}
+
+/// The subset of client fields whose bytes dispatch replaces or injects.
+/// Equal total request sizes do not imply equal upstream wire budgets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AutoRequestShape {
+    model_bytes: Option<usize>,
+    stream_bytes: Option<usize>,
+    stream_true: bool,
+    forced_options_removed: usize,
+    forced_options_added: usize,
+}
+
+fn auto_request_shape(request: &Value) -> AutoRequestShape {
+    let stream_true = request.get("stream") == Some(&Value::Bool(true));
+    let (removed, added) = if stream_true {
+        (0, 0)
+    } else {
+        let usage_key = encoded_json_bytes_of("include_usage") + 1;
+        let usage_true = encoded_json_bytes_of(&true);
+        match request.get("stream_options") {
+            None => (
+                0,
+                usize::from(request.as_object().is_some_and(|map| !map.is_empty()))
+                    + encoded_json_bytes_of("stream_options")
+                    + 1
+                    + 2
+                    + usage_key
+                    + usage_true,
+            ),
+            Some(Value::Object(options)) => match options.get("include_usage") {
+                Some(old) => (encoded_json_bytes(Some(old)), usage_true),
+                None => (0, usize::from(!options.is_empty()) + usage_key + usage_true),
+            },
+            Some(other) => (encoded_json_bytes(Some(other)), 2 + usage_key + usage_true),
+        }
+    };
+    AutoRequestShape {
+        model_bytes: request.get("model").map(encoded_json_bytes_of),
+        stream_bytes: request.get("stream").map(encoded_json_bytes_of),
+        stream_true,
+        forced_options_removed: removed,
+        forced_options_added: added,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -174,6 +219,7 @@ impl CacheKey {
             input_bytes,
             context_estimate,
             request_bytes,
+            request_shape: None,
             requirements,
             penalties: if config.auto.health_aware {
                 penalties.to_vec()
@@ -269,27 +315,26 @@ impl AutoRouteCache {
         penalties: &[u8],
         generation: u64,
     ) -> Result<Vec<ResolvedStep>, String> {
-        self.resolve_cached(
-            CacheKey::new(
+        let mut key = CacheKey::new(
+            config,
+            budget.input_bytes,
+            budget.context_estimate,
+            Some(budget.request_bytes),
+            requirements,
+            penalties,
+            generation,
+        );
+        key.request_shape = Some(auto_request_shape(request));
+        self.resolve_cached(key, || {
+            resolve_auto_for_request_sized(
                 config,
                 budget.input_bytes,
-                budget.context_estimate,
-                Some(budget.request_bytes),
+                request,
+                budget.request_bytes,
                 requirements,
                 penalties,
-                generation,
-            ),
-            || {
-                resolve_auto_for_request_sized(
-                    config,
-                    budget.input_bytes,
-                    request,
-                    budget.request_bytes,
-                    requirements,
-                    penalties,
-                )
-            },
-        )
+            )
+        })
     }
 
     fn resolve_cached(
@@ -1017,6 +1062,54 @@ mod tests {
                 "oversized wire accepted: {request}"
             );
         }
+    }
+
+    #[test]
+    fn auto_cache_does_not_reuse_equal_byte_size_between_stream_modes() {
+        let streaming = json!({"model":"auto","stream":true,"user":"xx",
+            "messages":[{"role":"user","content":"hi"}],"max_tokens":40});
+        let buffered = json!({"model":"auto","stream":false,"user":"x",
+            "messages":[{"role":"user","content":"hi"}],"max_tokens":40});
+        let (bytes, context) = auto_request_bytes_and_context_estimate(&streaming);
+        assert_eq!(
+            auto_request_bytes_and_context_estimate(&buffered),
+            (bytes, context)
+        );
+        assert_ne!(
+            auto_request_shape(&streaming),
+            auto_request_shape(&buffered)
+        );
+        let mut wire = streaming.clone();
+        wire["model"] = json!("sse");
+        let cap = auto_context_estimate(&wire) + 1;
+        let cfg: Config = serde_yaml::from_str(&format!(
+            "providers:\n  - name: p\n    type: openai\n    base_url: https://example.invalid\n    key_env: K\n    stream_only: true\nauto:\n  enabled: true\n  candidates:\n    - provider: p\n      model: sse\n      max_context_tokens: {cap}\n"
+        )).unwrap();
+        cfg.validate().unwrap();
+        let cache = AutoRouteCache::new();
+        let pick = |request: &Value| {
+            cache
+                .resolve_for_request(
+                    &cfg,
+                    AutoRequestBudget {
+                        input_bytes: auto_input_bytes(request.get("messages")),
+                        request_bytes: bytes,
+                        context_estimate: context,
+                    },
+                    request,
+                    auto_requirements(request),
+                    &[],
+                    1,
+                )
+                .unwrap()
+        };
+        assert_eq!(pick(&streaming)[0].model, "sse");
+        assert!(
+            pick(&buffered).is_empty(),
+            "forced stream_options must not reuse the stream:true route"
+        );
+        assert_eq!(pick(&streaming)[0].model, "sse");
+        assert_eq!(cache.state.lock().unwrap().entries.len(), 2);
     }
 
     #[test]
