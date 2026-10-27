@@ -47,6 +47,50 @@ impl Endpoint {
     }
 }
 
+enum SavedStreamOptions {
+    Missing,
+    Object(Option<Value>),
+    Replaced(Value),
+}
+
+/// Mutate the caller's optional SSE metadata in place rather than cloning it.
+fn force_sse_usage(object: &mut serde_json::Map<String, Value>) -> SavedStreamOptions {
+    match object.get_mut("stream_options") {
+        Some(Value::Object(options)) => {
+            SavedStreamOptions::Object(options.insert("include_usage".into(), Value::Bool(true)))
+        }
+        Some(value) => {
+            SavedStreamOptions::Replaced(std::mem::replace(value, json!({"include_usage":true})))
+        }
+        None => {
+            object.insert("stream_options".into(), json!({"include_usage":true}));
+            SavedStreamOptions::Missing
+        }
+    }
+}
+
+fn restore_sse_usage(object: &mut serde_json::Map<String, Value>, old: SavedStreamOptions) {
+    match old {
+        SavedStreamOptions::Missing => {
+            object.remove("stream_options");
+        }
+        SavedStreamOptions::Object(previous) => {
+            let options = object
+                .get_mut("stream_options")
+                .and_then(Value::as_object_mut)
+                .expect("usage options object still present");
+            if let Some(previous) = previous {
+                options.insert("include_usage".into(), previous);
+            } else {
+                options.remove("include_usage");
+            }
+        }
+        SavedStreamOptions::Replaced(previous) => {
+            object.insert("stream_options".into(), previous);
+        }
+    }
+}
+
 pub(super) async fn dispatch(
     state: Arc<AppState>,
     body: Bytes,
@@ -985,17 +1029,7 @@ async fn dispatch_inner(
         } else {
             None
         };
-        let original_stream_options = if override_stream {
-            let mut options = object
-                .get("stream_options")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            options.insert("include_usage".into(), Value::Bool(true));
-            object.insert("stream_options".into(), Value::Object(options))
-        } else {
-            None
-        };
+        let original_stream_options = override_stream.then(|| force_sse_usage(object));
         let mut injected_params = Vec::new();
         for (name, value) in &step.params {
             if matches!(endpoint, Endpoint::Embeddings)
@@ -1016,11 +1050,10 @@ async fn dispatch_inner(
             object.remove(&name);
         }
         if override_stream {
-            if let Some(original) = original_stream_options {
-                object.insert("stream_options".into(), original);
-            } else {
-                object.remove("stream_options");
-            }
+            restore_sse_usage(
+                object,
+                original_stream_options.expect("SSE usage override saved"),
+            );
             if let Some(original) = original_stream {
                 object.insert("stream".into(), original);
             } else {
@@ -1703,6 +1736,51 @@ async fn bounded_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forced_sse_usage_preserves_large_original_metadata_and_restores_every_variant() {
+        for original_options in [
+            None,
+            Some(Value::Null),
+            Some(json!("invalid")),
+            Some(json!({})),
+            Some(json!({"include_usage":false})),
+            Some(json!({"include_usage":true,"trace":"z".repeat(1024*1024)})),
+            Some(json!({"trace":"t".repeat(1024*1024),"source":7})),
+        ] {
+            let mut request = json!({"model":"auto","messages":[]});
+            if let Some(options) = original_options {
+                request["stream_options"] = options;
+            }
+            let prior = request.clone();
+            let original_ptr = request
+                .pointer("/stream_options/trace")
+                .and_then(Value::as_str)
+                .map(str::as_ptr);
+            let backup = force_sse_usage(request.as_object_mut().unwrap());
+            assert_eq!(request["stream_options"]["include_usage"], true);
+            assert_eq!(
+                request
+                    .pointer("/stream_options/trace")
+                    .and_then(Value::as_str)
+                    .map(str::as_ptr),
+                original_ptr,
+                "large metadata was copied when forcing the SSE usage flag"
+            );
+            restore_sse_usage(request.as_object_mut().unwrap(), backup);
+            assert_eq!(
+                request, prior,
+                "next candidate must see the original request"
+            );
+            assert_eq!(
+                request
+                    .pointer("/stream_options/trace")
+                    .and_then(Value::as_str)
+                    .map(str::as_ptr),
+                original_ptr
+            );
+        }
+    }
 
     #[test]
     fn untrusted_content_length_never_reserves_large_memory_without_permit() {
