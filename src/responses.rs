@@ -842,7 +842,10 @@ fn reasoning_text(message: &Value) -> Result<Option<String>, ()> {
     Ok(Some(result))
 }
 
-fn reasoning_item(response_id: &str, text: &str, status: &str) -> Value {
+fn reasoning_item(response_id: &str, text: impl Into<String>, status: &str) -> Value {
+    // Move the owned reasoning string into the output JSON without an extra
+    // potentially multi-megabyte clone.
+    let text = text.into();
     json!({
         "id":format!("rs_{response_id}"),"type":"reasoning","status":status,
         "summary":[],"content":[{"type":"reasoning_text","text":text}]
@@ -1024,7 +1027,7 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
             .min(i64::MAX as u64) as i64
     });
     let message = &chat["choices"][0]["message"];
-    let reasoning = match reasoning_text(message) {
+    let mut reasoning = match reasoning_text(message) {
         Ok(reasoning) => reasoning,
         Err(()) => {
             return error(
@@ -1067,7 +1070,7 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
             }
         };
         let mut output = Vec::with_capacity(calls.map_or(0, Vec::len) + 2);
-        if let Some(reasoning) = reasoning.as_deref() {
+        if let Some(reasoning) = reasoning.take() {
             output.push(reasoning_item(response_id, reasoning, output_status));
         }
         let content = &message["content"];
@@ -1158,13 +1161,14 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
     };
     let output_status = response_status;
     let mut output = Vec::with_capacity(2);
-    if let Some(reasoning) = reasoning.as_deref() {
+    let had_reasoning = reasoning.is_some();
+    if let Some(reasoning) = reasoning.take() {
         output.push(reasoning_item(response_id, reasoning, output_status));
     }
     let mirrored_refusal = refusal.is_some_and(|value| value == content);
     let output_text = if mirrored_refusal { "" } else { content };
     let mut parts = Vec::with_capacity(2);
-    if !output_text.is_empty() || (refusal.is_none() && reasoning.is_none()) {
+    if !output_text.is_empty() || (refusal.is_none() && !had_reasoning) {
         parts.push(json!({"type":"output_text","text":output_text,"annotations":[]}));
     }
     if let Some(refusal) = refusal {
