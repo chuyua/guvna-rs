@@ -2,9 +2,11 @@
 //! Request validation, request translation, chat-result translation and
 //! Responses SSE wrapping live here. Dispatch still uses one shared
 //! candidate/failover loop in dispatch.rs; this module never retries upstream.
-use super::dispatch::{BufferedResponseLease, Endpoint, dispatch_parsed, hold_buffered_response};
+use super::dispatch::{
+    BufferedResponseLease, Endpoint, ParsedChatResponse, dispatch_parsed, hold_buffered_response,
+};
 use super::responses_format;
-use super::{AppState, MAX_BODY_BYTES, authenticated_body, error};
+use super::{AppState, authenticated_body, error};
 use axum::{
     Json,
     body::{Body, to_bytes},
@@ -415,29 +417,18 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             json_mode,
         );
     }
+    let mut response = response;
     let memory_lease = response
         .extensions()
         .get::<BufferedResponseLease>()
         .cloned();
-    let bytes = match to_bytes(response.into_body(), MAX_BODY_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return error(
-                StatusCode::BAD_GATEWAY,
-                "invalid_upstream",
-                "Chat response exceeds size limit",
-            );
-        }
-    };
-    let chat: Value = match serde_json::from_slice(&bytes) {
-        Ok(chat) => chat,
-        Err(_) => {
-            return error(
-                StatusCode::BAD_GATEWAY,
-                "invalid_upstream",
-                "Invalid upstream chat response",
-            );
-        }
+    let Some(ParsedChatResponse(chat)) = response.extensions_mut().remove::<ParsedChatResponse>()
+    else {
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "invalid_upstream",
+            "Missing validated upstream Chat response",
+        );
     };
     // The original Chat body may have been drained, but its converted
     // Responses body can still be large and held by a slow TCP consumer.

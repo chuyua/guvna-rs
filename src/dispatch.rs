@@ -250,6 +250,11 @@ pub(super) struct BufferedResponseLease {
     _permit: Arc<OwnedSemaphorePermit>,
 }
 
+/// An internal, already-validated Chat JSON tree for the non-streaming
+/// Responses bridge. Returning it as an extension avoids serializing a
+/// potentially 32 MiB Chat body only to parse it back into a Value.
+pub(super) struct ParsedChatResponse(pub(super) Value);
+
 pub(super) fn hold_buffered_response(
     response: Response,
     reservation: Option<BufferedResponseLease>,
@@ -1297,11 +1302,16 @@ async fn dispatch_inner(
                         if let Some(context) = telemetry_context.as_mut() {
                             context.set_failure_type("success");
                         }
+                        let response = if matches!(endpoint, Endpoint::Responses) {
+                            let mut response = Response::new(Body::empty());
+                            *response.status_mut() = StatusCode::OK;
+                            response.extensions_mut().insert(ParsedChatResponse(value));
+                            response
+                        } else {
+                            (StatusCode::OK, Json(value)).into_response()
+                        };
                         return attach_telemetry_context(
-                            hold_buffered_response(
-                                (StatusCode::OK, Json(value)).into_response(),
-                                response_reservation,
-                            ),
+                            hold_buffered_response(response, response_reservation),
                             telemetry_context.take(),
                         );
                     }
