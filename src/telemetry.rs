@@ -1066,7 +1066,9 @@ fn worker(receiver: Receiver<TelemetryMessage>, path: PathBuf, metrics: Arc<Metr
         let first = match receiver.recv_timeout(Duration::from_secs(300)) {
             Ok(TelemetryMessage::Record(event)) => event,
             Ok(TelemetryMessage::Flush(ack)) => {
-                let _ = ack.send(true);
+                // An empty barrier is still a failed persistence check when
+                // SQLite never opened or the worker lost its connection.
+                let _ = ack.send(conn.is_some());
                 continue;
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -2338,6 +2340,27 @@ mod tests {
         assert_eq!(metrics.telemetry_write_failures.load(Ordering::Relaxed), 1);
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
+    #[test]
+    fn empty_flush_does_not_report_success_when_sqlite_failed_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unopenable.sqlite3");
+        let original = b"not a valid sqlite database";
+        std::fs::write(&path, original).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let metrics = Arc::new(Metrics::default());
+        let worker_path = path.clone();
+        let handle = thread::spawn(move || worker(receiver, worker_path, metrics));
+        let (ack, receipt) = mpsc::sync_channel(1);
+        sender.send(TelemetryMessage::Flush(ack)).unwrap();
+        assert!(
+            !receipt.recv_timeout(Duration::from_secs(3)).unwrap(),
+            "an empty flush must not claim SQLite persistence is healthy"
+        );
+        drop(sender);
+        handle.join().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
     #[test]
     fn readonly_database_rejects_writes_without_changing_existing_rows() {
         let dir = tempfile::tempdir().unwrap();
