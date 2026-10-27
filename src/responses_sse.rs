@@ -485,8 +485,7 @@ impl ResponsesSse {
                 // streaming handshake. Check the bounded assembled text
                 // before ever emitting a completed terminal event. Once any
                 // delta has been sent we cannot replay another provider.
-                let valid = serde_json::from_str::<Value>(&self.text)
-                    .is_ok_and(|parsed| !only_object || parsed.is_object());
+                let valid = crate::sse::valid_json_output(&self.text, only_object);
                 if !valid {
                     return Err(());
                 }

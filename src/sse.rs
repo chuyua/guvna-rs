@@ -2,6 +2,19 @@
 use bytes::Bytes;
 use serde_json::Value;
 
+/// Shared Chat/Responses JSON output-mode validation. Scan syntax without
+/// materializing another large JSON Value tree just for the success gate.
+pub(crate) fn valid_json_output(text: &str, object_required: bool) -> bool {
+    let object_prefix = text
+        .as_bytes()
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'{');
+    (!object_required || object_prefix)
+        && serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
+}
+
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 // Track only tool calls, and cap the cumulative memory retained across frames.
 // Each of up to 64 choices may contain 32 tool calls. Keep the global cap
@@ -381,8 +394,7 @@ impl ChatSse {
                 && !has_tools
                 && self.refusal_mask & choice_bit == 0
                 && let Some(object_only) = self.json_mode
-                && !serde_json::from_str::<Value>(&self.json_text[index as usize])
-                    .is_ok_and(|value| !object_only || value.is_object())
+                && !valid_json_output(&self.json_text[index as usize], object_only)
             {
                 return Err(SseError);
             }

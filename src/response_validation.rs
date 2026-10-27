@@ -37,19 +37,6 @@ fn request_value<'a>(
     request.get(name).or_else(|| params.get(name))
 }
 
-/// Check JSON-mode output without building a second potentially huge Value.
-/// IgnoredAny still parses the entire document, including trailing garbage.
-fn valid_json_output(text: &str, object_required: bool) -> bool {
-    let object_prefix = text
-        .as_bytes()
-        .iter()
-        .copied()
-        .find(|byte| !byte.is_ascii_whitespace())
-        == Some(b'{');
-    (!object_required || object_prefix)
-        && serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
-}
-
 // A result is only usable when every choice completed; a partial 2xx is NOT success.
 #[cfg(test)]
 fn validate_chat(request: &Value, response: &Value) -> bool {
@@ -159,7 +146,7 @@ fn validate_chat_with_params(
             let valid_json = message
                 .get("content")
                 .and_then(Value::as_str)
-                .is_some_and(|text| valid_json_output(text, format == "json_object"));
+                .is_some_and(|text| crate::sse::valid_json_output(text, format == "json_object"));
             let valid_refusal = message
                 .get("refusal")
                 .and_then(Value::as_str)
@@ -620,6 +607,7 @@ mod response_contract_tests {
 
     #[test]
     fn json_validator_skips_a_megabyte_without_losing_syntax_checks() {
+        use crate::sse::valid_json_output;
         let large = json!({"nested":{"payload":"x".repeat(1024 * 1024)}}).to_string();
         assert!(valid_json_output(&large, true));
         assert!(valid_json_output(&large, false));
