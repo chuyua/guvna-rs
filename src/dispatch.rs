@@ -228,6 +228,7 @@ pub(super) fn hold_buffered_response(
 enum JsonReadFailure {
     Invalid,
     MemoryBusy,
+    Transport,
 }
 
 fn outcome_failure_type(outcome: Outcome) -> &'static str {
@@ -1245,6 +1246,24 @@ async fn dispatch_inner(
                         }
                         break;
                     }
+                    Ok(Err(JsonReadFailure::Transport)) => {
+                        // A reset while reading a valid HTTP 200 body is a
+                        // network failure, not malformed model JSON. Apply
+                        // the same bounded key/circuit recovery as send().
+                        Metrics::inc(&state.metrics.upstream_transport_failures);
+                        ops_log::warn("upstream_body_transport_failure");
+                        if state.pools[step.provider_index]
+                            .record(&lease, Outcome::TransportFailure)
+                        {
+                            Metrics::inc(&state.metrics.credential_quarantines);
+                        }
+                        record_circuit_failure(&mut circuit_ticket, &state.metrics);
+                        state.mark_auto_failure_in(&live, step.provider_index, &step.model);
+                        if let Some(context) = telemetry_context.as_mut() {
+                            context.set_failure_type("transport_error");
+                        }
+                        break;
+                    }
                     Err(_) => {
                         if upstream_stream && !streaming {
                             Metrics::inc(&state.metrics.aggregation_failures);
@@ -1530,7 +1549,7 @@ async fn bounded_json(
     let mut bytes = Vec::new();
     let mut reservation = None;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| JsonReadFailure::Invalid)?;
+        let chunk = chunk.map_err(|_| JsonReadFailure::Transport)?;
         if chunk.len() > MAX_BODY_BYTES.saturating_sub(bytes.len()) {
             return Err(JsonReadFailure::Invalid);
         }
