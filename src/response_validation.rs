@@ -605,7 +605,7 @@ mod response_contract_tests {
     }
 
     #[test]
-    fn json_validator_skips_a_megabyte_without_losing_syntax_checks() {
+    fn json_validator_checks_a_megabyte_without_losing_syntax_checks() {
         use crate::sse::valid_json_output;
         let large = json!({"nested":{"payload":"x".repeat(1024 * 1024)}}).to_string();
         assert!(valid_json_output(&large, true));

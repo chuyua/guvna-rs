@@ -2,17 +2,11 @@
 use bytes::Bytes;
 use serde_json::Value;
 
-/// Shared Chat/Responses JSON output-mode validation. Scan syntax without
-/// materializing another large JSON Value tree just for the success gate.
+/// Shared Chat/Responses JSON output-mode validation. Retain the strict Value
+/// parser: IgnoredAny misses malformed UTF-16 escape sequences like an
+/// unpaired surrogate, so it cannot be used as a compliance success gate.
 pub(crate) fn valid_json_output(text: &str, object_required: bool) -> bool {
-    let object_prefix = text
-        .as_bytes()
-        .iter()
-        .copied()
-        .find(|byte| !byte.is_ascii_whitespace())
-        == Some(b'{');
-    (!object_required || object_prefix)
-        && serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
+    serde_json::from_str::<Value>(text).is_ok_and(|value| !object_required || value.is_object())
 }
 
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
@@ -586,7 +580,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn ignored_json_validation_matches_the_original_value_parser_contract() {
+    fn shared_json_validation_matches_the_original_value_parser_contract() {
         let cases = [
             "{}",
             "{\"nested\":[1,true,null,\"hello\"]}",
