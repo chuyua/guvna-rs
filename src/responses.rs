@@ -794,30 +794,48 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
     Ok(messages)
 }
 
+// Validate reasoning without allocating a second copy of the possibly huge
+// upstream string. Only the final Responses conversion needs an owned value.
+fn reasoning_fragments(message: &Value) -> Result<(Option<&str>, Option<&str>), ()> {
+    if let Some(ordered) = message.get("reasoning_ordered") {
+        return if ordered.is_null() {
+            Ok((None, None))
+        } else {
+            Ok((ordered.as_str().ok_or(())?.into(), None))
+        };
+    }
+    let read = |name: &str| match message.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_str().map(Some).ok_or(()),
+    };
+    let (left, right) = (read("reasoning")?, read("reasoning_content")?);
+    // Providers sometimes mirror the same reasoning in both aliases. Never
+    // concatenate it twice, in either validation or conversion.
+    let right = if left == right { None } else { right };
+    Ok((
+        left.filter(|text| !text.is_empty()),
+        right.filter(|text| !text.is_empty()),
+    ))
+}
+
 // Convert one fully buffered Chat Completion into a non-streaming Responses
 // document. This function performs no I/O, routing or retry decisions.
 fn reasoning_text(message: &Value) -> Result<Option<String>, ()> {
-    if let Some(ordered) = message.get("reasoning_ordered") {
-        return Ok(ordered
-            .as_str()
-            .filter(|text| !text.is_empty())
-            .map(str::to_owned));
+    let (left, right) = reasoning_fragments(message)?;
+    if left.is_none() && right.is_none() {
+        return Ok(None);
     }
-    let reasoning = message.get("reasoning").filter(|value| !value.is_null());
-    let reasoning_content = message
-        .get("reasoning_content")
-        .filter(|value| !value.is_null());
-    let text = match (reasoning, reasoning_content) {
-        (Some(left), Some(right)) if left == right => Some(left.as_str().ok_or(())?.to_owned()),
-        (Some(left), Some(right)) => Some(format!(
-            "{}{}",
-            left.as_str().ok_or(())?,
-            right.as_str().ok_or(())?
-        )),
-        (Some(value), None) | (None, Some(value)) => Some(value.as_str().ok_or(())?.to_owned()),
-        (None, None) => None,
-    };
-    Ok(text.filter(|text| !text.is_empty()))
+    let mut result = String::with_capacity(
+        left.map_or(0, str::len)
+            .saturating_add(right.map_or(0, str::len)),
+    );
+    if let Some(left) = left {
+        result.push_str(left);
+    }
+    if let Some(right) = right {
+        result.push_str(right);
+    }
+    Ok(Some(result))
 }
 
 fn reasoning_item(response_id: &str, text: &str, status: &str) -> Value {
@@ -877,9 +895,10 @@ pub(super) fn translatable_chat_result(chat: &Value) -> bool {
     }
     let choice = &choices[0];
     let message = &choice["message"];
-    if reasoning_text(message).is_err() {
-        return false;
-    }
+    let (reasoning_left, reasoning_right) = match reasoning_fragments(message) {
+        Ok(fragments) => fragments,
+        Err(()) => return false,
+    };
     let calls = message["tool_calls"].as_array();
     if message
         .get("tool_calls")
@@ -916,7 +935,7 @@ pub(super) fn translatable_chat_result(chat: &Value) -> bool {
     }
     let supports_content = message["content"].as_str().is_some()
         || (message["content"].is_null()
-            && (reasoning_text(message).ok().flatten().is_some()
+            && ((reasoning_left.is_some() || reasoning_right.is_some())
                 || message["refusal"].as_str().is_some()));
     supports_content
         && matches!(
@@ -1164,6 +1183,33 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
 #[cfg(test)]
 mod reasoning_tests {
     use super::*;
+
+    #[test]
+    fn large_reasoning_validation_borrows_upstream_text_without_copies() {
+        let long = "r".repeat(1024 * 1024);
+        let message = json!({
+            "role":"assistant", "content":Value::Null,
+            "reasoning":long, "reasoning_content":long
+        });
+        let (left, right) = reasoning_fragments(&message).unwrap();
+        let upstream = message["reasoning"].as_str().unwrap();
+        assert_eq!(left.unwrap().as_ptr(), upstream.as_ptr());
+        assert_eq!(left.unwrap().len(), 1024 * 1024);
+        assert!(right.is_none(), "mirrored reasoning must not be doubled");
+        assert_eq!(
+            reasoning_text(&message).unwrap().unwrap().len(),
+            1024 * 1024
+        );
+
+        let malformed = json!({"reasoning_ordered":{"unexpected":"object"}});
+        assert!(reasoning_fragments(&malformed).is_err());
+        assert!(reasoning_text(&malformed).is_err());
+        let separate = json!({"reasoning":"left","reasoning_content":"right"});
+        assert_eq!(
+            reasoning_text(&separate).unwrap().as_deref(),
+            Some("leftright")
+        );
+    }
 
     #[tokio::test]
     async fn malformed_present_chat_usage_cannot_be_silently_discarded() {
