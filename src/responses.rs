@@ -471,17 +471,25 @@ fn valid_function_name(name: &str) -> bool {
 
 // Map input text or complete message/function-call history into
 // Chat messages. Preserve all original rejection codes and requirements.
+fn chat_text_message(role: &str, content: String) -> Value {
+    let mut message = json!({"role":role,"content":Value::Null});
+    // json! borrows owned Strings and allocates a second copy. Transfer the
+    // already-parsed text into the Chat envelope directly.
+    message["content"] = Value::String(content);
+    message
+}
+
 fn translate_input(input: Value) -> Result<Value, Box<Response>> {
     // Translate the common Responses text message shape into Chat Completions.
     // Reject non-text content rather than silently discarding image/tool data.
     let messages = match input {
-        Value::String(text) => json!([{"role":"user","content":text}]),
+        Value::String(text) => Value::Array(vec![chat_text_message("user", text)]),
         Value::Array(items) if !items.is_empty() => {
             let mut messages = Vec::with_capacity(items.len());
             let mut pending_calls = std::collections::HashSet::<String>::new();
             let mut seen_calls = std::collections::HashSet::<String>::new();
             let mut pending_reasoning: Option<String> = None;
-            for item in items {
+            for mut item in items {
                 if item.get("type").and_then(Value::as_str) == Some("reasoning") {
                     // Replay only our own completed reasoning wire shape;
                     // rejecting extra fields avoids silently losing content.
@@ -656,7 +664,7 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                         "Function calls must be resolved before another message",
                     )));
                 }
-                let Some(role) = item.get("role").and_then(Value::as_str) else {
+                let Some(role) = item.get("role").and_then(Value::as_str).map(str::to_owned) else {
                     return Err(Box::new(error(
                         StatusCode::BAD_REQUEST,
                         "unsupported_input",
@@ -678,16 +686,20 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                         "Only plain text messages are supported",
                     )));
                 }
-                let Some(content) = item.get("content") else {
+                let Some(content) = item
+                    .as_object_mut()
+                    .expect("validated message object")
+                    .remove("content")
+                else {
                     return Err(Box::new(error(
                         StatusCode::BAD_REQUEST,
                         "unsupported_input",
                         "Input messages require content",
                     )));
                 };
-                let text = if let Some(text) = content.as_str() {
-                    text.to_owned()
-                } else if let Some(parts) = content.as_array() {
+                let text = if let Value::String(text) = content {
+                    text
+                } else if let Value::Array(parts) = content {
                     if parts.is_empty() {
                         return Err(Box::new(error(
                             StatusCode::BAD_REQUEST,
@@ -696,7 +708,7 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                         )));
                     }
                     let mut text = String::new();
-                    for part in parts {
+                    for part in &parts {
                         if part.get("type").and_then(Value::as_str) == Some("refusal") {
                             if role != "assistant" {
                                 return Err(Box::new(error(
@@ -771,7 +783,7 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                     messages.push(json!({"role":"assistant","content":Value::Null,
                         "reasoning_content":reasoning}));
                 }
-                let mut message = json!({"role":role,"content":text});
+                let mut message = chat_text_message(&role, text);
                 if role == "assistant"
                     && let Some(reasoning) = pending_reasoning.take()
                 {
@@ -1200,6 +1212,32 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
 #[cfg(test)]
 mod reasoning_tests {
     use super::*;
+
+    #[test]
+    fn simple_responses_text_inputs_retain_original_large_string_buffers() {
+        let input = Value::String("prompt".repeat(256 * 1024));
+        let initial_ptr = input.as_str().unwrap().as_ptr();
+        let translated = translate_input(input).unwrap();
+        assert_eq!(translated[0]["role"], "user");
+        assert_eq!(
+            translated[0]["content"].as_str().unwrap().as_ptr(),
+            initial_ptr
+        );
+        assert_eq!(
+            translated[0]["content"].as_str().unwrap().len(),
+            6 * 256 * 1024
+        );
+
+        let input = json!([{"role":"user","content":"history".repeat(128 * 1024)},
+            {"role":"assistant","content":"answer".repeat(128 * 1024)}]);
+        let first = input[0]["content"].as_str().unwrap().as_ptr();
+        let second = input[1]["content"].as_str().unwrap().as_ptr();
+        let translated = translate_input(input).unwrap();
+        assert_eq!(translated[0]["content"].as_str().unwrap().as_ptr(), first);
+        assert_eq!(translated[1]["content"].as_str().unwrap().as_ptr(), second);
+        assert_eq!(translated[0]["role"], "user");
+        assert_eq!(translated[1]["role"], "assistant");
+    }
 
     #[test]
     fn function_tool_wrapper_preserves_large_schema_allocation() {
