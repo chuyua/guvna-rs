@@ -260,7 +260,7 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             );
         }
         for tool in items {
-            let Some(map) = tool.as_object() else {
+            let Some(map) = tool.as_object_mut() else {
                 return error(
                     StatusCode::BAD_REQUEST,
                     "invalid_tools",
