@@ -566,6 +566,114 @@ fn request(model: &str, extra: &str, key: &str) -> Request<Body> {
 }
 
 #[tokio::test]
+async fn issue147_streamed_reasoning_output_replays_in_following_json_turn() {
+    let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let events = Arc::clone(&captured);
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(payload): axum::Json<Value>| {
+            let events = Arc::clone(&events);
+            async move {
+                let streaming = payload["stream"] == true;
+                events.lock().await.push(payload);
+                if streaming {
+                    let first = json!({
+                        "id":"reasoning-stream","created":100,"model":"physical",
+                        "choices":[{"index":0,"delta":{
+                            "role":"assistant","reasoning_content":"internal reasoning",
+                            "content":"visible"
+                        },"finish_reason":null}]
+                    });
+                    let last = json!({
+                        "id":"reasoning-stream","created":100,"model":"physical",
+                        "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]
+                    });
+                    let data = format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n");
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/event-stream")],
+                        data,
+                    )
+                        .into_response()
+                } else {
+                    axum::Json(json!({
+                        "id":"next-reply","created":101,"model":"physical",
+                        "choices":[{"index":0,"message":{
+                            "role":"assistant","content":"continued"
+                        },"finish_reason":"stop"}]
+                    }))
+                    .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: K
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: physical
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "test-secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let stream = router
+        .clone()
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hello","stream":true,"store":false
+        })))
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    let bytes = to_bytes(stream.into_body(), 2 << 20).await.unwrap();
+    let frames = String::from_utf8(bytes.to_vec()).unwrap();
+    let complete = frames
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+        .find(|event| event["type"] == "response.completed")
+        .expect("stream must complete with a fully replayable Response");
+    let output = complete["response"]["output"].as_array().unwrap();
+    assert_eq!(output[0]["type"], "reasoning");
+    assert_eq!(output[1]["type"], "message");
+    let mut replay = output.clone();
+    replay.push(json!({"role":"user","content":"continue"}));
+    let (status, second) = call(
+        router,
+        responses_stream_req(json!({
+            "model":"demo","input":replay,"stream":false,"store":false
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let seen = captured.lock().await;
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1]["messages"][0]["role"], "assistant");
+    assert_eq!(
+        seen[1]["messages"][0]["reasoning_content"],
+        "internal reasoning"
+    );
+    assert_eq!(seen[1]["messages"][0]["content"], "visible");
+    assert_eq!(seen[1]["messages"][1]["role"], "user");
+    assert_eq!(seen[1]["messages"][1]["content"], "continue");
+    server.abort();
+}
+
+#[tokio::test]
 async fn issue142_native_json_half_open_slow_recovery_accepts_two_next_requests() {
     use std::time::Duration;
     let visits = Arc::new(AtomicUsize::new(0));
