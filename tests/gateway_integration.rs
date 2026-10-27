@@ -2585,6 +2585,80 @@ async fn issue137_f02_large_parsed_requests_hold_memory_slots_through_upstream_w
 }
 
 #[tokio::test]
+async fn parsed_auto_and_responses_keep_large_upload_slots_until_provider_completes() {
+    use std::time::Duration;
+    let (upstream, hits) = start_slow_walk_provider(Duration::from_secs(3), StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {upstream}
+    key_env: K
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: physical
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: physical
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let content = "large".repeat(40_000);
+    let auto = json!({"messages":[{"role":"user","content":content}]});
+    let responses = json!({"model":"demo","input":content});
+    let mut inflight = Vec::new();
+    for index in 0..8 {
+        let router = router.clone();
+        let request = if index % 2 == 0 {
+            auto_request("/v1/auto", "client", auto.clone())
+        } else {
+            auto_request("/v1/responses", "client", responses.clone())
+        };
+        inflight.push(tokio::spawn(async move {
+            router.oneshot(request).await.unwrap()
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while hits.load(Ordering::SeqCst) < 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both parsed routes must hold eight upstream calls open");
+    let rejected = router
+        .clone()
+        .oneshot(auto_request("/v1/auto", "client", auto.clone()))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(rejected.headers()["retry-after"], "1");
+    assert_eq!(hits.load(Ordering::SeqCst), 8);
+    for task in inflight {
+        task.abort();
+        let _ = task.await;
+    }
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(5),
+        router.oneshot(auto_request("/v1/responses", "client", responses)),
+    )
+    .await
+    .expect("cancelled parsed routes must release upload memory")
+    .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn mixed_endpoint_slow_uploads_share_payload_admission_telemetry_and_recover() {
     let (url, calls) = start_upstream(StatusCode::OK).await;
     let router = make_app(&url, &url);
