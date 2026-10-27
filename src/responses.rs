@@ -517,7 +517,22 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                             "Unsupported reasoning history",
                         )));
                     }
-                    pending_reasoning = item["content"][0]["text"].as_str().map(str::to_owned);
+                    // Validation above guarantees a single reasoning_text
+                    // string. Move it from the parsed history instead of
+                    // retaining and copying a large reasoning item.
+                    let mut content = item
+                        .as_object_mut()
+                        .expect("reasoning shape validated")
+                        .remove("content")
+                        .expect("reasoning content validated");
+                    pending_reasoning = content[0]
+                        .as_object_mut()
+                        .expect("reasoning part validated")
+                        .remove("text")
+                        .and_then(|value| match value {
+                            Value::String(text) => Some(text),
+                            _ => None,
+                        });
                     continue;
                 }
                 if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
@@ -563,7 +578,14 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                             "Function output has no matching preceding call",
                         )));
                     }
-                    messages.push(json!({"role":"tool","tool_call_id":call_id,"content":output}));
+                    let mut tool_message =
+                        json!({"role":"tool","tool_call_id":call_id,"content":Value::Null});
+                    tool_message["content"] = item
+                        .as_object_mut()
+                        .expect("function output validated")
+                        .remove("output")
+                        .expect("function output validated");
+                    messages.push(tool_message);
                     continue;
                 }
                 if item.get("type").and_then(Value::as_str) == Some("function_call") {
@@ -637,7 +659,13 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                             "Function call id is already pending",
                         )));
                     }
-                    let tool_call = json!({"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}});
+                    let mut tool_call = json!({"id":call_id,"type":"function",
+                        "function":{"name":name,"arguments":Value::Null}});
+                    tool_call["function"]["arguments"] = item
+                        .as_object_mut()
+                        .expect("function call validated")
+                        .remove("arguments")
+                        .expect("function arguments validated");
                     if let Some(last) = messages.last_mut().filter(|message: &&mut Value| {
                         message["role"] == "assistant" && message["tool_calls"].is_array()
                     }) {
@@ -671,7 +699,7 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                         "Input messages require a role",
                     )));
                 };
-                if !matches!(role, "user" | "assistant" | "system" | "developer")
+                if !matches!(role.as_str(), "user" | "assistant" | "system" | "developer")
                     || item.get("type").is_some_and(|kind| kind != "message")
                     || item.as_object().is_none_or(|obj| {
                         obj.keys().any(|k| {
@@ -780,8 +808,9 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                 if role != "assistant"
                     && let Some(reasoning) = pending_reasoning.take()
                 {
-                    messages.push(json!({"role":"assistant","content":Value::Null,
-                        "reasoning_content":reasoning}));
+                    let mut assistant = json!({"role":"assistant","content":Value::Null});
+                    assistant["reasoning_content"] = Value::String(reasoning);
+                    messages.push(assistant);
                 }
                 let mut message = chat_text_message(&role, text);
                 if role == "assistant"
@@ -799,8 +828,9 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                 )));
             }
             if let Some(reasoning) = pending_reasoning {
-                messages.push(json!({"role":"assistant","content":Value::Null,
-                    "reasoning_content":reasoning}));
+                let mut assistant = json!({"role":"assistant","content":Value::Null});
+                assistant["reasoning_content"] = Value::String(reasoning);
+                messages.push(assistant);
             }
             Value::Array(messages)
         }
@@ -1237,6 +1267,44 @@ mod reasoning_tests {
         assert_eq!(translated[1]["content"].as_str().unwrap().as_ptr(), second);
         assert_eq!(translated[0]["role"], "user");
         assert_eq!(translated[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn function_history_replay_moves_validated_large_arguments_and_outputs() {
+        let arguments = format!(r#"{{"payload":"{}"}}"#, "a".repeat(512 * 1024));
+        let output = "result".repeat(96 * 1024);
+        let history = json!([
+            {"type":"function_call","call_id":"c1","name":"search","arguments":arguments},
+            {"type":"function_call_output","call_id":"c1","output":output},
+        ]);
+        let args_ptr = history[0]["arguments"].as_str().unwrap().as_ptr();
+        let output_ptr = history[1]["output"].as_str().unwrap().as_ptr();
+        let replay = translate_input(history).unwrap();
+        assert_eq!(replay[0]["role"], "assistant");
+        assert_eq!(replay[0]["tool_calls"][0]["function"]["name"], "search");
+        assert_eq!(
+            replay[0]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            args_ptr
+        );
+        assert_eq!(replay[1]["role"], "tool");
+        assert_eq!(replay[1]["tool_call_id"], "c1");
+        assert_eq!(replay[1]["content"].as_str().unwrap().as_ptr(), output_ptr);
+    }
+
+    #[test]
+    fn completed_reasoning_replay_moves_large_text_without_an_extra_copy() {
+        let reasoning = reasoning_item("large", "thinking".repeat(128 * 1024), "completed");
+        let source_ptr = reasoning["content"][0]["text"].as_str().unwrap().as_ptr();
+        let replay = translate_input(Value::Array(vec![reasoning])).unwrap();
+        assert_eq!(replay[0]["role"], "assistant");
+        assert_eq!(replay[0]["content"], Value::Null);
+        assert_eq!(
+            replay[0]["reasoning_content"].as_str().unwrap().as_ptr(),
+            source_ptr
+        );
     }
 
     #[test]
