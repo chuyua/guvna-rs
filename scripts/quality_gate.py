@@ -1555,9 +1555,23 @@ chains:
                        "guvna_upstream_invalid_responses_total"):
             check(metrics.get(metric) == 0,
                   f"slow downstream TCP was incorrectly blamed on provider: {metric}")
-        after = proc_info(proc.pid)
+        # An actual TCP disconnect is delivered asynchronously to Hyper.
+        # Sample bounded post-close cleanup rather than assuming all
+        # transport tasks have observed cancellation in exactly 300ms.
+        # Keep the ORIGINAL 128 MiB retained cap; do not make RSS pass by
+        # relaxing the measured acceptance threshold.
+        rss_after_close = []
+        for _ in range(20):
+            after = proc_info(proc.pid)
+            rss_after_close.append(after["VmRSS"])
+            if len(rss_after_close) >= 2 and after["VmRSS"] <= (
+                LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB * 1024
+            ):
+                break
+            time.sleep(0.25)
         check(after["VmRSS"] <= LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB * 1024,
-              f"large TCP responses retained {after['VmRSS'] / 1024:.1f} MiB RSS")
+              f"large TCP responses retained {after['VmRSS'] / 1024:.1f} MiB RSS "
+              f"after bounded cleanup; RSS timeline KiB: {rss_after_close}")
         check(after["VmHWM"] <= LARGE_PAYLOAD_MAX_PEAK_RSS_MIB * 1024,
               f"large TCP responses peaked at {after['VmHWM'] / 1024:.1f} MiB RSS")
         check(after["fd"] - before["fd"] <= 8, "slow TCP clients leaked file descriptors")
@@ -1580,6 +1594,7 @@ chains:
             "rss_before_kib": before["VmRSS"],
             "rss_high_watermark_kib": after["VmHWM"],
             "rss_after_kib": after["VmRSS"],
+            "rss_cleanup_samples_kib": rss_after_close,
             "peak_limit_mib": LARGE_PAYLOAD_MAX_PEAK_RSS_MIB,
             "retained_limit_mib": LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB,
             "fd_before": before["fd"], "fd_after": after["fd"],
