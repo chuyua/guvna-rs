@@ -7,9 +7,11 @@ use super::dispatch::{
 };
 use super::responses_format;
 use super::{AppState, authenticated_body, error};
+#[cfg(test)]
+use axum::body::to_bytes;
 use axum::{
     Json,
-    body::{Body, to_bytes},
+    body::Body,
     extract::State,
     http::{Request, StatusCode},
     response::{IntoResponse, Response},

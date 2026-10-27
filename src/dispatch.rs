@@ -253,6 +253,7 @@ pub(super) struct BufferedResponseLease {
 /// An internal, already-validated Chat JSON tree for the non-streaming
 /// Responses bridge. Returning it as an extension avoids serializing a
 /// potentially 32 MiB Chat body only to parse it back into a Value.
+#[derive(Clone)]
 pub(super) struct ParsedChatResponse(pub(super) Value);
 
 pub(super) fn hold_buffered_response(
