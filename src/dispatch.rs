@@ -1560,6 +1560,14 @@ async fn bounded_json(
     large_slots: Arc<tokio::sync::Semaphore>,
     mut circuit_ticket: Option<&mut crate::circuit::Ticket>,
 ) -> Result<(Value, Option<BufferedResponseLease>), JsonReadFailure> {
+    // Use one bounded allocation when the upstream declares its size.
+    // Geometric Vec growth for 12 MiB JSON otherwise reallocates several
+    // large buffers per request and may retain idle RSS after TCP drain.
+    // Do not trust a declared length beyond the actual response size cap.
+    let declared_len = response
+        .content_length()
+        .and_then(|size| usize::try_from(size).ok())
+        .filter(|size| *size <= MAX_BODY_BYTES);
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     let mut reservation = None;
@@ -1590,6 +1598,16 @@ async fn bounded_json(
             reservation = Some(BufferedResponseLease {
                 _permit: Arc::new(permit),
             });
+        }
+        if bytes.is_empty()
+            && !chunk.is_empty()
+            && let Some(length) = declared_len
+        {
+            // Capacity is reserved only after admission (and for large
+            // bodies, after acquiring a dedicated semaphore permit).
+            bytes
+                .try_reserve_exact(length)
+                .map_err(|_| JsonReadFailure::MemoryBusy)?;
         }
         bytes.extend_from_slice(&chunk);
     }
