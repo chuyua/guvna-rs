@@ -362,7 +362,7 @@ pub struct ResolvedStep {
 }
 
 /// Count serialized JSON bytes without retaining a copy of request content.
-fn encoded_json_bytes(value: Option<&Value>) -> usize {
+fn encoded_json_bytes_of<T: serde::Serialize + ?Sized>(value: &T) -> usize {
     struct Counter(usize);
     impl std::io::Write for Counter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -373,14 +373,15 @@ fn encoded_json_bytes(value: Option<&Value>) -> usize {
             Ok(())
         }
     }
-    let Some(value) = value else {
-        return 0;
-    };
     let mut counter = Counter(0);
     if serde_json::to_writer(&mut counter, value).is_err() {
         return usize::MAX;
     }
     counter.0
+}
+
+fn encoded_json_bytes(value: Option<&Value>) -> usize {
+    value.map_or(0, encoded_json_bytes_of)
 }
 
 /// Keep the established min/max input-byte contract for messages.
@@ -519,7 +520,7 @@ fn auto_candidate_eligible_for_request(
     let effective = |name: &str| request.get(name).or_else(|| candidate.params.get(name));
     // Dispatch always writes the physical model, even when /v1/auto callers
     // omit model entirely. Account for that replacement in the same pass.
-    let physical_model_bytes = encoded_json_bytes(Some(&Value::String(candidate.model.clone())));
+    let physical_model_bytes = encoded_json_bytes_of(candidate.model.as_str());
     let mut effective_request_bytes = if let Some(original) = request.get("model") {
         request_bytes
             .saturating_sub(encoded_json_bytes(Some(original)))
@@ -529,7 +530,7 @@ fn auto_candidate_eligible_for_request(
             .saturating_add(usize::from(
                 request.as_object().is_some_and(|map| !map.is_empty()),
             ))
-            .saturating_add(encoded_json_bytes(Some(&Value::String("model".into()))))
+            .saturating_add(encoded_json_bytes_of("model"))
             .saturating_add(1)
             .saturating_add(physical_model_bytes)
     };
@@ -542,7 +543,7 @@ fn auto_candidate_eligible_for_request(
             let separator = usize::from(field_count != 0);
             effective_request_bytes = effective_request_bytes
                 .saturating_add(separator)
-                .saturating_add(encoded_json_bytes(Some(&Value::String(name.clone()))))
+                .saturating_add(encoded_json_bytes_of(name.as_str()))
                 .saturating_add(1)
                 .saturating_add(encoded_json_bytes(Some(value)));
             field_count += 1;
@@ -908,6 +909,81 @@ mod tests {
                 .model,
             "short"
         );
+    }
+
+    #[test]
+    fn direct_json_string_byte_count_matches_value_encoding_with_unicode_and_escapes() {
+        let long = "x".repeat(4096);
+        for text in [
+            "auto",
+            "a/b",
+            "escaped \"\\ newline\n",
+            "模型🐈‍⬛",
+            "",
+            long.as_str(),
+        ] {
+            let expected = encoded_json_bytes(Some(&Value::String(text.to_owned())));
+            assert_eq!(encoded_json_bytes_of(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn request_aware_cache_distinguishes_equal_context_estimates_with_different_body_lengths() {
+        let mut small = json!({
+            "model":"auto",
+            "messages":[{"role":"user","content":"hi"}],
+            "max_tokens":3000,
+            "user":"x"
+        });
+        let mut found = false;
+        for length in 1..=5 {
+            small["user"] = json!("x".repeat(length));
+            if encoded_json_bytes(Some(&small)).is_multiple_of(5) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
+        let mut large = small.clone();
+        large["user"] = json!(format!("{}x", small["user"].as_str().unwrap()));
+        large["max_tokens"] = json!(2998);
+        let (small_bytes, common_estimate) = auto_request_bytes_and_context_estimate(&small);
+        let (large_bytes, large_estimate) = auto_request_bytes_and_context_estimate(&large);
+        assert_eq!(large_bytes, small_bytes + 1);
+        assert_eq!(
+            large_estimate, common_estimate,
+            "the old cache key cannot distinguish these two real requests"
+        );
+        let cfg: Config = serde_yaml::from_str(&format!(
+            "providers:\n  - name: p\n    type: openai\n    base_url: https://example.invalid\n    key_env: K\nauto:\n  enabled: true\n  candidates:\n    - provider: p\n      model: short\n      max_context_tokens: {}\n",
+            common_estimate + 1
+        ))
+        .unwrap();
+        cfg.validate().unwrap();
+        let cache = AutoRouteCache::new();
+        let pick = |req: &Value, bytes: usize| {
+            cache
+                .resolve_for_request(
+                    &cfg,
+                    AutoRequestBudget {
+                        input_bytes: auto_input_bytes(req.get("messages")),
+                        request_bytes: bytes,
+                        context_estimate: common_estimate,
+                    },
+                    req,
+                    auto_requirements(req),
+                    &[],
+                    1,
+                )
+                .unwrap()
+        };
+        // Replacing "auto" with "short" adds one JSON byte. The 20%
+        // ceil margin makes the smaller body exceed the window by 1 more.
+        assert_eq!(pick(&large, large_bytes)[0].model, "short");
+        assert!(pick(&small, small_bytes).is_empty());
+        assert_eq!(pick(&large, large_bytes)[0].model, "short");
+        assert!(pick(&small, small_bytes).is_empty());
+        assert_eq!(cache.state.lock().unwrap().entries.len(), 2);
     }
 
     #[test]
