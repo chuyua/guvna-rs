@@ -584,6 +584,48 @@ impl ChatSse {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ignored_json_validation_matches_the_original_value_parser_contract() {
+        let cases = [
+            "{}",
+            "{\"nested\":[1,true,null,\"hello\"]}",
+            "  {\"unicode\":\"中🌿文\"}\n",
+            "[]",
+            "[1,2,3]",
+            "null",
+            "true",
+            "42",
+            "-0.000001",
+            "1e309",
+            "\"escaped\\ntext\"",
+            "{\"a\":1,\"a\":2}",
+            "",
+            "  ",
+            "{}{}",
+            "{bad}",
+            "{\"a\":NaN}",
+            "{\"a\":Infinity}",
+            "{\"a\":1,}",
+            "{\"a\":\"unfinished}",
+            "[1,]",
+            "/* comment */ {}",
+            "\"\\uD800\"",
+        ];
+        for source in cases {
+            let original = serde_json::from_str::<Value>(source).ok();
+            for object_required in [false, true] {
+                assert_eq!(
+                    valid_json_output(source, object_required),
+                    original
+                        .as_ref()
+                        .is_some_and(|value| !object_required || value.is_object()),
+                    "validation parity lost for {source:?}, object_required={object_required}"
+                );
+            }
+        }
+    }
+
     const START: &[u8] =
         br#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
 
