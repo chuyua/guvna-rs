@@ -1555,6 +1555,29 @@ async fn bounded_error_json(mut upstream: reqwest::Response) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// An upstream Content-Length is untrusted. Never let a claimed large body
+/// allocate outside the two-slot response budget before actual bytes cross
+/// the threshold. Once the permit is held, reserve the remaining declared
+/// capacity in one step instead of repeatedly growing a large Vec.
+fn reserve_declared_json_capacity(
+    bytes: &mut Vec<u8>,
+    declared_len: Option<usize>,
+    large_permit_held: bool,
+) -> Result<(), JsonReadFailure> {
+    let Some(length) = declared_len.filter(|&length| length <= MAX_BODY_BYTES) else {
+        return Ok(());
+    };
+    if length > super::LARGE_RESPONSE_BODY_BYTES && !large_permit_held {
+        return Ok(());
+    }
+    if length > bytes.capacity() {
+        bytes
+            .try_reserve_exact(length.saturating_sub(bytes.len()))
+            .map_err(|_| JsonReadFailure::MemoryBusy)?;
+    }
+    Ok(())
+}
+
 async fn bounded_json(
     response: reqwest::Response,
     large_slots: Arc<tokio::sync::Semaphore>,
@@ -1599,15 +1622,8 @@ async fn bounded_json(
                 _permit: Arc::new(permit),
             });
         }
-        if bytes.is_empty()
-            && !chunk.is_empty()
-            && let Some(length) = declared_len
-        {
-            // Capacity is reserved only after admission (and for large
-            // bodies, after acquiring a dedicated semaphore permit).
-            bytes
-                .try_reserve_exact(length)
-                .map_err(|_| JsonReadFailure::MemoryBusy)?;
+        if !chunk.is_empty() {
+            reserve_declared_json_capacity(&mut bytes, declared_len, reservation.is_some())?;
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -1619,6 +1635,35 @@ async fn bounded_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untrusted_content_length_never_reserves_large_memory_without_permit() {
+        let mut bytes = Vec::new();
+        // A malicious upstream may advertise 32 MiB and only send one byte.
+        // With 128 in-flight requests the old first-chunk reservation could
+        // allocate gigabytes before acquiring either large response slot.
+        reserve_declared_json_capacity(&mut bytes, Some(MAX_BODY_BYTES), false).unwrap();
+        assert_eq!(bytes.capacity(), 0);
+        bytes.push(b'{');
+        reserve_declared_json_capacity(&mut bytes, Some(MAX_BODY_BYTES), false).unwrap();
+        assert!(bytes.capacity() < super::LARGE_RESPONSE_BODY_BYTES);
+
+        // Small responses can still reserve without consuming a large slot.
+        let mut small = Vec::new();
+        reserve_declared_json_capacity(&mut small, Some(super::LARGE_RESPONSE_BODY_BYTES), false)
+            .unwrap();
+        assert!(small.capacity() >= super::LARGE_RESPONSE_BODY_BYTES);
+
+        // Once the large-body permit has been acquired, preallocation is
+        // allowed even if the first upstream chunks were tiny.
+        let mut large = Vec::new();
+        large.extend_from_slice(b"{");
+        reserve_declared_json_capacity(&mut large, Some(2 * 1024 * 1024), true).unwrap();
+        assert!(large.capacity() >= 2 * 1024 * 1024);
+        let mut oversized = Vec::new();
+        reserve_declared_json_capacity(&mut oversized, Some(MAX_BODY_BYTES + 1), true).unwrap();
+        assert_eq!(oversized.capacity(), 0);
+    }
 
     #[test]
     fn shadow_accounting_is_identical_for_cached_proposal_and_unavailable_fallback() {
