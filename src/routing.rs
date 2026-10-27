@@ -548,7 +548,10 @@ fn auto_candidate_eligible_for_request(
             .find(|provider| provider.name == candidate.provider)
             .is_some_and(|provider| provider.stream_only);
     for (name, value) in &candidate.params {
-        if name != "model" && request.get(name).is_none() {
+        if name != "model"
+            && !(force_upstream_stream && name == "stream_options")
+            && request.get(name).is_none()
+        {
             let separator = usize::from(field_count != 0);
             effective_request_bytes = effective_request_bytes
                 .saturating_add(separator)
@@ -569,6 +572,37 @@ fn auto_candidate_eligible_for_request(
                 .saturating_add(encoded_json_bytes_of("stream"))
                 .saturating_add(1)
                 .saturating_add(encoded_json_bytes_of(&true));
+        }
+        // Non-streaming SSE aggregation also forces
+        // stream_options.include_usage=true. Account for the exact merge.
+        let forced_options_bytes =
+            encoded_json_bytes_of(&serde_json::json!({"include_usage":true}));
+        match request.get("stream_options") {
+            None => {
+                effective_request_bytes = effective_request_bytes
+                    .saturating_add(usize::from(field_count > 0))
+                    .saturating_add(encoded_json_bytes_of("stream_options"))
+                    .saturating_add(1)
+                    .saturating_add(forced_options_bytes);
+            }
+            Some(Value::Object(options)) => {
+                if let Some(existing) = options.get("include_usage") {
+                    effective_request_bytes = effective_request_bytes
+                        .saturating_sub(encoded_json_bytes(Some(existing)))
+                        .saturating_add(encoded_json_bytes_of(&true));
+                } else {
+                    effective_request_bytes = effective_request_bytes
+                        .saturating_add(usize::from(!options.is_empty()))
+                        .saturating_add(encoded_json_bytes_of("include_usage"))
+                        .saturating_add(1)
+                        .saturating_add(encoded_json_bytes_of(&true));
+                }
+            }
+            Some(other) => {
+                effective_request_bytes = effective_request_bytes
+                    .saturating_sub(encoded_json_bytes(Some(other)))
+                    .saturating_add(forced_options_bytes);
+            }
         }
     }
     // Both aliases can be present when the caller uses one and a candidate
@@ -905,6 +939,7 @@ mod tests {
         let mut actual = explicit_off.clone();
         actual["model"] = json!("sse");
         actual["stream"] = json!(true);
+        actual["stream_options"] = json!({"include_usage":true});
         let mut exact = config.clone();
         exact.auto.candidates[0].max_context_tokens = Some(auto_context_estimate(&actual));
         for value in [false, true] {
@@ -927,6 +962,60 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(chosen[0].model, "sse", "caller stream={value}");
+        }
+    }
+
+    #[test]
+    fn auto_sse_only_budget_matches_forced_usage_options_without_false_admission() {
+        let mut cfg: Config = serde_yaml::from_str(
+            "providers:\n  - name: s\n    type: openai\n    base_url: https://example.invalid\n    key_env: KEY\n    stream_only: true\nauto:\n  enabled: true\n  candidates:\n    - provider: s\n      model: physical\n      max_context_tokens: 8192\n      params:\n        stream_options:\n          unused_default: ignored\n",
+        ).unwrap();
+        cfg.validate().unwrap();
+        for stream_options in [
+            None,
+            Some(json!({})),
+            Some(json!({"include_usage":false})),
+            Some(json!({"include_usage":true,"trace":"hi"})),
+            Some(json!({"trace":"unicode 文本","another":42})),
+            Some(Value::Null),
+            Some(json!("invalid")),
+        ] {
+            let mut request = json!({"model":"auto","stream":false,
+                "messages":[{"role":"user","content":"hello"}],"max_tokens":64});
+            if let Some(options) = stream_options {
+                request["stream_options"] = options;
+            }
+            let mut actual = request.clone();
+            actual["model"] = json!("physical");
+            actual["stream"] = json!(true);
+            let mut options = actual["stream_options"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            options.insert("include_usage".into(), Value::Bool(true));
+            actual["stream_options"] = Value::Object(options);
+            let exact = auto_context_estimate(&actual);
+            cfg.auto.candidates[0].max_context_tokens = Some(exact);
+            let select = |cfg: &Config| {
+                resolve_auto_for_request(
+                    cfg,
+                    auto_input_bytes(request.get("messages")),
+                    &request,
+                    auto_requirements(&request),
+                    &[],
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                select(&cfg).len(),
+                1,
+                "exact wire budget rejected: {request}"
+            );
+            cfg.auto.candidates[0].max_context_tokens = Some(exact - 1);
+            assert!(
+                select(&cfg).is_empty(),
+                "oversized wire accepted: {request}"
+            );
         }
     }
 
