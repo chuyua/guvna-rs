@@ -1251,7 +1251,7 @@ async fn dispatch_inner(
                         // network failure, not malformed model JSON. Apply
                         // the same bounded key/circuit recovery as send().
                         Metrics::inc(&state.metrics.upstream_transport_failures);
-                        ops_log::warn("upstream_body_transport_failure");
+                        ops_log::warn("transport_failure");
                         if state.pools[step.provider_index]
                             .record(&lease, Outcome::TransportFailure)
                         {
