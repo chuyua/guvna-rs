@@ -569,9 +569,12 @@ async fn dispatch_inner(
     // independently. Analyze request features once; every ordering policy
     // consumes the exact same already-validated signals and candidate list.
     let auto_signals = auto_enabled.then(|| {
+        let (request_bytes, context_estimate) =
+            routing::auto_request_bytes_and_context_estimate(&request);
         (
             routing::auto_input_bytes(request.get("messages")),
-            routing::auto_context_estimate(&request),
+            request_bytes,
+            context_estimate,
             routing::auto_requirements(&request),
         )
     });
@@ -586,7 +589,8 @@ async fn dispatch_inner(
     // Keep byte-range eligibility and context-window budgeting separate.
     // The context estimate includes the full request, output allowance and safety reserve.
     let mut steps = match if auto_enabled {
-        let (input_bytes, context_estimate, signals) = auto_signals.expect("Auto signals present");
+        let (input_bytes, request_bytes, context_estimate, signals) =
+            auto_signals.expect("Auto signals present");
         let (min_context, max_context) = auto_bounds.expect("Auto bounds validated");
         let requirements = signals.with_context_bounds(min_context, max_context);
         // Request-specific candidate defaults are not covered by the shared
@@ -607,10 +611,14 @@ async fn dispatch_inner(
                     &initial_auto_penalties,
                 )
             } else {
-                state.auto_route_cache.resolve(
+                state.auto_route_cache.resolve_for_request(
                     &route_snapshot,
-                    input_bytes,
-                    context_estimate,
+                    routing::AutoRequestBudget {
+                        input_bytes,
+                        request_bytes,
+                        context_estimate,
+                    },
+                    &request,
                     features,
                     &initial_auto_penalties,
                     live.auto_generation,
@@ -674,7 +682,8 @@ async fn dispatch_inner(
     }
 
     if auto_enabled && let Some(decider) = &state.auto_decider {
-        let (input_bytes, context_estimate, signals) = auto_signals.expect("Auto signals present");
+        let (input_bytes, _request_bytes, context_estimate, signals) =
+            auto_signals.expect("Auto signals present");
         let (min_context, max_context) = auto_bounds.expect("Auto bounds validated");
         let requirements = signals.with_context_bounds(min_context, max_context);
         if state.config.auto.decider.shadow_only {

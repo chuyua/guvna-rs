@@ -145,8 +145,43 @@ struct CacheKey {
     generation: u64,
     input_bytes: usize,
     context_estimate: usize,
+    // Request-aware selection depends on the exact encoded body length, not
+    // only on rounded context estimates. Legacy resolution uses None.
+    request_bytes: Option<usize>,
     requirements: AutoRequirements,
     penalties: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub struct AutoRequestBudget {
+    pub input_bytes: usize,
+    pub request_bytes: usize,
+    pub context_estimate: usize,
+}
+
+impl CacheKey {
+    fn new(
+        config: &Config,
+        input_bytes: usize,
+        context_estimate: usize,
+        request_bytes: Option<usize>,
+        requirements: AutoRequirements,
+        penalties: &[u8],
+        generation: u64,
+    ) -> Self {
+        Self {
+            generation,
+            input_bytes,
+            context_estimate,
+            request_bytes,
+            requirements,
+            penalties: if config.auto.health_aware {
+                penalties.to_vec()
+            } else {
+                Vec::new()
+            },
+        }
+    }
 }
 struct CacheEntry {
     key: CacheKey,
@@ -200,17 +235,68 @@ impl AutoRouteCache {
         penalties: &[u8],
         generation: u64,
     ) -> Result<Vec<ResolvedStep>, String> {
-        let key = CacheKey {
-            generation,
-            input_bytes,
-            context_estimate,
-            requirements,
-            penalties: if config.auto.health_aware {
-                penalties.to_vec()
-            } else {
-                Vec::new()
+        self.resolve_cached(
+            CacheKey::new(
+                config,
+                input_bytes,
+                context_estimate,
+                None,
+                requirements,
+                penalties,
+                generation,
+            ),
+            || {
+                resolve_auto_with_requirements(
+                    config,
+                    input_bytes,
+                    context_estimate,
+                    requirements,
+                    penalties,
+                )
             },
-        };
+        )
+    }
+
+    /// Cached Auto selection must account for the actual physical model
+    /// written on the wire. The incoming logical model is always "auto",
+    /// but its candidate models may have very different serialized lengths.
+    pub fn resolve_for_request(
+        &self,
+        config: &Config,
+        budget: AutoRequestBudget,
+        request: &Value,
+        requirements: AutoRequirements,
+        penalties: &[u8],
+        generation: u64,
+    ) -> Result<Vec<ResolvedStep>, String> {
+        self.resolve_cached(
+            CacheKey::new(
+                config,
+                budget.input_bytes,
+                budget.context_estimate,
+                Some(budget.request_bytes),
+                requirements,
+                penalties,
+                generation,
+            ),
+            || {
+                resolve_auto_for_request_sized(
+                    config,
+                    budget.input_bytes,
+                    request,
+                    budget.request_bytes,
+                    requirements,
+                    penalties,
+                )
+            },
+        )
+    }
+
+    fn resolve_cached(
+        &self,
+        key: CacheKey,
+        compute: impl FnOnce() -> Result<Vec<ResolvedStep>, String>,
+    ) -> Result<Vec<ResolvedStep>, String> {
         let now = Instant::now();
         let cached = {
             let mut state = self
@@ -224,13 +310,7 @@ impl AutoRouteCache {
             return Ok((*steps).clone());
         }
 
-        let steps = resolve_auto_with_requirements(
-            config,
-            input_bytes,
-            context_estimate,
-            requirements,
-            penalties,
-        )?;
+        let steps = compute()?;
         let cached_copy = Arc::new(steps.clone());
         {
             let mut state = self
@@ -322,6 +402,15 @@ fn with_context_safety_margin(bytes: usize) -> usize {
 /// depending on a remote tokenizer or underestimating multilingual input.
 pub fn auto_context_estimate(request: &Value) -> usize {
     let bytes = encoded_json_bytes(Some(request));
+    auto_context_estimate_from_bytes(request, bytes)
+}
+
+pub fn auto_request_bytes_and_context_estimate(request: &Value) -> (usize, usize) {
+    let bytes = encoded_json_bytes(Some(request));
+    (bytes, auto_context_estimate_from_bytes(request, bytes))
+}
+
+fn auto_context_estimate_from_bytes(request: &Value, bytes: usize) -> usize {
     let output_budget = ["max_completion_tokens", "max_tokens"]
         .iter()
         .filter_map(|name| request.get(name).and_then(Value::as_u64))
@@ -531,6 +620,24 @@ pub fn resolve_auto_for_request(
     penalties: &[u8],
 ) -> Result<Vec<ResolvedStep>, String> {
     let request_bytes = encoded_json_bytes(Some(request));
+    resolve_auto_for_request_sized(
+        config,
+        input_bytes,
+        request,
+        request_bytes,
+        requirements,
+        penalties,
+    )
+}
+
+fn resolve_auto_for_request_sized(
+    config: &Config,
+    input_bytes: usize,
+    request: &Value,
+    request_bytes: usize,
+    requirements: AutoRequirements,
+    penalties: &[u8],
+) -> Result<Vec<ResolvedStep>, String> {
     resolve_auto_filtered(config, penalties, |candidate| {
         auto_candidate_eligible_for_request(
             config,
@@ -714,6 +821,79 @@ mod tests {
     use crate::config::Config;
     use serde_json::json;
     use std::hash::Hash;
+
+    #[test]
+    fn auto_cached_selection_accounts_for_physical_model_bytes_before_truncation() {
+        let long_model = "physical-model-".repeat(45);
+        let yaml = format!(
+            "providers:\n  - name: p\n    type: openai\n    base_url: https://example.invalid\n    key_env: K\nauto:\n  enabled: true\n  max_candidates: 1\n  candidates:\n    - provider: p\n      model: {long_model}\n      priority: 0\n      max_context_tokens: 450\n    - provider: p\n      model: short\n      priority: 10\n      max_context_tokens: 450\n"
+        );
+        let mut config: Config = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let request = json!({"model":"auto","messages":[{"role":"user","content":"hi"}],
+            "max_tokens":80});
+        let budget = |request: &Value| {
+            let (request_bytes, context_estimate) =
+                auto_request_bytes_and_context_estimate(request);
+            AutoRequestBudget {
+                input_bytes: auto_input_bytes(request.get("messages")),
+                request_bytes,
+                context_estimate,
+            }
+        };
+        let base = budget(&request);
+        let requirements = auto_requirements(&request);
+        assert!(
+            base.context_estimate < 450,
+            "incoming logical name still fits the advertised window"
+        );
+        assert_eq!(
+            AutoRouteCache::new()
+                .resolve(
+                    &config,
+                    base.input_bytes,
+                    base.context_estimate,
+                    requirements,
+                    &[],
+                    1,
+                )
+                .unwrap()[0]
+                .model,
+            long_model,
+            "the old estimate missed the physical-model substitution"
+        );
+        let cache = AutoRouteCache::new();
+        for _ in 0..3 {
+            let eligible = cache
+                .resolve_for_request(&config, base, &request, requirements, &[], 1)
+                .unwrap();
+            assert_eq!(eligible.len(), 1);
+            assert_eq!(eligible[0].model, "short");
+        }
+        let oversized = json!({"model":"auto","messages":[{"role":"user","content":"z".repeat(1000)}],
+            "max_tokens":80});
+        assert!(
+            cache
+                .resolve_for_request(
+                    &config,
+                    budget(&oversized),
+                    &oversized,
+                    auto_requirements(&oversized),
+                    &[],
+                    1,
+                )
+                .unwrap()
+                .is_empty(),
+            "a cached short prompt must not admit an oversized request"
+        );
+        assert_eq!(
+            cache
+                .resolve_for_request(&config, base, &request, requirements, &[], 1)
+                .unwrap()[0]
+                .model,
+            "short"
+        );
+    }
 
     #[test]
     fn allocation_free_config_generation_matches_original_fingerprint_contract() {

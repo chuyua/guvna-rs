@@ -5512,6 +5512,59 @@ auto:
 }
 
 #[tokio::test]
+async fn auto_cached_routes_filter_long_physical_model_before_network_and_keep_safe_fallback() {
+    let (primary, primary_calls) = start_upstream(StatusCode::OK).await;
+    let (backup, backup_calls) = start_upstream(StatusCode::OK).await;
+    let long_model = "physical-model-".repeat(45);
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: primary\n    type: openai\n    base_url: {primary}\n    key_env: FIRST\n  - name: backup\n    type: openai\n    base_url: {backup}\n    key_env: SECOND\nauto:\n  enabled: true\n  max_candidates: 1\n  candidates:\n    - provider: primary\n      model: {long_model}\n      priority: 0\n      max_context_tokens: 450\n    - provider: backup\n      model: short\n      priority: 10\n      max_context_tokens: 450\n"
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("FIRST".into(), "first-key".into()),
+            ("SECOND".into(), "second-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for path in ["/v1/auto", "/v1/chat/completions"] {
+        let (status, response) = call(
+            router.clone(),
+            auto_request(
+                path,
+                "client",
+                json!({"model":"auto","messages":[{"role":"user","content":"hi"}],"max_tokens":80}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {response}");
+        assert_eq!(response["model"], "short");
+    }
+    assert_eq!(
+        primary_calls.load(Ordering::SeqCst),
+        0,
+        "oversized physical model was never eligible"
+    );
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 2);
+    let (status, response) = call(
+        router.clone(),
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({"model":"auto","messages":[{"role":"user","content":"large".repeat(300)}],
+                "max_tokens":80}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+    assert_eq!(response["error"]["code"], "auto_no_eligible_candidate");
+    assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn auto_without_eligible_candidate_returns_422_without_network_attempt() {
     let (url, hits) = start_upstream(StatusCode::OK).await;
     let config: Config = serde_yaml::from_str(&format!(
