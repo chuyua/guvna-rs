@@ -566,6 +566,189 @@ fn request(model: &str, extra: &str, key: &str) -> Request<Body> {
 }
 
 #[tokio::test]
+async fn issue142_native_json_half_open_slow_recovery_accepts_two_next_requests() {
+    use std::time::Duration;
+    let visits = Arc::new(AtomicUsize::new(0));
+    let counts = Arc::clone(&visits);
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counts = Arc::clone(&counts);
+            async move {
+                let visit = counts.fetch_add(1, Ordering::SeqCst);
+                if visit == 0 {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(json!({
+                            "error":"initial outage"
+                        })),
+                    )
+                        .into_response();
+                }
+                if visit == 1 {
+                    // More than the old 20s probe lease, but strictly
+                    // within the 90s upstream attempt deadline.
+                    tokio::time::sleep(Duration::from_secs(22)).await;
+                } else {
+                    // Overlap both post-recovery requests. One would fail
+                    // over if the breaker were still HALF_OPEN.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({
+                        "id":"native-recovered", "created":100, "model":"physical",
+                        "choices":[{"index":0,"message":{
+                            "role":"assistant","content":"healthy native JSON"
+                        },"finish_reason":"stop"}]
+                    })),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let (backup, backup_calls) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: primary
+    type: openai
+    base_url: http://{addr}
+    key_env: FIRST
+    circuit_breaker:
+      enabled: true
+      failure_threshold: 1
+      cooldown: 100ms
+      max_cooldown: 800ms
+  - name: backup
+    type: openai
+    base_url: {backup}
+    key_env: SECOND
+chains:
+  - name: demo
+    steps:
+      - provider: primary
+        model: physical
+      - provider: backup
+        model: fallback
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("FIRST".into(), "primary-secret".into()),
+            ("SECOND".into(), "backup-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, first) = call(router.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["model"], "fallback");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let routed = router.clone();
+    let slow = tokio::spawn(async move { call(routed, request("demo", "", "client")).await });
+    tokio::time::sleep(Duration::from_secs(21)).await;
+    let (status, interleaved) = call(router.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{interleaved}");
+    assert_eq!(interleaved["model"], "fallback");
+    let (status, recovered) = tokio::time::timeout(Duration::from_secs(28), slow)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{recovered}");
+    assert_eq!(recovered["id"], "native-recovered");
+    let (one, two) = tokio::join!(
+        call(router.clone(), request("demo", "", "client")),
+        call(router, request("demo", "", "client")),
+    );
+    assert_eq!(one.0, StatusCode::OK);
+    assert_eq!(two.0, StatusCode::OK);
+    assert_eq!(one.1["id"], "native-recovered");
+    assert_eq!(two.1["id"], "native-recovered");
+    assert_eq!(visits.load(Ordering::SeqCst), 4);
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn issue147_full_reasoning_output_replays_across_two_http_responses_turns() {
+    let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let events = Arc::clone(&captured);
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(payload): axum::Json<Value>| {
+            let events = Arc::clone(&events);
+            async move {
+                events.lock().await.push(payload);
+                axum::Json(json!({
+                    "id":"roundtrip-reasoning", "created":100, "model":"physical",
+                    "choices":[{"index":0,"message":{
+                        "role":"assistant", "content":"visible answer",
+                        "reasoning_content":"separate reasoning text"
+                    },"finish_reason":"stop"}]
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: K
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: physical
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "test-secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, first) = call(
+        router.clone(),
+        responses_stream_req(json!({"model":"demo","input":"hello","store":false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["output"][0]["type"], "reasoning");
+    assert_eq!(first["output"][1]["type"], "message");
+    let mut previous = first["output"].as_array().unwrap().clone();
+    previous.push(json!({"role":"user","content":"continue"}));
+    let (status, second) = call(
+        router,
+        responses_stream_req(json!({"model":"demo","input":previous,"store":false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let seen = captured.lock().await;
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1]["messages"][0]["role"], "assistant");
+    assert_eq!(seen[1]["messages"][0]["content"], "visible answer");
+    assert_eq!(
+        seen[1]["messages"][0]["reasoning_content"],
+        "separate reasoning text"
+    );
+    assert_eq!(seen[1]["messages"][1]["role"], "user");
+    assert_eq!(seen[1]["messages"][1]["content"], "continue");
+    server.abort();
+}
+
+#[tokio::test]
 async fn last_upstream_caller_rejection_preserves_client_status_without_key_leak() {
     let (upstream, hits) = start_upstream(StatusCode::UNPROCESSABLE_ENTITY).await;
     let router = make_app(&upstream, &upstream);
@@ -1771,6 +1954,83 @@ chains:
         );
         assert_eq!(metric_value(&metrics, "chat_stream_failed_total"), 2);
     }
+}
+
+#[tokio::test]
+async fn native_json_body_reset_is_transport_failure_and_quarantines_key() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let broken = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(|State(hits): State<Arc<AtomicUsize>>| async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let chunks = futures_util::stream::unfold(0u8, |step| async move {
+                    match step {
+                        0 => Some((
+                            Ok::<_, std::io::Error>(Bytes::from_static(b"{\"choices\":[")),
+                            1,
+                        )),
+                        1 => {
+                            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+                            Some((
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    "injected JSON body reset",
+                                )),
+                                2,
+                            ))
+                        }
+                        _ => None,
+                    }
+                });
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    Body::from_stream(chunks),
+                )
+            }),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, broken).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: K
+    quarantine:
+      transient: 30s
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: x
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "key".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, _) = call(router.clone(), request("demo", "", "client")).await;
+    assert_ne!(status, StatusCode::OK);
+    let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(
+        metric_value(&metrics, "upstream_transport_failures_total"),
+        1
+    );
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        0
+    );
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 1);
+    let (status, _) = call(router, request("demo", "", "client")).await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "quarantined key retried");
 }
 
 #[tokio::test]
