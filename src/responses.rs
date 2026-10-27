@@ -310,11 +310,7 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
                     "Invalid function declaration fields",
                 );
             }
-            // The tool value is replaced immediately below. Move its owned
-            // JSON schema rather than copying every nested parameters field.
-            let mut function = std::mem::take(map);
-            function.remove("type");
-            *tool = json!({"type":"function","function":function});
+            wrap_validated_function_tool(tool);
         }
     }
     if let Some(choice) = object.get_mut("tool_choice") {
@@ -449,6 +445,18 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
         translate_chat_result(chat, logical_model, metadata),
         memory_lease,
     )
+}
+
+/// Called only after validating a Responses function declaration. Keep its
+/// nested parameters tree in the same allocation when wrapping for Chat.
+fn wrap_validated_function_tool(tool: &mut Value) {
+    let map = tool.as_object_mut().expect("validated above");
+    let mut function = std::mem::take(map);
+    function.remove("type");
+    let mut wrapped = serde_json::Map::new();
+    wrapped.insert("type".into(), Value::String("function".into()));
+    wrapped.insert("function".into(), Value::Object(function));
+    *tool = Value::Object(wrapped);
 }
 
 // Match Chat Completions' function name contract. Byte-based validation
@@ -1191,6 +1199,21 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
 #[cfg(test)]
 mod reasoning_tests {
     use super::*;
+
+    #[test]
+    fn function_tool_wrapper_preserves_large_schema_allocation() {
+        let mut tool = json!({"type":"function","name":"search",
+            "parameters":{"type":"object","description":"P".repeat(512 * 1024)}});
+        let source_ptr = tool["parameters"]["description"].as_str().unwrap().as_ptr();
+        wrap_validated_function_tool(&mut tool);
+        let forwarded = tool["function"]["parameters"]["description"]
+            .as_str()
+            .unwrap();
+        assert_eq!(forwarded.as_ptr(), source_ptr);
+        assert_eq!(forwarded.len(), 512 * 1024);
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["function"]["name"], "search");
+    }
 
     #[test]
     fn large_reasoning_validation_borrows_upstream_text_without_copies() {

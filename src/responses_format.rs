@@ -2,7 +2,7 @@
 //! Input schemas are data, not executable schema validators; the upstream
 //! model/provider is responsible for producing schema-conforming content.
 use axum::http::StatusCode;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 type Failure = (StatusCode, &'static str, &'static str);
 
@@ -90,7 +90,12 @@ pub(super) fn translate_owned(text: Option<Value>) -> Result<Option<Value>, Fail
             let nested = format;
             // Do not flatten or stringify the supplied schema: deep objects,
             // large JSON integer values and optional strict all retain type.
-            Ok(Some(json!({"type":"json_schema","json_schema":nested})))
+            // json! borrows nested Values when serializing and clones their
+            // Strings. Build the two-field envelope by ownership transfer.
+            let mut output = Map::new();
+            output.insert("type".into(), Value::String("json_schema".into()));
+            output.insert("json_schema".into(), Value::Object(nested));
+            Ok(Some(Value::Object(output)))
         }
         _ => Err(unsupported()),
     }
