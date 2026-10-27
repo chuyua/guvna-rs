@@ -4348,6 +4348,40 @@ async fn start_format_probe(output: &'static str) -> (String, Arc<tokio::sync::M
 }
 
 #[tokio::test]
+async fn sse_only_fallback_restores_original_large_stream_options_before_backup() {
+    let (failing, failures) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
+    let (healthy, seen) = start_format_probe("success").await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: sse\n    type: openai\n    base_url: {failing}\n    key_env: SSE\n    stream_only: true\n  - name: backup\n    type: openai\n    base_url: {healthy}\n    key_env: BACKUP\nchains:\n  - name: demo\n    steps:\n      - provider: sse\n        model: sse-model\n      - provider: backup\n        model: backup-model\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        config,
+        HashMap::from([
+            ("SSE".into(), "sse-key".into()),
+            ("BACKUP".into(), "backup-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let metadata = "extra".repeat(100 * 1024);
+    let extras = format!(
+        ",\"stream_options\":{}",
+        json!({
+            "include_usage":false,"trace":metadata
+        })
+    );
+    let (status, body) = call(gateway, request("demo", &extras, "client")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(failures.load(Ordering::SeqCst), 1);
+    let captured = seen.lock().await;
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0]["model"], "backup-model");
+    assert_eq!(captured[0]["stream_options"]["include_usage"], false);
+    assert_eq!(captured[0]["stream_options"]["trace"], metadata);
+    assert!(captured[0].get("stream").is_none());
+}
+
+#[tokio::test]
 async fn responses_text_format_maps_all_supported_types_to_real_upstream_payloads() {
     let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
     let app = make_app(&url, &url);
