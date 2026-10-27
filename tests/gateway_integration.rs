@@ -5602,6 +5602,43 @@ async fn auto_excludes_sse_only_candidate_when_forced_stream_field_exceeds_windo
 }
 
 #[tokio::test]
+async fn auto_stream_only_forced_usage_options_cannot_bypass_context_window() {
+    let (sse_url, sse_hits) = start_upstream(StatusCode::OK).await;
+    let (backup_url, backup_hits) = start_upstream(StatusCode::OK).await;
+    let payload = json!({"model":"auto",
+        "messages":[{"role":"user","content":"hi"}],"max_tokens":80});
+    let mut partial_wire = payload.clone();
+    partial_wire["model"] = json!("sse");
+    partial_wire["stream"] = json!(true);
+    let cap = guvna::routing::auto_context_estimate(&partial_wire) + 1;
+    partial_wire["stream_options"] = json!({"include_usage":true});
+    assert!(guvna::routing::auto_context_estimate(&partial_wire) > cap);
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: sse\n    type: openai\n    base_url: {sse_url}\n    key_env: SSE\n    stream_only: true\n  - name: backup\n    type: openai\n    base_url: {backup_url}\n    key_env: BACKUP\nauto:\n  enabled: true\n  max_candidates: 1\n  candidates:\n    - provider: sse\n      model: sse\n      priority: 0\n      max_context_tokens: {cap}\n    - provider: backup\n      model: short\n      priority: 10\n      max_context_tokens: 8192\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        cfg,
+        HashMap::from([
+            ("SSE".into(), "sse-key".into()),
+            ("BACKUP".into(), "backup-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for _ in 0..2 {
+        let (status, response) = call(
+            gateway.clone(),
+            auto_request("/v1/auto", "client", payload.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["model"], "short");
+    }
+    assert_eq!(sse_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn auto_without_eligible_candidate_returns_422_without_network_attempt() {
     let (url, hits) = start_upstream(StatusCode::OK).await;
     let config: Config = serde_yaml::from_str(&format!(
