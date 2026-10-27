@@ -2,12 +2,12 @@
 //! Request validation, request translation, chat-result translation and
 //! Responses SSE wrapping live here. Dispatch still uses one shared
 //! candidate/failover loop in dispatch.rs; this module never retries upstream.
-use super::dispatch::{BufferedResponseLease, Endpoint, dispatch, hold_buffered_response};
+use super::dispatch::{BufferedResponseLease, Endpoint, dispatch_parsed, hold_buffered_response};
 use super::responses_format;
 use super::{AppState, MAX_BODY_BYTES, authenticated_body, error};
 use axum::{
     Json,
-    body::{Body, Bytes, to_bytes},
+    body::{Body, to_bytes},
     extract::State,
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
@@ -394,9 +394,10 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     // routing-chain default injects n > 1 for ordinary Chat requests.
     object.insert("n".into(), Value::from(1));
     let response_metrics = state.metrics.clone();
-    let response = dispatch(
+    let response = dispatch_parsed(
         state,
-        Bytes::from(value.to_string()),
+        value,
+        large_payload,
         Endpoint::Responses,
         permit,
         None,

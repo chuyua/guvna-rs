@@ -54,6 +54,54 @@ pub(super) async fn dispatch(
     admission: OwnedSemaphorePermit,
     payload_permit: Option<OwnedSemaphorePermit>,
 ) -> Response {
+    dispatch_request(
+        state,
+        DispatchInput::Raw(body),
+        endpoint,
+        admission,
+        payload_permit,
+    )
+    .await
+}
+
+/// Auto and Responses already validate/translate a parsed object. Retain
+/// a single candidate walk without serializing and parsing the JSON again.
+pub(super) async fn dispatch_parsed(
+    state: Arc<AppState>,
+    request: Value,
+    original_large_payload: bool,
+    endpoint: Endpoint,
+    admission: OwnedSemaphorePermit,
+    payload_permit: Option<OwnedSemaphorePermit>,
+) -> Response {
+    dispatch_request(
+        state,
+        DispatchInput::Parsed {
+            request,
+            original_large_payload,
+        },
+        endpoint,
+        admission,
+        payload_permit,
+    )
+    .await
+}
+
+enum DispatchInput {
+    Raw(Bytes),
+    Parsed {
+        request: Value,
+        original_large_payload: bool,
+    },
+}
+
+async fn dispatch_request(
+    state: Arc<AppState>,
+    input: DispatchInput,
+    endpoint: Endpoint,
+    admission: OwnedSemaphorePermit,
+    payload_permit: Option<OwnedSemaphorePermit>,
+) -> Response {
     let started = tokio::time::Instant::now();
     let id = ops_log::next_request_id();
     // Correlation survives process restarts without deriving an id from user data.
@@ -71,7 +119,7 @@ pub(super) async fn dispatch(
     let metrics = Arc::clone(&state.metrics);
     let response = dispatch_inner(
         state,
-        body,
+        input,
         endpoint,
         admission,
         payload_permit,
@@ -328,27 +376,34 @@ fn walk_timeout(metrics: &Metrics) -> Response {
 
 async fn dispatch_inner(
     state: Arc<AppState>,
-    body: Bytes,
+    input: DispatchInput,
     endpoint: Endpoint,
     admission: OwnedSemaphorePermit,
     payload_permit: Option<OwnedSemaphorePermit>,
     started: tokio::time::Instant,
     request_id: &str,
 ) -> Response {
-    let large_payload = body.len() >= super::LARGE_REQUEST_BODY_BYTES;
-    let mut request: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(_) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "invalid_json",
-                "Expected one JSON object",
-            );
+    let (mut request, large_payload): (Value, bool) = match input {
+        DispatchInput::Raw(body) => {
+            let large_payload = body.len() >= super::LARGE_REQUEST_BODY_BYTES;
+            let request = match serde_json::from_slice(&body) {
+                Ok(value) => value,
+                Err(_) => {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_json",
+                        "Expected one JSON object",
+                    );
+                }
+            };
+            // Drop the raw body as soon as the parsed tree owns its strings.
+            (request, large_payload)
         }
+        DispatchInput::Parsed {
+            request,
+            original_large_payload,
+        } => (request, original_large_payload),
     };
-    // The parsed Value owns its strings; release the raw body buffer before
-    // routing and candidate serialization to reduce the per-request peak.
-    drop(body);
     // F02: hold a reservation until the parsed, possibly multi-megabyte JSON
     // Value is actually dropped. Small requests release their slot after
     // parse so 128 normal Chat/SSE requests remain independently admitted.

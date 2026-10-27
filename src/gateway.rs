@@ -818,9 +818,12 @@ async fn auto(State(state): State<Arc<AppState>>, request: Request<Body>) -> Res
         .as_object_mut()
         .expect("checked")
         .insert("model".into(), Value::String("auto".into()));
-    dispatch::dispatch(
+    let original_large_payload = body.len() >= LARGE_REQUEST_BODY_BYTES;
+    drop(body);
+    dispatch::dispatch_parsed(
         state,
-        Bytes::from(value.to_string()),
+        value,
+        original_large_payload,
         dispatch::Endpoint::Chat,
         permit,
         Some(payload_permit),
