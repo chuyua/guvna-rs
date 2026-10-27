@@ -852,13 +852,14 @@ fn reasoning_text(message: &Value) -> Result<Option<String>, ()> {
 }
 
 fn reasoning_item(response_id: &str, text: impl Into<String>, status: &str) -> Value {
-    // Move the owned reasoning string into the output JSON without an extra
-    // potentially multi-megabyte clone.
-    let text = text.into();
-    json!({
+    // Build only the small envelope first. json! can clone owned Strings;
+    // insert the large reasoning text directly to preserve its allocation.
+    let mut item = json!({
         "id":format!("rs_{response_id}"),"type":"reasoning","status":status,
-        "summary":[],"content":[{"type":"reasoning_text","text":text}]
-    })
+        "summary":[],"content":[{"type":"reasoning_text","text":Value::Null}]
+    });
+    item["content"][0]["text"] = Value::String(text.into());
+    item
 }
 
 /// Missing/null usage is compatible with older Chat providers. A present
@@ -1251,6 +1252,18 @@ mod reasoning_tests {
             reasoning_text(&json!({"reasoning_ordered":""})).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn reasoning_output_moves_large_owned_string_without_copying() {
+        let reasoning = "deep".repeat(256 * 1024);
+        let source_ptr = reasoning.as_ptr();
+        let output = reasoning_item("allocated", reasoning, "completed");
+        let forwarded = output["content"][0]["text"].as_str().unwrap();
+        assert_eq!(forwarded.as_ptr(), source_ptr);
+        assert_eq!(forwarded.len(), 1024 * 1024);
+        assert_eq!(output["status"], "completed");
+        assert_eq!(output["type"], "reasoning");
     }
 
     #[tokio::test]
