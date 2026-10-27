@@ -554,7 +554,7 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                             "function_call_output requires call_id",
                         )));
                     };
-                    let Some(output) = item.get("output").and_then(Value::as_str) else {
+                    let Some(_output) = item.get("output").and_then(Value::as_str) else {
                         return Err(Box::new(error(
                             StatusCode::BAD_REQUEST,
                             "invalid_function_output",
