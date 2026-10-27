@@ -468,8 +468,46 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
             let mut messages = Vec::with_capacity(items.len());
             let mut pending_calls = std::collections::HashSet::<String>::new();
             let mut seen_calls = std::collections::HashSet::<String>::new();
+            let mut pending_reasoning: Option<String> = None;
             for item in items {
+                if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                    // Replay only our own completed reasoning wire shape;
+                    // rejecting extra fields avoids silently losing content.
+                    let parts = item.get("content").and_then(Value::as_array);
+                    let valid = item.as_object().is_some_and(|obj| {
+                        obj.keys().all(|key| {
+                            ["type", "id", "status", "summary", "content"].contains(&key.as_str())
+                        })
+                    }) && item["id"].as_str().is_some_and(|id| !id.is_empty())
+                        && item["status"] == "completed"
+                        && item["summary"].as_array().is_some_and(Vec::is_empty)
+                        && parts.is_some_and(|items| {
+                            items.len() == 1
+                                && items[0]["type"] == "reasoning_text"
+                                && items[0]["text"].is_string()
+                                && items[0].as_object().is_some_and(|obj| {
+                                    obj.keys()
+                                        .all(|key| ["type", "text"].contains(&key.as_str()))
+                                })
+                        });
+                    if !valid || pending_reasoning.is_some() || !pending_calls.is_empty() {
+                        return Err(Box::new(error(
+                            StatusCode::NOT_IMPLEMENTED,
+                            "responses_input_unsupported",
+                            "Unsupported reasoning history",
+                        )));
+                    }
+                    pending_reasoning = item["content"][0]["text"].as_str().map(str::to_owned);
+                    continue;
+                }
                 if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+                    if pending_reasoning.is_some() {
+                        return Err(Box::new(error(
+                            StatusCode::BAD_REQUEST,
+                            "unsupported_input",
+                            "Reasoning cannot precede a tool result",
+                        )));
+                    }
                     let Some(call_id) = item
                         .get("call_id")
                         .and_then(Value::as_str)
@@ -584,12 +622,19 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                     if let Some(last) = messages.last_mut().filter(|message: &&mut Value| {
                         message["role"] == "assistant" && message["tool_calls"].is_array()
                     }) {
+                        if let Some(reasoning) = pending_reasoning.take() {
+                            last["reasoning_content"] = Value::String(reasoning);
+                        }
                         last["tool_calls"]
                             .as_array_mut()
                             .expect("checked above")
                             .push(tool_call);
                     } else {
-                        messages.push(json!({"role":"assistant","content":Value::Null,"tool_calls":[tool_call]}));
+                        let mut assistant = json!({"role":"assistant","content":Value::Null,"tool_calls":[tool_call]});
+                        if let Some(reasoning) = pending_reasoning.take() {
+                            assistant["reasoning_content"] = Value::String(reasoning);
+                        }
+                        messages.push(assistant);
                     }
                     continue;
                 }
@@ -709,7 +754,19 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                         "Unsupported message content",
                     )));
                 };
-                messages.push(json!({"role":role,"content":text}));
+                if role != "assistant" {
+                    if let Some(reasoning) = pending_reasoning.take() {
+                        messages.push(json!({"role":"assistant","content":Value::Null,
+                            "reasoning_content":reasoning}));
+                    }
+                }
+                let mut message = json!({"role":role,"content":text});
+                if role == "assistant" {
+                    if let Some(reasoning) = pending_reasoning.take() {
+                        message["reasoning_content"] = Value::String(reasoning);
+                    }
+                }
+                messages.push(message);
             }
             if !pending_calls.is_empty() {
                 return Err(Box::new(error(
@@ -717,6 +774,10 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                     "pending_function_calls",
                     "Function calls require matching output before continuing",
                 )));
+            }
+            if let Some(reasoning) = pending_reasoning {
+                messages.push(json!({"role":"assistant","content":Value::Null,
+                    "reasoning_content":reasoning}));
             }
             Value::Array(messages)
         }
@@ -1322,6 +1383,59 @@ mod reasoning_tests {
         assert_eq!(value["output"].as_array().unwrap().len(), 1);
         assert_eq!(value["output"][0]["type"], "reasoning");
         assert_eq!(value["output_text"], "");
+    }
+
+    #[tokio::test]
+    async fn completed_reasoning_and_text_replay_preserves_both() {
+        let chat = json!({"id":"r1","model":"upstream","choices":[{"index":0,
+            "message":{"role":"assistant","reasoning_content":"thinking","content":"answer"},
+            "finish_reason":"stop"}]});
+        let response = translate_chat_result(chat, "logical".into(), Value::Null);
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let output: Value = serde_json::from_slice(&bytes).unwrap();
+        let mut history = output["output"].as_array().unwrap().clone();
+        history.push(json!({"role":"user","content":"continue"}));
+        assert_eq!(
+            translate_input(Value::Array(history)).unwrap(),
+            json!([
+                {"role":"assistant","content":"answer","reasoning_content":"thinking"},
+                {"role":"user","content":"continue"}
+            ])
+        );
+    }
+
+    #[test]
+    fn reasoning_only_and_tool_call_replay_rejects_unknown_or_incomplete_items() {
+        assert_eq!(
+            translate_input(json!([reasoning_item("r", "thought", "completed")])).unwrap(),
+            json!([{"role":"assistant","content":null,"reasoning_content":"thought"}])
+        );
+        let history = json!([
+            reasoning_item("t", "why tool", "completed"),
+            {"type":"function_call","id":"call_a","call_id":"call_a",
+                "name":"lookup","arguments":"{}","status":"completed"},
+            {"type":"function_call_output","call_id":"call_a","output":"found"}
+        ]);
+        assert_eq!(
+            translate_input(history).unwrap(),
+            json!([
+                {"role":"assistant","content":null,"reasoning_content":"why tool",
+                    "tool_calls":[{"id":"call_a","type":"function",
+                        "function":{"name":"lookup","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"call_a","content":"found"}
+            ])
+        );
+        for invalid in [
+            reasoning_item("bad", "truncated", "incomplete"),
+            json!({"type":"reasoning","id":"r","status":"completed",
+                "summary":[{"text":"cannot discard"}],
+                "content":[{"type":"reasoning_text","text":"thought"}]}),
+            json!({"type":"reasoning","id":"r","status":"completed","summary":[],
+                "content":[{"type":"reasoning_text","text":"thought","unknown":"field"}]}),
+        ] {
+            assert!(translate_input(json!([invalid])).is_err());
+        }
     }
 
     #[test]

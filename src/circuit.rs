@@ -531,6 +531,43 @@ mod tests {
     }
 
     #[test]
+    fn native_json_lease_allows_progress_but_keeps_hard_expiry() {
+        let breaker = circuit();
+        let start = Instant::now();
+        for _ in 0..3 {
+            let mut ticket = breaker.admit_at(start).unwrap();
+            ticket.failure_at(start);
+        }
+        let opened = start + Duration::from_millis(100);
+        let mut probe = breaker.admit_at(opened).unwrap();
+        breaker.configure_probe_idle_timeout(&probe, Duration::from_secs(90), opened);
+        assert!(breaker.admit_at(opened + Duration::from_secs(25)).is_none());
+        probe.progress_at(opened + Duration::from_secs(80));
+        assert!(
+            breaker
+                .admit_at(opened + Duration::from_secs(100))
+                .is_none()
+        );
+        assert!(probe.success_at(opened + Duration::from_secs(110)));
+        assert!(
+            breaker
+                .admit_at(opened + Duration::from_secs(111))
+                .is_some()
+        );
+
+        let later = opened + Duration::from_secs(140);
+        for _ in 0..3 {
+            let mut ticket = breaker.admit_at(later).unwrap();
+            ticket.failure_at(later);
+        }
+        let next = later + Duration::from_millis(100);
+        let mut stale = breaker.admit_at(next).unwrap();
+        breaker.configure_probe_idle_timeout(&stale, Duration::from_secs(90), next);
+        stale.progress_at(next + Duration::from_secs(100));
+        assert!(!stale.success_at(next + Duration::from_secs(121)));
+    }
+
+    #[test]
     fn endlessly_progressing_probe_still_has_hard_deadline_and_stale_fence() {
         let breaker = circuit();
         let start = Instant::now();

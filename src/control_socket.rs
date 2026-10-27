@@ -303,21 +303,27 @@ async fn handle_client(
                 // be serialized. Dropping a timeout around spawn_blocking is
                 // essential: orphaned filesystem writes cannot race a newer
                 // snapshot into the older in-memory state.
-                let _serial = mutation_gate.lock().await;
-                let base = Arc::clone(&base_config);
-                let local_dir = directory.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let output = chain_store::execute(&base, &local_dir, cmd)?;
-                    let routes = base.as_ref().clone().with_runtime_chains(&local_dir)?;
-                    Ok::<_, String>((output, routes))
-                })
-                .await;
-                match result {
-                    Ok(Ok((output, routes))) => match state.replace_route_snapshot(routes) {
-                        Ok(()) => json!({"ok":true,"online":true,"result":output}),
-                        Err(_) => json!({"error":"route_reload_failed"}),
-                    },
-                    _ => json!({"error":"chain_update_failed"}),
+                match mutation_gate.try_lock() {
+                    Ok(_serial) => {
+                        let base = Arc::clone(&base_config);
+                        let local_dir = directory.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let output = chain_store::execute(&base, &local_dir, cmd)?;
+                            let routes = base.as_ref().clone().with_runtime_chains(&local_dir)?;
+                            Ok::<_, String>((output, routes))
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok((output, routes))) => {
+                                match state.replace_route_snapshot(routes) {
+                                    Ok(()) => json!({"ok":true,"online":true,"result":output}),
+                                    Err(_) => json!({"error":"route_reload_failed"}),
+                                }
+                            }
+                            _ => json!({"error":"chain_update_failed"}),
+                        }
+                    }
+                    Err(_) => json!({"error":"chain_update_busy"}),
                 }
             }
         }
@@ -677,7 +683,20 @@ mod tests {
         let a = query_chain_mutation(dir.path(), "chains_set", first.to_str().unwrap());
         let b = query_chain_mutation(dir.path(), "chains_set", second.to_str().unwrap());
         let (a, b) = tokio::join!(a, b);
-        for output in [a.unwrap().unwrap(), b.unwrap().unwrap()] {
+        for (output, path) in [
+            (a.unwrap().unwrap(), &first),
+            (b.unwrap().unwrap(), &second),
+        ] {
+            // A busy mutation is rejected rather than queued behind a
+            // potentially blocked disk writer; CLI can retry explicitly.
+            let output = if output.contains("chain_update_busy") {
+                query_chain_mutation(dir.path(), "chains_set", path.to_str().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            } else {
+                output
+            };
             assert!(
                 output.contains("\"online\": true") || output.contains("\"online\":true"),
                 "{output}"

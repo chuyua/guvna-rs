@@ -870,6 +870,15 @@ async fn dispatch_inner(
             && let Some(ticket) = circuit_ticket.as_mut()
         {
             ticket.configure_stream_idle_timeout(chat_aggregate::STREAM_IDLE);
+        } else if !upstream_stream
+            && !streaming
+            && let Some(ticket) = circuit_ticket.as_mut()
+        {
+            // Native JSON can legitimately spend nearly the entire 90s
+            // upstream attempt reading headers and body. The default 20s
+            // probe lease must not fence a healthy recovery before that
+            // same bounded request deadline expires.
+            ticket.configure_stream_idle_timeout(Duration::from_secs(90));
         }
         // Chain defaults are applied per candidate. An injected n must drive
         // the SSE parser and SSE-to-JSON aggregator just like a caller n;
@@ -1178,7 +1187,11 @@ async fn dispatch_inner(
                 } else {
                     tokio::time::timeout_at(
                         deadline,
-                        bounded_json(upstream, Arc::clone(&state.large_response_slots)),
+                        bounded_json(
+                            upstream,
+                            Arc::clone(&state.large_response_slots),
+                            circuit_ticket.as_mut(),
+                        ),
                     )
                     .await
                 };
@@ -1511,6 +1524,7 @@ async fn bounded_error_json(mut upstream: reqwest::Response) -> Option<Value> {
 async fn bounded_json(
     response: reqwest::Response,
     large_slots: Arc<tokio::sync::Semaphore>,
+    mut circuit_ticket: Option<&mut crate::circuit::Ticket>,
 ) -> Result<(Value, Option<BufferedResponseLease>), JsonReadFailure> {
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
@@ -1519,6 +1533,13 @@ async fn bounded_json(
         let chunk = chunk.map_err(|_| JsonReadFailure::Invalid)?;
         if chunk.len() > MAX_BODY_BYTES.saturating_sub(bytes.len()) {
             return Err(JsonReadFailure::Invalid);
+        }
+        if !chunk.is_empty() {
+            // Real upstream progress renews the idle lease; merely waiting
+            // for the body or acquiring local capacity must not do so.
+            if let Some(ticket) = circuit_ticket.as_mut() {
+                ticket.progress();
+            }
         }
         if reservation.is_none()
             && bytes.len().saturating_add(chunk.len()) > super::LARGE_RESPONSE_BODY_BYTES

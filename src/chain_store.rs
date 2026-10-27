@@ -10,7 +10,8 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_CHAIN_FILE_BYTES: usize = 1024 * 1024;
@@ -197,8 +198,20 @@ fn lock_directory(data_dir: &Path) -> Result<(PathBuf, File), String> {
             ));
         }
     }
-    lock.lock_exclusive()
-        .map_err(|e| format!("locking {}: {e}", path.display()))?;
+    // A stalled second writer must not block the CLI forever.
+    let lock_deadline = Instant::now() + Duration::from_millis(750);
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= lock_deadline {
+                    return Err(format!("lock {} is busy", path.display()));
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => return Err(format!("locking {}: {err}", path.display())),
+        }
+    }
     // The pathname must still identify the locked inode. Otherwise a
     // concurrent unlink/recreate could give two writers different locks.
     #[cfg(unix)]
@@ -505,6 +518,18 @@ mod lock_security_tests {
         let (second_directory, second) = lock_directory(dir.path()).unwrap();
         assert_eq!(first_directory, second_directory);
         drop(second);
+    }
+
+    #[test]
+    fn held_chain_lock_fails_bounded_then_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, held) = lock_directory(dir.path()).unwrap();
+        let start = Instant::now();
+        let failure = lock_directory(dir.path()).unwrap_err();
+        assert!(failure.contains("busy"), "{failure}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        drop(held);
+        assert!(lock_directory(dir.path()).is_ok());
     }
 
     #[test]
