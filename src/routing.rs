@@ -897,6 +897,37 @@ mod tests {
                 "short"
             );
         }
+        // An explicit false stream field is replaced with true on the wire,
+        // shrinking the encoded request by one byte. The exact context
+        // boundary must still admit this candidate (as must native SSE).
+        let mut explicit_off = request.clone();
+        explicit_off["stream"] = json!(false);
+        let mut actual = explicit_off.clone();
+        actual["model"] = json!("sse");
+        actual["stream"] = json!(true);
+        let mut exact = config.clone();
+        exact.auto.candidates[0].max_context_tokens = Some(auto_context_estimate(&actual));
+        for value in [false, true] {
+            let mut candidate_request = request.clone();
+            candidate_request["stream"] = json!(value);
+            let (request_bytes, context_estimate) =
+                auto_request_bytes_and_context_estimate(&candidate_request);
+            let chosen = AutoRouteCache::new()
+                .resolve_for_request(
+                    &exact,
+                    AutoRequestBudget {
+                        input_bytes: auto_input_bytes(candidate_request.get("messages")),
+                        request_bytes,
+                        context_estimate,
+                    },
+                    &candidate_request,
+                    auto_requirements(&candidate_request),
+                    &[],
+                    2,
+                )
+                .unwrap();
+            assert_eq!(chosen[0].model, "sse", "caller stream={value}");
+        }
     }
 
     #[test]
