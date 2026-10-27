@@ -3249,6 +3249,59 @@ async fn responses_stateless_metadata_and_mode_contract() {
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn responses_malformed_present_usage_fails_over_without_false_success() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let invalid = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let calls = Arc::clone(&seen);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({
+                    "id":"wrong-usage","model":"bad","created":123,
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"wrong"},
+                                "finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":1}
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let _task = tokio::spawn(async move { axum::serve(listener, invalid).await.unwrap() });
+    let (backup, backup_calls) = start_upstream(StatusCode::OK).await;
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: bad\n    type: openai\n    base_url: http://{address}\n    key_env: BAD\n  - name: good\n    type: openai\n    base_url: {backup}\n    key_env: GOOD\nchains:\n  - name: demo\n    steps:\n      - provider: bad\n        model: broken\n      - provider: good\n        model: healthy\n"
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        cfg,
+        HashMap::from([
+            ("BAD".into(), "bad-key".into()),
+            ("GOOD".into(), "good-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, output) = call(
+        router.clone(),
+        responses_stream_req(json!({"model":"demo","input":"hi"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(output["output_text"], "success");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        1
+    );
+    assert_eq!(metric_value(&metrics, "upstream_success_total"), 1);
+}
+
 fn responses_stream_req(payload: Value) -> Request<Body> {
     Request::builder()
         .method("POST")

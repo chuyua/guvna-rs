@@ -69,7 +69,15 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             "model must be a nonempty string",
         );
     };
-    let Some(input) = value.get("input").cloned() else {
+    // Input can be a multi-megabyte conversation. Move its JSON tree into the
+    // translator instead of cloning the entire tree while the parsed request
+    // still owns the original. The field is removed before upstream dispatch
+    // either way, so this does not alter the wire contract.
+    let Some(input) = value
+        .as_object_mut()
+        .expect("checked above")
+        .remove("input")
+    else {
         return error(
             StatusCode::BAD_REQUEST,
             "missing_input",
@@ -819,19 +827,31 @@ fn reasoning_item(response_id: &str, text: &str, status: &str) -> Value {
     })
 }
 
+/// Missing/null usage is compatible with older Chat providers. A present
+/// usage payload must never be silently discarded, including empty objects.
+fn parse_chat_usage(chat: &Value) -> Result<Option<(u64, u64, u64)>, ()> {
+    let Some(usage) = chat.get("usage").filter(|usage| !usage.is_null()) else {
+        return Ok(None);
+    };
+    let (Some(input), Some(output), Some(total)) = (
+        usage.get("prompt_tokens").and_then(Value::as_u64),
+        usage.get("completion_tokens").and_then(Value::as_u64),
+        usage.get("total_tokens").and_then(Value::as_u64),
+    ) else {
+        return Err(());
+    };
+    if input.checked_add(output) != Some(total) {
+        return Err(());
+    }
+    Ok(Some((input, output, total)))
+}
+
 /// Validate the endpoint-specific conversion contract *before* the shared
 /// candidate walker commits its success, health and key-lease accounting.
 /// This does not route/retry; it only rejects unusable Chat responses.
 pub(super) fn translatable_chat_result(chat: &Value) -> bool {
-    let usage = &chat["usage"];
-    match (
-        usage["prompt_tokens"].as_u64(),
-        usage["completion_tokens"].as_u64(),
-        usage["total_tokens"].as_u64(),
-    ) {
-        (Some(input), Some(output), Some(total)) if input.checked_add(output) == Some(total) => {}
-        (None, None, None) => {}
-        _ => return false,
+    if parse_chat_usage(chat).is_err() {
+        return false;
     }
     let Some(choices) = chat.get("choices").and_then(Value::as_array) else {
         return false;
@@ -907,17 +927,12 @@ pub(super) fn translatable_chat_result(chat: &Value) -> bool {
 
 fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) -> Response {
     // Validate and translate usage once for both text and function-call responses.
-    let usage = &chat["usage"];
-    let translated_usage = match (
-        usage["prompt_tokens"].as_u64(),
-        usage["completion_tokens"].as_u64(),
-        usage["total_tokens"].as_u64(),
-    ) {
-        (Some(input), Some(output), Some(total)) if input.checked_add(output) == Some(total) => {
+    let translated_usage = match parse_chat_usage(&chat) {
+        Ok(Some((input, output, total))) => {
             json!({"input_tokens":input,"output_tokens":output,"total_tokens":total})
         }
-        (None, None, None) => Value::Null,
-        _ => {
+        Ok(None) => Value::Null,
+        Err(()) => {
             return error(
                 StatusCode::BAD_GATEWAY,
                 "invalid_upstream_usage",
@@ -1149,6 +1164,40 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
 #[cfg(test)]
 mod reasoning_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_present_chat_usage_cannot_be_silently_discarded() {
+        let mut chat = json!({
+            "id":"chatcmpl-usage","model":"physical","created":123,
+            "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},
+                "finish_reason":"stop"}]
+        });
+        for invalid in [
+            json!({}),
+            json!({"prompt_tokens":4}),
+            json!({"prompt_tokens":4,"completion_tokens":2}),
+            json!({"prompt_tokens":4,"completion_tokens":2,"total_tokens":7}),
+            json!({"prompt_tokens":-1,"completion_tokens":2,"total_tokens":1}),
+            json!("not a usage object"),
+        ] {
+            chat["usage"] = invalid;
+            assert!(!translatable_chat_result(&chat));
+            assert_eq!(
+                translate_chat_result(chat.clone(), "demo".into(), Value::Null).status(),
+                StatusCode::BAD_GATEWAY
+            );
+        }
+        chat["usage"] = json!({"prompt_tokens":4,"completion_tokens":2,"total_tokens":6});
+        assert!(translatable_chat_result(&chat));
+        let good = translate_chat_result(chat.clone(), "demo".into(), Value::Null);
+        let body = to_bytes(good.into_body(), 1 << 20).await.unwrap();
+        let response: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["usage"]["total_tokens"], 6);
+        chat["usage"] = Value::Null;
+        assert!(translatable_chat_result(&chat));
+        chat.as_object_mut().unwrap().remove("usage");
+        assert!(translatable_chat_result(&chat));
+    }
 
     #[tokio::test]
     async fn responses_created_at_is_numeric_and_preserves_upstream_timestamps() {
