@@ -754,17 +754,17 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                         "Unsupported message content",
                     )));
                 };
-                if role != "assistant" {
-                    if let Some(reasoning) = pending_reasoning.take() {
-                        messages.push(json!({"role":"assistant","content":Value::Null,
-                            "reasoning_content":reasoning}));
-                    }
+                if role != "assistant"
+                    && let Some(reasoning) = pending_reasoning.take()
+                {
+                    messages.push(json!({"role":"assistant","content":Value::Null,
+                        "reasoning_content":reasoning}));
                 }
                 let mut message = json!({"role":role,"content":text});
-                if role == "assistant" {
-                    if let Some(reasoning) = pending_reasoning.take() {
-                        message["reasoning_content"] = Value::String(reasoning);
-                    }
+                if role == "assistant"
+                    && let Some(reasoning) = pending_reasoning.take()
+                {
+                    message["reasoning_content"] = Value::String(reasoning);
                 }
                 messages.push(message);
             }
