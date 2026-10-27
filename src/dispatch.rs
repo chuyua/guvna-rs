@@ -603,10 +603,11 @@ async fn dispatch_inner(
             .any(|candidate| !candidate.params.is_empty());
         let choose = |features| {
             if has_candidate_defaults {
-                routing::resolve_auto_for_request(
+                routing::resolve_auto_for_request_sized(
                     &route_snapshot,
                     input_bytes,
                     &request,
+                    request_bytes,
                     features,
                     &initial_auto_penalties,
                 )
@@ -628,21 +629,13 @@ async fn dispatch_inner(
         let mut resolved = choose(requirements);
         if matches!(&resolved, Ok(steps) if steps.is_empty())
             && !caller_context_bound
-            && if has_candidate_defaults {
-                routing::auto_operator_default_can_degrade_for_request(
-                    &route_snapshot,
-                    input_bytes,
-                    &request,
-                    requirements,
-                )
-            } else {
-                routing::auto_operator_default_can_degrade(
-                    &route_snapshot,
-                    input_bytes,
-                    context_estimate,
-                    requirements,
-                )
-            }
+            && routing::auto_operator_default_can_degrade_for_request_sized(
+                &route_snapshot,
+                input_bytes,
+                &request,
+                request_bytes,
+                requirements,
+            )
         {
             // Keep context-length budgeting and capability hard filters intact.
             // A second bounded cache lookup cannot issue network requests.

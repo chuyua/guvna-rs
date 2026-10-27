@@ -592,13 +592,28 @@ pub fn auto_operator_default_can_degrade_for_request(
     request: &Value,
     requirements: AutoRequirements,
 ) -> bool {
+    auto_operator_default_can_degrade_for_request_sized(
+        config,
+        input_bytes,
+        request,
+        encoded_json_bytes(Some(request)),
+        requirements,
+    )
+}
+
+pub(crate) fn auto_operator_default_can_degrade_for_request_sized(
+    config: &Config,
+    input_bytes: usize,
+    request: &Value,
+    request_bytes: usize,
+    requirements: AutoRequirements,
+) -> bool {
     if requirements.min_context == 0
         || requirements.max_context.is_some()
         || config.auto.candidates.is_empty()
     {
         return false;
     }
-    let request_bytes = encoded_json_bytes(Some(request));
     let relaxed = requirements.with_context_bounds(0, None);
     config.auto.candidates.iter().any(|candidate| {
         auto_candidate_eligible_for_request(
@@ -630,7 +645,7 @@ pub fn resolve_auto_for_request(
     )
 }
 
-fn resolve_auto_for_request_sized(
+pub(crate) fn resolve_auto_for_request_sized(
     config: &Config,
     input_bytes: usize,
     request: &Value,
@@ -828,7 +843,7 @@ mod tests {
         let yaml = format!(
             "providers:\n  - name: p\n    type: openai\n    base_url: https://example.invalid\n    key_env: K\nauto:\n  enabled: true\n  max_candidates: 1\n  candidates:\n    - provider: p\n      model: {long_model}\n      priority: 0\n      max_context_tokens: 450\n    - provider: p\n      model: short\n      priority: 10\n      max_context_tokens: 450\n"
         );
-        let mut config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
         config.validate().unwrap();
         let request = json!({"model":"auto","messages":[{"role":"user","content":"hi"}],
             "max_tokens":80});
