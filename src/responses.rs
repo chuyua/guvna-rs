@@ -585,8 +585,7 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                             "Function names must be 1-64 ASCII letters, digits, '_' or '-'",
                         )));
                     }
-                    if !serde_json::from_str::<Value>(arguments)
-                        .is_ok_and(|value| value.is_object())
+                    if !crate::sse::valid_json_output(arguments, true)
                         || item.as_object().is_none_or(|map| {
                             map.keys().any(|key| {
                                 !["type", "call_id", "name", "arguments", "id", "status"]
@@ -933,7 +932,7 @@ pub(super) fn translatable_chat_result(chat: &Value) -> bool {
                 && call["function"]["arguments"].as_str().is_some_and(|args| {
                     finish != Some("tool_calls")
                         || args.is_empty()
-                        || serde_json::from_str::<Value>(args).is_ok_and(|value| value.is_object())
+                        || crate::sse::valid_json_output(args, true)
                 })
         });
     }
@@ -1112,8 +1111,7 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
             if call["type"] != "function"
                 || (output_status == "completed"
                     && !arguments.is_empty()
-                    && !serde_json::from_str::<Value>(arguments)
-                        .is_ok_and(|value| value.is_object()))
+                    && !crate::sse::valid_json_output(arguments, true))
                 || !seen_ids.insert(id)
             {
                 return error(

@@ -670,8 +670,7 @@ impl ResponsesSse {
                     if !self.tools.iter().all(|tool| {
                         tool.arguments_seen
                             && (tool.arguments.is_empty()
-                                || serde_json::from_str::<Value>(&tool.arguments)
-                                    .is_ok_and(|value| value.is_object()))
+                                || crate::sse::valid_json_output(&tool.arguments, true))
                     }) {
                         return Err(());
                     }

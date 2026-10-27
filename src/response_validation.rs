@@ -196,8 +196,7 @@ fn validate_chat_with_params(
                         .is_some_and(|s| {
                             matches!(reason, Some("length" | "content_filter"))
                                 || s.is_empty()
-                                || serde_json::from_str::<Value>(s)
-                                    .is_ok_and(|args| args.is_object())
+                                || crate::sse::valid_json_output(s, true)
                         });
                 if !valid {
                     return false;
