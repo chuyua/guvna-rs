@@ -1512,6 +1512,44 @@ chains:
         sockets[0].close()
         sockets.clear()
         time.sleep(0.3)
+        # Completing the downstream HTTP body is a different release path
+        # from cancellation. Consume an entire new 12 MiB response slowly
+        # over the real TCP socket without retaining it in the test client.
+        slow_read_bytes = None
+        for attempt in range(5):
+            if attempt:
+                time.sleep(0.25)
+            try:
+                with urlopen(request, timeout=20) as response:
+                    check(response.status == 200, "slow reader HTTP response failed")
+                    total = 0
+                    while chunk := response.read(8192):
+                        total += len(chunk)
+                        time.sleep(0.0005)
+                    slow_read_bytes = total
+                    break
+            except HTTPError as error:
+                check(error.code == 503,
+                      f"unexpected recovery status during slow read: {error.code}")
+                error.close()
+        check(slow_read_bytes is not None
+              and slow_read_bytes >= len(upstream.large_response),
+              "slow reading failed to drain a complete large HTTP body")
+        metrics_req = Request(
+            f"http://127.0.0.1:{gateway_port}/metrics",
+            headers={"Authorization": "Bearer only-for-local-test"})
+        with urlopen(metrics_req, timeout=3) as response:
+            metrics_text = response.read(16 << 10).decode("utf-8")
+        metrics = {
+            key: int(value) for line in metrics_text.splitlines()
+            if line.startswith("guvna_")
+            for key, sep, value in [line.partition(" ")] if sep
+        }
+        for metric in ("guvna_upstream_transport_failures_total",
+                       "guvna_credential_quarantines_total",
+                       "guvna_upstream_invalid_responses_total"):
+            check(metrics.get(metric) == 0,
+                  f"slow downstream TCP was incorrectly blamed on provider: {metric}")
         after = proc_info(proc.pid)
         check(after["VmRSS"] <= LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB * 1024,
               f"large TCP responses retained {after['VmRSS'] / 1024:.1f} MiB RSS")
@@ -1527,6 +1565,12 @@ chains:
             "third_error": third_result["error"]["code"],
             "retry_after_seconds": third_retry,
             "recovered_status": recovered,
+            "slow_read_full_body_bytes": slow_read_bytes,
+            "provider_health_metrics": {
+                metric: metrics[metric] for metric in (
+                    "guvna_upstream_transport_failures_total",
+                    "guvna_credential_quarantines_total",
+                    "guvna_upstream_invalid_responses_total")},
             "primary_attempts": upstream.calls,
             "rss_before_kib": before["VmRSS"],
             "rss_high_watermark_kib": after["VmHWM"],
