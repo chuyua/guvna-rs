@@ -2,7 +2,7 @@
 //! Input schemas are data, not executable schema validators; the upstream
 //! model/provider is responsible for producing schema-conforming content.
 use axum::http::StatusCode;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 type Failure = (StatusCode, &'static str, &'static str);
 
@@ -21,27 +21,38 @@ fn unsupported() -> Failure {
     )
 }
 
-pub(super) fn translate(text: Option<&Value>) -> Result<Option<Value>, Failure> {
+#[cfg(test)]
+fn translate(text: Option<&Value>) -> Result<Option<Value>, Failure> {
+    translate_owned(text.cloned())
+}
+
+/// The Responses handler owns its input tree. Move the JSON Schema into the
+/// Chat envelope instead of cloning a potentially multi-megabyte schema.
+pub(super) fn translate_owned(text: Option<Value>) -> Result<Option<Value>, Failure> {
     let Some(text) = text else {
         return Ok(None);
     };
-    let Some(wrapper) = text.as_object() else {
+    let Value::Object(mut wrapper) = text else {
         return Err(malformed());
     };
     // verbosity and other Responses-specific options must not vanish silently.
     if wrapper.keys().any(|key| key != "format") {
         return Err(unsupported());
     }
-    let Some(raw) = wrapper.get("format") else {
+    let Some(raw) = wrapper.remove("format") else {
         return Ok(None); // Explicit {} behaves like the default text format.
     };
-    let Some(format) = raw.as_object() else {
+    let Value::Object(mut format) = raw else {
         return Err(malformed());
     };
-    let Some(kind) = format.get("type").and_then(Value::as_str) else {
+    let Some(kind) = format
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
         return Err(malformed());
     };
-    match kind {
+    match kind.as_str() {
         "text" | "json_object" => {
             if format.len() != 1 {
                 return Err(unsupported());
@@ -75,12 +86,8 @@ pub(super) fn translate(text: Option<&Value>) -> Result<Option<Value>, Failure> 
             {
                 return Err(malformed());
             }
-            let mut nested = Map::new();
-            for key in ["name", "description", "schema", "strict"] {
-                if let Some(value) = format.get(key) {
-                    nested.insert(key.into(), value.clone());
-                }
-            }
+            format.remove("type");
+            let nested = format;
             // Do not flatten or stringify the supplied schema: deep objects,
             // large JSON integer values and optional strict all retain type.
             Ok(Some(json!({"type":"json_schema","json_schema":nested})))
@@ -92,6 +99,25 @@ pub(super) fn translate(text: Option<&Value>) -> Result<Option<Value>, Failure> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owned_schema_translation_reuses_large_text_allocation() {
+        let description = "schema".repeat(128 * 1024);
+        let input = json!({
+            "format": {"type":"json_schema","name":"result",
+                "schema":{"type":"object","description":description},
+                "strict":true}
+        });
+        let source = input["format"]["schema"]["description"].as_str().unwrap();
+        let source_ptr = source.as_ptr();
+        let result = translate_owned(Some(input)).unwrap().unwrap();
+        let target = result["json_schema"]["schema"]["description"]
+            .as_str()
+            .unwrap();
+        assert_eq!(target.as_ptr(), source_ptr);
+        assert_eq!(target.len(), 6 * 128 * 1024);
+        assert_eq!(result["json_schema"]["strict"], true);
+    }
+
     #[test]
     fn equivalent_modes_map_without_dropping_schema_fields() {
         assert_eq!(translate(None), Ok(None));

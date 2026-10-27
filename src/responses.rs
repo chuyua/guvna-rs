@@ -230,7 +230,7 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     }
     // Structured text output uses a different envelope in Responses and Chat.
     // Translate only modes whose parameters can be forwarded without loss.
-    let mapped_text_format = match responses_format::translate(object.get("text")) {
+    let mapped_text_format = match responses_format::translate_owned(object.remove("text")) {
         Ok(format) => format,
         Err(problem) => return error(problem.0, problem.1, problem.2),
     };
@@ -310,7 +310,9 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
                     "Invalid function declaration fields",
                 );
             }
-            let mut function = map.clone();
+            // The tool value is replaced immediately below. Move its owned
+            // JSON schema rather than copying every nested parameters field.
+            let mut function = std::mem::take(map);
             function.remove("type");
             *tool = json!({"type":"function","function":function});
         }

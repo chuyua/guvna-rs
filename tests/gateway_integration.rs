@@ -4431,6 +4431,38 @@ async fn responses_json_schema_and_tools_are_combined_without_loss_or_duplicate_
 }
 
 #[tokio::test]
+async fn responses_large_schema_and_tool_parameters_forward_without_data_loss() {
+    let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
+    let app = make_app(&url, &url);
+    let schema_description = "S".repeat(256 * 1024);
+    let function_description = "T".repeat(256 * 1024);
+    let input = json!({
+        "model":"demo", "input":"describe the payload",
+        "text":{"format":{"type":"json_schema","name":"large",
+            "schema":{"type":"object","description":schema_description},
+            "strict":true}},
+        "tools":[{"type":"function","name":"lookup",
+            "parameters":{"type":"object","description":function_description}}],
+        "tool_choice":"auto"
+    });
+    let (status, response) = call(app, responses_stream_req(input)).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let incoming = seen.lock().await;
+    assert_eq!(incoming.len(), 1);
+    let translated = &incoming[0];
+    assert_eq!(
+        translated["response_format"]["json_schema"]["schema"]["description"],
+        schema_description
+    );
+    assert_eq!(
+        translated["tools"][0]["function"]["parameters"]["description"],
+        function_description
+    );
+    assert!(translated.get("text").is_none());
+    assert_eq!(translated["tools"][0]["function"]["name"], "lookup");
+}
+
+#[tokio::test]
 async fn responses_forced_tool_choice_ignoring_upstream_fails_over() {
     let (url, seen) = start_format_probe("ordinary text").await;
     let app = make_app(&url, &url);
