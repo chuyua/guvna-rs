@@ -1044,6 +1044,27 @@ fn drop_batch(batch: &[Event], metrics: &Metrics) {
     Metrics::inc(&metrics.telemetry_write_failures);
 }
 
+/// The background worker is the only writer. Test the FULL -> bounded
+/// reclamation -> retry sequence with a capped SQLite connection.
+fn write_batch_with_recovery(
+    conn: &mut Connection,
+    batch: &[Event],
+    now: i64,
+) -> rusqlite::Result<()> {
+    let result = write_batch(conn, batch);
+    match result {
+        Err(error)
+            if matches!(&error, rusqlite::Error::SqliteFailure(sqlite, _)
+                if sqlite.code == rusqlite::ErrorCode::DiskFull)
+                && recover_page_capacity(conn, now).unwrap_or(false) =>
+        {
+            crate::ops_log::warn("telemetry_page_capacity_recovered");
+            write_batch(conn, batch)
+        }
+        result => result,
+    }
+}
+
 fn worker(receiver: Receiver<TelemetryMessage>, path: PathBuf, metrics: Arc<Metrics>) {
     let mut conn = match open_database(&path) {
         Ok(database) => Some(database),
@@ -1117,20 +1138,8 @@ fn worker(receiver: Receiver<TelemetryMessage>, path: PathBuf, metrics: Arc<Metr
                 }
             }
         }
-        let write_result = write_batch(conn.as_mut().expect("opened above"), &batch);
-        let write_result = match write_result {
-            Err(error)
-                if matches!(&error, rusqlite::Error::SqliteFailure(sqlite, _)
-                    if sqlite.code == rusqlite::ErrorCode::DiskFull)
-                    && conn.as_mut().is_some_and(|db| {
-                        recover_page_capacity(db, now_secs()).unwrap_or(false)
-                    }) =>
-            {
-                crate::ops_log::warn("telemetry_page_capacity_recovered");
-                write_batch(conn.as_mut().expect("connection held"), &batch)
-            }
-            result => result,
-        };
+        let write_result =
+            write_batch_with_recovery(conn.as_mut().expect("opened above"), &batch, now_secs());
         match write_result {
             Ok(()) => {
                 secure_sidecars(&path);
@@ -2376,6 +2385,53 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn sqlite_full_worker_retry_persists_current_and_subsequent_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_database(&dir.path().join("full-then-recover.sqlite3")).unwrap();
+        let now = now_secs();
+        // Fill the request-event btree with reclaimable recent diagnostic
+        // rows, then forbid file growth on this same writer connection.
+        let seed = (0..1024)
+            .map(|_| event(now - 1, "p", "seed", 200, 1, "success"))
+            .collect::<Vec<_>>();
+        write_batch(&mut conn, &seed).unwrap();
+        let pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        let max_pages: i64 = conn
+            .query_row(&format!("PRAGMA max_page_count={pages}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(max_pages, pages);
+        let batch = (0..64)
+            .map(|index| event(now, "p", &format!("new-{index}"), 503, 2, "provider_5xx"))
+            .collect::<Vec<_>>();
+        let first_attempt = write_batch(&mut conn, &batch);
+        assert!(
+            matches!(first_attempt, Err(rusqlite::Error::SqliteFailure(sqlite, _))
+                if sqlite.code == rusqlite::ErrorCode::DiskFull),
+            "batch must genuinely encounter SQLITE_FULL before recovery"
+        );
+        write_batch_with_recovery(&mut conn, &batch, now)
+            .expect("worker must reclaim event pages and retry the batch");
+        write_batch_with_recovery(
+            &mut conn,
+            &[event(now, "p", "new-0", 200, 1, "success")],
+            now,
+        )
+        .expect("subsequent batch must remain writable after a recovered SQLITE_FULL");
+        let recent: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM request_events WHERE model LIKE 'new-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recent, 65);
     }
 
     #[test]
