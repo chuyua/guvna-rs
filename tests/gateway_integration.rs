@@ -5565,6 +5565,43 @@ async fn auto_cached_routes_filter_long_physical_model_before_network_and_keep_s
 }
 
 #[tokio::test]
+async fn auto_excludes_sse_only_candidate_when_forced_stream_field_exceeds_window() {
+    let (sse_url, sse_calls) = start_upstream(StatusCode::OK).await;
+    let (json_url, json_calls) = start_upstream(StatusCode::OK).await;
+    let payload =
+        json!({"model":"auto","messages":[{"role":"user","content":"hi"}],"max_tokens":80});
+    let mut physical = payload.clone();
+    physical["model"] = json!("sse");
+    let limit = guvna::routing::auto_context_estimate(&physical) + 1;
+    physical["stream"] = json!(true);
+    assert!(guvna::routing::auto_context_estimate(&physical) > limit);
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: sse\n    type: openai\n    base_url: {sse_url}\n    key_env: SSE\n    stream_only: true\n  - name: json\n    type: openai\n    base_url: {json_url}\n    key_env: JSON\nauto:\n  enabled: true\n  max_candidates: 1\n  candidates:\n    - provider: sse\n      model: sse\n      priority: 0\n      max_context_tokens: {limit}\n    - provider: json\n      model: short\n      priority: 10\n      max_context_tokens: 8192\n"
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        cfg,
+        HashMap::from([
+            ("SSE".into(), "sse-key".into()),
+            ("JSON".into(), "json-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for _ in 0..2 {
+        let (status, response) = call(
+            router.clone(),
+            auto_request("/v1/auto", "client", payload.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["model"], "short");
+    }
+    assert_eq!(sse_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(json_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn auto_without_eligible_candidate_returns_422_without_network_attempt() {
     let (url, hits) = start_upstream(StatusCode::OK).await;
     let config: Config = serde_yaml::from_str(&format!(

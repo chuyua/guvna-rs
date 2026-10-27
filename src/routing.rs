@@ -538,6 +538,15 @@ fn auto_candidate_eligible_for_request(
     if request.get("model").is_none() {
         field_count += 1;
     }
+    // Non-streaming callers of SSE-only Chat suppliers are transparently
+    // upgraded to upstream stream:true by dispatch. The stream field is
+    // reserved and cannot be set in candidate defaults.
+    let force_upstream_stream = request.get("stream") != Some(&Value::Bool(true))
+        && config
+            .providers
+            .iter()
+            .find(|provider| provider.name == candidate.provider)
+            .is_some_and(|provider| provider.stream_only);
     for (name, value) in &candidate.params {
         if name != "model" && request.get(name).is_none() {
             let separator = usize::from(field_count != 0);
@@ -547,6 +556,19 @@ fn auto_candidate_eligible_for_request(
                 .saturating_add(1)
                 .saturating_add(encoded_json_bytes(Some(value)));
             field_count += 1;
+        }
+    }
+    if force_upstream_stream {
+        if let Some(original) = request.get("stream") {
+            effective_request_bytes = effective_request_bytes
+                .saturating_sub(encoded_json_bytes(Some(original)))
+                .saturating_add(encoded_json_bytes_of(&true));
+        } else {
+            effective_request_bytes = effective_request_bytes
+                .saturating_add(usize::from(field_count > 0))
+                .saturating_add(encoded_json_bytes_of("stream"))
+                .saturating_add(1)
+                .saturating_add(encoded_json_bytes_of(&true));
         }
     }
     // Both aliases can be present when the caller uses one and a candidate
@@ -837,6 +859,45 @@ mod tests {
     use crate::config::Config;
     use serde_json::json;
     use std::hash::Hash;
+
+    #[test]
+    fn auto_stream_only_json_aggregation_budget_counts_forced_stream_field() {
+        let request = json!({"model":"auto","messages":[{"role":"user","content":"hi"}],
+            "max_tokens":80});
+        let mut physical = request.clone();
+        physical["model"] = json!("sse");
+        let cap = auto_context_estimate(&physical) + 1;
+        physical["stream"] = json!(true);
+        assert!(auto_context_estimate(&physical) > cap);
+        let config: Config = serde_yaml::from_str(&format!(
+            "providers:\n  - name: stream\n    type: openai\n    base_url: https://stream.invalid\n    key_env: FIRST\n    stream_only: true\n  - name: json\n    type: openai\n    base_url: https://json.invalid\n    key_env: SECOND\nauto:\n  enabled: true\n  max_candidates: 1\n  candidates:\n    - provider: stream\n      model: sse\n      priority: 0\n      max_context_tokens: {cap}\n    - provider: json\n      model: short\n      priority: 10\n      max_context_tokens: 8192\n"
+        ))
+        .unwrap();
+        config.validate().unwrap();
+        let (request_bytes, context_estimate) = auto_request_bytes_and_context_estimate(&request);
+        let budget = AutoRequestBudget {
+            input_bytes: auto_input_bytes(request.get("messages")),
+            request_bytes,
+            context_estimate,
+        };
+        let cache = AutoRouteCache::new();
+        for _ in 0..2 {
+            assert_eq!(
+                cache
+                    .resolve_for_request(
+                        &config,
+                        budget,
+                        &request,
+                        auto_requirements(&request),
+                        &[],
+                        1,
+                    )
+                    .unwrap()[0]
+                    .model,
+                "short"
+            );
+        }
+    }
 
     #[test]
     fn auto_cached_selection_accounts_for_physical_model_bytes_before_truncation() {
