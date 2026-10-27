@@ -89,6 +89,18 @@ class StubHandler(BaseHTTPRequestHandler):
             except (ConnectionResetError, BrokenPipeError):
                 pass
             return
+        if self.server.role == "inflated_length":
+            # The attacker controls the HTTP header, not actual bytes.
+            # Hold several connections after one tiny chunk to expose any
+            # allocation based solely on a fabricated 32 MiB length.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(32 * 1024 * 1024))
+            self.end_headers()
+            self.wfile.write(b"{")
+            self.wfile.flush()
+            time.sleep(1.5)
+            return
         if self.server.response_delay:
             time.sleep(self.server.response_delay)
         requested_format = query.get("response_format")
@@ -1612,6 +1624,95 @@ chains:
         upstream.server_close()
 
 
+def verify_untrusted_content_length_memory(binary: str, root: str, env: dict) -> dict:
+    """A forged 32MiB length + one byte must not preallocate 32MiB per client."""
+    upstream = Stub("inflated_length")
+    worker = threading.Thread(target=upstream.serve_forever, daemon=True)
+    worker.start()
+    gateway_port = port()
+    config = Path(root) / "inflated-content-length.yaml"
+    config.write_text(f"""port: {gateway_port}
+providers:
+  - name: inflated
+    type: openai
+    base_url: http://127.0.0.1:{upstream.server_address[1]}
+    key_env: INFLATED_KEY
+chains:
+  - name: large-lie
+    steps:
+      - provider: inflated
+        model: bogus
+""", encoding="utf-8")
+    data = Path(root) / "inflated-content-length-data"
+    data.mkdir()
+    gateway_env = dict(env, API_KEYS="only-for-local-test",
+                       INFLATED_KEY="fake-inflated-key", GUVNA_BIND_ADDR="127.0.0.1")
+    proc = subprocess.Popen(
+        [str(Path(binary).resolve()), "serve", "-config", str(config), "-data", str(data)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=gateway_env)
+    clients = 16
+    try:
+        health = f"http://127.0.0.1:{gateway_port}/healthz"
+        for _ in range(150):
+            check(proc.poll() is None, "inflated-length gateway exited")
+            if get_status(health, timeout=0.1) == 200:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("inflated-length gateway startup timeout")
+
+        request = Request(
+            f"http://127.0.0.1:{gateway_port}/v1/chat/completions",
+            method="POST",
+            headers={"Authorization": "Bearer only-for-local-test",
+                     "Content-Type": "application/json"},
+            data=b'{"model":"large-lie","messages":[{"role":"user","content":"x"}]}')
+
+        def submit(_: int) -> int:
+            try:
+                with urlopen(request, timeout=8) as response:
+                    response.read()
+                    return response.status
+            except HTTPError as error:
+                error.close()
+                return error.code
+
+        peak_rss = proc_info(proc.pid)["VmRSS"]
+        with ThreadPoolExecutor(max_workers=clients) as pool:
+            futures = [pool.submit(submit, i) for i in range(clients)]
+            deadline = time.monotonic() + 7
+            while not all(future.done() for future in futures):
+                check(time.monotonic() < deadline,
+                      "inflated-length body completion exceeded test bound")
+                peak_rss = max(peak_rss, proc_info(proc.pid)["VmRSS"])
+                time.sleep(0.02)
+            statuses = [future.result() for future in futures]
+
+        after = proc_info(proc.pid)
+        # 16 * 32MiB declared lengths previously meant >512MiB of unguarded
+        # reserve() even though the provider only sent one byte per request.
+        check(peak_rss <= 96 * 1024,
+              f"untrusted upstream lengths allocated {peak_rss / 1024:.1f} MiB RSS")
+        check(all(status != 200 for status in statuses),
+              f"incomplete upstream JSON was returned as successful: {statuses}")
+        check(upstream.calls == clients,
+              f"declared-length requests silently skipped: {upstream.calls}/{clients}")
+        return {"passed": True, "clients": clients,
+                "declared_bytes_per_client": 32 * 1024 * 1024,
+                "actual_body_bytes_per_client": 1,
+                "peak_rss_kib": peak_rss, "rss_after_kib": after["VmRSS"],
+                "statuses": sorted(set(statuses)), "upstream_calls": upstream.calls}
+    finally:
+        proc.terminate()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate(timeout=5)
+        upstream.shutdown()
+        upstream.server_close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", required=True)
@@ -1744,6 +1845,8 @@ chains:
                 summary["large_payload_memory_gate"] = verify_release_large_payload_memory(
                     a.binary, directory, env)
                 summary["large_response_tcp_gate"] = verify_release_slow_tcp_response_memory(
+                    a.binary, directory, env)
+                summary["untrusted_content_length_gate"] = verify_untrusted_content_length_memory(
                     a.binary, directory, env)
                 summary["post_structured_idle"] = idle(proc.pid, a.idle_seconds)
                 check(summary["post_structured_idle"]["rss_kib_max"] <=

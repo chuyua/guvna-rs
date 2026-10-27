@@ -1646,13 +1646,17 @@ mod tests {
         assert_eq!(bytes.capacity(), 0);
         bytes.push(b'{');
         reserve_declared_json_capacity(&mut bytes, Some(MAX_BODY_BYTES), false).unwrap();
-        assert!(bytes.capacity() < super::LARGE_RESPONSE_BODY_BYTES);
+        assert!(bytes.capacity() < super::super::LARGE_RESPONSE_BODY_BYTES);
 
         // Small responses can still reserve without consuming a large slot.
         let mut small = Vec::new();
-        reserve_declared_json_capacity(&mut small, Some(super::LARGE_RESPONSE_BODY_BYTES), false)
-            .unwrap();
-        assert!(small.capacity() >= super::LARGE_RESPONSE_BODY_BYTES);
+        reserve_declared_json_capacity(
+            &mut small,
+            Some(super::super::LARGE_RESPONSE_BODY_BYTES),
+            false,
+        )
+        .unwrap();
+        assert!(small.capacity() >= super::super::LARGE_RESPONSE_BODY_BYTES);
 
         // Once the large-body permit has been acquired, preallocation is
         // allowed even if the first upstream chunks were tiny.
