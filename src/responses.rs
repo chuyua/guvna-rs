@@ -677,7 +677,9 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                             .expect("checked above")
                             .push(tool_call);
                     } else {
-                        let mut assistant = json!({"role":"assistant","content":Value::Null,"tool_calls":[tool_call]});
+                        let mut assistant =
+                            json!({"role":"assistant","content":Value::Null,"tool_calls":[]});
+                        assistant["tool_calls"] = Value::Array(vec![tool_call]);
                         if let Some(reasoning) = pending_reasoning.take() {
                             assistant["reasoning_content"] = Value::String(reasoning);
                         }
