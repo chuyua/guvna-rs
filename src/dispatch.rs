@@ -212,13 +212,28 @@ pub(super) fn hold_buffered_response(
     let (mut parts, body) = response.into_parts();
     parts.extensions.insert(reservation.clone());
     let source = Box::pin(body.into_data_stream());
+    // Json(value) normally produces ONE enormous Bytes frame. A downstream
+    // TCP sender could buffer that whole frame, poll Body to EOF and release
+    // its reservation while a slow client still has megabytes outstanding.
+    // Frame at most 16 KiB so Hyper's transport backpressure keeps the Body
+    // and its memory lease live until the large buffer is truly drained.
+    const FRAME_BYTES: usize = 16 * 1024;
     let guarded = futures_util::stream::unfold(
-        (source, reservation),
-        |(mut source, reservation)| async move {
-            source
-                .next()
-                .await
-                .map(|chunk| (chunk, (source, reservation)))
+        (source, Bytes::new(), reservation),
+        |(mut source, mut pending, reservation)| async move {
+            loop {
+                if !pending.is_empty() {
+                    let frame = pending.split_to(pending.len().min(FRAME_BYTES));
+                    return Some((Ok(frame), (source, pending, reservation)));
+                }
+                match source.next().await {
+                    Some(Ok(data)) => pending = data,
+                    Some(Err(error)) => {
+                        return Some((Err(error), (source, pending, reservation)));
+                    }
+                    None => return None,
+                }
+            }
         },
     );
     Response::from_parts(parts, Body::from_stream(guarded))
