@@ -737,8 +737,9 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                             "Empty content parts",
                         )));
                     }
+                    let single_part = parts.len() == 1;
                     let mut text = String::new();
-                    for part in &parts {
+                    for mut part in parts {
                         if part.get("type").and_then(Value::as_str) == Some("refusal") {
                             if role != "assistant" {
                                 return Err(Box::new(error(
@@ -764,7 +765,18 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                                     "refusal parts require refusal text",
                                 )));
                             };
-                            text.push_str(fragment);
+                            if single_part {
+                                text = match part
+                                    .as_object_mut()
+                                    .expect("refusal part validated")
+                                    .remove("refusal")
+                                {
+                                    Some(Value::String(content)) => content,
+                                    _ => unreachable!("refusal text validated"),
+                                };
+                            } else {
+                                text.push_str(fragment);
+                            }
                             continue;
                         }
                         if !matches!(
@@ -797,7 +809,18 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                                 "input_text requires text",
                             )));
                         };
-                        text.push_str(fragment);
+                        if single_part {
+                            text = match part
+                                .as_object_mut()
+                                .expect("text part validated")
+                                .remove("text")
+                            {
+                                Some(Value::String(content)) => content,
+                                _ => unreachable!("text content validated"),
+                            };
+                        } else {
+                            text.push_str(fragment);
+                        }
                     }
                     text
                 } else {
@@ -1269,6 +1292,32 @@ mod reasoning_tests {
         assert_eq!(translated[1]["content"].as_str().unwrap().as_ptr(), second);
         assert_eq!(translated[0]["role"], "user");
         assert_eq!(translated[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn single_content_part_moves_validated_text_and_refusal_buffers() {
+        for (role, part_type, field) in [
+            ("user", "input_text", "text"),
+            ("assistant", "output_text", "text"),
+            ("assistant", "refusal", "refusal"),
+        ] {
+            let mut part = json!({"type":part_type});
+            part[field] = Value::String("token".repeat(256 * 1024));
+            let history = json!([{"role":role,"content":[part]}]);
+            let source_ptr = history[0]["content"][0][field].as_str().unwrap().as_ptr();
+            let replay = translate_input(history).unwrap();
+            assert_eq!(replay[0]["content"].as_str().unwrap().as_ptr(), source_ptr);
+            assert_eq!(replay[0]["role"], role);
+        }
+
+        let multipart = json!([{"role":"user","content":[
+            {"type":"input_text","text":"first"},
+            {"type":"input_text","text":" second"}
+        ]}]);
+        assert_eq!(
+            translate_input(multipart).unwrap()[0]["content"],
+            "first second"
+        );
     }
 
     #[test]
