@@ -797,12 +797,16 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
 // Validate reasoning without allocating a second copy of the possibly huge
 // upstream string. Only the final Responses conversion needs an owned value.
 fn reasoning_fragments(message: &Value) -> Result<(Option<&str>, Option<&str>), ()> {
-    if let Some(ordered) = message.get("reasoning_ordered") {
-        return if ordered.is_null() {
-            Ok((None, None))
-        } else {
-            Ok((ordered.as_str().ok_or(())?.into(), None))
-        };
+    if let Some(ordered) = message
+        .get("reasoning_ordered")
+        .filter(|value| !value.is_null())
+    {
+        let value = ordered.as_str().ok_or(())?;
+        if !value.is_empty() {
+            return Ok((Some(value), None));
+        }
+        // An empty hint is not a completed reasoning segment. Preserve
+        // actual reasoning from the ordinary provider aliases below.
     }
     let read = |name: &str| match message.get(name) {
         None | Some(Value::Null) => Ok(None),
@@ -1208,6 +1212,17 @@ mod reasoning_tests {
         assert_eq!(
             reasoning_text(&separate).unwrap().as_deref(),
             Some("leftright")
+        );
+        for empty in [json!(""), Value::Null] {
+            let message = json!({
+                "reasoning_ordered":empty, "reasoning":"actual",
+                "reasoning_content":"actual"
+            });
+            assert_eq!(reasoning_text(&message).unwrap().as_deref(), Some("actual"));
+        }
+        assert_eq!(
+            reasoning_text(&json!({"reasoning_ordered":""})).unwrap(),
+            None
         );
     }
 
