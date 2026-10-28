@@ -1548,6 +1548,7 @@ mod tests {
             &metrics,
         );
         telemetry.observe_stream_health(
+            "chat",
             "p",
             "model",
             "success",
@@ -1642,6 +1643,7 @@ mod tests {
                 &metrics,
             );
             telemetry.observe_stream_health(
+                "chat",
                 "p",
                 "model",
                 outcome,
@@ -1652,6 +1654,7 @@ mod tests {
         }
         // Duplicate callback must not create a second terminal row.
         telemetry.observe_stream_health(
+            "chat",
             "p",
             "model",
             "client_cancelled",
