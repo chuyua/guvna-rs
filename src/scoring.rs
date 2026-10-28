@@ -99,7 +99,7 @@ fn confirmed_chat_stream_outcomes(
 
 /// Correlate bounded real outcomes with shadow advice; never infer the
 /// success of a route that was not actually executed.
-fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
+fn sampled_shadow_outcomes(conn: &Connection, since: i64, until: i64) -> Option<Value> {
     // Timestamp-indexed bounded reads avoid unbounded request-id joins.
     // Multiple attempts can share a one-second timestamp; a first failed
     // attempt must never overwrite the final candidate's real outcome.
@@ -111,13 +111,13 @@ fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
     let mut query = conn
         .prepare(
             "SELECT request_id,provider,model,attempt_index,stream_requested,failure_type
-         FROM request_events WHERE ts >= ?1 AND endpoint='chat'
+         FROM request_events WHERE ts BETWEEN ?1 AND ?2 AND endpoint='chat'
            AND request_id IS NOT NULL
          ORDER BY ts DESC, attempt_index DESC LIMIT 512",
         )
         .ok()?;
     let rows = query
-        .query_map(params![since], |row| {
+        .query_map(params![since, until], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -146,10 +146,10 @@ fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
     // Old databases may have no terminal table. Unknown is never success.
     if let Ok(mut query) = conn.prepare(
         "SELECT request_id,attempt_index,provider,model,outcome FROM stream_terminals
-         WHERE ts >= ?1 ORDER BY ts DESC LIMIT 512",
+         WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts DESC LIMIT 512",
     ) {
         let rows = query
-            .query_map(params![since], |row| {
+            .query_map(params![since, until], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
@@ -171,11 +171,11 @@ fn sampled_shadow_outcomes(conn: &Connection, since: i64) -> Option<Value> {
         .prepare(
             "SELECT request_id,baseline_provider,baseline_model,
                 suggested_provider,suggested_model,available,disagreed
-         FROM shadow_events WHERE ts >= ?1 ORDER BY ts DESC LIMIT 256",
+         FROM shadow_events WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts DESC LIMIT 256",
         )
         .ok()?;
     let rows = query
-        .query_map(params![since], |row| {
+        .query_map(params![since, until], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -510,10 +510,10 @@ fn read_scoring_inner(
                         COUNT(DISTINCT CASE WHEN attempt_index = 1 AND stream_requested = 0
                                             AND failure_type = 'success' THEN request_id END)
                  FROM request_events
-                 WHERE ts >= ?1 AND endpoint='chat'
+                 WHERE ts BETWEEN ?1 AND ?2 AND endpoint='chat'
                    AND request_id IS NOT NULL AND attempt_index IS NOT NULL {verified_filter}"
                 ),
-                params![since],
+                params![since, now],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .map_err(|_| "cannot read request-level scoring")?;
@@ -537,8 +537,8 @@ fn read_scoring_inner(
         let (total, available, disagreements): (i64, i64, i64) = conn
             .query_row(
                 "SELECT COUNT(*),COALESCE(SUM(available),0),COALESCE(SUM(disagreed),0)
-             FROM shadow_events WHERE ts >= ?1",
-                params![since],
+             FROM shadow_events WHERE ts BETWEEN ?1 AND ?2",
+                params![since, now],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(|_| "cannot read shadow comparison summary")?;
@@ -551,7 +551,7 @@ fn read_scoring_inner(
                 Some(disagreements as f64 / available as f64)
             } else {None},
             "advisory_only":true,
-            "observed_actual_sample":sampled_shadow_outcomes(&conn, since),
+            "observed_actual_sample":sampled_shadow_outcomes(&conn, since, now),
         }))
     } else {
         None
@@ -569,8 +569,8 @@ fn read_scoring_inner(
                     COALESCE(SUM(outcome IN ('transport_error','invalid_response')),0),
                     COALESCE(SUM(outcome='client_cancelled'),0),
                     COALESCE(SUM(outcome IN ('timeout','local_error')),0)
-                 FROM stream_terminals WHERE ts >= ?1",
-                params![since],
+                 FROM stream_terminals WHERE ts BETWEEN ?1 AND ?2",
+                params![since, now],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -694,7 +694,7 @@ mod tests {
             )
             .unwrap();
         }
-        let sample = sampled_shadow_outcomes(&db, 999).unwrap();
+        let sample = sampled_shadow_outcomes(&db, 999, 1003).unwrap();
         assert_eq!(sample["sampled_shadow_rows"], 6);
         assert_eq!(sample["linked_actual_requests"], 6);
         assert_eq!(sample["actual_fallbacks"], 4);
@@ -732,7 +732,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            sampled_shadow_outcomes(&db, 999).is_none(),
+            sampled_shadow_outcomes(&db, 999, 1003).is_none(),
             "an endpoint-less trace could be Embeddings; it cannot certify a Chat Shadow outcome"
         );
     }
@@ -832,6 +832,23 @@ mod tests {
             )
             .unwrap();
         }
+        // Clock corrections must not let future observations crowd the
+        // bounded Shadow join or claim stream completion before it happened.
+        db.execute(
+            "INSERT INTO shadow_events VALUES(?1,'future','p','a','p','b',1,1)",
+            [now + 86400],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO request_events VALUES(?1,'chat','p','b',15,1,'future',2,1,'stream_started')",
+            [now + 86400],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO stream_terminals VALUES(?1,'future',2,'p','b','success')",
+            [now + 86400],
+        )
+        .unwrap();
         let result = read_scoring(dir.path(), 1).unwrap();
         let observed = &result["shadow_metrics"]["observed_actual_sample"];
         assert_eq!(observed["sampled_shadow_rows"], 9);
@@ -846,11 +863,16 @@ mod tests {
         assert_eq!(observed["proposed_top_matches_actual_final_route"], 2);
         assert_eq!(observed["disagreed_but_actual_completed"], 2);
         assert_eq!(observed["counterfactual_success_inferred"], false);
+        assert_eq!(result["shadow_metrics"]["evaluations"], 9);
+        assert_eq!(
+            result["stream_terminal_metrics"]["terminal_observations"],
+            4
+        );
         // Fixed sample size even if the historical window contains many rows.
         for i in 0..300 {
             db.execute(
                 "INSERT INTO shadow_events VALUES(?1,?2,'p','a',NULL,NULL,0,0)",
-                params![now + 1, format!("unlinked-{i}")],
+                params![now, format!("unlinked-{i}")],
             )
             .unwrap();
         }
@@ -943,6 +965,11 @@ mod tests {
             )
             .unwrap();
         }
+        db.execute(
+            "INSERT INTO request_events VALUES(?1,'chat','p','m',20,0,'future',2,0,'success')",
+            [now + 86400],
+        )
+        .unwrap();
         let result = read_scoring(dir.path(), 1).unwrap();
         assert!(result["shadow_metrics"].is_null());
         assert!(result["stream_terminal_metrics"].is_null());
