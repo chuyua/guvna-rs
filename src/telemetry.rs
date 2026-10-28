@@ -484,6 +484,75 @@ fn migrate_stream_terminal_outcomes(conn: &mut Connection) -> rusqlite::Result<(
     tx.commit()
 }
 
+/// Responses uses the Chat upstream bridge but needs its own telemetry
+/// endpoint label; merging it into Chat would contaminate Auto scoring.
+/// SQLite cannot ALTER a CHECK constraint, so rebuild each history table
+/// in a transaction, preserving rows and the timestamp index.
+fn migrate_responses_endpoint_constraints(conn: &mut Connection) -> rusqlite::Result<()> {
+    for table in ["request_events", "failure_events"] {
+        let schema: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !schema.contains("endpoint IN ('chat','embeddings')") {
+            continue;
+        }
+        let tx = conn.transaction()?;
+        if table == "request_events" {
+            tx.execute_batch(
+                "CREATE TABLE request_events_upgraded (
+                    ts INTEGER NOT NULL,
+                    endpoint TEXT NOT NULL CHECK (endpoint IN ('chat','embeddings','responses')),
+                    provider TEXT NOT NULL, model TEXT NOT NULL,
+                    status INTEGER NOT NULL, elapsed_ms INTEGER NOT NULL,
+                    sse_headers INTEGER NOT NULL CHECK (sse_headers IN (0,1)),
+                    identity_verified INTEGER NOT NULL DEFAULT 0 CHECK (identity_verified IN (0,1)),
+                    failure_type TEXT NOT NULL CHECK (failure_type IN (
+                        'success','stream_started','rate_limited','credential_error',
+                        'caller_error','provider_4xx','provider_5xx','transport_error','invalid_response',
+                        'timeout','upstream_unavailable','circuit_open','aggregation_busy',
+                        'local_error','capability_mismatch','unknown')),
+                    request_id TEXT, attempt_index INTEGER,
+                    stream_requested INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO request_events_upgraded
+                    (ts,endpoint,provider,model,status,elapsed_ms,sse_headers,
+                     identity_verified,failure_type,request_id,attempt_index,stream_requested)
+                SELECT ts,endpoint,provider,model,status,elapsed_ms,sse_headers,
+                       identity_verified,failure_type,request_id,attempt_index,stream_requested
+                  FROM request_events;
+                DROP TABLE request_events;
+                ALTER TABLE request_events_upgraded RENAME TO request_events;
+                CREATE INDEX request_events_ts ON request_events(ts);",
+            )?;
+        } else {
+            tx.execute_batch(
+                "CREATE TABLE failure_events_upgraded (
+                    ts INTEGER NOT NULL,
+                    endpoint TEXT NOT NULL CHECK (endpoint IN ('chat','embeddings','responses')),
+                    provider TEXT NOT NULL, model TEXT NOT NULL,
+                    status INTEGER NOT NULL, elapsed_ms INTEGER NOT NULL,
+                    failure_type TEXT NOT NULL CHECK (failure_type NOT IN ('success','stream_started')),
+                    request_id TEXT, attempt_index INTEGER,
+                    stream_requested INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO failure_events_upgraded
+                    (ts,endpoint,provider,model,status,elapsed_ms,failure_type,
+                     request_id,attempt_index,stream_requested)
+                SELECT ts,endpoint,provider,model,status,elapsed_ms,failure_type,
+                       request_id,attempt_index,stream_requested
+                  FROM failure_events;
+                DROP TABLE failure_events;
+                ALTER TABLE failure_events_upgraded RENAME TO failure_events;
+                CREATE INDEX failure_events_ts ON failure_events(ts);",
+            )?;
+        }
+        tx.commit()?;
+    }
+    Ok(())
+}
+
 fn open_database(path: &Path) -> rusqlite::Result<Connection> {
     // Avoid opening a pre-existing symlink or special file in the service
     // data directory. The normal path is owned by this local daemon.
@@ -512,7 +581,7 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
         PRAGMA max_page_count=8192;
         CREATE TABLE IF NOT EXISTS request_events (
             ts INTEGER NOT NULL,
-            endpoint TEXT NOT NULL CHECK (endpoint IN ('chat','embeddings')),
+            endpoint TEXT NOT NULL CHECK (endpoint IN ('chat','embeddings','responses')),
             provider TEXT NOT NULL,
             model TEXT NOT NULL,
             status INTEGER NOT NULL,
@@ -613,6 +682,10 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
             ))?;
         }
     }
+    // Existing installations still carry two-column endpoint CHECK clauses.
+    // Complete all column additions first, then preserve their historical
+    // rows during the one-time responses endpoint schema upgrade.
+    migrate_responses_endpoint_constraints(&mut conn)?;
     // Old databases stored only lossy labels in provider_health. A migration
     // must not silently treat those potentially collided rows as verified.
     if !has_column(&conn, "provider_health", "identity_verified")? {
@@ -1222,6 +1295,120 @@ mod tests {
             attempt_index: None,
             stream_requested: false,
             shadow: None,
+        }
+    }
+
+    #[test]
+    fn responses_and_chat_events_commit_in_same_batch_without_losing_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let telemetry = Telemetry::start(dir.path(), Arc::clone(&metrics)).unwrap();
+        let mut failed = TelemetryContext::new("physical", "model", "provider_5xx");
+        failed.set_trace("responses-trace", 1, false);
+        telemetry.submit(
+            "responses",
+            503,
+            Duration::from_millis(5),
+            false,
+            Some(failed),
+            &metrics,
+        );
+        telemetry.submit("chat", 200, Duration::from_millis(2), false, None, &metrics);
+        assert!(telemetry.flush(Duration::from_secs(3)));
+        let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        let total: i64 = db
+            .query_row("SELECT COUNT(*) FROM request_events", [], |r| r.get(0))
+            .unwrap();
+        let response_failures: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM failure_events WHERE endpoint='responses' AND status=503",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            total, 2,
+            "a Responses event must not roll back a Chat event"
+        );
+        assert_eq!(response_failures, 1);
+        let summary = crate::scoring::read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(
+            summary["candidate_count"], 0,
+            "Responses upstream results must not be mislabeled as Chat quality evidence"
+        );
+    }
+
+    #[test]
+    fn old_endpoint_checks_migrate_without_losing_failure_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old-telemetry.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE request_events (
+                ts INTEGER NOT NULL,
+                endpoint TEXT NOT NULL CHECK (endpoint IN ('chat','embeddings')),
+                provider TEXT NOT NULL, model TEXT NOT NULL,
+                status INTEGER NOT NULL, elapsed_ms INTEGER NOT NULL,
+                sse_headers INTEGER NOT NULL,
+                identity_verified INTEGER NOT NULL DEFAULT 0,
+                failure_type TEXT NOT NULL,
+                request_id TEXT, attempt_index INTEGER,
+                stream_requested INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX request_events_ts ON request_events(ts);
+            CREATE TABLE failure_events (
+                ts INTEGER NOT NULL,
+                endpoint TEXT NOT NULL CHECK (endpoint IN ('chat','embeddings')),
+                provider TEXT NOT NULL, model TEXT NOT NULL,
+                status INTEGER NOT NULL, elapsed_ms INTEGER NOT NULL,
+                failure_type TEXT NOT NULL,
+                request_id TEXT, attempt_index INTEGER,
+                stream_requested INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX failure_events_ts ON failure_events(ts);
+            INSERT INTO request_events VALUES (1000,'chat','old','m',503,10,0,1,
+                                              'provider_5xx','old-trace',1,0);
+            INSERT INTO failure_events VALUES (1000,'chat','old','m',503,10,
+                                              'provider_5xx','old-trace',1,0);",
+        )
+        .unwrap();
+        drop(db);
+        for _ in 0..2 {
+            let db = open_database(&path).unwrap();
+            db.execute(
+                "INSERT INTO request_events
+                 (ts,endpoint,provider,model,status,elapsed_ms,sse_headers,failure_type)
+                 VALUES (2000,'responses','new','m',200,3,0,'success')",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO failure_events
+                 (ts,endpoint,provider,model,status,elapsed_ms,failure_type)
+                 VALUES (2000,'responses','new','m',503,3,'provider_5xx')",
+                [],
+            )
+            .unwrap();
+            let preserved: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM request_events WHERE request_id='old-trace'
+                 AND endpoint='chat' AND identity_verified=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                preserved, 1,
+                "upgrading or reopening erased old request evidence"
+            );
+            let old_failure: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM failure_events WHERE request_id='old-trace'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(old_failure, 1);
         }
     }
 
