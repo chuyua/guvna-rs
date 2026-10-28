@@ -149,6 +149,9 @@ struct CacheKey {
     // only on rounded context estimates. Legacy resolution uses None.
     request_bytes: Option<usize>,
     request_shape: Option<AutoRequestShape>,
+    // Bit per candidate-default field overridden by this caller. Equal JSON
+    // lengths may still produce different upstream wire bodies and budgets.
+    default_presence: Vec<u64>,
     requirements: AutoRequirements,
     penalties: Vec<u8>,
 }
@@ -197,6 +200,25 @@ fn auto_request_shape(request: &Value) -> AutoRequestShape {
     }
 }
 
+fn candidate_default_presence(config: &Config, request: &Value) -> Vec<u64> {
+    let mut bits = Vec::new();
+    let mut position = 0_usize;
+    // The config generation fixes candidate order and default field order.
+    // Store only presence bits, never the caller body or field values.
+    for candidate in &config.auto.candidates {
+        for name in candidate.params.keys() {
+            if position.is_multiple_of(64) {
+                bits.push(0_u64);
+            }
+            if request.get(name).is_some() {
+                *bits.last_mut().expect("bitset word allocated") |= 1_u64 << (position % 64);
+            }
+            position += 1;
+        }
+    }
+    bits
+}
+
 #[derive(Clone, Copy)]
 pub struct AutoRequestBudget {
     pub input_bytes: usize,
@@ -220,6 +242,7 @@ impl CacheKey {
             context_estimate,
             request_bytes,
             request_shape: None,
+            default_presence: Vec::new(),
             requirements,
             penalties: if config.auto.health_aware {
                 penalties.to_vec()
@@ -325,6 +348,7 @@ impl AutoRouteCache {
             generation,
         );
         key.request_shape = Some(auto_request_shape(request));
+        key.default_presence = candidate_default_presence(config, request);
         self.resolve_cached(key, || {
             resolve_auto_for_request_sized(
                 config,
@@ -1062,6 +1086,65 @@ mod tests {
                 "oversized wire accepted: {request}"
             );
         }
+    }
+
+    #[test]
+    fn auto_cache_distinguishes_equal_size_requests_overriding_different_defaults() {
+        let explicit = json!({
+            "model":"auto",
+            "messages":[{"role":"user","content":"hi"}],
+            "max_tokens":80,
+            "user":"x".repeat(11)
+        });
+        let implicit = json!({
+            "model":"auto",
+            "messages":[{"role":"user","content":"hi"}],
+            "max_completion_tokens":80,
+            "user":""
+        });
+        let (bytes, context) = auto_request_bytes_and_context_estimate(&explicit);
+        assert_eq!(
+            auto_request_bytes_and_context_estimate(&implicit),
+            (bytes, context),
+            "these requests collide on the old Auto cache key"
+        );
+        let mut physical = explicit.clone();
+        physical["model"] = json!("short");
+        let limit = auto_context_estimate(&physical);
+        let cfg: Config = serde_yaml::from_str(&format!(
+            "providers:\n  - name: p\n    type: openai\n    base_url: https://example.invalid\n    key_env: K\nauto:\n  enabled: true\n  candidates:\n    - provider: p\n      model: short\n      max_context_tokens: {limit}\n      params:\n        max_tokens: 1000\n"
+        )).unwrap();
+        cfg.validate().unwrap();
+        assert_ne!(
+            candidate_default_presence(&cfg, &explicit),
+            candidate_default_presence(&cfg, &implicit),
+            "only explicit max_tokens must suppress the candidate default"
+        );
+        let cache = AutoRouteCache::new();
+        let choose = |request: &Value| {
+            cache
+                .resolve_for_request(
+                    &cfg,
+                    AutoRequestBudget {
+                        input_bytes: auto_input_bytes(request.get("messages")),
+                        request_bytes: bytes,
+                        context_estimate: context,
+                    },
+                    request,
+                    auto_requirements(request),
+                    &[],
+                    7,
+                )
+                .unwrap()
+        };
+        assert_eq!(choose(&explicit)[0].model, "short");
+        assert!(
+            choose(&implicit).is_empty(),
+            "the default max_tokens=1000 makes this otherwise identical request oversized"
+        );
+        assert_eq!(choose(&explicit)[0].model, "short");
+        assert!(choose(&implicit).is_empty());
+        assert_eq!(cache.state.lock().unwrap().entries.len(), 2);
     }
 
     #[test]
