@@ -14,6 +14,11 @@ pub fn classify(status: Option<u16>) -> Outcome {
         Some(200..=299) => Outcome::Success,
         Some(401 | 403) => Outcome::CredentialAuth,
         Some(429) => Outcome::RateLimited,
+        // Redirects are deliberately never followed by the upstream client
+        // (Bearer credentials must not reach a Location target). A redirect
+        // therefore cannot be a successful model answer or a caller error:
+        // treat a broken provider endpoint as transient for circuit recovery.
+        Some(300..=399) => Outcome::ProviderTransient,
         // Upstream 408 means the *provider* timed out handling this HTTP
         // request. Treat it like a transient 5xx, not a bad client prompt:
         // fail over, feed the circuit breaker and avoid repeated slow calls.
@@ -42,6 +47,10 @@ mod tests {
         let cases = [
             (None, Outcome::TransportFailure, false, false),
             (Some(200), Outcome::Success, false, false),
+            (Some(301), Outcome::ProviderTransient, false, true),
+            (Some(302), Outcome::ProviderTransient, false, true),
+            (Some(307), Outcome::ProviderTransient, false, true),
+            (Some(308), Outcome::ProviderTransient, false, true),
             (Some(400), Outcome::CallerRejected, false, false),
             (Some(401), Outcome::CredentialAuth, true, false),
             (Some(403), Outcome::CredentialAuth, true, false),

@@ -857,6 +857,36 @@ chains:
 }
 
 #[tokio::test]
+async fn redirecting_provider_opens_circuit_without_leaking_or_quarantining_key() {
+    let (redirected, redirect_hits) = start_upstream(StatusCode::FOUND).await;
+    let (healthy, healthy_hits) = start_upstream(StatusCode::OK).await;
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: redirecting\n    type: openai\n    base_url: {redirected}\n    key_env: REDIRECT_KEY\n    circuit_breaker:\n      enabled: true\n      failure_threshold: 2\n      cooldown: 10s\n      max_cooldown: 10s\n  - name: healthy\n    type: openai\n    base_url: {healthy}\n    key_env: GOOD_KEY\nchains:\n  - name: demo\n    steps:\n      - provider: redirecting\n        model: wrong-endpoint\n      - provider: healthy\n        model: working\n"
+    )).unwrap();
+    cfg.validate().unwrap();
+    let router = app(AppState::new(
+        cfg,
+        HashMap::from([
+            ("REDIRECT_KEY".into(), "redirect-secret".into()),
+            ("GOOD_KEY".into(), "working-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for _ in 0..5 {
+        let (status, body) = call(router.clone(), request("demo", "", "client")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["model"], "working");
+    }
+    assert_eq!(
+        redirect_hits.load(Ordering::SeqCst),
+        2,
+        "after two forbidden redirects, the circuit must skip the broken provider"
+    );
+    assert_eq!(healthy_hits.load(Ordering::SeqCst), 5);
+}
+
+#[tokio::test]
 async fn mixed_caller_rejection_and_provider_outage_never_mislabels_request_as_invalid() {
     for (first_status, second_status) in [
         (
