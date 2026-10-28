@@ -15,6 +15,9 @@ use std::{
 };
 
 const MAX_CHAIN_FILE_BYTES: usize = 1024 * 1024;
+// Offline updates fsync the backup, new file and directory while holding an
+// OS lock. Allow concurrent local writers to serialize even on slow disks.
+const MUTATION_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 pub enum Command {
     List,
@@ -152,7 +155,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn lock_directory(data_dir: &Path) -> Result<(PathBuf, File), String> {
+fn lock_directory(data_dir: &Path, wait: Duration) -> Result<(PathBuf, File), String> {
     fs::create_dir_all(data_dir)
         .map_err(|e| format!("creating data directory {}: {e}", data_dir.display()))?;
     let directory = fs::canonicalize(data_dir)
@@ -199,7 +202,7 @@ fn lock_directory(data_dir: &Path) -> Result<(PathBuf, File), String> {
         }
     }
     // A stalled second writer must not block the CLI forever.
-    let lock_deadline = Instant::now() + Duration::from_millis(750);
+    let lock_deadline = Instant::now() + wait;
     loop {
         match lock.try_lock_exclusive() {
             Ok(()) => break,
@@ -381,7 +384,7 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
                 return Err("chain name auto is reserved when Auto is enabled".into());
             }
             config.validate_chain(&chain)?;
-            let (directory, _lock) = lock_directory(data_dir)?;
+            let (directory, _lock) = lock_directory(data_dir, MUTATION_LOCK_WAIT)?;
             let target = runtime_path(&directory);
             let original = read_limited(&target)?;
             let mut state = validate_data(original.as_deref(), config)?;
@@ -408,7 +411,7 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
             if name.is_empty() {
                 return Err("delete requires a nonempty chain name".into());
             }
-            let (directory, _lock) = lock_directory(data_dir)?;
+            let (directory, _lock) = lock_directory(data_dir, MUTATION_LOCK_WAIT)?;
             let target = runtime_path(&directory);
             let original = read_limited(&target)?;
             let mut state = validate_data(original.as_deref(), config)?;
@@ -430,7 +433,7 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
             ))
         }
         Command::Recover(source) => {
-            let (directory, _lock) = lock_directory(data_dir)?;
+            let (directory, _lock) = lock_directory(data_dir, MUTATION_LOCK_WAIT)?;
             let target = runtime_path(&directory);
             let backup = source.unwrap_or_else(|| directory.join("chains.yaml.bak"));
             let incoming = read_limited(&backup)?
@@ -488,7 +491,7 @@ mod lock_security_tests {
         let lock_name = CString::new(lock.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(lock_name.as_ptr(), 0o600) }, 0);
         assert!(
-            lock_directory(dir.path())
+            lock_directory(dir.path(), Duration::from_millis(750))
                 .unwrap_err()
                 .contains("non-regular")
         );
@@ -506,16 +509,18 @@ mod lock_security_tests {
         let path = dir.path().join(".chains.yaml.lock");
         fs::write(&path, b"").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(lock_directory(dir.path()).is_err());
+        assert!(lock_directory(dir.path(), Duration::from_millis(750)).is_err());
     }
 
     #[test]
     fn ordinary_private_lock_remains_usable_across_sequential_writers() {
         let dir = tempfile::tempdir().unwrap();
-        let (first_directory, first) = lock_directory(dir.path()).unwrap();
+        let (first_directory, first) =
+            lock_directory(dir.path(), Duration::from_millis(750)).unwrap();
         assert_eq!(first_directory, fs::canonicalize(dir.path()).unwrap());
         drop(first);
-        let (second_directory, second) = lock_directory(dir.path()).unwrap();
+        let (second_directory, second) =
+            lock_directory(dir.path(), Duration::from_millis(750)).unwrap();
         assert_eq!(first_directory, second_directory);
         drop(second);
     }
@@ -523,13 +528,31 @@ mod lock_security_tests {
     #[test]
     fn held_chain_lock_fails_bounded_then_recovers() {
         let dir = tempfile::tempdir().unwrap();
-        let (_, held) = lock_directory(dir.path()).unwrap();
+        let (_, held) = lock_directory(dir.path(), Duration::from_millis(750)).unwrap();
         let start = Instant::now();
-        let failure = lock_directory(dir.path()).unwrap_err();
+        let failure = lock_directory(dir.path(), Duration::from_millis(750)).unwrap_err();
         assert!(failure.contains("busy"), "{failure}");
         assert!(start.elapsed() < Duration::from_secs(2));
         drop(held);
-        assert!(lock_directory(dir.path()).is_ok());
+        assert!(lock_directory(dir.path(), Duration::from_millis(750)).is_ok());
+    }
+
+    #[test]
+    fn chain_mutation_waits_for_fsync_contention_before_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, held) = lock_directory(dir.path(), Duration::from_millis(750)).unwrap();
+        let contender_dir = dir.path().to_path_buf();
+        let contender = thread::spawn(move || {
+            lock_directory(&contender_dir, MUTATION_LOCK_WAIT).map(|(_, lock)| drop(lock))
+        });
+        // A second offline writer must not fail just because the first still
+        // has a legitimate backup and directory fsync in progress.
+        thread::sleep(Duration::from_millis(1000));
+        drop(held);
+        assert!(
+            contender.join().unwrap().is_ok(),
+            "a local mutation should wait for a legitimate writer to finish"
+        );
     }
 
     #[test]
@@ -538,6 +561,6 @@ mod lock_security_tests {
         let path = dir.path().join(".chains.yaml.lock");
         fs::write(&path, b"").unwrap();
         fs::hard_link(&path, dir.path().join("another-link")).unwrap();
-        assert!(lock_directory(dir.path()).is_err());
+        assert!(lock_directory(dir.path(), Duration::from_millis(750)).is_err());
     }
 }
