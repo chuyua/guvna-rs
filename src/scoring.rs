@@ -504,8 +504,10 @@ fn read_scoring_inner(
         // The terminal request_events row can have attempt_index > 1:
         // intermediate failed attempts are stored in failure_events instead.
         // On migrated databases, recover the actual FIRST attempt's stream
-        // mode from its correlated failure. Legacy readers without this
-        // table remain conservative and use first terminal rows only.
+        // mode from the failed-attempt table. The uncorrelated IN set can be
+        // built ONCE from the bounded time window; a correlated EXISTS would
+        // repeatedly scan failure_events for every terminal request row.
+        // Legacy readers without this table stay conservative.
         let first_nonstream = if conn
             .prepare(
                 "SELECT request_id,attempt_index,stream_requested,endpoint,ts
@@ -514,10 +516,9 @@ fn read_scoring_inner(
             .is_ok()
         {
             "(stream_requested=0 AND (attempt_index=1 OR
-                (attempt_index>1 AND EXISTS (
-                    SELECT 1 FROM failure_events f
-                    WHERE f.request_id=request_events.request_id
-                      AND f.attempt_index=1 AND f.stream_requested=0
+                (attempt_index>1 AND request_id IN (
+                    SELECT f.request_id FROM failure_events f
+                    WHERE f.attempt_index=1 AND f.stream_requested=0
                       AND f.endpoint='chat' AND f.ts BETWEEN ?1 AND ?2))))"
         } else {
             "(attempt_index=1 AND stream_requested=0)"
