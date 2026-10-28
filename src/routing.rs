@@ -51,6 +51,18 @@ pub fn auto_requirements(request: &Value) -> AutoRequirements {
         .get("tools")
         .and_then(Value::as_array)
         .is_some_and(|tools| !tools.is_empty())
+        // OpenAI's legacy Chat functions are still accepted and forwarded.
+        // Routing them to an explicitly text-only model misclassifies their
+        // hard capability requirement as an ordinary text conversation.
+        || request
+            .get("functions")
+            .and_then(Value::as_array)
+            .is_some_and(|functions| !functions.is_empty())
+        || request.get("function_call").is_some_and(|choice| match choice {
+            Value::String(value) => !matches!(value.as_str(), "auto" | "none"),
+            Value::Null => false,
+            _ => true,
+        })
         // A required/named tool choice is a hard capability constraint even
         // if the caller supplied no usable tools array.
         || request.get("tool_choice").is_some_and(|choice| match choice {
@@ -68,6 +80,10 @@ pub fn auto_requirements(request: &Value) -> AutoRequirements {
                         Value::Null => false,
                         _ => true,
                     })
+                        || message
+                            .get("function_call")
+                            .is_some_and(|call| !call.is_null())
+                        || message.get("role").and_then(Value::as_str) == Some("function")
                         || message.get("role").and_then(Value::as_str) == Some("tool")
                 })
             });
@@ -2079,6 +2095,60 @@ auto:
                 .tools
         );
     }
+    #[test]
+    fn legacy_chat_function_history_requires_tools_without_blocking_plain_text() {
+        let legacy = [
+            json!({"functions":[{"name":"lookup","parameters":{"type":"object"}}]}),
+            json!({"function_call":{"name":"lookup"}}),
+            json!({"function_call":"required"}),
+            json!({"messages":[{"role":"assistant",
+                "function_call":{"name":"lookup","arguments":"{}"}}]}),
+            json!({"messages":[{"role":"function","name":"lookup","content":"ready"}]}),
+        ];
+        let cfg: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: https://example.invalid\n    key_env: K\nauto:\n  enabled: true\n  candidates:\n    - provider: p\n      model: text\n      supports_tools: false\n    - provider: p\n      model: tools\n      supports_tools: true\n",
+        ).unwrap();
+        cfg.validate().unwrap();
+        let cache = AutoRouteCache::new();
+        for (i, request) in legacy.iter().enumerate() {
+            assert!(auto_requirements(request).tools, "{i}: {request}");
+            let (bytes, context) = auto_request_bytes_and_context_estimate(request);
+            let selected = cache
+                .resolve_for_request(
+                    &cfg,
+                    AutoRequestBudget {
+                        input_bytes: auto_input_bytes(request.get("messages")),
+                        request_bytes: bytes,
+                        context_estimate: context,
+                    },
+                    request,
+                    auto_requirements(request),
+                    &[],
+                    123,
+                )
+                .unwrap();
+            assert_eq!(selected.len(), 1, "{i}: {request}");
+            assert_eq!(selected[0].model, "tools");
+        }
+        for neutral in [
+            json!({"functions":[],"function_call":"auto"}),
+            json!({"function_call":"none"}),
+            json!({"messages":[{"role":"assistant","function_call":null}]}),
+        ] {
+            assert!(!auto_requirements(&neutral).tools);
+        }
+        let ordinary = json!({"messages":[{"role":"user","content":"hi"}]});
+        let selected = resolve_auto_for_request(
+            &cfg,
+            auto_input_bytes(ordinary.get("messages")),
+            &ordinary,
+            auto_requirements(&ordinary),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(selected[0].model, "text");
+    }
+
     #[test]
     fn tool_choice_and_null_history_do_not_bypass_or_overconstrain_auto() {
         let null_history = serde_json::json!({"messages":[{"role":"assistant","tool_calls":null}]});

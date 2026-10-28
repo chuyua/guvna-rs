@@ -5608,6 +5608,55 @@ auto:
 }
 
 #[tokio::test]
+async fn auto_legacy_function_requests_never_select_declared_text_only_model() {
+    let (text_url, text_hits) = start_upstream(StatusCode::OK).await;
+    let (tool_url, tool_hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: text\n    type: openai\n    base_url: {text_url}\n    key_env: TEXT\n  - name: tools\n    type: openai\n    base_url: {tool_url}\n    key_env: TOOLS\nauto:\n  enabled: true\n  max_candidates: 1\n  candidates:\n    - provider: text\n      model: text-model\n      priority: 0\n      supports_tools: false\n    - provider: tools\n      model: tool-model\n      priority: 10\n      supports_tools: true\n"
+    )).unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("TEXT".into(), "text-key".into()),
+            ("TOOLS".into(), "tool-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for payload in [
+        json!({"model":"auto","messages":[{"role":"user","content":"hi"}],
+            "functions":[{"name":"lookup","parameters":{"type":"object"}}]}),
+        json!({"model":"auto","messages":[{"role":"user","content":"hi"}],
+            "function_call":{"name":"lookup"}}),
+        json!({"model":"auto","messages":[{"role":"assistant",
+            "function_call":{"name":"lookup","arguments":"{}"}}]}),
+        json!({"model":"auto","messages":[{"role":"function","name":"lookup","content":"ok"}]}),
+    ] {
+        let (status, body) = call(
+            router.clone(),
+            auto_request("/v1/auto", "client", payload.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}: {body}");
+        assert_eq!(body["model"], "tool-model");
+    }
+    assert_eq!(text_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(tool_hits.load(Ordering::SeqCst), 4);
+    let (status, body) = call(
+        router,
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({"model":"auto","messages":[{"role":"user","content":"hi"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "text-model");
+    assert_eq!(text_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn auto_candidate_default_override_cache_never_routes_oversized_alias() {
     let (upstream, hits) = start_upstream(StatusCode::OK).await;
     let explicit = json!({
