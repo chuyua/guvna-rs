@@ -495,7 +495,16 @@ fn migrate_responses_endpoint_constraints(conn: &mut Connection) -> rusqlite::Re
             [table],
             |row| row.get(0),
         )?;
-        if !schema.contains("endpoint IN ('chat','embeddings')") {
+        // SQLite stores the original CREATE TABLE statement, preserving
+        // arbitrary whitespace and keyword casing. Treat logically
+        // equivalent legacy CHECK clauses alike; otherwise a perfectly
+        // valid old database may silently reject every new Responses row.
+        let normalized = schema
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if !normalized.contains("endpointin('chat','embeddings')") {
             continue;
         }
         let tx = conn.transaction()?;
@@ -1346,7 +1355,7 @@ mod tests {
         db.execute_batch(
             "CREATE TABLE request_events (
                 ts INTEGER NOT NULL,
-                endpoint TEXT NOT NULL CHECK (endpoint IN ('chat','embeddings')),
+                endpoint TEXT NOT NULL CHECK (endpoint IN ('chat', 'embeddings')),
                 provider TEXT NOT NULL, model TEXT NOT NULL,
                 status INTEGER NOT NULL, elapsed_ms INTEGER NOT NULL,
                 sse_headers INTEGER NOT NULL,
@@ -1358,7 +1367,7 @@ mod tests {
             CREATE INDEX request_events_ts ON request_events(ts);
             CREATE TABLE failure_events (
                 ts INTEGER NOT NULL,
-                endpoint TEXT NOT NULL CHECK (endpoint IN ('chat','embeddings')),
+                endpoint TEXT NOT NULL check (ENDPOINT in ('chat', 'embeddings')),
                 provider TEXT NOT NULL, model TEXT NOT NULL,
                 status INTEGER NOT NULL, elapsed_ms INTEGER NOT NULL,
                 failure_type TEXT NOT NULL,
