@@ -3375,6 +3375,55 @@ fn responses_stream_req(payload: Value) -> Request<Body> {
 }
 
 #[tokio::test]
+async fn real_responses_request_does_not_poison_persistent_chat_telemetry() {
+    use rusqlite::Connection;
+    let (upstream, hits) = start_upstream(StatusCode::OK).await;
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {upstream}\n    key_env: K\nchains:\n  - name: demo\n    steps:\n      - provider: p\n        model: physical\n"
+    ))
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(
+        cfg,
+        HashMap::from([("K".into(), "provider-secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, running) = app_with_state(state);
+    let (status, response) = call(
+        router.clone(),
+        responses_stream_req(json!({"model":"demo","input":"hello"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let (status, chat) = call(router, request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{chat}");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert!(running.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let (responses, chats): (i64, i64) = db
+        .query_row(
+            "SELECT COALESCE(SUM(endpoint='responses'),0),
+                    COALESCE(SUM(endpoint='chat'),0)
+             FROM request_events WHERE provider='p'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (responses, chats),
+        (1, 1),
+        "Responses must remain separate, and must not roll back the following Chat request"
+    );
+    let score = guvna::scoring::read_scoring(dir.path(), 1).unwrap();
+    assert_eq!(
+        score["candidates"][0]["attempts"], 1,
+        "a Responses request must not double-count Chat's physical provider sample"
+    );
+}
+
+#[tokio::test]
 async fn responses_incomplete_tool_arguments_survive_the_real_dispatch_path() {
     let (url, hits) = start_upstream(StatusCode::OK).await;
     let router = make_app(&url, &url);
