@@ -501,13 +501,33 @@ fn read_scoring_inner(
         )
         .is_ok()
     {
+        // The terminal request_events row can have attempt_index > 1:
+        // intermediate failed attempts are stored in failure_events instead.
+        // On migrated databases, recover the actual FIRST attempt's stream
+        // mode from its correlated failure. Legacy readers without this
+        // table remain conservative and use first terminal rows only.
+        let first_nonstream = if conn
+            .prepare(
+                "SELECT request_id,attempt_index,stream_requested,endpoint,ts
+                 FROM failure_events LIMIT 0",
+            )
+            .is_ok()
+        {
+            "(stream_requested=0 AND (attempt_index=1 OR
+                (attempt_index>1 AND EXISTS (
+                    SELECT 1 FROM failure_events f
+                    WHERE f.request_id=request_events.request_id
+                      AND f.attempt_index=1 AND f.stream_requested=0
+                      AND f.endpoint='chat' AND f.ts BETWEEN ?1 AND ?2))))"
+        } else {
+            "(attempt_index=1 AND stream_requested=0)"
+        };
         let (traced, fallback, first_nonstream, first_success): (i64, i64, i64, i64) = conn
             .query_row(
                 &format!(
                     "SELECT COUNT(DISTINCT request_id),
                         COUNT(DISTINCT CASE WHEN attempt_index > 1 THEN request_id END),
-                        COUNT(DISTINCT CASE WHEN attempt_index = 1 AND stream_requested = 0
-                                            THEN request_id END),
+                        COUNT(DISTINCT CASE WHEN {first_nonstream} THEN request_id END),
                         COUNT(DISTINCT CASE WHEN attempt_index = 1 AND stream_requested = 0
                                             AND failure_type = 'success' THEN request_id END)
                  FROM request_events
@@ -1007,6 +1027,58 @@ mod tests {
             mixed["request_metrics"]["first_attempt_success_rate_nonstream"],
             json!(1.0 / 3.0)
         );
+        // Real telemetry writes the failed first attempt to failure_events
+        // but only the final fallback outcome to request_events.
+        db.execute_batch(
+            "CREATE TABLE failure_events (
+               ts INTEGER, endpoint TEXT, request_id TEXT,
+               attempt_index INTEGER, stream_requested INTEGER
+             )",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO failure_events VALUES (?1,'chat','nonstream-then-json',1,0)",
+            [now],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO request_events VALUES (?1,'chat','p','m',20,0,
+                'nonstream-then-json',2,0,'success')",
+            [now],
+        )
+        .unwrap();
+        let with_fallback = read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(with_fallback["request_metrics"]["traced_requests"], 6);
+        assert_eq!(
+            with_fallback["request_metrics"]["requests_with_fallback"],
+            3
+        );
+        assert_eq!(
+            with_fallback["request_metrics"]["first_attempt_nonstream"],
+            4
+        );
+        assert_eq!(
+            with_fallback["request_metrics"]["first_attempt_successes_nonstream"],
+            1
+        );
+        assert_eq!(
+            with_fallback["request_metrics"]["first_attempt_success_rate_nonstream"],
+            json!(0.25)
+        );
+        // Neither Embeddings nor future-dated failure records can declare a
+        // missing first Chat attempt or change the current rate denominator.
+        for (endpoint, id, when) in [
+            ("embeddings", "stream-then-json", now),
+            ("chat", "stream-then-json", now + 86400),
+        ] {
+            db.execute(
+                "INSERT INTO failure_events VALUES (?1,?2,?3,1,0)",
+                params![when, endpoint, id],
+            )
+            .unwrap();
+        }
+        let fenced = read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(fenced["request_metrics"]["first_attempt_nonstream"], 4);
     }
 
     #[test]
