@@ -219,6 +219,33 @@ fn candidate_default_presence(config: &Config, request: &Value) -> Vec<u64> {
     bits
 }
 
+/// Only tiny scalar defaults should occupy per-request Auto cache entries.
+/// A large JSON tool schema is intentionally resolved directly: putting up
+/// to 128 clones of such trees in the LRU would regress low-memory deployments.
+/// This check uses bounded scalar lengths without serializing default values.
+pub fn cacheable_auto_defaults(config: &Config) -> bool {
+    let mut budget = 0_usize;
+    for candidate in &config.auto.candidates {
+        if candidate.params.len() > 8 {
+            return false;
+        }
+        for (name, value) in &candidate.params {
+            let value_bound = match value {
+                Value::Null => 4,
+                Value::Bool(_) => 5,
+                Value::Number(_) => 32,
+                Value::String(text) if text.len() <= 64 => text.len().saturating_mul(6) + 2,
+                _ => return false,
+            };
+            budget = budget.saturating_add(name.len() + value_bound + 3);
+            if budget > 1024 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[derive(Clone, Copy)]
 pub struct AutoRequestBudget {
     pub input_bytes: usize,
@@ -1089,6 +1116,35 @@ mod tests {
     }
 
     #[test]
+    fn cache_only_tiny_scalar_defaults_never_large_tool_schemas() {
+        let mut cfg: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: https://example.invalid\n    key_env: K\nauto:\n  enabled: true\n  candidates:\n    - provider: p\n      model: small\n      params:\n        temperature: 0.5\n        max_tokens: 128\n",
+        ).unwrap();
+        cfg.validate().unwrap();
+        assert!(cacheable_auto_defaults(&cfg));
+        let defaults = &mut cfg.auto.candidates[0].params;
+        defaults.insert(
+            "tools".into(),
+            json!([{
+                "type":"function",
+                "function":{"name":"lookup","parameters":{"payload":"x".repeat(1024 * 1024)}}
+            }]),
+        );
+        assert!(
+            !cacheable_auto_defaults(&cfg),
+            "large nested tool defaults must not multiply across the LRU"
+        );
+        defaults.remove("tools");
+        defaults.insert("label".into(), json!("y".repeat(65)));
+        assert!(
+            !cacheable_auto_defaults(&cfg),
+            "large scalars must not be stored in per-request cache entries"
+        );
+        defaults.remove("label");
+        assert!(cacheable_auto_defaults(&cfg));
+    }
+
+    #[test]
     fn auto_cache_distinguishes_equal_size_requests_overriding_different_defaults() {
         let explicit = json!({
             "model":"auto",
@@ -1119,6 +1175,10 @@ mod tests {
             candidate_default_presence(&cfg, &explicit),
             candidate_default_presence(&cfg, &implicit),
             "only explicit max_tokens must suppress the candidate default"
+        );
+        assert!(
+            cacheable_auto_defaults(&cfg),
+            "real gateway may reuse the bounded small-default Auto route"
         );
         let cache = AutoRouteCache::new();
         let choose = |request: &Value| {

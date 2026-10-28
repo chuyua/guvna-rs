@@ -637,25 +637,13 @@ async fn dispatch_inner(
             auto_signals.expect("Auto signals present");
         let (min_context, max_context) = auto_bounds.expect("Auto bounds validated");
         let requirements = signals.with_context_bounds(min_context, max_context);
-        // Request-specific candidate defaults are not covered by the shared
-        // cache key. Resolve them directly, avoiding a large request clone and
-        // filtering BEFORE max_candidates truncates the candidate walk.
-        let has_candidate_defaults = route_snapshot
-            .auto
-            .candidates
-            .iter()
-            .any(|candidate| !candidate.params.is_empty());
+        // Small scalar candidate defaults are safe to cache: the key tracks
+        // which defaults the caller overrides. Large/structured defaults
+        // (notably tool JSON schemas) bypass the LRU to avoid retaining up
+        // to 128 additional copies in single-user low-memory deployments.
+        let cacheable_defaults = routing::cacheable_auto_defaults(&route_snapshot);
         let choose = |features| {
-            if has_candidate_defaults {
-                routing::resolve_auto_for_request_sized(
-                    &route_snapshot,
-                    input_bytes,
-                    &request,
-                    request_bytes,
-                    features,
-                    &initial_auto_penalties,
-                )
-            } else {
+            if cacheable_defaults {
                 state.auto_route_cache.resolve_for_request(
                     &route_snapshot,
                     routing::AutoRequestBudget {
@@ -667,6 +655,15 @@ async fn dispatch_inner(
                     features,
                     &initial_auto_penalties,
                     live.auto_generation,
+                )
+            } else {
+                routing::resolve_auto_for_request_sized(
+                    &route_snapshot,
+                    input_bytes,
+                    &request,
+                    request_bytes,
+                    features,
+                    &initial_auto_penalties,
                 )
             }
         };
