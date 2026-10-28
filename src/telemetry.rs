@@ -248,14 +248,14 @@ impl Telemetry {
     /// Record a terminal stream outcome without duplicating its request row or attempt count.
     pub fn observe_stream_health(
         &self,
-        endpoint: &'static str,
-        provider: &str,
+        target: (&'static str, &str),
         model: &str,
         failure_type: &'static str,
         elapsed: Duration,
         trace: (&str, u16),
         metrics: &Metrics,
     ) {
+        let (endpoint, provider) = target;
         let mut context = TelemetryContext::new(provider, model, failure_type);
         context.set_trace(trace.0, trace.1, true);
         if matches!(failure_type, "timeout" | "local_error") {
@@ -1369,8 +1369,7 @@ mod tests {
                 &metrics,
             );
             telemetry.observe_stream_health(
-                "responses",
-                "physical",
+                ("responses", "physical"),
                 "model",
                 outcome,
                 Duration::from_millis(40),
@@ -1505,8 +1504,7 @@ mod tests {
                 &metrics,
             );
             telemetry.observe_stream_health(
-                "chat",
-                "p",
+                ("chat", "p"),
                 "model",
                 kind,
                 Duration::from_secs(15),
@@ -1548,8 +1546,7 @@ mod tests {
             &metrics,
         );
         telemetry.observe_stream_health(
-            "chat",
-            "p",
+            ("chat", "p"),
             "model",
             "success",
             Duration::from_millis(100),
@@ -1643,8 +1640,7 @@ mod tests {
                 &metrics,
             );
             telemetry.observe_stream_health(
-                "chat",
-                "p",
+                ("chat", "p"),
                 "model",
                 outcome,
                 Duration::from_millis(40),
@@ -1654,8 +1650,7 @@ mod tests {
         }
         // Duplicate callback must not create a second terminal row.
         telemetry.observe_stream_health(
-            "chat",
-            "p",
+            ("chat", "p"),
             "model",
             "client_cancelled",
             Duration::from_millis(60),

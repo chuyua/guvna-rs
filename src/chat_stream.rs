@@ -79,8 +79,7 @@ impl Drop for ChatStreamState {
             if let Some(telemetry) = &self.owner.telemetry {
                 let provider = &self.owner.config.providers[self.provider_index].name;
                 telemetry.observe_stream_health(
-                    self.endpoint,
-                    provider,
+                    (self.endpoint, provider),
                     &self.telemetry_model,
                     "client_cancelled",
                     self.started_at.elapsed(),
@@ -195,8 +194,7 @@ fn stream_response(state: ChatStreamState) -> Response {
                     if let Some(telemetry) = &state.owner.telemetry {
                         let provider = &state.owner.config.providers[state.provider_index].name;
                         telemetry.observe_stream_health(
-                            state.endpoint,
-                            provider,
+                            (state.endpoint, provider),
                             &state.telemetry_model,
                             "success",
                             state.started_at.elapsed(),
@@ -295,8 +293,7 @@ fn stream_response(state: ChatStreamState) -> Response {
                 if let Some(telemetry) = &state.owner.telemetry {
                     let provider = &state.owner.config.providers[state.provider_index].name;
                     telemetry.observe_stream_health(
-                        state.endpoint,
-                        provider,
+                        (state.endpoint, provider),
                         &state.telemetry_model,
                         state.failure_type,
                         state.started_at.elapsed(),
