@@ -131,6 +131,34 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
         .ok()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
     let since = now.saturating_sub(options.max_snapshot_age_secs as i64);
+    // Up to 32 candidates share these same two SQL shapes. Compile each
+    // once per offline snapshot refresh, not twice for every candidate.
+    let mut recent_stmt = conn
+        .prepare(
+            "SELECT MAX(ts) FROM request_events
+             WHERE provider=?1 AND model=?2 AND ts BETWEEN ?3 AND ?4
+             AND endpoint='chat' AND identity_verified=1
+             AND (stream_requested=0 OR failure_type!='success')
+             AND failure_type IN ('success','provider_5xx','transport_error',
+                 'invalid_response','timeout','upstream_unavailable')",
+        )
+        .ok()?;
+    // A database without the optional legacy stream terminal table must
+    // continue to rank only from confirmed nonstream evidence.
+    let mut stream_stmt = conn
+        .prepare(
+            "SELECT MAX(t.ts) FROM stream_terminals t
+         JOIN request_events r
+           ON r.request_id=t.request_id AND r.attempt_index=t.attempt_index
+         WHERE t.provider=?1 AND t.model=?2 AND t.ts BETWEEN ?3 AND ?4
+           AND r.ts BETWEEN ?3 AND ?4
+           AND r.endpoint='chat' AND r.stream_requested=1
+           AND r.identity_verified=1
+           AND r.failure_type='stream_started'
+           AND r.provider=t.provider AND r.model=t.model
+           AND t.outcome IN ('success','transport_error','invalid_response')",
+        )
+        .ok();
     let mut scores = Vec::with_capacity(config.auto.candidates.len());
     for (index, candidate) in config.auto.candidates.iter().enumerate() {
         // Telemetry labels are bounded/sanitized. A changed or colliding label
@@ -154,36 +182,21 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
         if !score.is_finite() || !(0.0..=1.0).contains(&score) {
             return None;
         }
-        let recent: Option<i64> = conn
+        let recent: Option<i64> = recent_stmt
             .query_row(
-                "SELECT MAX(ts) FROM request_events
-             WHERE provider=?1 AND model=?2 AND ts BETWEEN ?3 AND ?4
-             AND endpoint='chat' AND identity_verified=1
-             AND (stream_requested=0 OR failure_type!='success')
-             AND failure_type IN ('success','provider_5xx','transport_error',
-                 'invalid_response','timeout','upstream_unavailable')",
                 params![candidate.provider, candidate.model, since, now],
                 |row| row.get(0),
             )
             .ok()?;
         // Confirmed stream terminals also qualify as recent Chat outcomes.
-        let recent_stream: Option<i64> = conn
-            .query_row(
-                "SELECT MAX(t.ts) FROM stream_terminals t
-                 JOIN request_events r
-                   ON r.request_id=t.request_id AND r.attempt_index=t.attempt_index
-                 WHERE t.provider=?1 AND t.model=?2 AND t.ts BETWEEN ?3 AND ?4
-                   AND r.ts BETWEEN ?3 AND ?4
-                   AND r.endpoint='chat' AND r.stream_requested=1
-                   AND r.identity_verified=1
-                   AND r.failure_type='stream_started'
-                   AND r.provider=t.provider AND r.model=t.model
-                   AND t.outcome IN ('success','transport_error','invalid_response')",
+        let recent_stream: Option<i64> = stream_stmt.as_mut().and_then(|stmt| {
+            stmt.query_row(
                 params![candidate.provider, candidate.model, since, now],
                 |row| row.get(0),
             )
             .ok()
-            .flatten();
+            .flatten()
+        });
         recent.max(recent_stream)?;
         scores.push((index, score));
     }
