@@ -506,7 +506,8 @@ fn read_scoring_inner(
                 &format!(
                     "SELECT COUNT(DISTINCT request_id),
                         COUNT(DISTINCT CASE WHEN attempt_index > 1 THEN request_id END),
-                        COUNT(DISTINCT CASE WHEN stream_requested = 0 THEN request_id END),
+                        COUNT(DISTINCT CASE WHEN attempt_index = 1 AND stream_requested = 0
+                                            THEN request_id END),
                         COUNT(DISTINCT CASE WHEN attempt_index = 1 AND stream_requested = 0
                                             AND failure_type = 'success' THEN request_id END)
                  FROM request_events
@@ -985,6 +986,27 @@ mod tests {
             .as_f64()
             .unwrap();
         assert!((rate - 1.0 / 3.0).abs() < 1e-9);
+        // The first attempt was streamed. A later nonstream fallback may
+        // succeed, but this request is NOT a first-attempt nonstream sample.
+        // Count its real fallback without diluting the first-attempt rate.
+        for (attempt, streaming, outcome) in [(1, 1, "stream_started"), (2, 0, "success")] {
+            db.execute(
+                "INSERT INTO request_events VALUES(?1,'chat','p','m',20,?2,'stream-then-json',?3,?4,?5)",
+                params![now, streaming, attempt, streaming, outcome],
+            ).unwrap();
+        }
+        let mixed = read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(mixed["request_metrics"]["traced_requests"], 5);
+        assert_eq!(mixed["request_metrics"]["requests_with_fallback"], 2);
+        assert_eq!(mixed["request_metrics"]["first_attempt_nonstream"], 3);
+        assert_eq!(
+            mixed["request_metrics"]["first_attempt_successes_nonstream"],
+            1
+        );
+        assert_eq!(
+            mixed["request_metrics"]["first_attempt_success_rate_nonstream"],
+            json!(1.0 / 3.0)
+        );
     }
 
     #[test]
