@@ -1122,8 +1122,7 @@ mod tests {
         ).unwrap();
         cfg.validate().unwrap();
         assert!(cacheable_auto_defaults(&cfg));
-        let defaults = &mut cfg.auto.candidates[0].params;
-        defaults.insert(
+        cfg.auto.candidates[0].params.insert(
             "tools".into(),
             json!([{
                 "type":"function",
@@ -1134,13 +1133,15 @@ mod tests {
             !cacheable_auto_defaults(&cfg),
             "large nested tool defaults must not multiply across the LRU"
         );
-        defaults.remove("tools");
-        defaults.insert("label".into(), json!("y".repeat(65)));
+        cfg.auto.candidates[0].params.remove("tools");
+        cfg.auto.candidates[0]
+            .params
+            .insert("label".into(), json!("y".repeat(65)));
         assert!(
             !cacheable_auto_defaults(&cfg),
             "large scalars must not be stored in per-request cache entries"
         );
-        defaults.remove("label");
+        cfg.auto.candidates[0].params.remove("label");
         assert!(cacheable_auto_defaults(&cfg));
     }
 
