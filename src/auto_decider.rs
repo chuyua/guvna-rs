@@ -173,6 +173,59 @@ impl AutoDecider {
         }
     }
 
+    /// The request walk can cancel the optional selector before its own
+    /// timeout expires. A synchronous, fail-open cooldown keeps that
+    /// cancellation from adding the same wait to every later Chat request.
+    pub(crate) fn cooldown_cancelled<T: SelectorIdentity>(
+        &self,
+        steps: &[T],
+        input_bytes: usize,
+        estimated_tokens: usize,
+        requirements: AutoRequirements,
+        generation: u64,
+    ) {
+        if (2..=32).contains(&steps.len()) {
+            self.record_failed_refresh(ranking_key(
+                steps,
+                input_bytes,
+                estimated_tokens,
+                requirements,
+                generation,
+            ));
+        }
+    }
+
+    fn record_failed_refresh(&self, key: u64) {
+        // Do not await the cache mutex from the critical request deadline path.
+        let Ok(mut entries) = self.cache.try_lock() else {
+            return;
+        };
+        let now = Instant::now();
+        entries.retain(|entry| entry.stale > now);
+        if let Some(index) = entries.iter().position(|entry| entry.key == key) {
+            let mut entry = entries.remove(index).expect("matched cache entry");
+            if entry.order.is_empty() {
+                entry.fresh = now + FAILURE_COOLDOWN;
+                entry.stale = entry.fresh;
+            } else {
+                // A verified ranking can remain a stale advisory, but do not
+                // extend its original hard stale deadline.
+                entry.fresh = (now + FAILURE_COOLDOWN).min(entry.stale);
+            }
+            entries.push_back(entry);
+        } else {
+            if entries.len() >= MAX_CACHE {
+                entries.pop_front();
+            }
+            entries.push_back(Cache {
+                key,
+                order: Vec::new(),
+                fresh: now + FAILURE_COOLDOWN,
+                stale: now + FAILURE_COOLDOWN,
+            });
+        }
+    }
+
     pub(crate) async fn rank<T: SelectorIdentity>(
         &self,
         cfg: &Config,
@@ -248,27 +301,7 @@ impl AutoDecider {
         let fallback = stale
             .filter(|(_, expiry)| *expiry > Instant::now())
             .and_then(|(order, _)| valid_permutation(&order, steps.len()).then_some(order));
-        let mut entries = self.cache.lock().await;
-        let now = Instant::now();
-        if fallback.is_some() {
-            // Preserve a previously verified ranking, but do not block each
-            // following request on another broken selector refresh. Its
-            // original stale deadline still applies, with no extension.
-            if let Some(entry) = entries.iter_mut().find(|entry| entry.key == key) {
-                entry.fresh = (now + FAILURE_COOLDOWN).min(entry.stale);
-            }
-        } else {
-            entries.retain(|entry| entry.stale > now && entry.key != key);
-            if entries.len() >= MAX_CACHE {
-                entries.pop_front();
-            }
-            entries.push_back(Cache {
-                key,
-                order: Vec::new(),
-                fresh: now + FAILURE_COOLDOWN,
-                stale: now + FAILURE_COOLDOWN,
-            });
-        }
+        self.record_failed_refresh(key);
         fallback
     }
 
@@ -851,6 +884,100 @@ auto:
         let (fresh, refresh) = decider.cached_rank(&steps, 12, 23, features, SELECTOR_GENERATION);
         assert_eq!(fresh.unwrap(), vec![1, 0]);
         assert!(!refresh);
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_selector_does_not_repeat_external_timeout_on_next_request() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let server = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post({
+                let calls = Arc::clone(&calls);
+                let entered = Arc::clone(&entered);
+                move || {
+                    let calls = Arc::clone(&calls);
+                    let entered = Arc::clone(&entered);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        entered.notify_one();
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        axum::Json(json!({"choices":[{"message":{"content":"{\"order\":[1,0]}"}}]}))
+                    }
+                }
+            }),
+        );
+        let server_task = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+        let cfg: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: http://127.0.0.1\n    key_env: K\nauto:\n  enabled: true\n  candidates:\n    - provider: p\n      model: one\n    - provider: p\n      model: two\n",
+        ).unwrap();
+        cfg.validate().unwrap();
+        let decider = Arc::new(AutoDecider {
+            client: reqwest::Client::new(),
+            endpoint: format!("http://{addr}/v1/chat/completions"),
+            model: "ranker".into(),
+            key: "fake-key".into(),
+            timeout: Duration::from_secs(5),
+            ttl: Duration::from_secs(30),
+            cache: Mutex::new(VecDeque::new()),
+            refresh: Semaphore::new(1),
+        });
+        let steps = vec![
+            ResolvedStep {
+                provider_index: 0,
+                model: "one".into(),
+                params: Default::default(),
+            },
+            ResolvedStep {
+                provider_index: 0,
+                model: "two".into(),
+                params: Default::default(),
+            },
+        ];
+        let req = AutoRequirements::default();
+        let running = {
+            let decider = Arc::clone(&decider);
+            tokio::spawn(async move { decider.rank(&cfg, &steps, 10, 40, req, 7).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("slow selector should start before cancellation");
+        running.abort();
+        let _ = running.await;
+        let steps = [
+            ResolvedStep {
+                provider_index: 0,
+                model: "one".into(),
+                params: Default::default(),
+            },
+            ResolvedStep {
+                provider_index: 0,
+                model: "two".into(),
+                params: Default::default(),
+            },
+        ];
+        decider.cooldown_cancelled(&steps, 10, 40, req, 7);
+        let (order, refresh) = decider.cached_rank(&steps, 10, 40, req, 7);
+        assert!(order.is_none());
+        assert!(
+            !refresh,
+            "the cancelled selector gets a short keyed cooldown"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        {
+            let mut entries = decider.cache.lock().await;
+            entries[0].fresh = Instant::now() - Duration::from_secs(1);
+            entries[0].stale = entries[0].fresh;
+        }
+        let (_, refresh) = decider.cached_rank(&steps, 10, 40, req, 7);
+        assert!(refresh, "the next request may refresh after the cooldown");
         server_task.abort();
     }
 

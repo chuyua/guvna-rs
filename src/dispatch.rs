@@ -816,10 +816,19 @@ async fn dispatch_inner(
                 if let Some(deadline) = walk_deadline {
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     let reserve = (remaining / 2).min(Duration::from_millis(250));
-                    tokio::time::timeout_at(deadline - reserve, selection)
-                        .await
-                        .ok()
-                        .flatten()
+                    match tokio::time::timeout_at(deadline - reserve, selection).await {
+                        Ok(order) => order,
+                        Err(_) => {
+                            decider.cooldown_cancelled(
+                                &steps,
+                                input_bytes,
+                                context_estimate,
+                                requirements,
+                                live.auto_generation,
+                            );
+                            None
+                        }
+                    }
                 } else {
                     None
                 }
