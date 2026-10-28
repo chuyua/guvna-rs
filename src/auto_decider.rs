@@ -207,9 +207,11 @@ impl AutoDecider {
             if entry.order.is_empty() {
                 entry.fresh = now + FAILURE_COOLDOWN;
                 entry.stale = entry.fresh;
-            } else {
+            } else if entry.fresh <= now {
                 // A verified ranking can remain a stale advisory, but do not
-                // extend its original hard stale deadline.
+                // extend its original hard stale deadline. More importantly,
+                // a cancelled older fetch must not shorten the freshness of
+                // a newer successful ranking published by another request.
                 entry.fresh = (now + FAILURE_COOLDOWN).min(entry.stale);
             }
             entries.push_back(entry);
@@ -885,6 +887,53 @@ auto:
         assert_eq!(fresh.unwrap(), vec![1, 0]);
         assert!(!refresh);
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn late_cancelled_selector_cannot_shorten_newly_successful_rank() {
+        let decider = AutoDecider {
+            client: reqwest::Client::new(),
+            endpoint: String::new(),
+            model: String::new(),
+            key: String::new(),
+            timeout: Duration::from_secs(1),
+            ttl: Duration::from_secs(30),
+            cache: Mutex::new(VecDeque::new()),
+            refresh: Semaphore::new(1),
+        };
+        let steps = vec![
+            ResolvedStep {
+                provider_index: 0,
+                model: "one".into(),
+                params: Default::default(),
+            },
+            ResolvedStep {
+                provider_index: 0,
+                model: "two".into(),
+                params: Default::default(),
+            },
+        ];
+        let features = AutoRequirements::default();
+        let key = ranking_key(&steps, 10, 40, features, SELECTOR_GENERATION);
+        let original_fresh = Instant::now() + Duration::from_secs(30);
+        let original_stale = original_fresh + Duration::from_secs(STALE_SECS);
+        decider.cache.lock().await.push_back(Cache {
+            key,
+            order: vec![1, 0],
+            fresh: original_fresh,
+            stale: original_stale,
+        });
+        // Simulates an old request's cancellation arriving after another
+        // request has already published a fresh, successful ranking.
+        decider.cooldown_cancelled(&steps, 10, 40, features, SELECTOR_GENERATION);
+        let entries = decider.cache.lock().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].fresh, original_fresh);
+        assert_eq!(entries[0].stale, original_stale);
+        drop(entries);
+        let (order, refresh) = decider.cached_rank(&steps, 10, 40, features, SELECTOR_GENERATION);
+        assert_eq!(order.unwrap(), vec![1, 0]);
+        assert!(!refresh);
     }
 
     #[tokio::test]
