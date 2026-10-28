@@ -3515,6 +3515,68 @@ async fn inline_usage_plus_final_trailer_succeeds_for_chat_and_responses() {
 }
 
 #[tokio::test]
+async fn responses_sse_terminal_persists_under_responses_not_chat() {
+    use rusqlite::Connection;
+    let (upstream, hits) = start_sse(vec![
+        RESP_START_A,
+        RESP_START_B,
+        RESP_END,
+        RESP_USAGE,
+        SSE_DONE,
+    ])
+    .await;
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {upstream}\n    key_env: K\nchains:\n  - name: demo\n    steps:\n      - provider: p\n        model: physical\n"
+    )).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(
+        cfg,
+        HashMap::from([("K".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, running) = app_with_state(state);
+    let response = router
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hello","stream":true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = to_bytes(response.into_body(), 4 << 20).await.unwrap();
+    assert!(String::from_utf8_lossy(&result).contains("event: response.completed"));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(running.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let (response_starts, chat_starts): (i64, i64) = db
+        .query_row(
+            "SELECT COALESCE(SUM(endpoint='responses'),0),
+                COALESCE(SUM(endpoint='chat'),0)
+         FROM request_events WHERE provider='p'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((response_starts, chat_starts), (1, 0));
+    let (response_hourly, chat_hourly): (i64, i64) = db
+        .query_row(
+            "SELECT COALESCE(SUM(endpoint='responses'),0),
+                COALESCE(SUM(endpoint='chat'),0)
+         FROM hourly_stats WHERE provider='p'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(response_hourly >= 1);
+    assert_eq!(chat_hourly, 0);
+    let terminal: String = db
+        .query_row("SELECT outcome FROM stream_terminals", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(terminal, "success");
+}
+
+#[tokio::test]
 async fn responses_sse_real_upstream_fragmentation_metadata_usage() {
     let (url, hits) = start_sse(vec![
         RESP_START_A,
