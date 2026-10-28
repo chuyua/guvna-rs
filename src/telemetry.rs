@@ -1381,14 +1381,17 @@ mod tests {
         let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
         let (responses, chat): (i64, i64) = db
             .query_row(
-                "SELECT COALESCE(SUM(endpoint='responses'),0),
-                    COALESCE(SUM(endpoint='chat'),0)
+                "SELECT COALESCE(SUM(CASE WHEN endpoint='responses' THEN request_count ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN endpoint='chat' THEN request_count ELSE 0 END),0)
                FROM hourly_stats WHERE provider='physical'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert!(responses >= 3);
+        assert_eq!(
+            responses, 3,
+            "three Responses stream starts count as three requests, even when grouped into fewer hourly rows"
+        );
         assert_eq!(
             chat, 0,
             "a Responses stream must not create phantom Chat quality rows"
