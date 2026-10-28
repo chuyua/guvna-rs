@@ -173,6 +173,7 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
                  JOIN request_events r
                    ON r.request_id=t.request_id AND r.attempt_index=t.attempt_index
                  WHERE t.provider=?1 AND t.model=?2 AND t.ts BETWEEN ?3 AND ?4
+                   AND r.ts BETWEEN ?3 AND ?4
                    AND r.endpoint='chat' AND r.stream_requested=1
                    AND r.identity_verified=1
                    AND r.failure_type='stream_started'
@@ -352,6 +353,20 @@ auto:
         .unwrap();
         conn.execute(
             "INSERT INTO stream_terminals VALUES (?1,'verified-stream',1,'p','second','success')",
+            params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE request_events SET ts=?1 WHERE model='second'",
+            params![now + 86400],
+        )
+        .unwrap();
+        assert!(
+            load(dir.path(), &cfg).is_none(),
+            "a current terminal linked to a future Chat attempt is not valid recent evidence"
+        );
+        conn.execute(
+            "UPDATE request_events SET ts=?1 WHERE model='second'",
             params![now],
         )
         .unwrap();
