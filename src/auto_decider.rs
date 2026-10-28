@@ -15,6 +15,10 @@ const MAX_CACHE: usize = 32;
 const MAX_REQUEST: usize = 8192;
 const MAX_RESPONSE: usize = 4096;
 const STALE_SECS: u64 = 120;
+// A failed optional selector must not add a network timeout to every
+// otherwise healthy Chat request. A brief, keyed negative entry is advisory;
+// the normal deterministic candidate order remains available immediately.
+const FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 
 struct Cache {
     key: u64,
@@ -241,9 +245,24 @@ impl AutoDecider {
             });
             return Some(order);
         }
-        stale
+        let fallback = stale
             .filter(|(_, expiry)| *expiry > Instant::now())
-            .and_then(|(order, _)| valid_permutation(&order, steps.len()).then_some(order))
+            .and_then(|(order, _)| valid_permutation(&order, steps.len()).then_some(order));
+        if fallback.is_none() {
+            let mut entries = self.cache.lock().await;
+            let now = Instant::now();
+            entries.retain(|entry| entry.stale > now && entry.key != key);
+            if entries.len() >= MAX_CACHE {
+                entries.pop_front();
+            }
+            entries.push_back(Cache {
+                key,
+                order: Vec::new(),
+                fresh: now + FAILURE_COOLDOWN,
+                stale: now + FAILURE_COOLDOWN,
+            });
+        }
+        fallback
     }
 
     async fn fetch<T: SelectorIdentity>(
@@ -826,6 +845,110 @@ auto:
         assert_eq!(fresh.unwrap(), vec![1, 0]);
         assert!(!refresh);
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_selector_is_cooldown_cached_and_retries_after_expiry() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            axum::Json(json!({"error":"temporary outage"})),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(
+                                json!({"choices":[{"message":{"content":"{\"order\":[1,0]}"}}]}),
+                            ),
+                        )
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config: Config = serde_yaml::from_str(&format!(
+            "providers:\n  - name: p\n    type: openai\n    base_url: http://{address}\n    key_env: K\nauto:\n  enabled: true\n  candidates:\n    - provider: p\n      model: one\n    - provider: p\n      model: two\n  decider:\n    enabled: true\n    provider: p\n    model: ranker\n    timeout_ms: 500\n    cache_ttl_secs: 30\n",
+        )).unwrap();
+        config.validate().unwrap();
+        let decider = AutoDecider::from_config(
+            &config,
+            &HashMap::from([("K".to_owned(), "fake-key".to_owned())]),
+            reqwest::Client::new(),
+        )
+        .unwrap()
+        .unwrap();
+        let steps = vec![
+            ResolvedStep {
+                provider_index: 0,
+                model: "one".into(),
+                params: Default::default(),
+            },
+            ResolvedStep {
+                provider_index: 0,
+                model: "two".into(),
+                params: Default::default(),
+            },
+        ];
+        let features = AutoRequirements::default();
+        assert!(
+            decider
+                .rank(&config, &steps, 10, 40, features, 7)
+                .await
+                .is_none()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for _ in 0..3 {
+            let (cached, refresh) = decider.cached_rank(&steps, 10, 40, features, 7);
+            assert!(cached.is_none());
+            assert!(
+                !refresh,
+                "failed ranking is cooling down; do not queue a retry"
+            );
+            assert!(
+                decider
+                    .rank(&config, &steps, 10, 40, features, 7)
+                    .await
+                    .is_none()
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        {
+            let mut entries = decider.cache.lock().await;
+            assert_eq!(entries.len(), 1);
+            entries[0].fresh = Instant::now() - Duration::from_secs(1);
+            entries[0].stale = entries[0].fresh;
+        }
+        assert_eq!(
+            decider
+                .rank(&config, &steps, 10, 40, features, 7)
+                .await
+                .unwrap(),
+            vec![1, 0],
+            "recovered selector must replace the expired negative entry"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            decider
+                .rank(&config, &steps, 10, 40, features, 7)
+                .await
+                .unwrap(),
+            vec![1, 0]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 
     #[tokio::test]
