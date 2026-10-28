@@ -5546,6 +5546,56 @@ auto:
 }
 
 #[tokio::test]
+async fn auto_candidate_default_override_cache_never_routes_oversized_alias() {
+    let (upstream, hits) = start_upstream(StatusCode::OK).await;
+    let explicit = json!({
+        "model":"auto","messages":[{"role":"user","content":"hi"}],
+        "max_tokens":80,"user":"x".repeat(11)
+    });
+    let implicit = json!({
+        "model":"auto","messages":[{"role":"user","content":"hi"}],
+        "max_completion_tokens":80,"user":""
+    });
+    let mut physical = explicit.clone();
+    physical["model"] = json!("short");
+    let context_cap = guvna::routing::auto_context_estimate(&physical) + 100;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {upstream}\n    key_env: K\nauto:\n  enabled: true\n  candidates:\n    - provider: p\n      model: short\n      max_context_tokens: {context_cap}\n      params:\n        max_tokens: 1000\n"
+    )).unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "key".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for path in ["/v1/auto", "/v1/chat/completions"] {
+        let (status, response) = call(
+            router.clone(),
+            auto_request(path, "client", explicit.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {response}");
+        assert_eq!(response["model"], "short");
+        let (status, response) = call(
+            router.clone(),
+            auto_request(path, "client", implicit.clone()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{path}: {response}"
+        );
+        assert_eq!(response["error"]["code"], "auto_no_eligible_candidate");
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "two oversized max_completion_tokens requests must be rejected before networking"
+    );
+}
+
+#[tokio::test]
 async fn auto_cached_routes_filter_long_physical_model_before_network_and_keep_safe_fallback() {
     let (primary, primary_calls) = start_upstream(StatusCode::OK).await;
     let (backup, backup_calls) = start_upstream(StatusCode::OK).await;
