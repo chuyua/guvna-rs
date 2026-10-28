@@ -608,7 +608,7 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
         CREATE INDEX IF NOT EXISTS request_events_ts ON request_events(ts);
         CREATE TABLE IF NOT EXISTS failure_events (
             ts INTEGER NOT NULL,
-            endpoint TEXT NOT NULL CHECK (endpoint IN ('chat','embeddings')),
+            endpoint TEXT NOT NULL CHECK (endpoint IN ('chat','embeddings','responses')),
             provider TEXT NOT NULL,
             model TEXT NOT NULL,
             status INTEGER NOT NULL,
@@ -1411,6 +1411,38 @@ mod tests {
             })
             .unwrap();
         assert_eq!(terminals, 3);
+    }
+
+    #[test]
+    fn new_database_reopen_does_not_rebuild_endpoint_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh-telemetry.sqlite3");
+        let first = open_database(&path).unwrap();
+        let schema_version: i64 = first
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        for table in ["request_events", "failure_events"] {
+            let ddl: String = first
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                ddl.contains("'responses'"),
+                "{table} must allow Responses from first creation"
+            );
+        }
+        drop(first);
+        let second = open_database(&path).unwrap();
+        let reopened_version: i64 = second
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            reopened_version, schema_version,
+            "reopening a fresh database must not rebuild its endpoint tables"
+        );
     }
 
     #[test]
