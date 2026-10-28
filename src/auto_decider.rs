@@ -248,9 +248,16 @@ impl AutoDecider {
         let fallback = stale
             .filter(|(_, expiry)| *expiry > Instant::now())
             .and_then(|(order, _)| valid_permutation(&order, steps.len()).then_some(order));
-        if fallback.is_none() {
-            let mut entries = self.cache.lock().await;
-            let now = Instant::now();
+        let mut entries = self.cache.lock().await;
+        let now = Instant::now();
+        if fallback.is_some() {
+            // Preserve a previously verified ranking, but do not block each
+            // following request on another broken selector refresh. Its
+            // original stale deadline still applies, with no extension.
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.key == key) {
+                entry.fresh = (now + FAILURE_COOLDOWN).min(entry.stale);
+            }
+        } else {
             entries.retain(|entry| entry.stale > now && entry.key != key);
             if entries.len() >= MAX_CACHE {
                 entries.pop_front();
@@ -862,7 +869,7 @@ auto:
             axum::routing::post(move || {
                 let counter = Arc::clone(&counter);
                 async move {
-                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    if counter.fetch_add(1, Ordering::SeqCst) != 1 {
                         (
                             axum::http::StatusCode::SERVICE_UNAVAILABLE,
                             axum::Json(json!({"error":"temporary outage"})),
@@ -948,6 +955,36 @@ auto:
             vec![1, 0]
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let old_stale = {
+            let mut entries = decider.cache.lock().await;
+            entries[0].fresh = Instant::now() - Duration::from_secs(1);
+            entries[0].stale
+        };
+        assert_eq!(
+            decider
+                .rank(&config, &steps, 10, 40, features, 7)
+                .await
+                .unwrap(),
+            vec![1, 0],
+            "a failed refresh must preserve an unexpired successful ranking"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let (cached, refresh) = decider.cached_rank(&steps, 10, 40, features, 7);
+        assert_eq!(cached.unwrap(), vec![1, 0]);
+        assert!(!refresh, "stale success must get short refresh cooldown");
+        assert_eq!(
+            decider
+                .rank(&config, &steps, 10, 40, features, 7)
+                .await
+                .unwrap(),
+            vec![1, 0]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            decider.cache.lock().await[0].stale,
+            old_stale,
+            "refresh failure cannot extend the hard stale deadline"
+        );
         server.abort();
     }
 
