@@ -857,6 +857,33 @@ chains:
 }
 
 #[tokio::test]
+async fn mixed_caller_rejection_and_provider_outage_never_mislabels_request_as_invalid() {
+    for (first_status, second_status) in [
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let (first, first_calls) = start_upstream(first_status).await;
+        let (second, second_calls) = start_upstream(second_status).await;
+        let router = make_app(&first, &second);
+        let (status, body) = call(router, request("demo", "", "client")).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "{first_status} -> {second_status}: {body}"
+        );
+        assert_eq!(body["error"]["code"], "upstream_unavailable");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
 async fn last_upstream_caller_rejection_preserves_client_status_without_key_leak() {
     let (upstream, hits) = start_upstream(StatusCode::UNPROCESSABLE_ENTITY).await;
     let router = make_app(&upstream, &upstream);

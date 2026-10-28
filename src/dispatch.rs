@@ -856,6 +856,11 @@ async fn dispatch_inner(
     let mut candidates_visited = 0usize;
     let mut attempted_network = false;
     let mut last_upstream_client_error: Option<(StatusCode, Value)> = None;
+    // A 4xx from one provider does not prove the caller is wrong if another
+    // provider encountered a 5xx, network fault or invalid 2xx payload.
+    // Return a sanitized caller rejection only when every observed network
+    // result in this candidate walk was a caller rejection.
+    let mut saw_non_client_network_result = false;
     let mut bypassed_circuit = false;
     let mut aggregation_busy = false;
     let mut buffered_response_busy = false;
@@ -1110,6 +1115,7 @@ async fn dispatch_inner(
             let response = match tokio::time::timeout_at(deadline, send).await {
                 Ok(result) => result,
                 Err(_) => {
+                    saw_non_client_network_result = true;
                     if walk_expired(walk_deadline) {
                         let mut context = telemetry_context.take();
                         if let Some(context) = context.as_mut() {
@@ -1134,6 +1140,7 @@ async fn dispatch_inner(
             let upstream = match response {
                 Ok(response) => response,
                 Err(_) => {
+                    saw_non_client_network_result = true;
                     Metrics::inc(&state.metrics.upstream_transport_failures);
                     ops_log::warn("transport_failure");
                     if state.pools[step.provider_index].record(&lease, Outcome::TransportFailure) {
@@ -1149,6 +1156,9 @@ async fn dispatch_inner(
             };
             let status = upstream.status().as_u16();
             let outcome = classify(Some(status));
+            if outcome != Outcome::CallerRejected {
+                saw_non_client_network_result = true;
+            }
             if let Some(context) = telemetry_context.as_mut() {
                 context.set_upstream_status(Some(status));
                 context.set_failure_type(if matches!(status, 408 | 504) {
@@ -1637,7 +1647,7 @@ async fn dispatch_inner(
         }
         return attach_telemetry_context(response, context);
     }
-    if let Some((status, value)) = last_upstream_client_error {
+    if !saw_non_client_network_result && let Some((status, value)) = last_upstream_client_error {
         return attach_telemetry_context(
             (status, Json(value)).into_response(),
             telemetry_context.take(),
