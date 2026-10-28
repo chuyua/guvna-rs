@@ -177,7 +177,7 @@ pub fn load(data_dir: &Path, config: &Config) -> Option<Vec<(String, String)>> {
                    AND r.identity_verified=1
                    AND r.failure_type='stream_started'
                    AND r.provider=t.provider AND r.model=t.model
-                   AND t.outcome IN ('success','transport_error')",
+                   AND t.outcome IN ('success','transport_error','invalid_response')",
                 params![candidate.provider, candidate.model, since, now],
                 |row| row.get(0),
             )
@@ -356,6 +356,30 @@ auto:
         )
         .unwrap();
         assert!(load(dir.path(), &cfg).is_some());
+        // A verified malformed stream terminal is a real *failed* model
+        // observation, just as the scoring denominator already counts it.
+        // Excluding it from freshness incorrectly disables the whole
+        // ranking after providers start producing invalid SSE.
+        conn.execute(
+            "UPDATE stream_terminals SET outcome='invalid_response'
+             WHERE request_id='verified-stream'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            load(dir.path(), &cfg).is_some(),
+            "a verified malformed stream terminal must qualify as recent failure evidence"
+        );
+        conn.execute(
+            "UPDATE stream_terminals SET outcome='unverified'
+             WHERE request_id='verified-stream'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            load(dir.path(), &cfg).is_none(),
+            "unknown terminal outcomes must not authorize ranking"
+        );
         conn.execute("DELETE FROM stream_terminals", []).unwrap();
         assert!(load(dir.path(), &cfg).is_none());
         conn.execute(
