@@ -248,6 +248,7 @@ impl Telemetry {
     /// Record a terminal stream outcome without duplicating its request row or attempt count.
     pub fn observe_stream_health(
         &self,
+        endpoint: &'static str,
         provider: &str,
         model: &str,
         failure_type: &'static str,
@@ -268,7 +269,7 @@ impl Telemetry {
             "client_cancelled" => 499,
             _ => 502,
         };
-        self.enqueue_observation("chat", status, elapsed, context, false, metrics);
+        self.enqueue_observation(endpoint, status, elapsed, context, false, metrics);
     }
 
     /// A bounded asynchronous Shadow observation. Never claim the suggested
@@ -1348,6 +1349,69 @@ mod tests {
     }
 
     #[test]
+    fn responses_stream_terminals_keep_endpoint_identity_and_do_not_penalize_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let telemetry = Telemetry::start(dir.path(), Arc::clone(&metrics)).unwrap();
+        for (id, outcome) in [
+            ("response-complete", "success"),
+            ("response-transport", "transport_error"),
+            ("response-cancel", "client_cancelled"),
+        ] {
+            let mut started = TelemetryContext::new("physical", "model", "stream_started");
+            started.set_trace(id, 1, true);
+            telemetry.submit(
+                "responses",
+                200,
+                Duration::from_millis(2),
+                true,
+                Some(started),
+                &metrics,
+            );
+            telemetry.observe_stream_health(
+                "responses",
+                "physical",
+                "model",
+                outcome,
+                Duration::from_millis(40),
+                (id, 1),
+                &metrics,
+            );
+        }
+        assert!(telemetry.flush(Duration::from_secs(3)));
+        let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+        let (responses, chat): (i64, i64) = db
+            .query_row(
+                "SELECT COALESCE(SUM(endpoint='responses'),0),
+                    COALESCE(SUM(endpoint='chat'),0)
+               FROM hourly_stats WHERE provider='physical'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(responses >= 3);
+        assert_eq!(
+            chat, 0,
+            "a Responses stream must not create phantom Chat quality rows"
+        );
+        let failed: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM failure_events
+             WHERE endpoint='responses' AND failure_type='transport_error'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed, 1);
+        let terminals: i64 = db
+            .query_row("SELECT COUNT(*) FROM stream_terminals", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(terminals, 3);
+    }
+
+    #[test]
     fn old_endpoint_checks_migrate_without_losing_failure_history() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old-telemetry.sqlite3");
@@ -1441,6 +1505,7 @@ mod tests {
                 &metrics,
             );
             telemetry.observe_stream_health(
+                "chat",
                 "p",
                 "model",
                 kind,

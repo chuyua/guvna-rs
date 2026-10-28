@@ -40,6 +40,7 @@ impl PreflightError {
 
 pub(super) struct StreamRoute {
     pub(super) provider_index: usize,
+    pub(super) endpoint: &'static str,
     pub(super) model: String,
     pub(super) telemetry_model: String,
     pub(super) live: Arc<LiveRouteSnapshot>,
@@ -49,6 +50,7 @@ pub(super) struct StreamRoute {
 struct ChatStreamState {
     owner: Arc<AppState>,
     provider_index: usize,
+    endpoint: &'static str,
     model: String,
     telemetry_model: String,
     live: Arc<LiveRouteSnapshot>,
@@ -77,6 +79,7 @@ impl Drop for ChatStreamState {
             if let Some(telemetry) = &self.owner.telemetry {
                 let provider = &self.owner.config.providers[self.provider_index].name;
                 telemetry.observe_stream_health(
+                    self.endpoint,
                     provider,
                     &self.telemetry_model,
                     "client_cancelled",
@@ -116,6 +119,7 @@ pub(super) async fn start(
     let mut state = ChatStreamState {
         owner,
         provider_index: route.provider_index,
+        endpoint: route.endpoint,
         model: route.model,
         telemetry_model: route.telemetry_model,
         live: route.live,
@@ -191,6 +195,7 @@ fn stream_response(state: ChatStreamState) -> Response {
                     if let Some(telemetry) = &state.owner.telemetry {
                         let provider = &state.owner.config.providers[state.provider_index].name;
                         telemetry.observe_stream_health(
+                            state.endpoint,
                             provider,
                             &state.telemetry_model,
                             "success",
@@ -290,6 +295,7 @@ fn stream_response(state: ChatStreamState) -> Response {
                 if let Some(telemetry) = &state.owner.telemetry {
                     let provider = &state.owner.config.providers[state.provider_index].name;
                     telemetry.observe_stream_health(
+                        state.endpoint,
                         provider,
                         &state.telemetry_model,
                         state.failure_type,

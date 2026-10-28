@@ -1212,6 +1212,7 @@ async fn dispatch_inner(
                         state.clone(),
                         chat_stream::StreamRoute {
                             provider_index: step.provider_index,
+                            endpoint: telemetry_endpoint(endpoint),
                             model: step.model.clone(),
                             live: Arc::clone(&live),
                             telemetry_model: state
