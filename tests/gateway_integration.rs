@@ -879,7 +879,11 @@ async fn mixed_caller_rejection_and_provider_outage_never_mislabels_request_as_i
         );
         assert_eq!(body["error"]["code"], "upstream_unavailable");
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            2,
+            "the first credential is intentionally rate limited before the second answers"
+        );
     }
 }
 

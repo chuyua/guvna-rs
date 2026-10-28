@@ -1156,7 +1156,10 @@ async fn dispatch_inner(
             };
             let status = upstream.status().as_u16();
             let outcome = classify(Some(status));
-            if outcome != Outcome::CallerRejected {
+            // A key-local 429 is not a model validation result. Other keys
+            // may still establish a true caller 4xx; preserve that historical
+            // response even if a different credential exhausted its quota.
+            if !matches!(outcome, Outcome::CallerRejected | Outcome::RateLimited) {
                 saw_non_client_network_result = true;
             }
             if let Some(context) = telemetry_context.as_mut() {
