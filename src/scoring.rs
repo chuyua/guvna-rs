@@ -33,6 +33,7 @@ type StreamOutcomeCounts = HashMap<(String, String), (i64, i64)>;
 fn confirmed_chat_stream_outcomes(
     conn: &Connection,
     since: i64,
+    until: i64,
     targets: &[(String, String)],
     verified_only: bool,
 ) -> Result<StreamOutcomeCounts, String> {
@@ -49,7 +50,10 @@ fn confirmed_chat_stream_outcomes(
     } else {
         ""
     };
-    let mut args = vec![rusqlite::types::Value::Integer(since)];
+    let mut args = vec![
+        rusqlite::types::Value::Integer(since),
+        rusqlite::types::Value::Integer(until),
+    ];
     for (provider, model) in targets {
         args.push(rusqlite::types::Value::Text(provider.clone()));
         args.push(rusqlite::types::Value::Text(model.clone()));
@@ -61,7 +65,8 @@ fn confirmed_chat_stream_outcomes(
          FROM request_events r
          JOIN stream_terminals t
            ON t.request_id=r.request_id AND t.attempt_index=r.attempt_index
-         WHERE r.ts>=?1 AND t.ts>=?1 AND r.endpoint='chat'
+         WHERE r.ts BETWEEN ?1 AND ?2 AND t.ts BETWEEN ?1 AND ?2
+           AND r.endpoint='chat'
            AND r.stream_requested=1 AND r.failure_type='stream_started'
            AND r.provider=t.provider AND r.model=t.model
            AND t.outcome IN ('success','transport_error','invalid_response')
@@ -320,6 +325,7 @@ fn read_scoring_inner(
         .min(i64::MAX as u64) as i64;
     let since = now - (hours as i64) * 3600;
     let start_hour = since - since.rem_euclid(3600);
+    let current_hour = now - now.rem_euclid(3600);
     // Legacy aggregates without endpoint labels cannot safely rank Chat.
     // Continue to show request/shadow diagnostics, but fail closed for scores.
     let chat_filter = if conn
@@ -345,7 +351,10 @@ fn read_scoring_inner(
         ),
         None => String::new(),
     };
-    let mut args = vec![rusqlite::types::Value::Integer(start_hour)];
+    let mut args = vec![
+        rusqlite::types::Value::Integer(start_hour),
+        rusqlite::types::Value::Integer(current_hour),
+    ];
     if let Some(candidates) = candidates {
         for (provider, model) in candidates {
             args.push(rusqlite::types::Value::Text(provider.clone()));
@@ -361,7 +370,8 @@ fn read_scoring_inner(
                     THEN MIN(request_count,failure_count) ELSE 0 END),0),
                 COALESCE(SUM(CASE WHEN failure_type='stream_started' THEN request_count ELSE 0 END),0)
          FROM hourly_stats
-         WHERE hour_ts >= ?1 AND provider != 'unknown' {chat_filter} {candidate_filter} {verified_filter}
+         WHERE hour_ts BETWEEN ?1 AND ?2 AND provider != 'unknown'
+           {chat_filter} {candidate_filter} {verified_filter}
          GROUP BY provider,model
          ORDER BY COALESCE(SUM(request_count),0) DESC,provider,model
          LIMIT 32"
@@ -391,7 +401,7 @@ fn read_scoring_inner(
         .map(|row| (row.0.clone(), row.1.clone()))
         .collect::<Vec<_>>();
     let stream_outcomes =
-        confirmed_chat_stream_outcomes(&conn, since, &targets, candidates.is_some())?;
+        confirmed_chat_stream_outcomes(&conn, since, now, &targets, candidates.is_some())?;
     let mut candidates = Vec::new();
     for record in rows {
         let (
@@ -431,14 +441,15 @@ fn read_scoring_inner(
         };
         let latency_sql = format!(
             "SELECT elapsed_ms,sse_headers FROM request_events
-             WHERE provider=?1 AND model=?2 AND ts >= ?3 {latency_filter} {verified_filter}
+             WHERE provider=?1 AND model=?2 AND ts BETWEEN ?3 AND ?4
+               {latency_filter} {verified_filter}
              ORDER BY ts DESC LIMIT 512"
         );
         let mut sample_stmt = conn
             .prepare(&latency_sql)
             .map_err(|_| "cannot prepare latency sample")?;
         let samples = sample_stmt
-            .query_map(params![provider, model, since], |row| {
+            .query_map(params![provider, model, since, now], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
             })
             .map_err(|_| "cannot read latency samples")?;
@@ -1051,6 +1062,18 @@ mod tests {
             [hour],
         )
         .unwrap();
+        // A VPS clock corrected backwards must not let future aggregates
+        // dominate today's quality score or future latency samples skew p95.
+        db.execute(
+            "INSERT INTO hourly_stats VALUES(?1,'chat','test','alpha',10000,0,100,100,'success')",
+            [hour + 3600],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO request_events VALUES('test','alpha',?1,1000000,0,'chat')",
+            [now + 86400],
+        )
+        .unwrap();
         drop(db);
         let result = read_scoring(dir.path(), 1).unwrap();
         assert_eq!(result["candidate_count"], 2);
@@ -1161,9 +1184,26 @@ mod tests {
             )
             .unwrap();
         }
-        let outcomes =
-            confirmed_chat_stream_outcomes(&db, now - 3600, &[("p".into(), "m".into())], false)
-                .unwrap();
+        // A fabricated future stream terminal is never current evidence,
+        // even when its Chat request and attempt identity both match.
+        db.execute(
+            "INSERT INTO request_events VALUES(?1,'chat','p','m',10,1,'future',1,1,'stream_started')",
+            [now + 86400],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO stream_terminals VALUES(?1,'future',1,'p','m','success')",
+            [now + 86400],
+        )
+        .unwrap();
+        let outcomes = confirmed_chat_stream_outcomes(
+            &db,
+            now - 3600,
+            now,
+            &[("p".into(), "m".into())],
+            false,
+        )
+        .unwrap();
         assert_eq!(
             outcomes.len(),
             1,
