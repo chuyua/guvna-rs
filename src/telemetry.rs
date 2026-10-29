@@ -813,9 +813,10 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
         )?;
         let mut terminal = tx.prepare_cached(
-            "INSERT OR IGNORE INTO stream_terminals
+            "INSERT INTO stream_terminals
              (ts,request_id,attempt_index,provider,model,outcome,elapsed_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(request_id,attempt_index) DO NOTHING",
         )?;
         let mut health = tx.prepare_cached(
             "INSERT INTO provider_health
@@ -2296,6 +2297,34 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(requests, 1);
+    }
+
+    #[test]
+    fn invalid_stream_terminal_rejects_entire_batch_not_silently_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_database(&dir.path().join("stream-invalid.sqlite3")).unwrap();
+        let accepted = event(7200, "p", "m", 200, 5, "success");
+        let mut bad_terminal = event(7201, "p", "m", 502, 9, "provider_5xx");
+        bad_terminal.record_request = false;
+        bad_terminal.count_attempt = false;
+        bad_terminal.stream_requested = true;
+        bad_terminal.request_id = Some("bad-terminal".into());
+        bad_terminal.attempt_index = Some(1);
+        assert!(
+            write_batch(&mut conn, &[accepted, bad_terminal]).is_err(),
+            "only duplicate trace keys may be ignored; invalid terminal outcomes must surface"
+        );
+        for table in [
+            "request_events",
+            "failure_events",
+            "hourly_stats",
+            "provider_health",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "transaction left partial writes in {table}");
+        }
     }
     #[test]
     fn provider_health_snapshot_restores_only_recent_provider_summary() {
