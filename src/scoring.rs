@@ -515,11 +515,11 @@ fn read_scoring_inner(
             )
             .is_ok()
         {
-            "(stream_requested=0 AND (attempt_index=1 OR
+            "((attempt_index=1 AND stream_requested=0) OR
                 (attempt_index>1 AND request_id IN (
                     SELECT f.request_id FROM failure_events f
                     WHERE f.attempt_index=1 AND f.stream_requested=0
-                      AND f.endpoint='chat' AND f.ts BETWEEN ?1 AND ?2))))"
+                      AND f.endpoint='chat' AND f.ts BETWEEN ?1 AND ?2)))"
         } else {
             "(attempt_index=1 AND stream_requested=0)"
         };
@@ -1066,6 +1066,32 @@ mod tests {
             with_fallback["request_metrics"]["first_attempt_success_rate_nonstream"],
             json!(0.25)
         );
+        // A first-attempt JSON failure can fall back to a stream-only model.
+        // The terminal request is streamed, but the FIRST attempt was still
+        // nonstream, so it must remain in the nonstream success denominator.
+        db.execute(
+            "INSERT INTO failure_events VALUES (?1,'chat','nonstream-then-stream',1,0)",
+            [now],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO request_events VALUES (?1,'chat','p','m',20,1,
+                'nonstream-then-stream',2,1,'stream_started')",
+            [now],
+        )
+        .unwrap();
+        let cross_mode = read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(cross_mode["request_metrics"]["traced_requests"], 7);
+        assert_eq!(cross_mode["request_metrics"]["requests_with_fallback"], 4);
+        assert_eq!(cross_mode["request_metrics"]["first_attempt_nonstream"], 5);
+        assert_eq!(
+            cross_mode["request_metrics"]["first_attempt_successes_nonstream"],
+            1
+        );
+        assert_eq!(
+            cross_mode["request_metrics"]["first_attempt_success_rate_nonstream"],
+            json!(0.2)
+        );
         // Neither Embeddings nor future-dated failure records can declare a
         // missing first Chat attempt or change the current rate denominator.
         for (endpoint, id, when) in [
@@ -1079,7 +1105,7 @@ mod tests {
             .unwrap();
         }
         let fenced = read_scoring(dir.path(), 1).unwrap();
-        assert_eq!(fenced["request_metrics"]["first_attempt_nonstream"], 4);
+        assert_eq!(fenced["request_metrics"]["first_attempt_nonstream"], 5);
     }
 
     #[test]
