@@ -84,6 +84,10 @@ fn validate_chat_with_params(
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
             return false;
         }
+        let explicitly_refused = message
+            .get("refusal")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty());
         if !choice
             .get("finish_reason")
             .and_then(Value::as_str)
@@ -97,10 +101,7 @@ fn validate_chat_with_params(
                 .get("content")
                 .and_then(Value::as_str)
                 .is_some_and(|s| !s.is_empty())
-            && !message
-                .get("refusal")
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty())
+            && !explicitly_refused
             && !message
                 .get("tool_calls")
                 .and_then(Value::as_array)
@@ -147,11 +148,7 @@ fn validate_chat_with_params(
                 .get("content")
                 .and_then(Value::as_str)
                 .is_some_and(|text| crate::sse::valid_json_output(text, format == "json_object"));
-            let valid_refusal = message
-                .get("refusal")
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty());
-            if !valid_json && !valid_refusal {
+            if !valid_json && !explicitly_refused {
                 return false;
             }
         }
@@ -166,7 +163,8 @@ fn validate_chat_with_params(
             || ((tool_choice.and_then(Value::as_str) == Some("required")
                 || required_name.is_some())
                 && reason == Some("stop")
-                && !finished_with_tools)
+                && !finished_with_tools
+                && !explicitly_refused)
         {
             return false;
         }
@@ -497,6 +495,26 @@ mod response_contract_tests {
             &tool("lookup")
         ));
         assert!(validate_chat(&json!({"tool_choice":"auto"}), &text));
+    }
+
+    #[test]
+    fn explicit_refusal_can_complete_forced_tool_choice() {
+        let refused = json!({"choices":[{"index":0,
+            "message":{"role":"assistant","content":null,"refusal":"Cannot perform this request"},
+            "finish_reason":"stop"}]});
+        let empty_refusal = json!({"choices":[{"index":0,
+            "message":{"role":"assistant","content":null,"refusal":""},
+            "finish_reason":"stop"}]});
+        let ordinary_text = json!({"choices":[assistant(0)]});
+        for tool_choice in [
+            json!("required"),
+            json!({"type":"function","function":{"name":"lookup"}}),
+        ] {
+            let request = json!({"tool_choice":tool_choice});
+            assert!(validate_chat(&request, &refused));
+            assert!(!validate_chat(&request, &empty_refusal));
+            assert!(!validate_chat(&request, &ordinary_text));
+        }
     }
 
     #[test]
