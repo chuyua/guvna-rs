@@ -402,6 +402,25 @@ fn read_scoring_inner(
         .collect::<Vec<_>>();
     let stream_outcomes =
         confirmed_chat_stream_outcomes(&conn, since, now, &targets, candidates.is_some())?;
+    // Candidate identity is bound, not interpolated. Prepare this one SQL
+    // shape once per offline scoring snapshot rather than up to 32 times.
+    let latency_filter = if conn
+        .prepare("SELECT endpoint FROM request_events LIMIT 0")
+        .is_ok()
+    {
+        "AND endpoint='chat'"
+    } else {
+        "AND 1=0"
+    };
+    let latency_sql = format!(
+        "SELECT elapsed_ms,sse_headers FROM request_events
+         WHERE provider=?1 AND model=?2 AND ts BETWEEN ?3 AND ?4
+           {latency_filter} {verified_filter}
+         ORDER BY ts DESC LIMIT 512"
+    );
+    let mut sample_stmt = conn
+        .prepare(&latency_sql)
+        .map_err(|_| "cannot prepare latency sample")?;
     let mut candidates = Vec::new();
     for record in rows {
         let (
@@ -431,23 +450,6 @@ fn read_scoring_inner(
             .min(attempts - confirmed_successes);
         let observed = confirmed_successes + provider_failures;
         let eligible = observed >= MIN_SCORE_SAMPLES;
-        let latency_filter = if conn
-            .prepare("SELECT endpoint FROM request_events LIMIT 0")
-            .is_ok()
-        {
-            "AND endpoint='chat'"
-        } else {
-            "AND 1=0"
-        };
-        let latency_sql = format!(
-            "SELECT elapsed_ms,sse_headers FROM request_events
-             WHERE provider=?1 AND model=?2 AND ts BETWEEN ?3 AND ?4
-               {latency_filter} {verified_filter}
-             ORDER BY ts DESC LIMIT 512"
-        );
-        let mut sample_stmt = conn
-            .prepare(&latency_sql)
-            .map_err(|_| "cannot prepare latency sample")?;
         let samples = sample_stmt
             .query_map(params![provider, model, since, now], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
