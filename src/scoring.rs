@@ -418,9 +418,10 @@ fn read_scoring_inner(
            {latency_filter} {verified_filter}
          ORDER BY ts DESC LIMIT 512"
     );
-    let mut sample_stmt = conn
-        .prepare(&latency_sql)
-        .map_err(|_| "cannot prepare latency sample")?;
+    // Older databases can have an empty hourly summary without the request
+    // detail table. With no candidate rows, there are no samples to query;
+    // preserve the former empty-report behavior instead of failing early.
+    let mut sample_stmt = conn.prepare(&latency_sql).ok();
     let mut candidates = Vec::new();
     for record in rows {
         let (
@@ -451,6 +452,8 @@ fn read_scoring_inner(
         let observed = confirmed_successes + provider_failures;
         let eligible = observed >= MIN_SCORE_SAMPLES;
         let samples = sample_stmt
+            .as_mut()
+            .ok_or("cannot prepare latency sample")?
             .query_map(params![provider, model, since, now], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
             })
@@ -1108,6 +1111,29 @@ mod tests {
         }
         let fenced = read_scoring(dir.path(), 1).unwrap();
         assert_eq!(fenced["request_metrics"]["first_attempt_nonstream"], 5);
+    }
+
+    #[test]
+    fn empty_legacy_hourly_database_remains_readable_without_request_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().join("telemetry");
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = Connection::open(directory.join("requests.sqlite3")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE hourly_stats (
+                hour_ts INTEGER, provider TEXT, model TEXT,
+                request_count INTEGER, failure_count INTEGER,
+                total_elapsed_ms INTEGER, max_elapsed_ms INTEGER,
+                failure_type TEXT
+            );",
+        )
+        .unwrap();
+        drop(db);
+        let result = read_scoring(dir.path(), 1).unwrap();
+        assert_eq!(result["candidate_count"], 0);
+        assert_eq!(result["candidates"], json!([]));
+        assert!(result["request_metrics"].is_null());
+        assert!(result["stream_terminal_metrics"].is_null());
     }
 
     #[test]
