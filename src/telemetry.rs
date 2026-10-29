@@ -856,6 +856,28 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
              updated_ts=?4,identity_verified=1",
         )?;
         for event in batch {
+            // A terminal is uniquely identified by (request_id, attempt_index).
+            // Gate *all* dependent accounting on that insertion, not just
+            // the terminal table itself. Otherwise a duplicate callback
+            // counts twice in hourly failures and persistent provider health
+            // even though INSERT OR IGNORE keeps only one terminal row.
+            if event.stream_requested
+                && !event.record_request
+                && !event.count_attempt
+                && event.shadow.is_none()
+                && let (Some(request_id), Some(attempt)) = (&event.request_id, event.attempt_index)
+                && terminal.execute(params![
+                    event.ts,
+                    request_id,
+                    attempt,
+                    event.provider,
+                    event.model,
+                    event.failure_type,
+                    event.elapsed_ms
+                ])? == 0
+            {
+                continue;
+            }
             if let Some(observation) = &event.shadow {
                 shadow.execute(params![
                     event.ts,
@@ -935,25 +957,6 @@ fn write_batch(conn: &mut Connection, batch: &[Event]) -> rusqlite::Result<()> {
                     1_i64,
                     event.elapsed_ms,
                     i64::from(event.health_observation),
-                ])?;
-            }
-            // Only actual SSE terminal callbacks enter this table. The initial
-            // stream_started request row and failed candidate attempts cannot
-            // masquerade as a completed stream or a client cancellation.
-            if event.stream_requested
-                && !event.record_request
-                && !event.count_attempt
-                && event.shadow.is_none()
-                && let (Some(request_id), Some(attempt)) = (&event.request_id, event.attempt_index)
-            {
-                terminal.execute(params![
-                    event.ts,
-                    request_id,
-                    attempt,
-                    event.provider,
-                    event.model,
-                    event.failure_type,
-                    event.elapsed_ms
                 ])?;
             }
             if let Some(failed) = health_failure(event) {
@@ -2233,6 +2236,66 @@ mod tests {
         assert_eq!(requests, 1);
         assert_eq!(failures, 1);
         assert_eq!(aggregate, (0, 1, 2000));
+    }
+
+    #[test]
+    fn duplicate_stream_terminal_does_not_repeat_failure_or_change_provider_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_database(&dir.path().join("stream-dedup.sqlite3")).unwrap();
+        let mut started = event(7200, "p", "m", 200, 12, "stream_started");
+        started.stream_requested = true;
+        started.request_id = Some("single-stream".into());
+        started.attempt_index = Some(1);
+        let mut terminal = event(7201, "p", "m", 502, 25, "transport_error");
+        terminal.record_request = false;
+        terminal.count_attempt = false;
+        terminal.stream_requested = true;
+        terminal.request_id = started.request_id.clone();
+        terminal.attempt_index = Some(1);
+        write_batch(&mut conn, &[started, terminal.clone()]).unwrap();
+        // Model a repeated callback in another worker batch, then a late
+        // contradictory success for the same attempt. The first terminal
+        // must remain authoritative for history AND health.
+        let mut late_success = terminal.clone();
+        late_success.failure_type = "success";
+        late_success.status = 200;
+        late_success.ts += 2;
+        write_batch(&mut conn, &[terminal, late_success]).unwrap();
+
+        let terminal_outcome: String = conn
+            .query_row(
+                "SELECT outcome FROM stream_terminals WHERE request_id='single-stream'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_outcome, "transport_error");
+        let failures: i64 = conn
+            .query_row("SELECT COUNT(*) FROM failure_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(failures, 1);
+        let hourly_failures: i64 = conn
+            .query_row(
+                "SELECT SUM(failure_count) FROM hourly_stats
+                 WHERE failure_type='transport_error'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hourly_failures, 1);
+        let health: (i64, i64) = conn
+            .query_row(
+                "SELECT penalty,consecutive_failures FROM provider_health
+                 WHERE provider='p' AND model='m'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(health, (35, 1), "duplicate or late terminal changed health");
+        let requests: i64 = conn
+            .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(requests, 1);
     }
     #[test]
     fn provider_health_snapshot_restores_only_recent_provider_summary() {
