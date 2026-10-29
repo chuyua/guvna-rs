@@ -732,6 +732,14 @@ fn auto_candidate_eligible_for_request(
         || effective("tools")
             .and_then(Value::as_array)
             .is_some_and(|tools| !tools.is_empty())
+        || effective("functions")
+            .and_then(Value::as_array)
+            .is_some_and(|functions| !functions.is_empty())
+        || effective("function_call").is_some_and(|choice| match choice {
+            Value::String(value) => !matches!(value.as_str(), "auto" | "none"),
+            Value::Null => false,
+            _ => true,
+        })
         || effective("tool_choice").is_some_and(|choice| match choice {
             Value::String(value) => !matches!(value.as_str(), "auto" | "none"),
             Value::Null => false,
@@ -1526,6 +1534,30 @@ auto:
             json!([{"type":"function","function":{"name":"noop"}}]),
         );
         assert_eq!(choose(&cfg, &request)[0].model, "fallback");
+        cfg.auto.candidates[0].params.remove("tools");
+        cfg.auto.candidates[0].params.insert(
+            "functions".into(),
+            json!([{"name":"legacy","parameters":{"type":"object"}}]),
+        );
+        assert_eq!(
+            choose(&cfg, &request)[0].model,
+            "fallback",
+            "candidate-injected legacy functions require tool support"
+        );
+        cfg.auto.candidates[0].params.remove("functions");
+        cfg.auto.candidates[0]
+            .params
+            .insert("function_call".into(), json!({"name":"legacy"}));
+        assert_eq!(
+            choose(&cfg, &request)[0].model,
+            "fallback",
+            "candidate-injected required function calls require tool support"
+        );
+        cfg.auto.candidates[0]
+            .params
+            .insert("function_call".into(), json!("none"));
+        assert_eq!(choose(&cfg, &request)[0].model, "default-large");
+        cfg.auto.candidates[0].params.clear();
 
         cfg.auto.candidates[0].supports_tools = Some(true);
         assert_eq!(choose(&cfg, &request)[0].model, "default-large");
