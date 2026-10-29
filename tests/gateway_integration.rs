@@ -5748,6 +5748,47 @@ auto:
 }
 
 #[tokio::test]
+async fn auto_legacy_function_defaults_never_call_text_only_upstream() {
+    let (text_url, text_hits) = start_upstream(StatusCode::OK).await;
+    let (tool_url, tool_hits) = start_upstream(StatusCode::OK).await;
+    for defaults in [
+        "        functions:\n          - name: lookup\n            parameters:\n              type: object\n",
+        "        function_call:\n          name: lookup\n",
+    ] {
+        let config: Config = serde_yaml::from_str(&format!(
+            "providers:\n  - name: text\n    type: openai\n    base_url: {text_url}\n    key_env: TEXT\n  - name: tools\n    type: openai\n    base_url: {tool_url}\n    key_env: TOOLS\nauto:\n  enabled: true\n  max_candidates: 1\n  candidates:\n    - provider: text\n      model: text-model\n      supports_tools: false\n      params:\n{defaults}    - provider: tools\n      model: tool-model\n      supports_tools: true\n"
+        ))
+        .unwrap();
+        let router = app(AppState::new(
+            config,
+            HashMap::from([
+                ("TEXT".into(), "text-key".into()),
+                ("TOOLS".into(), "tool-key".into()),
+            ]),
+            vec!["client".into()],
+        )
+        .unwrap());
+        let (status, body) = call(
+            router,
+            auto_request(
+                "/v1/auto",
+                "client",
+                json!({"model":"auto","messages":[{"role":"user","content":"hi"}]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{defaults}: {body}");
+        assert_eq!(body["model"], "tool-model");
+    }
+    assert_eq!(
+        text_hits.load(Ordering::SeqCst),
+        0,
+        "even default-injected legacy calls must never reach a text-only model"
+    );
+    assert_eq!(tool_hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn auto_legacy_function_requests_never_select_declared_text_only_model() {
     let (text_url, text_hits) = start_upstream(StatusCode::OK).await;
     let (tool_url, tool_hits) = start_upstream(StatusCode::OK).await;
