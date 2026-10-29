@@ -4736,6 +4736,57 @@ async fn responses_large_schema_and_tool_parameters_forward_without_data_loss() 
 }
 
 #[tokio::test]
+async fn chat_forced_tool_refusal_is_delivered_without_trying_backup() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream_hits = Arc::clone(&hits);
+    let refusing = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let hits = Arc::clone(&upstream_hits);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({"id":"refusal","object":"chat.completion",
+                    "choices":[{"index":0,"message":{"role":"assistant",
+                        "content":null,"refusal":"Cannot perform that request"},
+                        "finish_reason":"stop"}]}))
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(socket, refusing).await.unwrap() });
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let gateway = make_app(&format!("http://{addr}"), &backup);
+
+    for choice in [
+        json!("required"),
+        json!({"type":"function","function":{"name":"lookup"}}),
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model":"demo",
+                "messages":[{"role":"user","content":"decline"}],
+                "tools":[{"type":"function","function":{"name":"lookup"}}],
+                "tool_choice":choice})
+                .to_string(),
+            ))
+            .unwrap();
+        let (status, output) = call(gateway.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "{output}");
+        assert_eq!(
+            output["choices"][0]["message"]["refusal"],
+            "Cannot perform that request"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn responses_forced_tool_choice_ignoring_upstream_fails_over() {
     let (url, seen) = start_format_probe("ordinary text").await;
     let app = make_app(&url, &url);
