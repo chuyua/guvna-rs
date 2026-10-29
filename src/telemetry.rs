@@ -1152,6 +1152,16 @@ fn write_batch_with_recovery(
     }
 }
 
+/// SQLite reports a busy checkpoint in its result row, not necessarily as
+/// an SQL error. A long-lived reader can pin WAL frames after execute_batch
+/// has apparently succeeded.
+fn checkpoint_wal(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        let busy: i64 = row.get(0)?;
+        Ok(busy == 0)
+    })
+}
+
 fn worker(receiver: Receiver<TelemetryMessage>, path: PathBuf, metrics: Arc<Metrics>) {
     let mut conn = match open_database(&path) {
         Ok(database) => Some(database),
@@ -1278,10 +1288,7 @@ fn worker(receiver: Receiver<TelemetryMessage>, path: PathBuf, metrics: Arc<Metr
                 crate::ops_log::warn("telemetry_prune_failed");
             }
             // Checkpoint and truncate WAL from the single writer, never on the request path.
-            if database
-                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                .is_err()
-            {
+            if !matches!(checkpoint_wal(database), Ok(true)) {
                 Metrics::inc(&metrics.telemetry_write_failures);
                 crate::ops_log::warn("telemetry_checkpoint_failed");
             }
@@ -2801,6 +2808,40 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn checkpoint_busy_is_not_reported_as_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.sqlite3");
+        let writer = open_database(&path).unwrap();
+        writer.busy_timeout(Duration::from_millis(50)).unwrap();
+        writer
+            .execute_batch("CREATE TABLE wal_probe(value INTEGER)")
+            .unwrap();
+        writer
+            .execute("INSERT INTO wal_probe VALUES(1)", [])
+            .unwrap();
+
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let observed: i64 = reader
+            .query_row("SELECT COUNT(*) FROM wal_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(observed, 1);
+        writer
+            .execute("INSERT INTO wal_probe VALUES(2)", [])
+            .unwrap();
+
+        assert!(
+            !checkpoint_wal(&writer).unwrap(),
+            "a pinned WAL must report an incomplete checkpoint"
+        );
+        reader.execute_batch("COMMIT").unwrap();
+        assert!(
+            checkpoint_wal(&writer).unwrap(),
+            "checkpoint must succeed once the reader is released"
+        );
     }
 
     #[test]
