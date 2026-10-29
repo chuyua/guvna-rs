@@ -858,13 +858,15 @@ chains:
 
 #[tokio::test]
 async fn redirecting_provider_opens_circuit_without_leaking_or_quarantining_key() {
+    use rusqlite::Connection;
     let (redirected, redirect_hits) = start_upstream(StatusCode::FOUND).await;
     let (healthy, healthy_hits) = start_upstream(StatusCode::OK).await;
     let cfg: Config = serde_yaml::from_str(&format!(
         "providers:\n  - name: redirecting\n    type: openai\n    base_url: {redirected}\n    key_env: REDIRECT_KEY\n    circuit_breaker:\n      enabled: true\n      failure_threshold: 2\n      cooldown: 10s\n      max_cooldown: 10s\n  - name: healthy\n    type: openai\n    base_url: {healthy}\n    key_env: GOOD_KEY\nchains:\n  - name: demo\n    steps:\n      - provider: redirecting\n        model: wrong-endpoint\n      - provider: healthy\n        model: working\n"
     )).unwrap();
     cfg.validate().unwrap();
-    let router = app(AppState::new(
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(
         cfg,
         HashMap::from([
             ("REDIRECT_KEY".into(), "redirect-secret".into()),
@@ -872,7 +874,9 @@ async fn redirecting_provider_opens_circuit_without_leaking_or_quarantining_key(
         ]),
         vec!["client".into()],
     )
-    .unwrap());
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, running) = app_with_state(state);
     for _ in 0..5 {
         let (status, body) = call(router.clone(), request("demo", "", "client")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -884,6 +888,23 @@ async fn redirecting_provider_opens_circuit_without_leaking_or_quarantining_key(
         "after two forbidden redirects, the circuit must skip the broken provider"
     );
     assert_eq!(healthy_hits.load(Ordering::SeqCst), 5);
+    assert!(running.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let (redirects, mislabeled): (i64, i64) = db
+        .query_row(
+            "SELECT
+            COALESCE(SUM(failure_type='upstream_unavailable'),0),
+            COALESCE(SUM(failure_type='provider_5xx'),0)
+         FROM failure_events WHERE provider='redirecting' AND status=302",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        redirects, 2,
+        "real upstream redirects must be retained as outage evidence"
+    );
+    assert_eq!(mislabeled, 0, "HTTP 302 is not a provider 5xx response");
 }
 
 #[tokio::test]

@@ -1165,6 +1165,10 @@ async fn dispatch_inner(
                 context.set_upstream_status(Some(status));
                 context.set_failure_type(if matches!(status, 408 | 504) {
                     "timeout"
+                } else if (300..400).contains(&status) {
+                    // Redirects cannot be followed with upstream credentials.
+                    // They are a provider routing problem, but not a 5xx.
+                    "upstream_unavailable"
                 } else {
                     outcome_failure_type(outcome)
                 });
