@@ -1174,8 +1174,16 @@ fn worker(receiver: Receiver<TelemetryMessage>, path: PathBuf, metrics: Arc<Metr
         let first = match receiver.recv_timeout(Duration::from_secs(300)) {
             Ok(TelemetryMessage::Record(event)) => event,
             Ok(TelemetryMessage::Flush(ack)) => {
-                // An empty barrier is still a failed persistence check when
-                // SQLite never opened or the worker lost its connection.
+                // A recovered filesystem must be observable even when no new
+                // requests arrive. The ordinary Record path also retries the
+                // open, but an empty shutdown barrier must not stay failed
+                // forever after an initial SQLite open error.
+                if conn.is_none()
+                    && let Ok(database) = open_database(&path)
+                {
+                    conn = Some(database);
+                    consecutive_failures = 0;
+                }
                 let _ = ack.send(conn.is_some());
                 continue;
             }
@@ -2754,6 +2762,45 @@ mod tests {
         drop(sender);
         handle.join().unwrap();
         assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn empty_flush_reopens_restored_database_before_new_traffic() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_dir = dir.path().join("restored");
+        let path = database_dir.join("requests.sqlite3");
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let metrics = Arc::new(Metrics::default());
+        let worker_path = path.clone();
+        let handle = thread::spawn(move || worker(receiver, worker_path, metrics));
+        let flush = |sender: &SyncSender<TelemetryMessage>| {
+            let (ack, receipt) = mpsc::sync_channel(1);
+            sender.send(TelemetryMessage::Flush(ack)).unwrap();
+            receipt.recv_timeout(Duration::from_secs(3)).unwrap()
+        };
+
+        assert!(!flush(&sender), "missing directory must fail closed");
+        std::fs::create_dir(&database_dir).unwrap();
+        assert!(flush(&sender), "empty flush must detect restored SQLite");
+        sender
+            .send(TelemetryMessage::Record(event(
+                now_secs(),
+                "provider",
+                "model",
+                200,
+                1,
+                "success",
+            )))
+            .unwrap();
+        assert!(flush(&sender), "a subsequent record must still persist");
+        drop(sender);
+        handle.join().unwrap();
+
+        let db = Connection::open(&path).unwrap();
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
