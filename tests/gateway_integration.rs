@@ -919,6 +919,14 @@ async fn mixed_caller_rejection_and_provider_outage_never_mislabels_request_as_i
             StatusCode::UNPROCESSABLE_ENTITY,
         ),
         (StatusCode::FOUND, StatusCode::UNPROCESSABLE_ENTITY),
+        (
+            StatusCode::from_u16(600).unwrap(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::from_u16(600).unwrap(),
+        ),
     ] {
         let (first, first_calls) = start_upstream(first_status).await;
         let (second, second_calls) = start_upstream(second_status).await;

@@ -24,8 +24,12 @@ pub fn classify(status: Option<u16>) -> Outcome {
         // fail over, feed the circuit breaker and avoid repeated slow calls.
         Some(408) => Outcome::ProviderTransient,
         Some(500..=599) => Outcome::ProviderTransient,
+        // 1xx is not a final model response; nonstandard 6xx+ errors are
+        // also not evidence of a malformed caller request. In both cases
+        // fail over and let the existing provider circuit recover.
+        Some(400..=499) => Outcome::CallerRejected,
         None => Outcome::TransportFailure,
-        Some(_) => Outcome::CallerRejected,
+        Some(_) => Outcome::ProviderTransient,
     }
 }
 
@@ -47,6 +51,7 @@ mod tests {
         let cases = [
             (None, Outcome::TransportFailure, false, false),
             (Some(200), Outcome::Success, false, false),
+            (Some(103), Outcome::ProviderTransient, false, true),
             (Some(301), Outcome::ProviderTransient, false, true),
             (Some(302), Outcome::ProviderTransient, false, true),
             (Some(307), Outcome::ProviderTransient, false, true),
@@ -61,6 +66,8 @@ mod tests {
             (Some(429), Outcome::RateLimited, true, false),
             (Some(500), Outcome::ProviderTransient, false, true),
             (Some(502), Outcome::ProviderTransient, false, true),
+            (Some(600), Outcome::ProviderTransient, false, true),
+            (Some(999), Outcome::ProviderTransient, false, true),
         ];
         for (status, expected, key, model) in cases {
             let o = classify(status);
