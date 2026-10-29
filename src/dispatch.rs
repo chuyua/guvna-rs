@@ -1198,6 +1198,11 @@ async fn dispatch_inner(
                 continue; // try a different key; each key is attempted once
             }
             if outcome == Outcome::Success {
+                // HTTP 2xx only establishes successful headers. The body
+                // may still fail JSON/SSE parsing or model-result validation;
+                // if a later candidate rejects parameters with 4xx, that
+                // rejection must not mask this upstream protocol failure.
+                saw_non_client_network_result = true;
                 if streaming {
                     match chat_stream::start(
                         upstream,

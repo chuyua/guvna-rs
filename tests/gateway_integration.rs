@@ -948,6 +948,43 @@ async fn mixed_caller_rejection_and_provider_outage_never_mislabels_request_as_i
 }
 
 #[tokio::test]
+async fn malformed_http_200_and_caller_422_in_either_order_cannot_blame_client() {
+    for (first_status, second_status) in [
+        (StatusCode::OK, StatusCode::UNPROCESSABLE_ENTITY),
+        (StatusCode::UNPROCESSABLE_ENTITY, StatusCode::OK),
+    ] {
+        let (first, first_calls) = start_upstream(first_status).await;
+        let (second, second_calls) = start_upstream(second_status).await;
+        let router = make_app(&first, &second);
+        // The OK mock intentionally returns a 200 Chat completion without
+        // choices. A different supplier's 422 cannot retroactively prove
+        // that the request itself was invalid.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"demo",
+                    "messages":[{"role":"user","content":"invalidchat:nochoices"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let (status, body) = call(router, request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "{first_status} -> {second_status}: {body}"
+        );
+        assert_eq!(body["error"]["code"], "upstream_unavailable");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
 async fn last_upstream_caller_rejection_preserves_client_status_without_key_leak() {
     let (upstream, hits) = start_upstream(StatusCode::UNPROCESSABLE_ENTITY).await;
     let router = make_app(&upstream, &upstream);
