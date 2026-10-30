@@ -5286,6 +5286,41 @@ async fn responses_json_text_format_preserves_stream_lifecycle_and_no_false_term
 }
 
 #[tokio::test]
+async fn responses_reasoning_effort_maps_to_chat_and_survives_streaming() {
+    let (url, seen) = start_format_probe("success").await;
+    let gateway = make_app(&url, &url);
+    for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        let (status, body) = call(
+            gateway.clone(),
+            responses_stream_req(json!({
+                "model":"demo","input":"hello","reasoning":{"effort":effort}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["output_text"], "success");
+        let last = seen.lock().await.last().unwrap().clone();
+        assert_eq!(last["reasoning_effort"], effort);
+        assert!(last.get("reasoning").is_none());
+    }
+    let response = gateway
+        .clone()
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hello","stream":true,"reasoning":{"effort":"high"}
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("event: response.completed"), "{text}");
+    let last = seen.lock().await.last().unwrap().clone();
+    assert_eq!(last["reasoning_effort"], "high");
+    assert_eq!(last["stream"], true);
+    assert!(last.get("reasoning").is_none());
+}
+
+#[tokio::test]
 async fn unsupported_or_corrupt_format_is_rejected_without_any_provider_calls() {
     let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
     let app = make_app(&url, &url);
@@ -5348,9 +5383,19 @@ async fn unsupported_or_corrupt_format_is_rejected_without_any_provider_calls() 
             "responses_parameter_unsupported",
         ),
         (
-            json!({"reasoning":{"effort":"high"}}),
+            json!({"reasoning":{"effort":"huge"}}),
+            StatusCode::BAD_REQUEST,
+            "invalid_reasoning_effort",
+        ),
+        (
+            json!({"reasoning":{"summary":"detailed"}}),
             StatusCode::NOT_IMPLEMENTED,
             "responses_feature_unsupported",
+        ),
+        (
+            json!({"reasoning":[]}),
+            StatusCode::BAD_REQUEST,
+            "invalid_reasoning",
         ),
     ];
     for (extra, expected_status, expected_code) in cases {

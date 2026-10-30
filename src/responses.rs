@@ -166,11 +166,50 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             );
         }
     };
+    // The official Responses reasoning.effort has an exact Chat equivalent.
+    // Other reasoning settings (summaries, context, mode) do not: never drop
+    // them silently or imply that this stateless adapter implements them.
+    let reasoning_effort = match value.get("reasoning") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(fields)) if fields.keys().all(|key| key == "effort") => {
+            match fields.get("effort") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(effort))
+                    if matches!(
+                        effort.as_str(),
+                        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                    ) =>
+                {
+                    Some(effort.clone())
+                }
+                _ => {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_reasoning_effort",
+                        "reasoning.effort must be a supported effort level",
+                    );
+                }
+            }
+        }
+        Some(Value::Object(_)) => {
+            return error(
+                StatusCode::NOT_IMPLEMENTED,
+                "responses_feature_unsupported",
+                "Other reasoning options cannot be mapped to Chat Completions",
+            );
+        }
+        Some(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_reasoning",
+                "reasoning must be an object or null",
+            );
+        }
+    };
     let object = value.as_object_mut().expect("checked above");
     for key in [
         "previous_response_id",
         "conversation",
-        "reasoning",
         "modalities",
         "include",
         "service_tier",
@@ -201,6 +240,7 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             "top_p",
             "user",
             "instructions",
+            "reasoning",
             "tools",
             "tool_choice",
             "parallel_tool_calls",
@@ -365,8 +405,11 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     }
     // Instructions become a leading system message, not a provider-specific field.
     // Validate before moving any data into the shared chat dispatcher.
-    for key in ["metadata", "store", "background", "truncation"] {
+    for key in ["metadata", "store", "background", "truncation", "reasoning"] {
         object.remove(key);
+    }
+    if let Some(effort) = reasoning_effort {
+        object.insert("reasoning_effort".into(), Value::String(effort));
     }
     object.remove("text");
     if let Some(format) = mapped_text_format {

@@ -62,6 +62,8 @@ Responses user-image URL and base64 data-URI input are translated to Chat
 vision parts, preserving image order, text, and detail. File-ID images,
 image-generation tools, audio, advanced reasoning controls, stateful
 continuation, and other advanced Responses modes remain unsupported.
+The supported reasoning.effort values are translated to Chat reasoning_effort;
+reasoning summaries, context modes and other reasoning options remain unsupported.
 The gateway is not a full OpenAI Responses implementation or a production
 drop-in replacement.
 
