@@ -220,14 +220,9 @@ impl ChatSse {
             .get("choices")
             .and_then(Value::as_array)
             .ok_or(SseError)?;
-        if choices.is_empty() {
-            // Stream usage is optional, but if present it must be complete
-            // and occur only once after every choice has finished. Otherwise
-            // malformed accounting can be forwarded as a successful response.
-            if self.finished_mask.count_ones() as u64 != self.expected || self.usage_seen {
-                return Err(SseError);
-            }
-            let usage = event.get("usage").ok_or(SseError)?;
+        // Compatible providers may attach provisional usage to content
+        // frames. Reject malformed counts there too, not only in trailers.
+        if let Some(usage) = event.get("usage").filter(|usage| !usage.is_null()) {
             let (Some(prompt), Some(completion), Some(total)) = (
                 usage.get("prompt_tokens").and_then(Value::as_u64),
                 usage.get("completion_tokens").and_then(Value::as_u64),
@@ -236,6 +231,17 @@ impl ChatSse {
                 return Err(SseError);
             };
             if prompt.checked_add(completion) != Some(total) {
+                return Err(SseError);
+            }
+        }
+        if choices.is_empty() {
+            // Stream usage is optional, but if present it must be complete
+            // and occur only once after every choice has finished. Otherwise
+            // malformed accounting can be forwarded as a successful response.
+            if self.finished_mask.count_ones() as u64 != self.expected
+                || self.usage_seen
+                || !event.get("usage").is_some_and(|usage| !usage.is_null())
+            {
                 return Err(SseError);
             }
             self.usage_seen = true;
@@ -1152,6 +1158,42 @@ mod tests {
         parser.push(valid_usage).unwrap();
         parser.push(b"data: [DONE]\n\n").unwrap();
         assert!(parser.finish().is_ok());
+    }
+
+    #[test]
+    fn provisional_usage_in_content_frames_must_obey_trailer_contract() {
+        for usage in [
+            json!({}),
+            json!("unknown"),
+            json!({"prompt_tokens":2,"completion_tokens":3,"total_tokens":6}),
+            json!({"prompt_tokens":-1,"completion_tokens":3,"total_tokens":2}),
+            json!({"prompt_tokens":u64::MAX,"completion_tokens":1,"total_tokens":0}),
+        ] {
+            let frame = format!(
+                "data: {}\n\n",
+                json!({"choices":[{"index":0,"delta":{"content":"answer"},
+                    "finish_reason":"stop"}],"usage":usage})
+            );
+            let mut parser = ChatSse::new(1).unwrap();
+            assert!(
+                parser.push(frame.as_bytes()).is_err(),
+                "accepted usage {usage}"
+            );
+        }
+        for usage in [
+            Value::Null,
+            json!({"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}),
+        ] {
+            let frame = format!(
+                "data: {}\n\n",
+                json!({"choices":[{"index":0,"delta":{"content":"answer"},
+                    "finish_reason":"stop"}],"usage":usage})
+            );
+            let mut parser = ChatSse::new(1).unwrap();
+            parser.push(frame.as_bytes()).unwrap();
+            parser.push(b"data: [DONE]\n\n").unwrap();
+            parser.finish().unwrap();
+        }
     }
 
     #[test]

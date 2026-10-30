@@ -2038,6 +2038,35 @@ async fn empty_sse_stop_is_not_committed_as_a_successful_chat_answer() {
 }
 
 #[tokio::test]
+async fn malformed_provisional_usage_is_not_a_successful_stream_or_aggregation() {
+    let malformed = aggregate_chat_frame(json!({
+        "choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":6}
+    }));
+    let (upstream, hits) = start_sse_owned(vec![
+        Bytes::from(malformed.clone()),
+        Bytes::from_static(SSE_DONE),
+    ])
+    .await;
+    let response = make_app(&upstream, &upstream)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(hits.load(Ordering::SeqCst) >= 1);
+
+    let (primary, primary_hits, _) =
+        start_strict_stream_only(vec![malformed, SSE_DONE.to_vec()]).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let gateway = app_with_stream_only_and_auto(&primary, &backup, false);
+    let (status, output) = call(gateway, request("ordered", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(output["choices"][0]["message"]["content"], "success");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn malformed_tool_arguments_cannot_complete_chat_stream() {
     let tool = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"[1]\"}}]},\"finish_reason\":null}]}\n\n";
     let finish =
