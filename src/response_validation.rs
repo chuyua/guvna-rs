@@ -241,6 +241,35 @@ fn validate_chat_with_params(
 }
 
 // Do not accept duplicate / missing embeddings, mixed dimensions or corrupt vectors.
+// JSON already owns the entire encoded string; keep decoder scratch fixed
+// instead of allocating a second large decoded vector for each response.
+fn base64_embedding_dimension(encoded: &str) -> Option<usize> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    const ENCODED_CHUNK: usize = 4096;
+    const DECODED_CHUNK: usize = ENCODED_CHUNK * 3 / 4;
+    let mut scratch = [0u8; DECODED_CHUNK];
+    let mut total_bytes = 0usize;
+    let mut chunks = encoded.as_bytes().chunks(ENCODED_CHUNK).peekable();
+    while let Some(chunk) = chunks.next() {
+        // Padding belongs only at the end of the complete encoded vector.
+        if chunks.peek().is_some() && chunk.contains(&b'=') {
+            return None;
+        }
+        let len = STANDARD.decode_slice(chunk, &mut scratch).ok()?;
+        if len % 4 != 0
+            || !scratch[..len]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|word| f32::from_le_bytes(*word).is_finite())
+        {
+            return None;
+        }
+        total_bytes = total_bytes.checked_add(len)?;
+    }
+    (total_bytes > 0).then_some(total_bytes / 4)
+}
+
 #[cfg(test)]
 fn validate_embeddings(request: &Value, response: &Value) -> bool {
     validate_embeddings_with_params(request, &BTreeMap::new(), response)
@@ -303,21 +332,10 @@ fn validate_embeddings_with_params(
                 }
             }
             Value::String(data) if !data.is_empty() => {
-                use base64::{Engine, engine::general_purpose::STANDARD};
-                let Ok(raw) = STANDARD.decode(data) else {
+                let Some(dim) = base64_embedding_dimension(data) else {
                     return false;
                 };
-                if raw.is_empty()
-                    || raw.len() % 4 != 0
-                    || !raw
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .all(|part| f32::from_le_bytes(*part).is_finite())
-                {
-                    return false;
-                }
-                ("base64", raw.len() / 4)
+                ("base64", dim)
             }
             _ => return false,
         };
@@ -807,5 +825,52 @@ mod response_contract_tests {
             &request,
             &json!({"data":[{"embedding":nan}]})
         ));
+    }
+
+    #[test]
+    fn bounded_base64_embedding_decoder_preserves_full_decoder_semantics() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        for dimensions in [1usize, 2, 3, 767, 768, 769, 1023, 1024, 1536, 2048, 3072] {
+            let mut raw = Vec::with_capacity(dimensions * 4);
+            for i in 0..dimensions {
+                raw.extend_from_slice(&((i as f32) / 100.0).to_le_bytes());
+            }
+            let encoded = STANDARD.encode(&raw);
+            assert_eq!(base64_embedding_dimension(&encoded), Some(dimensions));
+            assert!(validate_embeddings(
+                &json!({"input":"hello","dimensions":dimensions,"encoding_format":"base64"}),
+                &json!({"data":[{"index":0,"embedding":encoded}]})
+            ));
+            if dimensions >= 1024 {
+                raw[800 * 4..800 * 4 + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+                assert_eq!(base64_embedding_dimension(&STANDARD.encode(&raw)), None);
+            }
+        }
+        let mut invalid_padding = STANDARD.encode(vec![0u8; 8192]);
+        invalid_padding.replace_range(4095..4096, "=");
+        let incomplete = "a".repeat(4095);
+        for encoded in [
+            "",
+            "A",
+            "%%%",
+            "AAAAA",
+            "AQ==AAAA",
+            "AAAA====",
+            "AAAAAA==",
+            incomplete.as_str(),
+            invalid_padding.as_str(),
+        ] {
+            let old = STANDARD.decode(encoded).ok().and_then(|bytes| {
+                (!bytes.is_empty()
+                    && bytes.len() % 4 == 0
+                    && bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|word| f32::from_le_bytes(*word).is_finite()))
+                .then_some(bytes.len() / 4)
+            });
+            assert_eq!(base64_embedding_dimension(encoded), old, "{encoded}");
+        }
     }
 }
