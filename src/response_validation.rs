@@ -48,6 +48,12 @@ fn validate_chat_with_params(
     params: &BTreeMap<String, Value>,
     response: &Value,
 ) -> bool {
+    // Chat, Responses and Chat SSE must agree on the optional usage
+    // contract. A present but inconsistent token count is not a valid
+    // upstream success, even if the content itself is well formed.
+    if super::responses::parse_chat_usage(response).is_err() {
+        return false;
+    }
     let Some(choices) = response.get("choices").and_then(Value::as_array) else {
         return false;
     };
@@ -410,6 +416,31 @@ mod response_contract_tests {
             &params,
             &response,
         ));
+    }
+
+    #[test]
+    fn malformed_present_chat_usage_cannot_be_accepted_as_success() {
+        let valid = json!({"choices":[assistant(0)]});
+        assert!(validate_chat(&json!({}), &valid));
+        let mut response = valid.clone();
+        response["usage"] = Value::Null;
+        assert!(validate_chat(&json!({}), &response));
+        response["usage"] = json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":8});
+        assert!(validate_chat(&json!({}), &response));
+        for invalid in [
+            json!({}),
+            json!("unknown"),
+            json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":7}),
+            json!({"prompt_tokens":-1,"completion_tokens":3,"total_tokens":2}),
+            json!({"prompt_tokens":18446744073709551615_u64,
+                "completion_tokens":1,"total_tokens":0}),
+        ] {
+            response["usage"] = invalid;
+            assert!(
+                !validate_chat(&json!({}), &response),
+                "bad usage accepted: {response}"
+            );
+        }
     }
 
     #[test]

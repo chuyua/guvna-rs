@@ -931,7 +931,7 @@ fn reasoning_item(response_id: &str, text: impl Into<String>, status: &str) -> V
 
 /// Missing/null usage is compatible with older Chat providers. A present
 /// usage payload must never be silently discarded, including empty objects.
-fn parse_chat_usage(chat: &Value) -> Result<Option<(u64, u64, u64)>, ()> {
+pub(super) fn parse_chat_usage(chat: &Value) -> Result<Option<(u64, u64, u64)>, ()> {
     let Some(usage) = chat.get("usage").filter(|usage| !usage.is_null()) else {
         return Ok(None);
     };
