@@ -394,11 +394,13 @@ impl ChatSse {
             }
             match &self.tool_choice {
                 Some(ToolChoice::None) if has_tools => return Err(SseError),
-                Some(ToolChoice::Required) if !has_tools && reason == "stop" => {
+                Some(ToolChoice::Required)
+                    if !has_tools && reason == "stop" && self.refusal_mask & choice_bit == 0 =>
+                {
                     return Err(SseError);
                 }
                 Some(ToolChoice::Named(name))
-                    if (!has_tools && reason == "stop")
+                    if (!has_tools && reason == "stop" && self.refusal_mask & choice_bit == 0)
                         || self.tool_calls.iter().any(|tool| {
                             tool.choice == index && tool.name.as_deref() != Some(name.as_str())
                         }) =>
@@ -1180,6 +1182,43 @@ mod tests {
         valid.push(finish).unwrap();
         valid.push(b"data: [DONE]\n\n").unwrap();
         assert!(valid.finish().is_ok());
+    }
+
+    #[test]
+    fn explicit_refusal_satisfies_forced_tool_stream_without_allowing_plain_text() {
+        let refusal = br#"data: {"choices":[{"index":0,"delta":{"role":"assistant","refusal":"Cannot help"},"finish_reason":null}]}
+
+"#;
+        let empty_refusal =
+            br#"data: {"choices":[{"index":0,"delta":{"refusal":""},"finish_reason":null}]}
+
+"#;
+        let finish = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+"#;
+        for tool_choice in [
+            serde_json::json!("required"),
+            serde_json::json!({"type":"function","function":{"name":"lookup"}}),
+        ] {
+            let mut allowed = ChatSse::new(1)
+                .unwrap()
+                .with_tool_choice(Some(&tool_choice));
+            allowed.push(refusal).unwrap();
+            allowed.push(finish).unwrap();
+            allowed.push(b"data: [DONE]\n\n").unwrap();
+            allowed.finish().unwrap();
+
+            for invalid_delta in [empty_refusal.as_slice(), START] {
+                let mut rejected = ChatSse::new(1)
+                    .unwrap()
+                    .with_tool_choice(Some(&tool_choice));
+                rejected.push(invalid_delta).unwrap();
+                assert!(
+                    rejected.push(finish).is_err(),
+                    "non-refusal cannot bypass required tool"
+                );
+            }
+        }
     }
 
     #[test]

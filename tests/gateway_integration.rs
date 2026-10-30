@@ -7575,6 +7575,52 @@ fn aggregate_chat_frame(event: Value) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn forced_tool_refusal_matches_direct_sse_and_sse_only_json_aggregation() {
+    let frames = vec![
+        aggregate_chat_frame(json!({"choices":[{"index":0,
+            "delta":{"role":"assistant","refusal":"Cannot perform that request"},
+            "finish_reason":null}]})),
+        aggregate_chat_frame(json!({"choices":[{"index":0,
+            "delta":{},"finish_reason":"stop"}]})),
+        b"data: [DONE]\n\n".to_vec(),
+    ];
+    let (url, hits, streamed) = start_strict_stream_only(frames).await;
+    let (backup_url, backup_hits) = start_upstream(StatusCode::OK).await;
+    let gateway = app_with_stream_only_and_auto(&url, &backup_url, false);
+
+    for choice in [
+        r#""required""#,
+        r#"{"type":"function","function":{"name":"lookup"}}"#,
+    ] {
+        let extra = format!(
+            ",\"tools\":[{{\"type\":\"function\",\"function\":{{\"name\":\"lookup\"}}}}],\"tool_choice\":{choice}"
+        );
+        let (status, body) = call(gateway.clone(), request("ordered", &extra, "client")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["choices"][0]["message"]["refusal"],
+            "Cannot perform that request"
+        );
+
+        let streaming_extra = format!("{extra},\"stream\":true");
+        let response = gateway
+            .clone()
+            .oneshot(request("ordered", &streaming_extra, "client"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let data = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8(data.to_vec()).unwrap();
+        assert!(text.contains("Cannot perform that request"), "{text}");
+        assert!(text.contains("data: [DONE]"), "{text}");
+        assert!(!text.contains("upstream_stream_incomplete"), "{text}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    assert_eq!(streamed.load(Ordering::SeqCst), 4);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn sse_only_aggregate_preserves_reasoning_and_refusal_without_replaying_to_backup() {
     let scenarios = [
         (
