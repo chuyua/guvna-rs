@@ -8301,6 +8301,20 @@ async fn sse_only_logprobs_request_never_returns_silently_lost_logprobs() {
 }
 
 #[tokio::test]
+async fn sse_only_upstream_explicit_error_event_falls_back_immediately() {
+    let error_event = b"event: error\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fake\"},\"finish_reason\":\"stop\"}]}\n\n";
+    let (primary, primary_hits, _) =
+        start_strict_stream_only(vec![error_event.to_vec(), SSE_DONE.to_vec()]).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let router = app_with_stream_only_and_auto(&primary, &backup, false);
+    let (status, body) = call(router, request("ordered", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["choices"][0]["message"]["content"], "success");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn direct_sse_logprobs_request_must_not_silently_lose_token_probabilities() {
     let (missing, missing_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
     let response = make_app(&missing, &missing)

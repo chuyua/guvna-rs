@@ -46,6 +46,7 @@ enum ToolChoice {
 pub struct ChatSse {
     line: Vec<u8>,
     data: Vec<u8>,
+    error_event: bool,
     // Streaming and SSE->JSON aggregation must agree on event identity.
     // An upstream cannot splice frames from another generation/model into
     // one successful Chat Completion. Retain only small metadata strings.
@@ -172,6 +173,12 @@ impl ChatSse {
 
     fn process_line(&mut self, line: &[u8], emitted: &mut Vec<Bytes>) -> Result<(), SseError> {
         if line.is_empty() {
+            // An explicit event: error label can carry data that resembles
+            // an ordinary Chat chunk; never forward it as a success.
+            let error_event = std::mem::take(&mut self.error_event);
+            if error_event {
+                return Err(SseError);
+            }
             if self.data.is_empty() {
                 return Ok(());
             }
@@ -575,11 +582,13 @@ impl ChatSse {
         if self.done {
             return Err(SseError);
         }
-        if line.starts_with(b":")
-            || line.starts_with(b"event:")
-            || line.starts_with(b"id:")
-            || line.starts_with(b"retry:")
-        {
+        if let Some(name) = line.strip_prefix(b"event:") {
+            let name = name.strip_prefix(b" ").unwrap_or(name);
+            // The latest event field wins, including across TCP chunks.
+            self.error_event = name == b"error";
+            return Ok(());
+        }
+        if line.starts_with(b":") || line.starts_with(b"id:") || line.starts_with(b"retry:") {
             return Ok(());
         }
         if let Some(value) = line.strip_prefix(b"data:") {
@@ -610,6 +619,33 @@ impl ChatSse {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn explicitly_labeled_sse_error_must_never_be_a_chat_success() {
+        let valid_shape = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n";
+        for error_label in [b"event: error\n".as_slice(), b"event:error\n"] {
+            let mut parser = ChatSse::new(1).unwrap();
+            parser.push(error_label).unwrap();
+            assert!(
+                parser.push(valid_shape).is_err(),
+                "accepted an explicitly labeled upstream error"
+            );
+        }
+        let mut empty_error = ChatSse::new(1).unwrap();
+        assert!(empty_error.push(b"event: error\n\n").is_err());
+
+        // The last event field wins, and ordinary named messages still work.
+        let mut ordinary = ChatSse::new(1).unwrap();
+        ordinary.push(b"event: error\nevent: message\n").unwrap();
+        ordinary.push(valid_shape).unwrap();
+        ordinary.push(b"data: [DONE]\n\n").unwrap();
+        ordinary.finish().unwrap();
+
+        let mut fragmented = ChatSse::new(1).unwrap();
+        fragmented.push(b"ev").unwrap();
+        fragmented.push(b"ent: error\n").unwrap();
+        assert!(fragmented.push(valid_shape).is_err());
+    }
 
     #[test]
     fn shared_json_validation_matches_the_original_value_parser_contract() {
