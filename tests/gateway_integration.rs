@@ -3143,6 +3143,42 @@ chains:
 }
 
 #[tokio::test]
+async fn responses_input_audio_preserves_chat_wire_for_json_and_sse() {
+    let (url, seen) = start_format_probe("heard").await;
+    let gateway = make_app(&url, &url);
+    for streaming in [false, true] {
+        let request = responses_stream_req(json!({
+            "model":"demo","stream":streaming,
+            "input":[{"role":"user","content":[
+                {"type":"input_text","text":"listen"},
+                {"type":"input_audio","input_audio":{"data":"YQ==","format":"mp3"}}
+            ]}]
+        }));
+        let response = gateway.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        if streaming {
+            let events = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(events.contains("event: response.completed"), "{events}");
+        } else {
+            let output: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(output["output_text"], "heard");
+        }
+    }
+    let requests = seen.lock().await;
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert_eq!(
+            request["messages"][0]["content"],
+            json!([
+                {"type":"text","text":"listen"},
+                {"type":"input_audio","input_audio":{"data":"YQ==","format":"mp3"}}
+            ])
+        );
+    }
+}
+
+#[tokio::test]
 async fn responses_vision_url_and_base64_reach_upstream_in_json_and_sse() {
     let recorded = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
     let captured = Arc::clone(&recorded);

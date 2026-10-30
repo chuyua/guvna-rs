@@ -566,9 +566,9 @@ fn chat_text_message(role: &str, content: String) -> Value {
     message
 }
 
-// Map user image input to Chat vision parts, moving large data URIs instead
-// of cloning them. Reject any item without an equivalent Chat representation.
-fn translate_vision_parts(parts: Vec<Value>) -> Result<Value, Box<Response>> {
+// Map user multimedia input to Chat parts by moving large base64 payloads.
+// Reject any item without an equivalent Chat representation.
+fn translate_multimodal_parts(parts: Vec<Value>) -> Result<Value, Box<Response>> {
     let mut output = Vec::with_capacity(parts.len());
     let mut text = String::new();
     for mut part in parts {
@@ -662,6 +662,57 @@ fn translate_vision_parts(parts: Vec<Value>) -> Result<Value, Box<Response>> {
                 item.insert("image_url".into(), Value::Object(url));
                 output.push(Value::Object(item));
             }
+            Some("input_audio") => {
+                if part.as_object().is_none_or(|obj| {
+                    obj.keys()
+                        .any(|key| !["type", "input_audio"].contains(&key.as_str()))
+                }) {
+                    return Err(Box::new(error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "responses_input_unsupported",
+                        "Unsupported input_audio fields",
+                    )));
+                }
+                let Some(Value::Object(audio)) = part
+                    .as_object_mut()
+                    .expect("validated part")
+                    .remove("input_audio")
+                else {
+                    return Err(Box::new(error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_input_audio",
+                        "input_audio requires data and format",
+                    )));
+                };
+                if !audio
+                    .keys()
+                    .all(|key| ["data", "format"].contains(&key.as_str()))
+                    || !audio
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty())
+                    || !matches!(
+                        audio.get("format").and_then(Value::as_str),
+                        Some("mp3" | "wav")
+                    )
+                {
+                    return Err(Box::new(error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_input_audio",
+                        "input_audio needs nonempty data and mp3/wav format",
+                    )));
+                }
+                if !text.is_empty() {
+                    let mut item = serde_json::Map::new();
+                    item.insert("type".into(), Value::String("text".into()));
+                    item.insert("text".into(), Value::String(std::mem::take(&mut text)));
+                    output.push(Value::Object(item));
+                }
+                let mut item = serde_json::Map::new();
+                item.insert("type".into(), Value::String("input_audio".into()));
+                item.insert("input_audio".into(), Value::Object(audio));
+                output.push(Value::Object(item));
+            }
             _ => {
                 return Err(Box::new(error(
                     StatusCode::NOT_IMPLEMENTED,
@@ -682,7 +733,7 @@ fn translate_vision_parts(parts: Vec<Value>) -> Result<Value, Box<Response>> {
 
 fn translate_input(input: Value) -> Result<Value, Box<Response>> {
     // Translate the common Responses text message shape into Chat Completions.
-    // Preserve image input where Chat has a lossless equivalent.
+    // Preserve supported image and audio input where Chat has an equivalent.
     let messages = match input {
         Value::String(text) => Value::Array(vec![chat_text_message("user", text)]),
         Value::Array(items) if !items.is_empty() => {
@@ -929,21 +980,24 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                     )));
                 };
                 if content.as_array().is_some_and(|parts| {
-                    parts
-                        .iter()
-                        .any(|part| part.get("type").and_then(Value::as_str) == Some("input_image"))
+                    parts.iter().any(|part| {
+                        matches!(
+                            part.get("type").and_then(Value::as_str),
+                            Some("input_image" | "input_audio")
+                        )
+                    })
                 }) {
                     if role != "user" {
                         return Err(Box::new(error(
                             StatusCode::NOT_IMPLEMENTED,
                             "responses_input_unsupported",
-                            "Only users may submit images",
+                            "Only users may submit multimedia input",
                         )));
                     }
                     let Value::Array(parts) = content else {
                         unreachable!()
                     };
-                    let chat_content = translate_vision_parts(parts)?;
+                    let chat_content = translate_multimodal_parts(parts)?;
                     if let Some(reasoning) = pending_reasoning.take() {
                         let mut assistant = json!({"role":"assistant","content":Value::Null});
                         assistant["reasoning_content"] = Value::String(reasoning);
@@ -1494,6 +1548,41 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
 #[cfg(test)]
 mod reasoning_tests {
     use super::*;
+
+    #[test]
+    fn audio_input_moves_large_data_and_preserves_interleaving() {
+        let data = "YQ==".repeat(180_000);
+        let input = json!([{"role":"user","content":[
+            {"type":"input_text","text":"listen "},
+            {"type":"input_audio","input_audio":{"data":data,"format":"wav"}},
+            {"type":"input_text","text":"then look "},
+            {"type":"input_image","image_url":"https://example.test/a.png"}
+        ]}]);
+        let pointer = input[0]["content"][1]["input_audio"]["data"]
+            .as_str()
+            .unwrap()
+            .as_ptr();
+        let replay = translate_input(input).unwrap();
+        let parts = &replay[0]["content"];
+        assert_eq!(parts.as_array().unwrap().len(), 4);
+        assert_eq!(parts[0], json!({"type":"text","text":"listen "}));
+        assert_eq!(parts[1]["type"], "input_audio");
+        assert_eq!(parts[1]["input_audio"]["format"], "wav");
+        assert_eq!(
+            parts[1]["input_audio"]["data"].as_str().unwrap().as_ptr(),
+            pointer
+        );
+        assert_eq!(parts[2], json!({"type":"text","text":"then look "}));
+        assert_eq!(parts[3]["type"], "image_url");
+        for bad in [
+            json!({"type":"input_audio","input_audio":{"data":"","format":"mp3"}}),
+            json!({"type":"input_audio","input_audio":{"data":"YQ==","format":"flac"}}),
+            json!({"type":"input_audio","input_audio":{"data":"YQ==","format":"wav","extra":1}}),
+            json!({"type":"input_audio","input_audio":"wrong"}),
+        ] {
+            assert!(translate_input(json!([{"role":"user","content":[bad]}])).is_err());
+        }
+    }
 
     #[test]
     fn user_vision_parts_preserve_order_and_move_large_data_uri() {

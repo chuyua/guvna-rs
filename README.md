@@ -59,8 +59,9 @@ has been sent). JSON-schema adherence beyond JSON syntax remains the
 responsibility of the upstream model/provider.
 
 Responses user-image URL and base64 data-URI input are translated to Chat
-vision parts, preserving image order, text, and detail. File-ID images,
-image-generation tools, audio, advanced reasoning controls, stateful
+vision parts, preserving image order, text, and detail. User input_audio
+(mp3/wav base64) is also forwarded to Chat providers. File-ID images,
+image-generation tools, audio output and streaming, advanced reasoning controls, stateful
 continuation, and other advanced Responses modes remain unsupported.
 The supported reasoning.effort values are translated to Chat reasoning_effort;
 reasoning summaries, context modes and other reasoning options remain unsupported.
