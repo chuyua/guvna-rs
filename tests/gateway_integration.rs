@@ -4787,6 +4787,43 @@ async fn chat_forced_tool_refusal_is_delivered_without_trying_backup() {
 }
 
 #[tokio::test]
+async fn invalid_chat_message_field_types_fail_over_before_responses_translation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tracked = calls.clone();
+    let invalid = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let calls = tracked.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({"choices":[{"index":0,"message":{
+                "role":"assistant","content":"apparently valid answer",
+                "reasoning":{"unexpected":"not text"}},"finish_reason":"stop"}]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, invalid).await.unwrap() });
+    let (backup, backup_calls) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&format!("http://{addr}"), &backup);
+
+    let (status, chat) = call(router.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{chat}");
+    assert_eq!(chat["choices"][0]["message"]["content"], "success");
+    let (status, responses) = call(
+        router,
+        responses_stream_req(json!({
+        "model":"demo","input":"hello"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{responses}");
+    assert_eq!(responses["output_text"], "success");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn responses_forced_tool_refusal_survives_json_and_sse_without_retry() {
     let frames = vec![
         aggregate_chat_frame(json!({"id":"chat-refusal","created":123,

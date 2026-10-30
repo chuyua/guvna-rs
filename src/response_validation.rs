@@ -84,6 +84,20 @@ fn validate_chat_with_params(
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
             return false;
         }
+        // A valid text or tool result must not mask a malformed sibling
+        // field. Otherwise an upstream HTTP 200 can pass validation even
+        // though callers (or the Responses adapter) cannot interpret the
+        // non-string message field. Direct SSE rejects these same shapes.
+        if ["content", "refusal", "reasoning", "reasoning_content"]
+            .iter()
+            .any(|field| {
+                message
+                    .get(*field)
+                    .is_some_and(|value| !value.is_null() && !value.is_string())
+            })
+        {
+            return false;
+        }
         let explicitly_refused = message
             .get("refusal")
             .and_then(Value::as_str)
@@ -396,6 +410,37 @@ mod response_contract_tests {
             &params,
             &response,
         ));
+    }
+
+    #[test]
+    fn malformed_nonstring_assistant_fields_cannot_hide_behind_valid_output() {
+        let valid_text = json!({"choices":[{"index":0,"message":{
+            "role":"assistant","content":"ok","refusal":null,"reasoning":null,
+            "reasoning_content":null},"finish_reason":"stop"}]});
+        let valid_tool = json!({"choices":[{"index":0,"message":{
+            "role":"assistant","content":null,"tool_calls":[{
+                "id":"call_1","type":"function",
+                "function":{"name":"lookup","arguments":"{}"}}]},
+            "finish_reason":"tool_calls"}]});
+        assert!(validate_chat(&json!({}), &valid_text));
+        assert!(validate_chat(&json!({}), &valid_tool));
+        for field in ["content", "refusal", "reasoning", "reasoning_content"] {
+            for invalid in [
+                json!({"unexpected":true}),
+                json!(["text"]),
+                json!(42),
+                json!(true),
+            ] {
+                for baseline in [&valid_text, &valid_tool] {
+                    let mut response = baseline.clone();
+                    response["choices"][0]["message"][field] = invalid.clone();
+                    assert!(
+                        !validate_chat(&json!({}), &response),
+                        "non-string {field} accepted alongside another valid field"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
