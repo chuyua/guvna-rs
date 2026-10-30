@@ -2012,7 +2012,8 @@ async fn streamed_required_tool_choice_cannot_complete_plain_text() {
 async fn empty_sse_stop_is_not_committed_as_a_successful_chat_answer() {
     // The downstream has already received SSE headers, so it must receive
     // an incomplete-stream error rather than a fabricated successful end.
-    let (upstream, hits) = start_sse(vec![SSE_END, SSE_DONE]).await;
+    let role_only = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
+    let (upstream, hits) = start_sse(vec![role_only, SSE_END, SSE_DONE]).await;
     let response = make_app(&upstream, &upstream)
         .oneshot(request("demo", r#","stream":true"#, "client"))
         .await
