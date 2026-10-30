@@ -434,7 +434,6 @@ chains:
         params:
           stream_options:
             include_usage: true
-          stream: true
           n: 2
           tool_choice: required
           tools:

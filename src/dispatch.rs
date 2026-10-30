@@ -1052,8 +1052,7 @@ async fn dispatch_inner(
             if matches!(endpoint, Endpoint::Embeddings)
                 && matches!(
                     name.as_str(),
-                    "stream"
-                        | "stream_options"
+                    "stream_options"
                         | "n"
                         | "tools"
                         | "tool_choice"
