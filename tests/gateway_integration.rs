@@ -4787,6 +4787,33 @@ async fn chat_forced_tool_refusal_is_delivered_without_trying_backup() {
 }
 
 #[tokio::test]
+async fn chat_rejects_malformed_present_completion_metadata() {
+    let (upstream, hits) = start_upstream(StatusCode::OK).await;
+    let gateway = make_app(&upstream, &upstream);
+    for mode in [
+        "emptyid",
+        "negativecreated",
+        "stringcreated",
+        "emptymodel",
+        "numbermodel",
+    ] {
+        let payload = json!({"model":"demo","messages":[{
+            "role":"user","content":format!("invalidchat:{mode}")}]});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let (status, output) = call(gateway.clone(), request).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{mode}: {output}");
+        assert_eq!(output["error"]["code"], "upstream_unavailable");
+    }
+    assert!(hits.load(Ordering::SeqCst) >= 5);
+}
+
+#[tokio::test]
 async fn bad_usage_counts_fail_over_on_both_chat_and_responses() {
     let calls = Arc::new(AtomicUsize::new(0));
     let tracked = calls.clone();

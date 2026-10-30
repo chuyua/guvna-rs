@@ -54,6 +54,21 @@ fn validate_chat_with_params(
     if super::responses::parse_chat_usage(response).is_err() {
         return false;
     }
+    // Keep legacy upstreams that omit optional Chat metadata, but reject
+    // values that are present and malformed. Direct SSE already enforces
+    // the same types before declaring an upstream response successful.
+    if response
+        .get("id")
+        .is_some_and(|id| id.as_str().is_none_or(str::is_empty))
+        || response
+            .get("model")
+            .is_some_and(|model| model.as_str().is_none_or(str::is_empty))
+        || response
+            .get("created")
+            .is_some_and(|created| created.as_u64().is_none())
+    {
+        return false;
+    }
     let Some(choices) = response.get("choices").and_then(Value::as_array) else {
         return false;
     };
@@ -416,6 +431,31 @@ mod response_contract_tests {
             &params,
             &response,
         ));
+    }
+
+    #[test]
+    fn malformed_present_chat_metadata_cannot_be_accepted_as_success() {
+        let mut result = json!({"choices":[assistant(0)]});
+        assert!(validate_chat(&json!({}), &result));
+        result["id"] = json!("chatcmpl-test");
+        result["model"] = json!("model-a");
+        result["created"] = json!(123);
+        assert!(validate_chat(&json!({}), &result));
+        for (name, invalid) in [
+            ("id", json!("")),
+            ("id", json!(42)),
+            ("model", json!("")),
+            ("model", json!(false)),
+            ("created", json!(-1)),
+            ("created", json!("yesterday")),
+        ] {
+            let mut response = result.clone();
+            response[name] = invalid;
+            assert!(
+                !validate_chat(&json!({}), &response),
+                "malformed present metadata {name} accepted"
+            );
+        }
     }
 
     #[test]
