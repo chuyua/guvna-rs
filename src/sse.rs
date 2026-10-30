@@ -55,6 +55,7 @@ pub struct ChatSse {
     progress_since_push: bool,
     finished_mask: u64,
     tool_calls_mask: u64,
+    output_mask: u64,
     tool_calls: Vec<StreamToolCall>,
     tool_argument_bytes: usize,
     usage_seen: bool,
@@ -319,12 +320,23 @@ impl ChatSse {
             return Err(SseError);
         }
         let choice_bit = 1u64 << index;
-        if delta
+        let has_refusal = delta
             .get("refusal")
             .and_then(Value::as_str)
-            .is_some_and(|text| !text.is_empty())
-        {
+            .is_some_and(|text| !text.is_empty());
+        if has_refusal {
             self.refusal_mask |= choice_bit;
+        }
+        let has_output = ["content", "reasoning", "reasoning_content"]
+            .iter()
+            .any(|field| {
+                delta
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+            });
+        if has_output {
+            self.output_mask |= choice_bit;
         }
         if self.json_mode.is_some()
             && let Some(fragment) = delta.get("content").and_then(Value::as_str)
@@ -356,20 +368,7 @@ impl ChatSse {
                 tool_progress |= self.process_tool_call(index, call)?;
             }
         }
-        if tool_progress
-            || delta
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|content| !content.is_empty())
-            || ["reasoning", "reasoning_content", "refusal"]
-                .iter()
-                .any(|field| {
-                    delta
-                        .get(*field)
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| !text.is_empty())
-                })
-        {
+        if tool_progress || has_output || has_refusal {
             self.progress_since_push = true;
         }
         if let Some(reason) = choice.get("finish_reason").filter(|v| !v.is_null()) {
@@ -382,6 +381,16 @@ impl ChatSse {
             // completed function invocation. Legacy function_call deltas
             // are unsupported, so only tool_calls may terminate tool data.
             if (reason == "tool_calls" && !has_tools) || (reason == "stop" && has_tools) {
+                return Err(SseError);
+            }
+            // Do not report an empty, cleanly stopped stream as a valid
+            // answer. Explicit refusals and reasoning-only completions are
+            // legitimate; partial length/content_filter endings are unchanged.
+            if reason == "stop"
+                && !has_tools
+                && self.output_mask & choice_bit == 0
+                && self.refusal_mask & choice_bit == 0
+            {
                 return Err(SseError);
             }
             if reason == "stop"
@@ -1108,7 +1117,8 @@ mod tests {
 
     #[test]
     fn usage_frames_must_be_complete_consistent_and_unique() {
-        let finished = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+        let finished =
+            br#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}
 
 "#;
         let valid_usage = br#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}
@@ -1284,8 +1294,48 @@ mod tests {
     }
 
     #[test]
+    fn clean_stop_requires_text_reasoning_or_refusal() {
+        for (delta, allowed) in [
+            (json!({}), false),
+            (json!({"role":"assistant"}), false),
+            (
+                json!({"content":"","reasoning_content":"","refusal":""}),
+                false,
+            ),
+            (json!({"content":"ok"}), true),
+            (json!({"reasoning_content":"thought"}), true),
+            (json!({"reasoning":"thought"}), true),
+            (json!({"refusal":"Cannot help"}), true),
+        ] {
+            let mut parser = ChatSse::new(1).unwrap();
+            let frame = format!(
+                "data: {}\n\n",
+                json!({"choices":[{"index":0,"delta":delta,"finish_reason":"stop"}]})
+            );
+            assert_eq!(parser.push(frame.as_bytes()).is_ok(), allowed, "{frame}");
+        }
+        let mut parser = ChatSse::new(1).unwrap();
+        parser.push(br#"data: {"choices":[{"index":0,"delta":{"refusal":"Cannot help"},"finish_reason":null}]}
+
+"#).unwrap();
+        assert!(parser.take_progress());
+        parser
+            .push(
+                br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":null}]}
+
+"#,
+            )
+            .unwrap();
+        assert!(
+            !parser.take_progress(),
+            "empty frame is not renewed progress"
+        );
+    }
+
+    #[test]
     fn duplicate_done_is_rejected() {
         let mut parser = ChatSse::new(1).unwrap();
+        parser.push(START).unwrap();
         parser.push(END).unwrap();
         parser.push(b"data: [DONE]\n\n").unwrap();
         assert!(parser.push(b"data: [DONE]\n\n").is_err());
@@ -1294,7 +1344,7 @@ mod tests {
     #[test]
     fn invalid_later_choice_cannot_commit_earlier_finish() {
         let mut parser = ChatSse::new(2).unwrap();
-        let bad = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delta":null,"finish_reason":null}]}
+        let bad = br#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"},{"index":1,"delta":null,"finish_reason":null}]}
 
 "#;
         assert!(parser.push(bad).is_err());
@@ -1304,9 +1354,11 @@ mod tests {
     #[test]
     fn rejects_trailing_bytes_after_done_in_same_and_later_chunk() {
         let mut parser = ChatSse::new(1).unwrap();
+        parser.push(START).unwrap();
         parser.push(END).unwrap();
         assert!(parser.push(b"data: [DONE]\n\nextra").is_err());
         let mut parser = ChatSse::new(1).unwrap();
+        parser.push(START).unwrap();
         parser.push(END).unwrap();
         parser.push(b"data: [DONE]\n\n").unwrap();
         assert!(parser.push(b"extra").is_err());
@@ -1316,11 +1368,11 @@ mod tests {
         let mut parser = ChatSse::new(64).unwrap();
         let high: Vec<Value> = (32..64)
             .rev()
-            .map(|index| serde_json::json!({"index":index,"delta":{},"finish_reason":"stop"}))
+            .map(|index| serde_json::json!({"index":index,"delta":{"content":"ok"},"finish_reason":"stop"}))
             .collect();
         let low: Vec<Value> = (0..32)
             .rev()
-            .map(|index| serde_json::json!({"index":index,"delta":{},"finish_reason":"stop"}))
+            .map(|index| serde_json::json!({"index":index,"delta":{"content":"ok"},"finish_reason":"stop"}))
             .collect();
         assert_eq!(high.len(), 32);
         let first = format!("data: {}\n\n", serde_json::json!({"choices":high}));

@@ -2009,6 +2009,34 @@ async fn streamed_required_tool_choice_cannot_complete_plain_text() {
 }
 
 #[tokio::test]
+async fn empty_sse_stop_is_not_committed_as_a_successful_chat_answer() {
+    // The downstream has already received SSE headers, so it must receive
+    // an incomplete-stream error rather than a fabricated successful end.
+    let (upstream, hits) = start_sse(vec![SSE_END, SSE_DONE]).await;
+    let response = make_app(&upstream, &upstream)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // Non-stream callers can still fall back before any answer is exposed.
+    let (stream_only, stream_hits, _) =
+        start_strict_stream_only(vec![SSE_END.to_vec(), SSE_DONE.to_vec()]).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let gateway = app_with_stream_only_and_auto(&stream_only, &backup, false);
+    let (status, output) = call(gateway, request("ordered", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(output["choices"][0]["message"]["content"], "success");
+    assert_eq!(stream_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn malformed_tool_arguments_cannot_complete_chat_stream() {
     let tool = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"[1]\"}}]},\"finish_reason\":null}]}\n\n";
     let finish =
