@@ -10,8 +10,31 @@ use std::{
     time::Duration,
 };
 
+fn main() {
+    // glibc otherwise raises its mmap threshold after freeing large JSON
+    // buffers, leaving later large allocations on a retained heap. Use
+    // independent mmap-backed buffers for the single-user Linux gateway.
+    // Respect operator-provided glibc allocator overrides.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if env::var_os("MALLOC_MMAP_THRESHOLD_").is_none()
+        && !env::var_os("GLIBC_TUNABLES").is_some_and(|tunables| {
+            tunables
+                .to_string_lossy()
+                .split(':')
+                .any(|setting| setting.starts_with("glibc.malloc.mmap_threshold="))
+        })
+    {
+        // SAFETY: this glibc initialization happens before Tokio creates
+        // its runtime or other worker threads.
+        if unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 512 * 1024) } == 0 {
+            eprintln!("guvna: warning: glibc mmap threshold tuning unavailable");
+        }
+    }
+    async_main();
+}
+
 #[tokio::main]
-async fn main() {
+async fn async_main() {
     if let Err(err) = run().await {
         eprintln!("guvna: {err}");
         std::process::exit(1);
