@@ -4787,6 +4787,55 @@ async fn chat_forced_tool_refusal_is_delivered_without_trying_backup() {
 }
 
 #[tokio::test]
+async fn responses_forced_tool_refusal_survives_json_and_sse_without_retry() {
+    let frames = vec![
+        aggregate_chat_frame(json!({"id":"chat-refusal","created":123,
+            "choices":[{"index":0,"delta":{"role":"assistant",
+                "refusal":"Cannot perform that request"},"finish_reason":null}]})),
+        aggregate_chat_frame(json!({"id":"chat-refusal","created":123,
+            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})),
+        b"data: [DONE]\n\n".to_vec(),
+    ];
+    let (url, hits, streamed) = start_strict_stream_only(frames).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let gateway = app_with_stream_only_and_auto(&url, &backup, false);
+
+    for choice in [
+        json!("required"),
+        json!({"type":"function","name":"lookup"}),
+    ] {
+        for stream in [false, true] {
+            let input = json!({"model":"ordered","input":"hello","stream":stream,
+                "tools":[{"type":"function","name":"lookup"}],"tool_choice":choice});
+            if stream {
+                let response = gateway
+                    .clone()
+                    .oneshot(responses_stream_req(input))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let data = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                let events = String::from_utf8(data.to_vec()).unwrap();
+                assert!(events.contains("event: response.refusal.delta"), "{events}");
+                assert!(events.contains("event: response.completed"), "{events}");
+                assert!(!events.contains("event: response.failed"), "{events}");
+            } else {
+                let (status, response) = call(gateway.clone(), responses_stream_req(input)).await;
+                assert_eq!(status, StatusCode::OK, "{response}");
+                assert_eq!(response["output"][0]["content"][0]["type"], "refusal");
+                assert_eq!(
+                    response["output"][0]["content"][0]["refusal"],
+                    "Cannot perform that request"
+                );
+            }
+        }
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    assert_eq!(streamed.load(Ordering::SeqCst), 4);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn responses_forced_tool_choice_ignoring_upstream_fails_over() {
     let (url, seen) = start_format_probe("ordinary text").await;
     let app = make_app(&url, &url);
