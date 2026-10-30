@@ -3185,6 +3185,44 @@ async fn responses_stateless_baseline_envelope_is_consistent_in_json_and_sse() {
 }
 
 #[tokio::test]
+async fn responses_inline_pdf_maps_to_chat_file_for_json_and_stream() {
+    let (url, seen) = start_format_probe("document understood").await;
+    let gateway = make_app(&url, &url);
+    for stream in [false, true] {
+        let request = responses_stream_req(json!({
+            "model":"demo","stream":stream,
+            "input":[{"role":"user","content":[
+                {"type":"input_file","filename":"summary.pdf",
+                    "file_data":"data:application/pdf;base64,JVBERi0xLjQK"},
+                {"type":"input_text","text":"Summarize the PDF"}
+            ]}]
+        }));
+        let response = gateway.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        if stream {
+            let events = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(events.contains("event: response.completed"), "{events}");
+        } else {
+            let output: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(output["output_text"], "document understood");
+        }
+    }
+    let requests = seen.lock().await;
+    assert_eq!(requests.len(), 2);
+    for req in requests.iter() {
+        assert_eq!(
+            req["messages"][0]["content"],
+            json!([
+                {"type":"file","file":{"filename":"summary.pdf",
+                    "file_data":"data:application/pdf;base64,JVBERi0xLjQK"}},
+                {"type":"text","text":"Summarize the PDF"}
+            ])
+        );
+    }
+}
+
+#[tokio::test]
 async fn responses_input_audio_preserves_chat_wire_for_json_and_sse() {
     let (url, seen) = start_format_probe("heard").await;
     let gateway = make_app(&url, &url);

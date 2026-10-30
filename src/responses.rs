@@ -713,6 +713,65 @@ fn translate_multimodal_parts(parts: Vec<Value>) -> Result<Value, Box<Response>>
                 item.insert("input_audio".into(), Value::Object(audio));
                 output.push(Value::Object(item));
             }
+            Some("input_file") => {
+                // Only inline PDF data is shared between Responses and Chat.
+                // File IDs are provider-specific; file URLs and detail levels
+                // have no lossless Chat counterpart.
+                if part.as_object().is_none_or(|obj| {
+                    obj.keys()
+                        .any(|key| !["type", "filename", "file_data"].contains(&key.as_str()))
+                }) {
+                    return Err(Box::new(error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "responses_input_unsupported",
+                        "Only inline PDF without detail can be mapped to Chat",
+                    )));
+                }
+                let obj = part.as_object_mut().expect("validated part");
+                let Some(Value::String(name)) = obj.remove("filename") else {
+                    return Err(Box::new(error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_input_file",
+                        "PDF file requires filename",
+                    )));
+                };
+                if !name.to_ascii_lowercase().ends_with(".pdf") {
+                    return Err(Box::new(error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "responses_input_unsupported",
+                        "Only PDF files are supported",
+                    )));
+                }
+                let Some(Value::String(data)) = obj.remove("file_data") else {
+                    return Err(Box::new(error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_input_file",
+                        "PDF file requires file_data",
+                    )));
+                };
+                if !data.starts_with("data:application/pdf;base64,")
+                    || data.len() <= "data:application/pdf;base64,".len()
+                {
+                    return Err(Box::new(error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_input_file",
+                        "PDF file_data must be a PDF base64 data URI",
+                    )));
+                }
+                if !text.is_empty() {
+                    let mut item = serde_json::Map::new();
+                    item.insert("type".into(), Value::String("text".into()));
+                    item.insert("text".into(), Value::String(std::mem::take(&mut text)));
+                    output.push(Value::Object(item));
+                }
+                let mut file = serde_json::Map::new();
+                file.insert("filename".into(), Value::String(name));
+                file.insert("file_data".into(), Value::String(data));
+                let mut item = serde_json::Map::new();
+                item.insert("type".into(), Value::String("file".into()));
+                item.insert("file".into(), Value::Object(file));
+                output.push(Value::Object(item));
+            }
             _ => {
                 return Err(Box::new(error(
                     StatusCode::NOT_IMPLEMENTED,
@@ -983,7 +1042,7 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                     parts.iter().any(|part| {
                         matches!(
                             part.get("type").and_then(Value::as_str),
-                            Some("input_image" | "input_audio")
+                            Some("input_image" | "input_audio" | "input_file")
                         )
                     })
                 }) {
@@ -1552,6 +1611,55 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
 #[cfg(test)]
 mod reasoning_tests {
     use super::*;
+
+    #[test]
+    fn inline_pdf_moves_data_without_copying_and_rejects_unportable_files() {
+        let pdf = format!(
+            "data:application/pdf;base64,{}",
+            "JVBERi0xLjQK".repeat(80_000)
+        );
+        let message = json!([{"role":"user","content":[
+            {"type":"input_text","text":"Summarize "},
+            {"type":"input_file","filename":"proposal.pdf","file_data":pdf},
+            {"type":"input_text","text":"and compare"}
+        ]}]);
+        let pointer = message[0]["content"][1]["file_data"]
+            .as_str()
+            .unwrap()
+            .as_ptr();
+        let converted = translate_input(message).unwrap();
+        assert_eq!(converted[0]["content"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            converted[0]["content"][0],
+            json!({"type":"text","text":"Summarize "})
+        );
+        assert_eq!(converted[0]["content"][1]["type"], "file");
+        assert_eq!(
+            converted[0]["content"][1]["file"]["filename"],
+            "proposal.pdf"
+        );
+        assert_eq!(
+            converted[0]["content"][1]["file"]["file_data"]
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            pointer
+        );
+        assert_eq!(
+            converted[0]["content"][2],
+            json!({"type":"text","text":"and compare"})
+        );
+        for invalid in [
+            json!({"type":"input_file","file_id":"file_abc"}),
+            json!({"type":"input_file","file_url":"https://example.test/a.pdf"}),
+            json!({"type":"input_file","filename":"data.csv","file_data":"data:application/pdf;base64,YQ=="}),
+            json!({"type":"input_file","filename":"a.pdf","file_data":""}),
+            json!({"type":"input_file","filename":"a.pdf","file_data":"base64-raw"}),
+            json!({"type":"input_file","filename":"a.pdf","file_data":"data:application/pdf;base64,YQ==","detail":"high"}),
+        ] {
+            assert!(translate_input(json!([{"role":"user","content":[invalid]}])).is_err());
+        }
+    }
 
     #[test]
     fn audio_input_moves_large_data_and_preserves_interleaving() {

@@ -63,6 +63,9 @@ vision parts, preserving image order, text, and detail. User input_audio
 (mp3/wav base64) is also forwarded to Chat providers. File-ID images,
 image-generation tools, audio output and streaming, advanced reasoning controls, stateful
 continuation, and other advanced Responses modes remain unsupported.
+Inline input_file PDF data URLs (without PDF-specific detail) map to Chat file
+parts. Non-PDF files, file_url, and file_id are not portable to Chat chains and
+are explicitly rejected.
 The supported reasoning.effort values are translated to Chat reasoning_effort;
 reasoning summaries, context modes and other reasoning options remain unsupported.
 Responses text.verbosity is mapped to the equivalent Chat verbosity field.
