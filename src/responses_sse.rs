@@ -204,6 +204,8 @@ impl ResponsesSse {
         }
         json!({"id":self.id,"object":"response","created_at":self.created_at,
             "model":self.model,"status":status,
+            "error":null, "store":false, "background":false,
+            "previous_response_id":null, "truncation":"disabled",
             "incomplete_details": if status == "incomplete" {
                 json!({"reason": if self.finish_reason.as_deref() == Some("content_filter") {
                     "content_filter"

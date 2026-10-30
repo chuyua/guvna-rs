@@ -3143,6 +3143,48 @@ chains:
 }
 
 #[tokio::test]
+async fn responses_stateless_baseline_envelope_is_consistent_in_json_and_sse() {
+    let (url, _) = start_format_probe("success").await;
+    let gateway = make_app(&url, &url);
+    for stream in [false, true] {
+        let response = gateway
+            .clone()
+            .oneshot(responses_stream_req(json!({
+                "model":"demo","input":"hello","stream":stream,"store":false
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let body: Value = if stream {
+            let events = String::from_utf8(bytes.to_vec()).unwrap();
+            let mut completed = None;
+            for section in events.split("\n\n") {
+                if section.starts_with("event: response.completed\n") {
+                    let data = section
+                        .lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .expect("completed event carries JSON");
+                    completed =
+                        Some(serde_json::from_str::<Value>(data).unwrap()["response"].clone());
+                }
+            }
+            completed.expect("completed response")
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["error"], Value::Null);
+        assert!(body.get("error").is_some());
+        assert_eq!(body["store"], false);
+        assert_eq!(body["background"], false);
+        assert!(body.get("previous_response_id").is_some());
+        assert_eq!(body["previous_response_id"], Value::Null);
+        assert_eq!(body["truncation"], "disabled");
+    }
+}
+
+#[tokio::test]
 async fn responses_input_audio_preserves_chat_wire_for_json_and_sse() {
     let (url, seen) = start_format_probe("heard").await;
     let gateway = make_app(&url, &url);

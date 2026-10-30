@@ -68,6 +68,9 @@ reasoning summaries, context modes and other reasoning options remain unsupporte
 Responses text.verbosity is mapped to the equivalent Chat verbosity field.
 Request-level service_tier, safety_identifier and prompt_cache_key are
 validated and forwarded to Chat providers without inventing response metadata.
+Successful JSON and SSE Responses envelopes declare the actual stateless mode:
+store=false, background=false, previous_response_id=null, truncation=disabled,
+and error=null.
 The gateway is not a full OpenAI Responses implementation or a production
 drop-in replacement.
 

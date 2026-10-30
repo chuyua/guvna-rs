@@ -1484,6 +1484,8 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
         return (StatusCode::OK, Json(json!({
             "id":chat["id"], "object":"response", "status":output_status, "model":logical_model,
             "output":output, "output_text":content.as_str().unwrap_or(""), "usage":translated_usage, "created_at":created_at, "incomplete_details":incomplete_details, "metadata":metadata,
+            "error":null, "store":false, "background":false,
+            "previous_response_id":null, "truncation":"disabled",
         }))).into_response();
     }
     let content_value = &message["content"];
@@ -1541,7 +1543,9 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
         "id":chat["id"], "object":"response", "status":response_status, "incomplete_details":incomplete_details, "created_at":created_at, "model":logical_model,
         "output":output,
         "output_text":output_text,
-        "usage": translated_usage, "metadata":metadata
+        "usage": translated_usage, "metadata":metadata,
+        "error":null, "store":false, "background":false,
+        "previous_response_id":null, "truncation":"disabled",
     }))).into_response()
 }
 
