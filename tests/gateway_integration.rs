@@ -8345,6 +8345,48 @@ async fn direct_sse_logprobs_request_must_not_silently_lose_token_probabilities(
     assert_eq!(valid_hits.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn sse_only_aggregation_skips_untranslatable_chain_logprobs_defaults() {
+    for (defaults, extra, skip_primary) in [
+        ("logprobs: true", "", true),
+        ("top_logprobs: 4", "", true),
+        ("logprobs: true", r#","logprobs":false"#, false),
+    ] {
+        let (primary, primary_hits, _) = start_strict_stream_only(vec![
+            SSE_START.to_vec(),
+            SSE_END.to_vec(),
+            SSE_DONE.to_vec(),
+        ])
+        .await;
+        let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+        let yaml = format!(
+            "providers:\n  - name: streaming\n    type: openai\n    base_url: {primary}\n    key_env: STREAM_KEY\n    stream_only: true\n  - name: backup\n    type: openai\n    base_url: {backup}\n    key_env: BACKUP_KEY\nchains:\n  - name: ordered\n    steps:\n      - provider: streaming\n        model: streaming-model\n        params:\n          {defaults}\n      - provider: backup\n        model: backup-model\n"
+        );
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let gateway = app(AppState::new(
+            config,
+            HashMap::from([
+                ("STREAM_KEY".into(), "stream-secret".into()),
+                ("BACKUP_KEY".into(), "backup-secret".into()),
+            ]),
+            vec!["client".into()],
+        )
+        .unwrap());
+        let (status, body) = call(gateway, request("ordered", extra, "client")).await;
+        assert_eq!(status, StatusCode::OK, "{defaults}, {extra}: {body}");
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            if skip_primary { 0 } else { 1 },
+            "{defaults}, {extra}"
+        );
+        assert_eq!(
+            backup_hits.load(Ordering::SeqCst),
+            if skip_primary { 1 } else { 0 },
+            "{defaults}, {extra}"
+        );
+    }
+}
+
 async fn start_variable_choice_upstream() -> (String, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let counted = hits.clone();

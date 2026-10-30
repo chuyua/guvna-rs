@@ -924,8 +924,14 @@ async fn dispatch_inner(
         // candidate to returning an apparently complete but lossy response.
         if provider.stream_only
             && !streaming
-            && (request.get("logprobs") == Some(&Value::Bool(true))
-                || request.get("top_logprobs").is_some())
+            && (request
+                .get("logprobs")
+                .or_else(|| step.params.get("logprobs"))
+                == Some(&Value::Bool(true))
+                || request
+                    .get("top_logprobs")
+                    .or_else(|| step.params.get("top_logprobs"))
+                    .is_some())
         {
             unsupported_aggregate_logprobs = true;
             all_candidates_rate_limited = false;
