@@ -3143,6 +3143,98 @@ chains:
 }
 
 #[tokio::test]
+async fn responses_vision_url_and_base64_reach_upstream_in_json_and_sse() {
+    let recorded = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&recorded);
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(payload): axum::Json<Value>| {
+            let captured = Arc::clone(&captured);
+            async move {
+                let stream = payload["stream"] == true;
+                captured.lock().await.push(payload);
+                if stream {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from(concat!(
+                            "data: {\"id\":\"cmpl-vision\",\"choices\":[{\"index\":0,",
+                            "\"delta\":{\"content\":\"seen\"},\"finish_reason\":null}]}\n\n",
+                            "data: {\"id\":\"cmpl-vision\",\"choices\":[{\"index\":0,",
+                            "\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n"
+                        )),
+                    )
+                        .into_response()
+                } else {
+                    axum::Json(json!({"id":"cmpl-vision","object":"chat.completion",
+                        "model":"physical","choices":[{"index":0,
+                            "message":{"role":"assistant","content":"seen"},
+                            "finish_reason":"stop"}]}))
+                    .into_response()
+                }
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(socket, upstream).await.unwrap();
+    });
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: visual\n    type: openai\n    base_url: http://{address}\n    key_env: KEY\nchains:\n  - name: demo\n    steps:\n      - provider: visual\n        model: physical\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        config,
+        HashMap::from([("KEY".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let parts = json!([{"role":"user","content":[
+        {"type":"input_text","text":"first "},
+        {"type":"input_image","image_url":"https://example.test/a.png","detail":"original"},
+        {"type":"input_text","text":"second "},
+        {"type":"input_image","image_url":"data:image/png;base64,YQ==","detail":"low"}
+    ]}]);
+    for streaming in [false, true] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"demo","input":parts,"stream":streaming
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = gateway.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        if streaming {
+            let output = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(output.contains("event: response.completed"), "{output}");
+        } else {
+            let output: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(output["output_text"], "seen");
+        }
+    }
+    let requests = recorded.lock().await;
+    assert_eq!(requests.len(), 2);
+    let expected = json!([
+        {"type":"text","text":"first "},
+        {"type":"image_url","image_url":{"url":"https://example.test/a.png","detail":"original"}},
+        {"type":"text","text":"second "},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,YQ==","detail":"low"}}
+    ]);
+    for request in requests.iter() {
+        assert_eq!(request["model"], "physical");
+        assert_eq!(request["messages"][0]["role"], "user");
+        assert_eq!(request["messages"][0]["content"], expected);
+    }
+}
+
+#[tokio::test]
 async fn responses_text_bridge_and_unsupported_modes() {
     let (url, hits) = start_upstream(StatusCode::OK).await;
     let router = make_app(&url, &url);
@@ -3354,7 +3446,6 @@ async fn responses_text_bridge_and_unsupported_modes() {
         json!({"model":"demo","input":"hello","n":2}),
         json!({"model":"demo","input":"hello","unknown_option":42}),
         json!({"model":"demo","input":"hello","messages":[]}),
-        json!({"model":"demo","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.org/img.png"}]}]}),
         json!({"model":"demo","input":[{"role":"user","content":"hi","unknown":1}]}),
     ] {
         let (status, _) = call(router.clone(), req(payload)).await;

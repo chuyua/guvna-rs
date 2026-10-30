@@ -58,9 +58,12 @@ precision. The gateway validates parseable JSON before reporting completion
 has been sent). JSON-schema adherence beyond JSON syntax remains the
 responsibility of the upstream model/provider.
 
-Unsupported reasoning, image, audio, stateful continuation, and other
-advanced Responses modes remain explicitly unsupported. The gateway must not
-be treated as full OpenAI Responses parity or a production drop-in replacement.
+Responses user-image URL and base64 data-URI input are translated to Chat
+vision parts, preserving image order, text, and detail. File-ID images,
+image-generation tools, audio, advanced reasoning controls, stateful
+continuation, and other advanced Responses modes remain unsupported.
+The gateway is not a full OpenAI Responses implementation or a production
+drop-in replacement.
 
 Not yet shipped: learned Auto scoring, complete Go protocol parity and full multi-modal streaming.
 The current Auto cache stores only route metadata (128 entries, 30s TTL); it does not learn from or retain prompts.

@@ -479,9 +479,123 @@ fn chat_text_message(role: &str, content: String) -> Value {
     message
 }
 
+// Map user image input to Chat vision parts, moving large data URIs instead
+// of cloning them. Reject any item without an equivalent Chat representation.
+fn translate_vision_parts(parts: Vec<Value>) -> Result<Value, Box<Response>> {
+    let mut output = Vec::with_capacity(parts.len());
+    let mut text = String::new();
+    for mut part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("input_text") => {
+                if part.as_object().is_none_or(|obj| {
+                    obj.keys()
+                        .any(|key| !["type", "text", "annotations"].contains(&key.as_str()))
+                        || obj
+                            .get("annotations")
+                            .is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty()))
+                }) {
+                    return Err(Box::new(error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "responses_input_unsupported",
+                        "Unsupported text part fields",
+                    )));
+                }
+                let Some(Value::String(fragment)) =
+                    part.as_object_mut().expect("validated part").remove("text")
+                else {
+                    return Err(Box::new(error(
+                        StatusCode::BAD_REQUEST,
+                        "unsupported_input",
+                        "input_text requires text",
+                    )));
+                };
+                if text.is_empty() {
+                    text = fragment;
+                } else {
+                    text.push_str(&fragment);
+                }
+            }
+            Some("input_image") => {
+                if part.as_object().is_none_or(|obj| {
+                    obj.keys()
+                        .any(|key| !["type", "image_url", "detail"].contains(&key.as_str()))
+                }) {
+                    return Err(Box::new(error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "responses_input_unsupported",
+                        "Unsupported image fields",
+                    )));
+                }
+                let obj = part.as_object_mut().expect("validated part");
+                let mut url = match obj.remove("image_url") {
+                    Some(Value::String(s)) if !s.is_empty() => {
+                        let mut map = serde_json::Map::new();
+                        map.insert("url".into(), Value::String(s));
+                        map
+                    }
+                    Some(Value::Object(map))
+                        if map
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty())
+                            && map
+                                .keys()
+                                .all(|key| ["url", "detail"].contains(&key.as_str())) =>
+                    {
+                        map
+                    }
+                    _ => {
+                        return Err(Box::new(error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_image_url",
+                            "input_image requires image_url",
+                        )));
+                    }
+                };
+                if let Some(detail) = obj.remove("detail") {
+                    url.insert("detail".into(), detail);
+                }
+                if url.get("detail").is_some_and(|v| {
+                    !matches!(v.as_str(), Some("auto" | "low" | "high" | "original"))
+                }) {
+                    return Err(Box::new(error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_image_detail",
+                        "Unknown image detail level",
+                    )));
+                }
+                if !text.is_empty() {
+                    let mut item = serde_json::Map::new();
+                    item.insert("type".into(), Value::String("text".into()));
+                    item.insert("text".into(), Value::String(std::mem::take(&mut text)));
+                    output.push(Value::Object(item));
+                }
+                let mut item = serde_json::Map::new();
+                item.insert("type".into(), Value::String("image_url".into()));
+                item.insert("image_url".into(), Value::Object(url));
+                output.push(Value::Object(item));
+            }
+            _ => {
+                return Err(Box::new(error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "responses_input_unsupported",
+                    "Unsupported multimodal content part",
+                )));
+            }
+        }
+    }
+    if !text.is_empty() {
+        let mut item = serde_json::Map::new();
+        item.insert("type".into(), Value::String("text".into()));
+        item.insert("text".into(), Value::String(text));
+        output.push(Value::Object(item));
+    }
+    Ok(Value::Array(output))
+}
+
 fn translate_input(input: Value) -> Result<Value, Box<Response>> {
     // Translate the common Responses text message shape into Chat Completions.
-    // Reject non-text content rather than silently discarding image/tool data.
+    // Preserve image input where Chat has a lossless equivalent.
     let messages = match input {
         Value::String(text) => Value::Array(vec![chat_text_message("user", text)]),
         Value::Array(items) if !items.is_empty() => {
@@ -727,6 +841,32 @@ fn translate_input(input: Value) -> Result<Value, Box<Response>> {
                         "Input messages require content",
                     )));
                 };
+                if content.as_array().is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part.get("type").and_then(Value::as_str) == Some("input_image"))
+                }) {
+                    if role != "user" {
+                        return Err(Box::new(error(
+                            StatusCode::NOT_IMPLEMENTED,
+                            "responses_input_unsupported",
+                            "Only users may submit images",
+                        )));
+                    }
+                    let Value::Array(parts) = content else {
+                        unreachable!()
+                    };
+                    let chat_content = translate_vision_parts(parts)?;
+                    if let Some(reasoning) = pending_reasoning.take() {
+                        let mut assistant = json!({"role":"assistant","content":Value::Null});
+                        assistant["reasoning_content"] = Value::String(reasoning);
+                        messages.push(assistant);
+                    }
+                    let mut message = json!({"role":role,"content":Value::Null});
+                    message["content"] = chat_content;
+                    messages.push(message);
+                    continue;
+                }
                 let text = if let Value::String(text) = content {
                     text
                 } else if let Value::Array(parts) = content {
@@ -1267,6 +1407,65 @@ fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) ->
 #[cfg(test)]
 mod reasoning_tests {
     use super::*;
+
+    #[test]
+    fn user_vision_parts_preserve_order_and_move_large_data_uri() {
+        let data_uri = format!("data:image/png;base64,{}", "YQ==".repeat(180_000));
+        let input = json!([{"role":"user","content":[
+            {"type":"input_text","text":"What "},
+            {"type":"input_text","text":"is in "},
+            {"type":"input_image","image_url":"https://example.test/cat.png","detail":"original"},
+            {"type":"input_text","text":"this and "},
+            {"type":"input_image","image_url":{"url":data_uri,"detail":"low"}},
+            {"type":"input_text","text":"that?"}
+        ]}]);
+        let old_ptr = input[0]["content"][4]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .as_ptr();
+        let translated = translate_input(input).unwrap();
+        let parts = &translated[0]["content"];
+        assert_eq!(parts.as_array().unwrap().len(), 5);
+        assert_eq!(parts[0], json!({"type":"text","text":"What is in "}));
+        assert_eq!(
+            parts[1],
+            json!({"type":"image_url","image_url":{
+                "url":"https://example.test/cat.png","detail":"original"
+            }})
+        );
+        assert_eq!(parts[2], json!({"type":"text","text":"this and "}));
+        assert_eq!(parts[3]["image_url"]["detail"], "low");
+        assert_eq!(
+            parts[3]["image_url"]["url"].as_str().unwrap().as_ptr(),
+            old_ptr
+        );
+        assert_eq!(parts[4], json!({"type":"text","text":"that?"}));
+    }
+
+    #[test]
+    fn unsupported_image_items_fail_closed_without_dropping_prompt_parts() {
+        for content in [
+            json!([{"type":"input_image","file_id":"file_123"}]),
+            json!([{"type":"input_image","image_url":""}]),
+            json!([{"type":"input_image","image_url":123}]),
+            json!([{"type":"input_image","image_url":"https://example.test/a","detail":"giant"}]),
+            json!([{"type":"input_image","image_url":{"url":"https://example.test/a","extra":1}}]),
+            json!([{"type":"input_image","image_url":"https://example.test/a"},
+                {"type":"input_file","file_id":"file_123"}]),
+            json!([{"type":"input_image","image_url":"https://example.test/a"},
+                {"type":"input_text","text":123}]),
+            json!([{"type":"input_image","image_url":"https://example.test/a"},
+                {"type":"output_text","text":"not user text"}]),
+        ] {
+            assert!(translate_input(json!([{"role":"user","content":content}])).is_err());
+        }
+        assert!(
+            translate_input(json!([{"role":"assistant","content":[
+                {"type":"input_image","image_url":"https://example.test/a"}
+            ]}]))
+            .is_err()
+        );
+    }
 
     #[test]
     fn simple_responses_text_inputs_retain_original_large_string_buffers() {
