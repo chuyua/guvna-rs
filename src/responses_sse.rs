@@ -496,17 +496,13 @@ impl ResponsesSse {
         }
         let event: Value = serde_json::from_slice(data).map_err(|_| ())?;
         let choices = event.get("choices").and_then(Value::as_array).ok_or(())?;
-        // Mirror ChatSse: compatible providers may attach provisional usage
-        // to the final content choice and then send authoritative accounting
-        // in an empty-choices trailer. Count only that trailer, once.
-        if choices.is_empty() {
-            let usage = event
-                .get("usage")
-                .filter(|value| !value.is_null())
-                .ok_or(())?;
-            if self.usage_seen {
-                return Err(());
-            }
+        // An inline usage sample is useful if no trailer follows. Preserve
+        // it as a fallback and let an authoritative empty-choices trailer
+        // replace it without counting that trailer more than once.
+        if choices.is_empty() && (self.usage_seen || self.finish_reason.is_none()) {
+            return Err(());
+        }
+        if let Some(usage) = event.get("usage").filter(|value| !value.is_null()) {
             let (Some(input), Some(output), Some(total)) = (
                 usage["prompt_tokens"].as_u64(),
                 usage["completion_tokens"].as_u64(),
@@ -518,10 +514,12 @@ impl ResponsesSse {
                 return Err(());
             }
             self.usage = json!({"input_tokens":input,"output_tokens":output,"total_tokens":total});
-            self.usage_seen = true;
-            if self.finish_reason.is_none() {
+        }
+        if choices.is_empty() {
+            if event.get("usage").is_none_or(Value::is_null) {
                 return Err(());
             }
+            self.usage_seen = true;
             return Ok(());
         }
         if choices.len() != 1 || choices[0]["index"] != 0 || self.finish_reason.is_some() {
@@ -1005,6 +1003,37 @@ mod tests {
     }
 
     #[test]
+    fn inline_only_usage_is_preserved_in_completed_response() {
+        let mut translator = ResponsesSse::new("logical".into(), Value::Null);
+        let mut output = VecDeque::new();
+        translator
+            .feed(
+                &frame(json!({"id":"inline-only","created":123,
+                    "choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}})),
+                &mut output,
+            )
+            .unwrap();
+        assert!(!translator.usage_seen);
+        translator.feed(b"data: [DONE]\n\n", &mut output).unwrap();
+        assert!(translator.done);
+        let completed = String::from_utf8_lossy(output.back().unwrap());
+        assert!(
+            completed.contains("event: response.completed"),
+            "{completed}"
+        );
+        let data = completed
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let event: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(
+            event["response"]["usage"],
+            json!({"input_tokens":4,"output_tokens":2,"total_tokens":6})
+        );
+    }
+
+    #[test]
     fn content_frame_usage_does_not_conflict_with_authoritative_trailer() {
         let usage = json!({"prompt_tokens":2,"completion_tokens":3,"total_tokens":5});
         let mut translator = ResponsesSse::new("logical".into(), Value::Null);
@@ -1018,7 +1047,10 @@ mod tests {
             )
             .unwrap();
         assert!(!translator.usage_seen);
-        assert_eq!(translator.usage, Value::Null);
+        assert_eq!(
+            translator.usage,
+            json!({"input_tokens":2,"output_tokens":3,"total_tokens":5})
+        );
         translator
             .feed(
                 &frame(json!({"choices":[],"usage":usage.clone()})),

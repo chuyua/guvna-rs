@@ -3639,6 +3639,50 @@ async fn inline_usage_plus_final_trailer_succeeds_for_chat_and_responses() {
 }
 
 #[tokio::test]
+async fn responses_sse_preserves_inline_usage_without_final_trailer() {
+    let (url, hits) = start_sse(vec![
+        RESP_START_A,
+        RESP_START_B,
+        RESP_END_WITH_INLINE_USAGE,
+        SSE_DONE,
+    ])
+    .await;
+    let response = make_app(&url, &url)
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hello","stream":true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        body.matches("event: response.completed").count(),
+        1,
+        "{body}"
+    );
+    assert!(!body.contains("event: response.failed"), "{body}");
+    let completed: Value = serde_json::from_str(
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .next_back()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        completed["response"]["usage"],
+        json!({"input_tokens":4,"output_tokens":2,"total_tokens":6})
+    );
+    assert_eq!(completed["response"]["output_text"], "hi!");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn responses_sse_terminal_persists_under_responses_not_chat() {
     use rusqlite::Connection;
     let (upstream, hits) = start_sse(vec![
