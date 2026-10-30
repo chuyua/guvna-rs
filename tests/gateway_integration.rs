@@ -6328,6 +6328,50 @@ auto:
 }
 
 #[tokio::test]
+async fn responses_auto_routes_image_only_to_vision_capable_candidate() {
+    let (text_url, text_seen) = start_format_probe("wrong provider").await;
+    let (vision_url, vision_seen) = start_format_probe("vision success").await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: text\n    type: openai\n    base_url: {text_url}\n    key_env: TEXT\n  - name: vision\n    type: openai\n    base_url: {vision_url}\n    key_env: VISION\nauto:\n  enabled: true\n  candidates:\n    - provider: text\n      model: text-physical\n      supports_images: false\n    - provider: vision\n      model: vision-physical\n      supports_images: true\n"
+    )).unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("TEXT".into(), "text-key".into()),
+            ("VISION".into(), "vision-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, result) = call(
+        router,
+        responses_stream_req(json!({
+            "model":"auto","input":[{"role":"user","content":[
+                {"type":"input_text","text":"describe image"},
+                {"type":"input_image","image_url":"https://example.test/scene.png","detail":"high"}
+            ]}]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["output_text"], "vision success");
+    assert!(
+        text_seen.lock().await.is_empty(),
+        "text-only provider received image"
+    );
+    let calls = vision_seen.lock().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["model"], "vision-physical");
+    assert_eq!(
+        calls[0]["messages"][0]["content"][1],
+        json!({
+            "type":"image_url",
+            "image_url":{"url":"https://example.test/scene.png","detail":"high"}
+        })
+    );
+}
+
+#[tokio::test]
 async fn go_auto_operator_floor_degrades_without_weakening_explicit_bounds_or_capabilities() {
     let (url, hits) = start_strict_auto_upstream().await;
     let config: Config = serde_yaml::from_str(&format!(
@@ -6403,6 +6447,22 @@ auto:
                 ]}]
             }),
         ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{result}");
+    assert_eq!(result["error"]["code"], "auto_no_eligible_candidate");
+    // The Responses image adapter must not bypass the same vision-capability
+    // filter merely because its incoming image part uses input_image instead
+    // of Chat's image_url. Reject before any provider receives those bytes.
+    let (status, result) = call(
+        router.clone(),
+        responses_stream_req(json!({
+            "model":"auto",
+            "input":[{"role":"user","content":[
+                {"type":"input_text","text":"what is in this picture?"},
+                {"type":"input_image","image_url":"data:image/png;base64,YQ=="}
+            ]}]
+        })),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{result}");
