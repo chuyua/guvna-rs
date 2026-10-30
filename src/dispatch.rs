@@ -1061,6 +1061,16 @@ async fn dispatch_inner(
                         | "response_format"
                         | "logprobs"
                         | "top_logprobs"
+                        | "temperature"
+                        | "top_p"
+                        | "max_tokens"
+                        | "max_completion_tokens"
+                        | "max_output_tokens"
+                        | "stop"
+                        | "presence_penalty"
+                        | "frequency_penalty"
+                        | "seed"
+                        | "reasoning_effort"
                 )
             {
                 // A chain shared with Chat cannot inject Chat-only controls

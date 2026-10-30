@@ -446,6 +446,16 @@ chains:
             type: json_object
           logprobs: true
           top_logprobs: 4
+          temperature: 0.7
+          top_p: 0.8
+          max_tokens: 100
+          max_completion_tokens: 101
+          max_output_tokens: 102
+          stop: ["end"]
+          presence_penalty: 0.1
+          frequency_penalty: 0.2
+          seed: 42
+          reasoning_effort: low
           dimensions: 2
 "#
     ))
@@ -483,6 +493,16 @@ chains:
         "response_format",
         "logprobs",
         "top_logprobs",
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "stop",
+        "presence_penalty",
+        "frequency_penalty",
+        "seed",
+        "reasoning_effort",
     ] {
         assert!(
             requests[0].get(chat_only).is_none(),
