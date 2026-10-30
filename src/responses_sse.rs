@@ -7,6 +7,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::VecDeque, sync::Arc};
 
 const MAX_FRAME: usize = 1024 * 1024 + 8;
@@ -14,6 +15,7 @@ const MAX_INPUT_CHUNK: usize = 2 * 1024 * 1024;
 const MAX_TEXT: usize = 512 * 1024;
 const MAX_TOOLS: usize = 32;
 const MAX_TOOL_ARGUMENTS: usize = 256 * 1024;
+static SYNTHETIC_STREAM_IDS: AtomicU64 = AtomicU64::new(1);
 
 struct Tool {
     id: String,
@@ -114,6 +116,7 @@ struct ResponsesSse {
     buffer: Vec<u8>,
     scan_from: usize,
     id: Option<String>,
+    source_id: Option<String>,
     created_at: Option<i64>,
     text: String,
     text_index: Option<usize>,
@@ -141,6 +144,7 @@ impl ResponsesSse {
             buffer: Vec::new(),
             scan_from: 0,
             id: None,
+            source_id: None,
             created_at: None,
             text: String::new(),
             text_index: None,
@@ -213,10 +217,21 @@ impl ResponsesSse {
     fn begin(&mut self, event: &Value, pending: &mut VecDeque<Bytes>) -> Result<(), ()> {
         let id = event
             .get("id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .ok_or(())?;
-        self.id = Some(id.to_owned());
+            .map(|id| id.as_str().filter(|value| !value.is_empty()).ok_or(()))
+            .transpose()?
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "chatcmpl-rs-{}-{}-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis(),
+                    std::process::id(),
+                    SYNTHETIC_STREAM_IDS.fetch_add(1, Ordering::Relaxed)
+                )
+            });
+        self.id = Some(id);
         self.created_at = event
             .get("created")
             .and_then(|ts| {
@@ -527,8 +542,15 @@ impl ResponsesSse {
         }
         if let Some(id) = event.get("id") {
             let current = id.as_str().filter(|id| !id.is_empty()).ok_or(())?;
-            if self.id.as_deref().is_some_and(|saved| saved != current) {
+            if self
+                .source_id
+                .as_deref()
+                .is_some_and(|saved| saved != current)
+            {
                 return Err(());
+            }
+            if self.source_id.is_none() {
+                self.source_id = Some(current.to_owned());
             }
         }
         if self.id.is_none() {
@@ -929,6 +951,66 @@ mod tests {
             })
             .collect();
         assert_eq!(done, vec![0, 1], "out-of-order terminal output items");
+    }
+
+    #[test]
+    fn absent_early_chat_id_is_synthesized_without_losing_later_identity_fencing() {
+        let mut translator = ResponsesSse::new("logical".into(), Value::Null);
+        let mut output = VecDeque::new();
+        translator
+            .feed(
+                &frame(json!({"created":123,"choices":[{"index":0,
+                    "delta":{"content":"hel"},"finish_reason":null}]})),
+                &mut output,
+            )
+            .unwrap();
+        let generated = translator.id.clone().unwrap();
+        assert!(generated.starts_with("chatcmpl-rs-"), "{generated}");
+        assert_eq!(translator.source_id, None);
+        translator
+            .feed(
+                &frame(json!({"id":"provider-id","choices":[{"index":0,
+                    "delta":{"content":"lo"},"finish_reason":"stop"}]})),
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(translator.source_id.as_deref(), Some("provider-id"));
+        assert_eq!(translator.id.as_deref(), Some(generated.as_str()));
+        translator.feed(b"data: [DONE]\n\n", &mut output).unwrap();
+        let completed = String::from_utf8_lossy(output.back().unwrap());
+        let data = completed
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let event: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(event["response"]["id"], generated);
+        assert_eq!(event["response"]["output_text"], "hello");
+
+        let mut conflicting = ResponsesSse::new("logical".into(), Value::Null);
+        let mut events = VecDeque::new();
+        conflicting
+            .feed(
+                &frame(json!({"choices":[{"index":0,"delta":{"content":"start"},
+                    "finish_reason":null}]})),
+                &mut events,
+            )
+            .unwrap();
+        conflicting
+            .feed(
+                &frame(json!({"id":"source-a","choices":[{"index":0,
+                    "delta":{"content":"middle"},"finish_reason":null}]})),
+                &mut events,
+            )
+            .unwrap();
+        assert!(
+            conflicting
+                .feed(
+                    &frame(json!({"id":"source-b","choices":[{"index":0,
+                    "delta":{"content":"end"},"finish_reason":"stop"}]})),
+                    &mut events,
+                )
+                .is_err()
+        );
     }
 
     #[test]

@@ -3639,6 +3639,46 @@ async fn inline_usage_plus_final_trailer_succeeds_for_chat_and_responses() {
 }
 
 #[tokio::test]
+async fn responses_sse_synthesizes_stable_id_for_valid_idless_chat_stream() {
+    let (url, hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let response = make_app(&url, &url)
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hello","stream":true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        body.matches("event: response.completed").count(),
+        1,
+        "{body}"
+    );
+    assert!(!body.contains("event: response.failed"), "{body}");
+    let completed: Value = serde_json::from_str(
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .next_back()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        completed["response"]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("chatcmpl-rs-")),
+        "{completed}"
+    );
+    assert_eq!(completed["response"]["output_text"], "hi");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn responses_sse_preserves_inline_usage_without_final_trailer() {
     let (url, hits) = start_sse(vec![
         RESP_START_A,
