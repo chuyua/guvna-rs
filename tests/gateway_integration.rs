@@ -6505,6 +6505,22 @@ auto:
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{result}");
     assert_eq!(result["error"]["code"], "auto_no_eligible_candidate");
+    // Chat file parts derived from Responses inline PDFs need the same
+    // vision-capable route as an image, not a known text-only provider.
+    let (status, result) = call(
+        router.clone(),
+        responses_stream_req(json!({
+            "model":"auto",
+            "input":[{"role":"user","content":[
+                {"type":"input_text","text":"summarize the PDF"},
+                {"type":"input_file","filename":"report.pdf",
+                    "file_data":"data:application/pdf;base64,JVBERi0xLjQK"}
+            ]}]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{result}");
+    assert_eq!(result["error"]["code"], "auto_no_eligible_candidate");
     assert_eq!(
         hits.load(Ordering::SeqCst),
         4,

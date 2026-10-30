@@ -99,7 +99,10 @@ pub fn auto_requirements(request: &Value) -> AutoRequirements {
                         parts.iter().any(|part| {
                             matches!(
                                 part.get("type").and_then(Value::as_str),
-                                Some("image_url" | "image" | "input_image")
+                                // Chat PDF file parts require vision support
+                                // too. Auto must not dispatch them to known
+                                // text-only providers after Responses mapping.
+                                Some("image_url" | "image" | "input_image" | "file")
                             )
                         })
                     })
@@ -2089,6 +2092,13 @@ auto:
             "response_format": {"type":"json_schema","json_schema":{"name":"result","schema":{"type":"object"}}}
         });
         let features = auto_requirements(&image_request);
+        let pdf_request = serde_json::json!({
+            "messages":[{"role":"user","content":[
+                {"type":"file","file":{"filename":"report.pdf",
+                    "file_data":"data:application/pdf;base64,YQ=="}}
+            ]}]
+        });
+        assert!(auto_requirements(&pdf_request).requires_images());
         assert_eq!(
             features,
             AutoRequirements {
