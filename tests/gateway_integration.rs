@@ -434,7 +434,18 @@ chains:
         params:
           stream_options:
             include_usage: true
+          stream: true
           n: 2
+          tool_choice: required
+          tools:
+            - type: function
+              function:
+                name: lookup
+          parallel_tool_calls: true
+          response_format:
+            type: json_object
+          logprobs: true
+          top_logprobs: 4
           dimensions: 2
 "#
     ))
@@ -465,6 +476,19 @@ chains:
     assert!(requests[0].get("stream").is_none());
     assert!(requests[0].get("stream_options").is_none());
     assert!(requests[0].get("n").is_none());
+    for chat_only in [
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "response_format",
+        "logprobs",
+        "top_logprobs",
+    ] {
+        assert!(
+            requests[0].get(chat_only).is_none(),
+            "{chat_only} leaked into Embeddings"
+        );
+    }
     assert_eq!(requests[0]["dimensions"], 2);
     drop(requests);
     let request = Request::builder()

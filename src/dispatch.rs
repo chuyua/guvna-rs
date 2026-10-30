@@ -1050,10 +1050,21 @@ async fn dispatch_inner(
         let mut injected_params = Vec::new();
         for (name, value) in &step.params {
             if matches!(endpoint, Endpoint::Embeddings)
-                && matches!(name.as_str(), "stream_options" | "n")
+                && matches!(
+                    name.as_str(),
+                    "stream"
+                        | "stream_options"
+                        | "n"
+                        | "tools"
+                        | "tool_choice"
+                        | "parallel_tool_calls"
+                        | "response_format"
+                        | "logprobs"
+                        | "top_logprobs"
+                )
             {
-                // These are Chat-only defaults. A chain reused by embeddings
-                // cannot inject an unsupported stream mode or choice count.
+                // A chain shared with Chat cannot inject Chat-only controls
+                // into Embeddings; preserve dimensions and encoding_format.
                 continue;
             }
             if !object.contains_key(name) {
