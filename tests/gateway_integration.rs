@@ -5321,6 +5321,38 @@ async fn responses_reasoning_effort_maps_to_chat_and_survives_streaming() {
 }
 
 #[tokio::test]
+async fn responses_official_text_verbosity_maps_in_json_and_sse_modes() {
+    let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
+    let gateway = make_app(&url, &url);
+    for level in ["low", "medium", "high"] {
+        for stream in [false, true] {
+            let request = responses_stream_req(json!({
+                "model":"demo","input":"hello","stream":stream,
+                "text":{"verbosity":level,"format":{"type":"json_object"}}
+            }));
+            let response = gateway.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            if stream {
+                let event_stream = String::from_utf8(bytes.to_vec()).unwrap();
+                assert!(
+                    event_stream.contains("event: response.completed"),
+                    "{event_stream}"
+                );
+            } else {
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["output_text"], r#"{"ok":true}"#);
+            }
+            let upstream = seen.lock().await.last().unwrap().clone();
+            assert_eq!(upstream["verbosity"], level);
+            assert_eq!(upstream["response_format"]["type"], "json_object");
+            assert!(upstream.get("text").is_none());
+        }
+    }
+    assert_eq!(seen.lock().await.len(), 6);
+}
+
+#[tokio::test]
 async fn unsupported_or_corrupt_format_is_rejected_without_any_provider_calls() {
     let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
     let app = make_app(&url, &url);
@@ -5368,9 +5400,9 @@ async fn unsupported_or_corrupt_format_is_rejected_without_any_provider_calls() 
             "responses_text_format_unsupported",
         ),
         (
-            json!({"text":{"verbosity":"low"}}),
-            StatusCode::NOT_IMPLEMENTED,
-            "responses_text_format_unsupported",
+            json!({"text":{"verbosity":"verbose"}}),
+            StatusCode::BAD_REQUEST,
+            "invalid_text_format",
         ),
         (
             json!({"text":{"format":{"type":"json_object","undocumented":true}}}),

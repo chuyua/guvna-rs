@@ -26,6 +26,20 @@ fn translate(text: Option<&Value>) -> Result<Option<Value>, Failure> {
     translate_owned(text.cloned())
 }
 
+/// Move the Responses text.verbosity level to the identical Chat field.
+pub(super) fn take_verbosity(text: &mut Option<Value>) -> Result<Option<Value>, Failure> {
+    let Some(Value::Object(wrapper)) = text.as_mut() else {
+        return Ok(None); // translate_owned validates non-object configurations.
+    };
+    match wrapper.remove("verbosity") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(level)) if matches!(level.as_str(), "low" | "medium" | "high") => {
+            Ok(Some(Value::String(level)))
+        }
+        _ => Err(malformed()),
+    }
+}
+
 /// The Responses handler owns its input tree. Move the JSON Schema into the
 /// Chat envelope instead of cloning a potentially multi-megabyte schema.
 pub(super) fn translate_owned(text: Option<Value>) -> Result<Option<Value>, Failure> {
@@ -35,7 +49,7 @@ pub(super) fn translate_owned(text: Option<Value>) -> Result<Option<Value>, Fail
     let Value::Object(mut wrapper) = text else {
         return Err(malformed());
     };
-    // verbosity and other Responses-specific options must not vanish silently.
+    // Other Responses-specific options must not vanish silently.
     if wrapper.keys().any(|key| key != "format") {
         return Err(unsupported());
     }
@@ -147,6 +161,26 @@ mod tests {
         assert_eq!(mapped["json_schema"]["strict"], true);
         assert_eq!(mapped["json_schema"]["description"], "Schema for data");
     }
+    #[test]
+    fn text_verbosity_maps_with_existing_format() {
+        for level in ["low", "medium", "high"] {
+            let mut config = Some(json!({"verbosity":level,
+                "format":{"type":"json_object"}}));
+            assert_eq!(take_verbosity(&mut config).unwrap(), Some(json!(level)));
+            assert_eq!(
+                translate_owned(config),
+                Ok(Some(json!({"type":"json_object"})))
+            );
+        }
+        let mut nullable = Some(json!({"verbosity":null}));
+        assert_eq!(take_verbosity(&mut nullable).unwrap(), None);
+        assert_eq!(translate_owned(nullable), Ok(None));
+        for invalid in [json!("verbose"), json!(4), json!(false)] {
+            let mut config = Some(json!({"verbosity":invalid}));
+            assert!(take_verbosity(&mut config).is_err());
+        }
+    }
+
     #[test]
     fn malformed_and_unsupported_modes_fail_closed() {
         for item in [

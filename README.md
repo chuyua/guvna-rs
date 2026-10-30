@@ -64,6 +64,7 @@ image-generation tools, audio, advanced reasoning controls, stateful
 continuation, and other advanced Responses modes remain unsupported.
 The supported reasoning.effort values are translated to Chat reasoning_effort;
 reasoning summaries, context modes and other reasoning options remain unsupported.
+Responses text.verbosity is mapped to the equivalent Chat verbosity field.
 The gateway is not a full OpenAI Responses implementation or a production
 drop-in replacement.
 

@@ -270,7 +270,12 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     }
     // Structured text output uses a different envelope in Responses and Chat.
     // Translate only modes whose parameters can be forwarded without loss.
-    let mapped_text_format = match responses_format::translate_owned(object.remove("text")) {
+    let mut text_config = object.remove("text");
+    let verbosity = match responses_format::take_verbosity(&mut text_config) {
+        Ok(verbosity) => verbosity,
+        Err(problem) => return error(problem.0, problem.1, problem.2),
+    };
+    let mapped_text_format = match responses_format::translate_owned(text_config) {
         Ok(format) => format,
         Err(problem) => return error(problem.0, problem.1, problem.2),
     };
@@ -414,6 +419,9 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     object.remove("text");
     if let Some(format) = mapped_text_format {
         object.insert("response_format".into(), format);
+    }
+    if let Some(verbosity) = verbosity {
+        object.insert("verbosity".into(), verbosity);
     }
     let instructions = match object.remove("instructions") {
         Some(Value::String(text)) => Some(text),
