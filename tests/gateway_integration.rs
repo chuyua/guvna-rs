@@ -5286,6 +5286,58 @@ async fn responses_json_text_format_preserves_stream_lifecycle_and_no_false_term
 }
 
 #[tokio::test]
+async fn responses_shared_openai_control_fields_survive_chat_dispatch() {
+    let (url, seen) = start_format_probe("success").await;
+    let gateway = make_app(&url, &url);
+    for tier in [
+        "auto",
+        "default",
+        "flex",
+        "scale",
+        "priority",
+        "fast",
+        "ultrafast",
+    ] {
+        let payload = json!({
+            "model":"demo","input":"hello",
+            "service_tier":tier,
+            "safety_identifier":"anonymous-42",
+            "prompt_cache_key":"shared-prompt-prefix"
+        });
+        let (status, response) = call(gateway.clone(), responses_stream_req(payload)).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let upstream = seen.lock().await.last().unwrap().clone();
+        assert_eq!(upstream["service_tier"], tier);
+        assert_eq!(upstream["safety_identifier"], "anonymous-42");
+        assert_eq!(upstream["prompt_cache_key"], "shared-prompt-prefix");
+    }
+    for (extra, code) in [
+        (json!({"service_tier":"extra"}), "invalid_service_tier"),
+        (json!({"service_tier":42}), "invalid_service_tier"),
+        (json!({"safety_identifier":42}), "invalid_safety_identifier"),
+        (
+            json!({"safety_identifier":"x".repeat(129)}),
+            "invalid_safety_identifier",
+        ),
+        (json!({"prompt_cache_key":true}), "invalid_prompt_cache_key"),
+    ] {
+        let mut request = json!({"model":"demo","input":"hello"});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (status, response) = call(gateway.clone(), responses_stream_req(request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"]["code"], code);
+    }
+    assert_eq!(
+        seen.lock().await.len(),
+        7,
+        "malformed requests reached provider"
+    );
+}
+
+#[tokio::test]
 async fn responses_reasoning_effort_maps_to_chat_and_survives_streaming() {
     let (url, seen) = start_format_probe("success").await;
     let gateway = make_app(&url, &url);

@@ -206,16 +206,49 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             );
         }
     };
+    // These Responses request controls are also native Chat parameters.
+    // Preserve them across the adapter (never impersonate an effective
+    // service tier in the translated result).
+    if value.get("service_tier").is_some_and(|tier| {
+        !tier.is_null()
+            && !matches!(
+                tier.as_str(),
+                Some("auto" | "default" | "flex" | "scale" | "priority" | "fast" | "ultrafast")
+            )
+    }) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_service_tier",
+            "Unknown service_tier",
+        );
+    }
+    if value
+        .get("safety_identifier")
+        .is_some_and(|id| !id.is_null() && id.as_str().is_none_or(|value| value.len() > 128))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_safety_identifier",
+            "safety_identifier must be a string of at most 128 characters",
+        );
+    }
+    if value
+        .get("prompt_cache_key")
+        .is_some_and(|key| !key.is_null() && !key.is_string())
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_prompt_cache_key",
+            "prompt_cache_key must be a string",
+        );
+    }
     let object = value.as_object_mut().expect("checked above");
     for key in [
         "previous_response_id",
         "conversation",
         "modalities",
         "include",
-        "service_tier",
-        "safety_identifier",
         "prompt",
-        "prompt_cache_key",
         "messages",
         "max_tokens",
     ] {
@@ -239,6 +272,9 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             "temperature",
             "top_p",
             "user",
+            "service_tier",
+            "safety_identifier",
+            "prompt_cache_key",
             "instructions",
             "reasoning",
             "tools",

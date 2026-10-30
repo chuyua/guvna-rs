@@ -65,6 +65,8 @@ continuation, and other advanced Responses modes remain unsupported.
 The supported reasoning.effort values are translated to Chat reasoning_effort;
 reasoning summaries, context modes and other reasoning options remain unsupported.
 Responses text.verbosity is mapped to the equivalent Chat verbosity field.
+Request-level service_tier, safety_identifier and prompt_cache_key are
+validated and forwarded to Chat providers without inventing response metadata.
 The gateway is not a full OpenAI Responses implementation or a production
 drop-in replacement.
 
