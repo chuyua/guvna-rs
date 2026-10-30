@@ -55,6 +55,8 @@ pub struct ChatSse {
     progress_since_push: bool,
     finished_mask: u64,
     tool_calls_mask: u64,
+    logprobs_mask: u64,
+    logprobs_required: bool,
     output_mask: u64,
     tool_calls: Vec<StreamToolCall>,
     tool_argument_bytes: usize,
@@ -135,6 +137,13 @@ impl ChatSse {
         if self.json_mode.is_some() {
             self.json_text = vec![String::new(); self.expected as usize];
         }
+        self
+    }
+
+    /// Match native JSON Chat: requested token logprobs must actually be
+    /// present in every completed choice. Retain only one bit per choice.
+    pub fn with_logprobs(mut self, required: bool) -> Self {
+        self.logprobs_required = required;
         self
     }
 
@@ -326,6 +335,9 @@ impl ChatSse {
             return Err(SseError);
         }
         let choice_bit = 1u64 << index;
+        if choice.get("logprobs").is_some_and(Value::is_object) {
+            self.logprobs_mask |= choice_bit;
+        }
         let has_refusal = delta
             .get("refusal")
             .and_then(Value::as_str)
@@ -379,6 +391,9 @@ impl ChatSse {
         }
         if let Some(reason) = choice.get("finish_reason").filter(|v| !v.is_null()) {
             let reason = reason.as_str().ok_or(SseError)?;
+            if self.logprobs_required && self.logprobs_mask & choice_bit == 0 {
+                return Err(SseError);
+            }
             if !["stop", "length", "tool_calls", "content_filter"].contains(&reason) {
                 return Err(SseError);
             }
@@ -644,6 +659,48 @@ mod tests {
     const END: &[u8] = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 "#;
+    #[test]
+    fn requested_logprobs_must_reach_every_completed_choice() {
+        for (logprobs, accepted) in [
+            (None, false),
+            (Some(Value::Null), false),
+            (Some(json!("unexpected")), false),
+            (Some(json!({"content": []})), true),
+        ] {
+            let mut parser = ChatSse::new(1).unwrap().with_logprobs(true);
+            let first = json!({"choices":[{"index":0,"delta":{"content":"answer"},
+                "logprobs":logprobs,"finish_reason":null}]});
+            parser
+                .push(format!("data: {first}\n\n").as_bytes())
+                .unwrap();
+            assert_eq!(parser.push(END).is_ok(), accepted, "{first}");
+            if accepted {
+                parser.push(b"data: [DONE]\n\n").unwrap();
+                parser.finish().unwrap();
+            }
+        }
+        let mut unrequested = ChatSse::new(1).unwrap();
+        unrequested.push(START).unwrap();
+        unrequested.push(END).unwrap();
+        unrequested.push(b"data: [DONE]\n\n").unwrap();
+
+        let mut multiple = ChatSse::new(2).unwrap().with_logprobs(true);
+        for (index, with_probabilities) in [(0, true), (1, false)] {
+            let first = json!({"choices":[{"index":index,"delta":{"content":"text"},
+                "logprobs":if with_probabilities { json!({"content":[]}) } else { Value::Null },
+                "finish_reason":null}]});
+            multiple
+                .push(format!("data: {first}\n\n").as_bytes())
+                .unwrap();
+        }
+        let second = json!({"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]});
+        assert!(
+            multiple
+                .push(format!("data: {second}\n\n").as_bytes())
+                .is_err()
+        );
+    }
+
     #[test]
     fn direct_json_mode_validates_each_choice_at_completion() {
         for (format, fragments, finish, accepted) in [

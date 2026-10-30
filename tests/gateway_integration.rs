@@ -8300,6 +8300,51 @@ async fn sse_only_logprobs_request_never_returns_silently_lost_logprobs() {
     assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn direct_sse_logprobs_request_must_not_silently_lose_token_probabilities() {
+    let (missing, missing_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let response = make_app(&missing, &missing)
+        .oneshot(request(
+            "demo",
+            r#","stream":true,"logprobs":true"#,
+            "client",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(missing_hits.load(Ordering::SeqCst), 1);
+
+    let with_logprobs = Bytes::from(format!(
+        "data: {}\n\n",
+        json!({"choices":[{"index":0,"delta":{"content":"hi"},
+            "logprobs":{"content":[{"token":"hi","logprob":-0.1}]},
+            "finish_reason":null}]})
+    ));
+    let (valid, valid_hits) = start_sse_owned(vec![
+        with_logprobs,
+        Bytes::from_static(SSE_END),
+        Bytes::from_static(SSE_DONE),
+    ])
+    .await;
+    let response = make_app(&valid, &valid)
+        .oneshot(request(
+            "demo",
+            r#","stream":true,"logprobs":true"#,
+            "client",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("data: [DONE]"), "{text}");
+    assert_eq!(valid_hits.load(Ordering::SeqCst), 1);
+}
+
 async fn start_variable_choice_upstream() -> (String, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let counted = hits.clone();

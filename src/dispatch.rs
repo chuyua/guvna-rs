@@ -1217,6 +1217,12 @@ async fn dispatch_inner(
                                 request
                                     .get("response_format")
                                     .or_else(|| step.params.get("response_format")),
+                            )
+                            .with_logprobs(
+                                request
+                                    .get("logprobs")
+                                    .or_else(|| step.params.get("logprobs"))
+                                    == Some(&Value::Bool(true)),
                             ),
                         state.clone(),
                         chat_stream::StreamRoute {
