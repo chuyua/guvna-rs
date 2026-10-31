@@ -2,6 +2,7 @@
 //! Request validation, request translation, chat-result translation and
 //! Responses SSE wrapping live here. Dispatch still uses one shared
 //! candidate/failover loop in dispatch.rs; this module never retries upstream.
+use super::chat_stream::NativeResponseStream;
 use super::dispatch::{
     BufferedResponseLease, ParsedChatResponse, ParsedNativeResponse, dispatch_responses_parsed,
     hold_buffered_response,
@@ -508,6 +509,14 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
         return response;
     }
     if streaming {
+        if response
+            .extensions()
+            .get::<NativeResponseStream>()
+            .is_some()
+        {
+            // The native event stream is already in Responses wire format.
+            return response;
+        }
         return crate::responses_sse::wrap(
             response,
             logical_model,

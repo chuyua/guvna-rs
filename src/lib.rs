@@ -16,4 +16,5 @@ pub mod sse;
 pub mod telemetry;
 pub(crate) mod telemetry_rank;
 
+pub(crate) mod native_responses_sse;
 pub(crate) mod responses_sse;

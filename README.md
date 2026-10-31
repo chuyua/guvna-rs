@@ -80,11 +80,11 @@ drop-in replacement.
 Mixed Responses upstreams: set `responses_protocol: native` on a provider
 whose OpenAI-compatible upstream implements `POST /v1/responses`. The
 default is `chat`, which keeps the validated Chat Completions bridge for
-Chat-only providers. Native non-streaming responses preserve provider output
-items, including native-only item types, and share the same candidate/key
-failover as Chat-only candidates. **Native Responses streaming is not yet
-implemented**, so native candidates are skipped for `stream: true` until a
-native-event validator is available; Chat bridge candidates still work.
+Chat-only providers. Native responses preserve provider output items,
+including native-only item types. Native SSE events pass through a bounded
+Responses event validator; Chat-only providers retain the Chat SSE bridge.
+Both paths share candidate/key fallback, preflight, cancellation accounting
+and circuit health, without spawning a second candidate walk.
 Native advanced request options remain subject to the bridge's current input
 validation limits. Do not claim full official Responses parity yet.
 

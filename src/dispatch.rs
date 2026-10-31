@@ -945,12 +945,6 @@ async fn dispatch_inner(
             all_candidates_rate_limited = false;
             continue;
         }
-        // Native SSE needs its own lifecycle validator, never the Chat parser.
-        // Other Chat-capable candidates may still satisfy streaming requests.
-        if native_responses && streaming {
-            all_candidates_rate_limited = false;
-            continue;
-        }
         if !streaming
             && endpoint.is_chat()
             && provider.stream_only
@@ -1080,7 +1074,7 @@ async fn dispatch_inner(
             .get("n")
             .or_else(|| step.params.get("n"))
             .map_or(1, |v| v.as_u64().unwrap_or(0));
-        if upstream_stream && ChatSse::new(effective_n).is_err() {
+        if upstream_stream && !native_responses && ChatSse::new(effective_n).is_err() {
             if let Some(context) = telemetry_context.as_mut() {
                 context.set_failure_type("capability_mismatch");
             }
@@ -1307,48 +1301,61 @@ async fn dispatch_inner(
                 // rejection must not mask this upstream protocol failure.
                 saw_non_client_network_result = true;
                 if streaming {
-                    match chat_stream::start(
-                        upstream,
-                        ChatSse::new(effective_n)
-                            .expect("validated candidate stream n")
-                            .with_tool_choice(
-                                request
-                                    .get("tool_choice")
-                                    .or_else(|| step.params.get("tool_choice")),
+                    let route = chat_stream::StreamRoute {
+                        provider_index: step.provider_index,
+                        endpoint: telemetry_endpoint(endpoint),
+                        model: step.model.clone(),
+                        live: Arc::clone(&live),
+                        telemetry_model: state
+                            .telemetry_model_name_in(
+                                &route_snapshot,
+                                step.provider_index,
+                                &step.model,
                             )
-                            .with_json_format(
-                                request
-                                    .get("response_format")
-                                    .or_else(|| step.params.get("response_format")),
-                            )
-                            .with_logprobs(
-                                request
-                                    .get("logprobs")
-                                    .or_else(|| step.params.get("logprobs"))
-                                    == Some(&Value::Bool(true)),
-                            ),
-                        state.clone(),
-                        chat_stream::StreamRoute {
-                            provider_index: step.provider_index,
-                            endpoint: telemetry_endpoint(endpoint),
-                            model: step.model.clone(),
-                            live: Arc::clone(&live),
-                            telemetry_model: state
-                                .telemetry_model_name_in(
-                                    &route_snapshot,
-                                    step.provider_index,
-                                    &step.model,
+                            .to_owned(),
+                        request_id: request_id.to_owned(),
+                        attempt_index: u16::try_from(candidates_visited).unwrap_or(u16::MAX),
+                    };
+                    let stream_result = if native_responses {
+                        chat_stream::start_native(
+                            upstream,
+                            state.clone(),
+                            route,
+                            lease.clone(),
+                            &mut permit,
+                            &mut circuit_ticket,
+                        )
+                        .await
+                    } else {
+                        chat_stream::start(
+                            upstream,
+                            ChatSse::new(effective_n)
+                                .expect("validated candidate stream n")
+                                .with_tool_choice(
+                                    request
+                                        .get("tool_choice")
+                                        .or_else(|| step.params.get("tool_choice")),
                                 )
-                                .to_owned(),
-                            request_id: request_id.to_owned(),
-                            attempt_index: u16::try_from(candidates_visited).unwrap_or(u16::MAX),
-                        },
-                        lease.clone(),
-                        &mut permit,
-                        &mut circuit_ticket,
-                    )
-                    .await
-                    {
+                                .with_json_format(
+                                    request
+                                        .get("response_format")
+                                        .or_else(|| step.params.get("response_format")),
+                                )
+                                .with_logprobs(
+                                    request
+                                        .get("logprobs")
+                                        .or_else(|| step.params.get("logprobs"))
+                                        == Some(&Value::Bool(true)),
+                                ),
+                            state.clone(),
+                            route,
+                            lease.clone(),
+                            &mut permit,
+                            &mut circuit_ticket,
+                        )
+                        .await
+                    };
+                    match stream_result {
                         Ok(stream_response) => {
                             if let Some(context) = telemetry_context.as_mut() {
                                 context.set_failure_type("stream_started");

@@ -53,6 +53,10 @@ pub(crate) fn translated_responses_usage(chat: &Value) -> Result<Value, ()> {
     responses::translated_chat_usage(chat)
 }
 
+pub(crate) fn valid_native_responses(value: &Value) -> bool {
+    response_validation::valid_native_responses(value)
+}
+
 const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_INFLIGHT_REQUESTS: usize = 128;

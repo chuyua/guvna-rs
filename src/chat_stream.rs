@@ -2,7 +2,14 @@
 //! No request routing or key retry policy: the single dispatch candidate walk
 //! transfers ownership only after the first valid event is observed.
 use super::{AppState, LiveRouteSnapshot, record_circuit_failure, record_circuit_success};
-use crate::{circuit::Ticket, keypool::Lease, metrics::Metrics, outcome::Outcome, sse::ChatSse};
+use crate::{
+    circuit::Ticket,
+    keypool::Lease,
+    metrics::Metrics,
+    native_responses_sse::NativeResponsesSse,
+    outcome::Outcome,
+    sse::{ChatSse, SseError},
+};
 use axum::{
     body::{Body, Bytes},
     response::Response,
@@ -47,6 +54,56 @@ pub(super) struct StreamRoute {
     pub(super) request_id: String,
     pub(super) attempt_index: u16,
 }
+
+#[derive(Clone)]
+pub(super) struct NativeResponseStream;
+
+enum StreamParser {
+    Chat(ChatSse),
+    Native(NativeResponsesSse),
+}
+
+impl StreamParser {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<Bytes>, SseError> {
+        match self {
+            Self::Chat(parser) => parser.push(chunk),
+            Self::Native(parser) => parser.push(chunk),
+        }
+    }
+    fn is_done(&self) -> bool {
+        match self {
+            Self::Chat(parser) => parser.is_done(),
+            Self::Native(parser) => parser.is_done(),
+        }
+    }
+    fn take_progress(&mut self) -> bool {
+        match self {
+            Self::Chat(parser) => parser.take_progress(),
+            Self::Native(parser) => parser.take_progress(),
+        }
+    }
+    fn hit_resource_limit(&self) -> bool {
+        match self {
+            Self::Chat(parser) => parser.hit_resource_limit(),
+            Self::Native(parser) => parser.hit_resource_limit(),
+        }
+    }
+    fn finalize_on_eof(&mut self) -> Option<Bytes> {
+        match self {
+            Self::Chat(parser) => parser.finalize_on_eof(),
+            Self::Native(parser) => parser.finalize_on_eof(),
+        }
+    }
+    fn is_completion_event(&self, event: &Bytes) -> bool {
+        match self {
+            Self::Chat(_) => event.as_ref() == b"data: [DONE]\n\n",
+            Self::Native(parser) => parser.is_completion_event(event),
+        }
+    }
+    fn is_native(&self) -> bool {
+        matches!(self, Self::Native(_))
+    }
+}
 struct ChatStreamState {
     owner: Arc<AppState>,
     provider_index: usize,
@@ -60,7 +117,7 @@ struct ChatStreamState {
     last_progress_at: tokio::time::Instant,
     lease: Lease,
     upstream: reqwest::Response,
-    parser: ChatSse,
+    parser: StreamParser,
     pending: VecDeque<Bytes>,
     terminated: bool,
     failure_type: &'static str,
@@ -90,13 +147,60 @@ impl Drop for ChatStreamState {
         }
     }
 }
-fn stream_error() -> Bytes {
-    Bytes::from_static(b"data: {\"error\":{\"type\":\"gateway_error\",\"code\":\"upstream_stream_incomplete\"}}\n\n")
+fn stream_error(native: bool) -> Bytes {
+    if native {
+        Bytes::from_static(b"event: error\ndata: {\"type\":\"error\",\"code\":\"upstream_stream_incomplete\",\"message\":\"Upstream Responses stream ended without valid completion\"}\n\n")
+    } else {
+        Bytes::from_static(b"data: {\"error\":{\"type\":\"gateway_error\",\"code\":\"upstream_stream_incomplete\"}}\n\n")
+    }
 }
 
 pub(super) async fn start(
     upstream: reqwest::Response,
     parser: ChatSse,
+    owner: Arc<AppState>,
+    route: StreamRoute,
+    lease: Lease,
+    permit: &mut Option<OwnedSemaphorePermit>,
+    circuit_ticket: &mut Option<Ticket>,
+) -> Result<Response, PreflightError> {
+    start_with_parser(
+        upstream,
+        StreamParser::Chat(parser),
+        owner,
+        route,
+        lease,
+        permit,
+        circuit_ticket,
+    )
+    .await
+}
+
+pub(super) async fn start_native(
+    upstream: reqwest::Response,
+    owner: Arc<AppState>,
+    route: StreamRoute,
+    lease: Lease,
+    permit: &mut Option<OwnedSemaphorePermit>,
+    circuit_ticket: &mut Option<Ticket>,
+) -> Result<Response, PreflightError> {
+    let mut response = start_with_parser(
+        upstream,
+        StreamParser::Native(NativeResponsesSse::new()),
+        owner,
+        route,
+        lease,
+        permit,
+        circuit_ticket,
+    )
+    .await?;
+    response.extensions_mut().insert(NativeResponseStream);
+    Ok(response)
+}
+
+async fn start_with_parser(
+    upstream: reqwest::Response,
+    parser: StreamParser,
     owner: Arc<AppState>,
     route: StreamRoute,
     lease: Lease,
@@ -181,7 +285,7 @@ fn stream_response(state: ChatStreamState) -> Response {
     let output = futures_util::stream::unfold(state, |mut state| async move {
         loop {
             if let Some(event) = state.pending.pop_front() {
-                if event == Bytes::from_static(b"data: [DONE]\n\n") {
+                if state.parser.is_completion_event(&event) {
                     state.owner.pools[state.provider_index].record_success(&state.lease);
                     record_circuit_success(&mut state.circuit_ticket, &state.owner.metrics);
                     Metrics::inc(&state.owner.metrics.upstream_success);
@@ -305,7 +409,7 @@ fn stream_response(state: ChatStreamState) -> Response {
                     record_circuit_failure(&mut state.circuit_ticket, &state.owner.metrics);
                 }
                 state.terminal_reported = true;
-                return Some((Ok(stream_error()), state));
+                return Some((Ok(stream_error(state.parser.is_native())), state));
             }
         }
     });

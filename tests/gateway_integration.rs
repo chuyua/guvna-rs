@@ -3259,6 +3259,82 @@ async fn responses_input_audio_preserves_chat_wire_for_json_and_sse() {
 }
 
 #[tokio::test]
+async fn native_responses_sse_is_not_downgraded_and_can_preflight_fallback() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&calls);
+    let native = Router::new().route("/v1/responses", post(move || {
+        let count = Arc::clone(&count);
+        async move {
+            let first = count.fetch_add(1, Ordering::SeqCst) == 0;
+            let payload = if first {
+                concat!(
+                    "event: response.created\ndata: {\"type\":\"response.created\",",
+                    "\"sequence_number\":0,\"response\":{\"id\":\"resp_sse\",",
+                    "\"object\":\"response\",\"status\":\"in_progress\"}}\n\n",
+                    "event: response.completed\ndata: {\"type\":\"response.completed\",",
+                    "\"sequence_number\":1,\"response\":{\"id\":\"resp_sse\",",
+                    "\"object\":\"response\",\"status\":\"completed\",",
+                    "\"model\":\"real-native\",\"created_at\":123,\"error\":null,",
+                    "\"output\":[{\"type\":\"image_generation_call\",",
+                    "\"status\":\"completed\",\"result\":\"YQ==\"}]}}\n\n"
+                )
+            } else {
+                // Missing required response.created event: reject at preflight.
+                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+            };
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                Body::from(payload),
+            )
+        }
+    }));
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(socket, native).await.unwrap();
+    });
+    let (chat_url, chat_calls) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: native\n    type: openai\n    base_url: http://{addr}\n    key_env: NATIVE\n    responses_protocol: native\n  - name: text\n    type: openai\n    base_url: {chat_url}\n    key_env: TEXT\nchains:\n  - name: mixed\n    steps:\n      - provider: native\n        model: real-native\n      - provider: text\n        model: real-chat\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        cfg,
+        HashMap::from([
+            ("NATIVE".into(), "native-key".into()),
+            ("TEXT".into(), "chat-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let make = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model":"mixed","input":"hello","stream":true}).to_string(),
+            ))
+            .unwrap()
+    };
+    let first = gateway.clone().oneshot(make()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("event: response.created"), "{text}");
+    assert!(text.contains("event: response.completed"), "{text}");
+    assert!(text.contains("image_generation_call"), "{text}");
+    assert_eq!(chat_calls.load(Ordering::SeqCst), 0);
+    let second = gateway.oneshot(make()).await.unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("event: response.completed"), "{text}");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(chat_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn mixed_responses_native_and_chat_share_one_fallback_walk() {
     let native_calls = Arc::new(AtomicUsize::new(0));
     let native_payloads = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
