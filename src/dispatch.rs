@@ -664,14 +664,31 @@ async fn dispatch_inner(
     // to serialize the same (potentially multi-megabyte) messages/request
     // independently. Analyze request features once; every ordering policy
     // consumes the exact same already-validated signals and candidate list.
+    // Native-only Responses carries real input in native_request, whereas
+    // request is only a synthetic Chat routing envelope. Use one consistent
+    // request for Auto size accounting, default-presence cache keys, and
+    // candidate constraints; otherwise estimates and eligibility diverge.
+    let routing_request = if native_only {
+        native_request.as_ref().unwrap_or(&request)
+    } else {
+        &request
+    };
     let auto_signals = auto_enabled.then(|| {
         let (request_bytes, context_estimate) =
-            routing::auto_request_bytes_and_context_estimate(&request);
+            routing::auto_request_bytes_and_context_estimate(routing_request);
         (
-            routing::auto_input_bytes(request.get("messages")),
+            routing::auto_input_bytes(routing_request.get(if native_only {
+                "input"
+            } else {
+                "messages"
+            })),
             request_bytes,
             context_estimate,
-            routing::auto_requirements(&request),
+            if native_only {
+                routing::auto_requirements_responses(routing_request)
+            } else {
+                routing::auto_requirements(&request)
+            },
         )
     });
     let initial_auto_penalties = if auto_enabled {
@@ -703,7 +720,7 @@ async fn dispatch_inner(
                         request_bytes,
                         context_estimate,
                     },
-                    &request,
+                    routing_request,
                     features,
                     &initial_auto_penalties,
                     live.auto_generation,
@@ -712,7 +729,7 @@ async fn dispatch_inner(
                 routing::resolve_auto_for_request_sized(
                     &route_snapshot,
                     input_bytes,
-                    &request,
+                    routing_request,
                     request_bytes,
                     features,
                     &initial_auto_penalties,
@@ -725,7 +742,7 @@ async fn dispatch_inner(
             && routing::auto_operator_default_can_degrade_for_request_sized(
                 &route_snapshot,
                 input_bytes,
-                &request,
+                routing_request,
                 request_bytes,
                 requirements,
             )

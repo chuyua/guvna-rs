@@ -3487,6 +3487,87 @@ async fn responses_chat_bridge_accepts_official_nullable_options_and_token_minim
 }
 
 #[tokio::test]
+async fn native_only_auto_filters_real_multimodal_input_and_output_budget() {
+    let blocked_hits = Arc::new(AtomicUsize::new(0));
+    let blocked_count = Arc::clone(&blocked_hits);
+    let blocked = Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let count = Arc::clone(&blocked_count);
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({"id":"blocked","object":"response","model":"blocked",
+                "created_at":1,"status":"completed","output":[],"error":null}))
+            }
+        }),
+    );
+    let blocked_socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let blocked_addr = blocked_socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(blocked_socket, blocked).await.unwrap() });
+
+    let accepted = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let seen = Arc::clone(&accepted);
+    let capable = Router::new().route(
+        "/v1/responses",
+        post(move |axum::Json(request): axum::Json<Value>| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().await.push(request);
+                axum::Json(
+                    json!({"id":"resp_capable","object":"response","model":"physical",
+                    "created_at":1,"status":"completed","output":[],"error":null}),
+                )
+            }
+        }),
+    );
+    let capable_socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let capable_addr = capable_socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(capable_socket, capable).await.unwrap() });
+
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: blocked\n    type: openai\n    base_url: http://{blocked_addr}\n    key_env: BLOCKED\n    responses_protocol: native\n  - name: capable\n    type: openai\n    base_url: http://{capable_addr}\n    key_env: CAPABLE\n    responses_protocol: native\nauto:\n  enabled: true\n  candidates:\n    - provider: blocked\n      model: no-vision\n      priority: 1\n      supports_images: false\n      max_context_tokens: 1024\n    - provider: capable\n      model: vision\n      priority: 2\n      supports_images: true\n      max_context_tokens: 16384\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        config,
+        HashMap::from([
+            ("BLOCKED".into(), "blocked-key".into()),
+            ("CAPABLE".into(), "capable-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let request = |max_output_tokens| {
+        auto_request(
+            "/v1/responses",
+            "client",
+            json!({
+                "model":"auto","max_output_tokens":max_output_tokens,
+                "tools":[{"type":"image_generation","size":"1024x1024"}],
+                "input":[{"type":"message","role":"user","content":[
+                    {"type":"input_text","text":"draw this picture"},
+                    {"type":"input_image","image_url":"https://example.test/image.png"}
+                ]}]
+            }),
+        )
+    };
+    let (status, result) = call(gateway.clone(), request(4096)).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["model"], "auto");
+    assert_eq!(blocked_hits.load(Ordering::SeqCst), 0);
+    let seen = accepted.lock().await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["model"], "vision");
+    assert_eq!(seen[0]["input"][0]["content"][1]["type"], "input_image");
+    drop(seen);
+
+    let (status, result) = call(gateway, request(20000)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{result}");
+    assert_eq!(result["error"]["code"], "auto_no_eligible_candidate");
+    assert_eq!(blocked_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(accepted.lock().await.len(), 1);
+}
+
+#[tokio::test]
 async fn native_responses_sse_is_not_downgraded_and_can_preflight_fallback() {
     let calls = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&calls);

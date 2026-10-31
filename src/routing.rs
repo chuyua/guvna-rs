@@ -139,6 +139,64 @@ pub fn auto_requirements(request: &Value) -> AutoRequirements {
     }
 }
 
+/// Inspect original Responses input for Auto capability requirements.
+/// Native-only requests carry a placeholder Chat envelope through dispatch;
+/// using that placeholder would lose real multimodal/tool requirements.
+pub fn auto_requirements_responses(request: &Value) -> AutoRequirements {
+    let items = request.get("input").and_then(Value::as_array);
+    let contains_part = |item: &Value, kind: &str| {
+        item.get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| part.get("type").and_then(Value::as_str) == Some(kind))
+            })
+    };
+    let tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+        || request
+            .get("tool_choice")
+            .is_some_and(|choice| match choice {
+                Value::String(choice) => !matches!(choice.as_str(), "auto" | "none"),
+                Value::Null => false,
+                _ => true,
+            })
+        || items.is_some_and(|items| {
+            items.iter().any(|item| {
+                matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("function_call" | "function_call_output")
+                )
+            })
+        });
+    let images = items.is_some_and(|items| {
+        items.iter().any(|item| {
+            ["input_image", "input_file", "input_video"]
+                .iter()
+                .any(|kind| contains_part(item, kind))
+        })
+    });
+    let audio = request
+        .get("modalities")
+        .and_then(Value::as_array)
+        .is_some_and(|modalities| modalities.iter().any(|value| value == "audio"))
+        || items.is_some_and(|items| {
+            items.iter().any(|item| {
+                contains_part(item, "input_audio")
+                    || contains_part(item, "input_audio_transcription")
+            })
+        });
+    let json_schema =
+        request.pointer("/text/format/type").and_then(Value::as_str) == Some("json_schema");
+    AutoRequirements {
+        audio,
+        ..AutoRequirements::from_signals(tools, images, json_schema)
+    }
+}
+
 /// Go-compatible Auto-only window filters. Zero/negative values mean
 /// unspecified. Unknown window sizes must not satisfy an explicit bound.
 /// The 512-token Go default is used only when the local registry is opted in:
@@ -550,7 +608,7 @@ pub fn auto_request_bytes_and_context_estimate(request: &Value) -> (usize, usize
 }
 
 fn auto_context_estimate_from_bytes(request: &Value, bytes: usize) -> usize {
-    let output_budget = ["max_completion_tokens", "max_tokens"]
+    let output_budget = ["max_completion_tokens", "max_tokens", "max_output_tokens"]
         .iter()
         .filter_map(|name| request.get(name).and_then(Value::as_u64))
         .map(|tokens| tokens.min(usize::MAX as u64) as usize)
@@ -753,7 +811,7 @@ fn auto_candidate_eligible_for_request(
     // default supplies the other. They are sent upstream as distinct fields;
     // take the larger bound rather than assuming one silently overrides the
     // other, which could admit a candidate far beyond its context window.
-    let budgets = ["max_completion_tokens", "max_tokens"]
+    let budgets = ["max_completion_tokens", "max_tokens", "max_output_tokens"]
         .iter()
         .filter_map(|name| effective(name).and_then(Value::as_u64))
         .map(|tokens| tokens.min(usize::MAX as u64) as usize);
@@ -2757,5 +2815,43 @@ default_chain: backup
         );
         let no_default: Config = serde_yaml::from_str("providers: []").unwrap();
         assert!(resolve(&no_default, "unknown").is_err());
+    }
+
+    #[test]
+    fn native_responses_auto_routing_uses_real_input_and_capabilities() {
+        let rich = serde_json::json!({
+            "model":"auto", "max_output_tokens":4096,
+            "tools":[{"type":"function","name":"lookup"}],
+            "text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object"}}},
+            "input":[
+                {"type":"message","role":"user","content":[
+                    {"type":"input_text","text":"inspect"},
+                    {"type":"input_image","image_url":"https://example.test/a.png"},
+                    {"type":"input_audio","input_audio":{"data":"YQ==","format":"wav"}}
+                ]},
+                {"type":"function_call","call_id":"call_a","name":"lookup","arguments":"{}"}
+            ]
+        });
+        let features = auto_requirements_responses(&rich);
+        assert!(features.tools);
+        assert!(features.images);
+        assert!(features.audio);
+        assert!(features.json_schema);
+        assert_eq!(
+            auto_input_bytes(rich.get("input")),
+            encoded_json_bytes(rich.get("input"))
+        );
+        let (_, estimate) = auto_request_bytes_and_context_estimate(&rich);
+        assert!(estimate >= 4096 + encoded_json_bytes(Some(&rich)));
+
+        let plain = serde_json::json!({"model":"auto","input":"hello"});
+        assert_eq!(
+            auto_requirements_responses(&plain),
+            AutoRequirements::default()
+        );
+        let audio_output = serde_json::json!({
+            "model":"auto","modalities":["text","audio"],"input":"hello"
+        });
+        assert!(auto_requirements_responses(&audio_output).audio);
     }
 }
