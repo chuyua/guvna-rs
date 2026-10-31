@@ -7,6 +7,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::VecDeque, sync::Arc};
 
 const MAX_FRAME: usize = 1024 * 1024 + 8;
@@ -14,6 +15,7 @@ const MAX_INPUT_CHUNK: usize = 2 * 1024 * 1024;
 const MAX_TEXT: usize = 512 * 1024;
 const MAX_TOOLS: usize = 32;
 const MAX_TOOL_ARGUMENTS: usize = 256 * 1024;
+static SYNTHETIC_STREAM_IDS: AtomicU64 = AtomicU64::new(1);
 
 struct Tool {
     id: String,
@@ -110,13 +112,18 @@ struct ResponsesSse {
     model: String,
     metadata: Value,
     json_mode: Option<bool>,
+    has_refusal: bool,
     buffer: Vec<u8>,
     scan_from: usize,
     id: Option<String>,
+    source_id: Option<String>,
     created_at: Option<i64>,
     text: String,
     text_index: Option<usize>,
     text_closed: bool,
+    text_part_index: Option<usize>,
+    refusal: String,
+    refusal_part_index: Option<usize>,
     reasoning_text: String,
     reasoning_index: Option<usize>,
     next_output_index: usize,
@@ -133,13 +140,18 @@ impl ResponsesSse {
             model,
             metadata,
             json_mode: None,
+            has_refusal: false,
             buffer: Vec::new(),
             scan_from: 0,
             id: None,
+            source_id: None,
             created_at: None,
             text: String::new(),
             text_index: None,
             text_closed: false,
+            text_part_index: None,
+            refusal: String::new(),
+            refusal_part_index: None,
             reasoning_text: String::new(),
             reasoning_index: None,
             next_output_index: 0,
@@ -163,11 +175,23 @@ impl ResponsesSse {
     fn reasoning_id(&self) -> String {
         format!("rs_{}", self.id.as_deref().unwrap_or_default())
     }
+    fn message_parts(&self) -> Vec<Value> {
+        let count = usize::from(self.text_part_index.is_some())
+            + usize::from(self.refusal_part_index.is_some());
+        let mut parts = vec![Value::Null; count];
+        if let Some(index) = self.text_part_index {
+            parts[index] = json!({"type":"output_text","text":self.text,"annotations":[]});
+        }
+        if let Some(index) = self.refusal_part_index {
+            parts[index] = json!({"type":"refusal","refusal":self.refusal});
+        }
+        parts
+    }
     fn response(&self, status: &str) -> Value {
         let mut output = vec![Value::Null; self.next_output_index];
         if let Some(index) = self.text_index {
             output[index] = json!({"id":self.message_id(),"type":"message","status":status,
-                "role":"assistant","content":[{"type":"output_text","text":self.text,"annotations":[]}]});
+                "role":"assistant","content":self.message_parts()});
         }
         if let Some(index) = self.reasoning_index {
             output[index] = json!({"id":self.reasoning_id(),"type":"reasoning","status":status,
@@ -180,6 +204,8 @@ impl ResponsesSse {
         }
         json!({"id":self.id,"object":"response","created_at":self.created_at,
             "model":self.model,"status":status,
+            "error":null, "store":false, "background":false,
+            "previous_response_id":null, "truncation":"disabled",
             "incomplete_details": if status == "incomplete" {
                 json!({"reason": if self.finish_reason.as_deref() == Some("content_filter") {
                     "content_filter"
@@ -193,10 +219,21 @@ impl ResponsesSse {
     fn begin(&mut self, event: &Value, pending: &mut VecDeque<Bytes>) -> Result<(), ()> {
         let id = event
             .get("id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .ok_or(())?;
-        self.id = Some(id.to_owned());
+            .map(|id| id.as_str().filter(|value| !value.is_empty()).ok_or(()))
+            .transpose()?
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "chatcmpl-rs-{}-{}-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis(),
+                    std::process::id(),
+                    SYNTHETIC_STREAM_IDS.fetch_add(1, Ordering::Relaxed)
+                )
+            });
+        self.id = Some(id);
         self.created_at = event
             .get("created")
             .and_then(|ts| {
@@ -230,7 +267,7 @@ impl ResponsesSse {
         Ok(())
     }
 
-    fn begin_text(&mut self, pending: &mut VecDeque<Bytes>) {
+    fn begin_message(&mut self, pending: &mut VecDeque<Bytes>) {
         if self.text_index.is_some() {
             return;
         }
@@ -245,12 +282,38 @@ impl ResponsesSse {
                     "status":"in_progress","role":"assistant","content":[]}
             }),
         ));
+    }
+
+    fn begin_text(&mut self, pending: &mut VecDeque<Bytes>) {
+        self.begin_message(pending);
+        if self.text_part_index.is_some() {
+            return;
+        }
+        let content_index = usize::from(self.refusal_part_index.is_some());
+        self.text_part_index = Some(content_index);
         let message_id = self.message_id();
         pending.push_back(self.emit(
             "response.content_part.added",
             json!({
-                "item_id":message_id,"output_index":index,"content_index":0,
+                "item_id":message_id,"output_index":self.text_index,"content_index":content_index,
                 "part":{"type":"output_text","text":"","annotations":[]}
+            }),
+        ));
+    }
+
+    fn begin_refusal(&mut self, pending: &mut VecDeque<Bytes>) {
+        self.begin_message(pending);
+        if self.refusal_part_index.is_some() {
+            return;
+        }
+        let content_index = usize::from(self.text_part_index.is_some());
+        self.refusal_part_index = Some(content_index);
+        let message_id = self.message_id();
+        pending.push_back(self.emit(
+            "response.content_part.added",
+            json!({
+                "item_id":message_id,"output_index":self.text_index,"content_index":content_index,
+                "part":{"type":"refusal","refusal":""}
             }),
         ));
     }
@@ -432,14 +495,14 @@ impl ResponsesSse {
                 return Err(());
             }
             if self.finish_reason.as_deref() == Some("stop")
+                && !self.has_refusal
                 && let Some(only_object) = self.json_mode
             {
                 // A model may ignore response_format even after a valid 200
                 // streaming handshake. Check the bounded assembled text
                 // before ever emitting a completed terminal event. Once any
                 // delta has been sent we cannot replay another provider.
-                let valid = serde_json::from_str::<Value>(&self.text)
-                    .is_ok_and(|parsed| !only_object || parsed.is_object());
+                let valid = crate::sse::valid_json_output(&self.text, only_object);
                 if !valid {
                     return Err(());
                 }
@@ -450,32 +513,20 @@ impl ResponsesSse {
         }
         let event: Value = serde_json::from_slice(data).map_err(|_| ())?;
         let choices = event.get("choices").and_then(Value::as_array).ok_or(())?;
-        // Mirror ChatSse: compatible providers may attach provisional usage
-        // to the final content choice and then send authoritative accounting
-        // in an empty-choices trailer. Count only that trailer, once.
+        // An inline usage sample is useful if no trailer follows. Preserve
+        // it as a fallback and let an authoritative empty-choices trailer
+        // replace it without counting that trailer more than once.
+        if choices.is_empty() && (self.usage_seen || self.finish_reason.is_none()) {
+            return Err(());
+        }
+        if event.get("usage").is_some_and(|usage| !usage.is_null()) {
+            self.usage = crate::gateway::translated_responses_usage(&event)?;
+        }
         if choices.is_empty() {
-            let usage = event
-                .get("usage")
-                .filter(|value| !value.is_null())
-                .ok_or(())?;
-            if self.usage_seen {
+            if event.get("usage").is_none_or(Value::is_null) {
                 return Err(());
             }
-            let (Some(input), Some(output), Some(total)) = (
-                usage["prompt_tokens"].as_u64(),
-                usage["completion_tokens"].as_u64(),
-                usage["total_tokens"].as_u64(),
-            ) else {
-                return Err(());
-            };
-            if input.checked_add(output) != Some(total) {
-                return Err(());
-            }
-            self.usage = json!({"input_tokens":input,"output_tokens":output,"total_tokens":total});
             self.usage_seen = true;
-            if self.finish_reason.is_none() {
-                return Err(());
-            }
             return Ok(());
         }
         if choices.len() != 1 || choices[0]["index"] != 0 || self.finish_reason.is_some() {
@@ -483,8 +534,15 @@ impl ResponsesSse {
         }
         if let Some(id) = event.get("id") {
             let current = id.as_str().filter(|id| !id.is_empty()).ok_or(())?;
-            if self.id.as_deref().is_some_and(|saved| saved != current) {
+            if self
+                .source_id
+                .as_deref()
+                .is_some_and(|saved| saved != current)
+            {
                 return Err(());
+            }
+            if self.source_id.is_none() {
+                self.source_id = Some(current.to_owned());
             }
         }
         if self.id.is_none() {
@@ -535,6 +593,7 @@ impl ResponsesSse {
                 > MAX_TEXT.saturating_sub(
                     self.text
                         .len()
+                        .saturating_add(self.refusal.len())
                         .saturating_add(self.reasoning_text.len())
                         .saturating_add(used),
                 )
@@ -555,10 +614,15 @@ impl ResponsesSse {
         }
         for field in ["content", "refusal"] {
             if let Some(content) = delta.get(field).filter(|part| !part.is_null()) {
-                if field == "refusal" && delta.get("content") == Some(content) {
-                    continue; // Do not duplicate mirrored text.
-                }
                 let part = content.as_str().ok_or(())?;
+                if field == "refusal" && !part.is_empty() {
+                    self.has_refusal = true;
+                }
+                // Some upstreams mirror the refusal in content in the SAME
+                // delta. Emit only the typed refusal, never a duplicate text.
+                if field == "content" && delta.get("refusal") == Some(content) && !part.is_empty() {
+                    continue;
+                }
                 if !part.is_empty() {
                     if !self.tools.is_empty() {
                         return Err(());
@@ -572,22 +636,39 @@ impl ResponsesSse {
                         > MAX_TEXT.saturating_sub(
                             self.text
                                 .len()
+                                .saturating_add(self.refusal.len())
                                 .saturating_add(self.reasoning_text.len())
                                 .saturating_add(used),
                         )
                     {
                         return Err(());
                     }
-                    self.begin_text(pending);
-                    self.text.push_str(part);
                     let item_id = self.message_id();
-                    pending.push_back(self.emit(
-                        "response.output_text.delta",
-                        json!({
-                            "item_id":item_id,"output_index":self.text_index,"content_index":0,
-                            "delta":part,"logprobs":[]
-                        }),
-                    ));
+                    if field == "refusal" {
+                        self.begin_refusal(pending);
+                        self.refusal.push_str(part);
+                        pending.push_back(self.emit(
+                            "response.refusal.delta",
+                            json!({
+                                "item_id":item_id,
+                                "output_index":self.text_index,
+                                "content_index":self.refusal_part_index,
+                                "delta":part
+                            }),
+                        ));
+                    } else {
+                        self.begin_text(pending);
+                        self.text.push_str(part);
+                        pending.push_back(self.emit(
+                            "response.output_text.delta",
+                            json!({
+                                "item_id":item_id,
+                                "output_index":self.text_index,
+                                "content_index":self.text_part_index,
+                                "delta":part,"logprobs":[]
+                            }),
+                        ));
+                    }
                 }
             }
         } // content/refusal parts
@@ -601,8 +682,7 @@ impl ResponsesSse {
                     if !self.tools.iter().all(|tool| {
                         tool.arguments_seen
                             && (tool.arguments.is_empty()
-                                || serde_json::from_str::<Value>(&tool.arguments)
-                                    .is_ok_and(|value| value.is_object()))
+                                || crate::sse::valid_json_output(&tool.arguments, true))
                     }) {
                         return Err(());
                     }
@@ -676,18 +756,25 @@ impl ResponsesSse {
                     tool.arguments.clone(),
                     tool.output_index,
                 );
-                pending.push_back(self.emit(
-                    "response.function_call_arguments.done",
-                    json!({
-                        "item_id":id,"output_index":output_index,"arguments":arguments
-                    }),
-                ));
+                // A max-token/content-filter truncation can leave JSON
+                // arguments unfinished. An arguments.done event tells a
+                // consumer it may execute this call; do not emit it for
+                // incomplete calls even though the output item itself must
+                // terminate with an incomplete status.
+                if status == "completed" {
+                    pending.push_back(self.emit(
+                        "response.function_call_arguments.done",
+                        json!({
+                            "item_id":id,"output_index":output_index,"arguments":arguments
+                        }),
+                    ));
+                }
                 pending.push_back(self.emit(
                     "response.output_item.done",
                     json!({
                         "output_index":output_index,
                         "item":{"id":id,"call_id":id,"name":name,"arguments":arguments,
-                            "type":"function_call","status":"completed"}
+                            "type":"function_call","status":status}
                     }),
                 ));
             }
@@ -706,29 +793,41 @@ impl ResponsesSse {
             return;
         }
         if let Some(index) = self.text_index {
-            let item_id = self.message_id();
-            pending.push_back(self.emit(
-                "response.output_text.done",
-                json!({
-                    "item_id":item_id,"output_index":index,"content_index":0,
-                    "text":self.text,"logprobs":[]
-                }),
-            ));
-            let item_id = self.message_id();
-            pending.push_back(self.emit(
-                "response.content_part.done",
-                json!({
-                    "item_id":item_id,"output_index":index,"content_index":0,
-                    "part":{"type":"output_text","text":self.text,"annotations":[]}
-                }),
-            ));
+            let parts = self.message_parts();
+            for (content_index, part) in parts.iter().enumerate() {
+                if self.text_part_index == Some(content_index) {
+                    let item_id = self.message_id();
+                    pending.push_back(self.emit(
+                        "response.output_text.done",
+                        json!({
+                            "item_id":item_id,"output_index":index,"content_index":content_index,
+                            "text":self.text,"logprobs":[]
+                        }),
+                    ));
+                } else if self.refusal_part_index == Some(content_index) {
+                    let item_id = self.message_id();
+                    pending.push_back(self.emit(
+                        "response.refusal.done",
+                        json!({
+                            "item_id":item_id,"output_index":index,"content_index":content_index,
+                            "refusal":self.refusal
+                        }),
+                    ));
+                }
+                let item_id = self.message_id();
+                pending.push_back(self.emit(
+                    "response.content_part.done",
+                    json!({
+                        "item_id":item_id,"output_index":index,"content_index":content_index,
+                        "part":part
+                    }),
+                ));
+            }
             let item = json!({"id":self.message_id(),"type":"message","status":status,
-                "role":"assistant","content":[{"type":"output_text","text":self.text,"annotations":[]}]});
+                "role":"assistant","content":parts});
             pending.push_back(self.emit(
                 "response.output_item.done",
-                json!({
-                    "output_index":index,"item":item
-                }),
+                json!({"output_index":index,"item":item}),
             ));
             self.text_closed = true;
         }
@@ -753,6 +852,61 @@ mod tests {
     use super::*;
     fn frame(event: Value) -> Bytes {
         Bytes::from(format!("data: {event}\n\n"))
+    }
+    #[test]
+    fn audit_f01_truncated_function_call_item_never_reports_completed() {
+        for reason in ["length", "content_filter"] {
+            let mut translator = ResponsesSse::new("m".into(), Value::Null);
+            let mut frames = VecDeque::new();
+            translator
+                .feed(
+                    &frame(json!({"id":"chat","choices":[{
+                "index":0,"delta":{"tool_calls":[{"index":0,"id":"call1",
+                    "type":"function","function":{"name":"lookup","arguments":"{\"city\":"}}]},
+                "finish_reason":null}]})),
+                    &mut frames,
+                )
+                .unwrap();
+            translator
+                .feed(
+                    &frame(json!({"id":"chat","choices":[{
+                "index":0,"delta":{},"finish_reason":reason}]})),
+                    &mut frames,
+                )
+                .unwrap();
+            translator.feed(b"data: [DONE]\n\n", &mut frames).unwrap();
+            let events: Vec<Value> = frames
+                .iter()
+                .filter_map(|raw| {
+                    std::str::from_utf8(raw)
+                        .ok()?
+                        .lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .and_then(|data| serde_json::from_str(data).ok())
+                })
+                .collect();
+            let item = events
+                .iter()
+                .find(|v| {
+                    v["type"] == "response.output_item.done" && v["item"]["type"] == "function_call"
+                })
+                .unwrap();
+            assert_eq!(item["item"]["status"], "incomplete", "{reason}");
+            let terminal = events
+                .iter()
+                .find(|v| v["type"] == "response.incomplete")
+                .unwrap();
+            assert_eq!(terminal["response"]["status"], "incomplete");
+            assert_eq!(
+                terminal["response"]["output"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["type"] == "function_call")
+                    .unwrap()["status"],
+                "incomplete"
+            );
+        }
     }
     #[test]
     fn mixed_text_then_reasoning_completes_in_output_index_order() {
@@ -789,6 +943,66 @@ mod tests {
             })
             .collect();
         assert_eq!(done, vec![0, 1], "out-of-order terminal output items");
+    }
+
+    #[test]
+    fn absent_early_chat_id_is_synthesized_without_losing_later_identity_fencing() {
+        let mut translator = ResponsesSse::new("logical".into(), Value::Null);
+        let mut output = VecDeque::new();
+        translator
+            .feed(
+                &frame(json!({"created":123,"choices":[{"index":0,
+                    "delta":{"content":"hel"},"finish_reason":null}]})),
+                &mut output,
+            )
+            .unwrap();
+        let generated = translator.id.clone().unwrap();
+        assert!(generated.starts_with("chatcmpl-rs-"), "{generated}");
+        assert_eq!(translator.source_id, None);
+        translator
+            .feed(
+                &frame(json!({"id":"provider-id","choices":[{"index":0,
+                    "delta":{"content":"lo"},"finish_reason":"stop"}]})),
+                &mut output,
+            )
+            .unwrap();
+        assert_eq!(translator.source_id.as_deref(), Some("provider-id"));
+        assert_eq!(translator.id.as_deref(), Some(generated.as_str()));
+        translator.feed(b"data: [DONE]\n\n", &mut output).unwrap();
+        let completed = String::from_utf8_lossy(output.back().unwrap());
+        let data = completed
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let event: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(event["response"]["id"], generated);
+        assert_eq!(event["response"]["output_text"], "hello");
+
+        let mut conflicting = ResponsesSse::new("logical".into(), Value::Null);
+        let mut events = VecDeque::new();
+        conflicting
+            .feed(
+                &frame(json!({"choices":[{"index":0,"delta":{"content":"start"},
+                    "finish_reason":null}]})),
+                &mut events,
+            )
+            .unwrap();
+        conflicting
+            .feed(
+                &frame(json!({"id":"source-a","choices":[{"index":0,
+                    "delta":{"content":"middle"},"finish_reason":null}]})),
+                &mut events,
+            )
+            .unwrap();
+        assert!(
+            conflicting
+                .feed(
+                    &frame(json!({"id":"source-b","choices":[{"index":0,
+                    "delta":{"content":"end"},"finish_reason":"stop"}]})),
+                    &mut events,
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -863,6 +1077,69 @@ mod tests {
     }
 
     #[test]
+    fn chat_token_breakdown_survives_inline_then_final_sse_usage() {
+        let mut translator = ResponsesSse::new("logical".into(), Value::Null);
+        let mut events = VecDeque::new();
+        translator
+            .feed(
+                &frame(json!({"id":"usage-details","created":123,
+                "choices":[{"index":0,"delta":{"content":"answer"},
+                    "finish_reason":"stop"}],
+                "usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,
+                    "prompt_tokens_details":{"cached_tokens":9},
+                    "completion_tokens_details":{"reasoning_tokens":5}}})),
+                &mut events,
+            )
+            .unwrap();
+        assert_eq!(translator.usage["input_tokens_details"]["cached_tokens"], 9);
+        translator
+            .feed(
+                &frame(json!({"choices":[],"usage":{
+                "prompt_tokens":12,"completion_tokens":8,"total_tokens":20,
+                "prompt_tokens_details":{"cached_tokens":7},
+                "completion_tokens_details":{"reasoning_tokens":6}}})),
+                &mut events,
+            )
+            .unwrap();
+        translator.feed(b"data: [DONE]\n\n", &mut events).unwrap();
+        let done = String::from_utf8_lossy(events.back().unwrap());
+        assert!(done.contains("event: response.completed"));
+        assert!(done.contains("\"cached_tokens\":7"), "{done}");
+        assert!(done.contains("\"reasoning_tokens\":6"), "{done}");
+    }
+
+    #[test]
+    fn inline_only_usage_is_preserved_in_completed_response() {
+        let mut translator = ResponsesSse::new("logical".into(), Value::Null);
+        let mut output = VecDeque::new();
+        translator
+            .feed(
+                &frame(json!({"id":"inline-only","created":123,
+                    "choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}})),
+                &mut output,
+            )
+            .unwrap();
+        assert!(!translator.usage_seen);
+        translator.feed(b"data: [DONE]\n\n", &mut output).unwrap();
+        assert!(translator.done);
+        let completed = String::from_utf8_lossy(output.back().unwrap());
+        assert!(
+            completed.contains("event: response.completed"),
+            "{completed}"
+        );
+        let data = completed
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let event: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(
+            event["response"]["usage"],
+            json!({"input_tokens":4,"output_tokens":2,"total_tokens":6})
+        );
+    }
+
+    #[test]
     fn content_frame_usage_does_not_conflict_with_authoritative_trailer() {
         let usage = json!({"prompt_tokens":2,"completion_tokens":3,"total_tokens":5});
         let mut translator = ResponsesSse::new("logical".into(), Value::Null);
@@ -876,7 +1153,10 @@ mod tests {
             )
             .unwrap();
         assert!(!translator.usage_seen);
-        assert_eq!(translator.usage, Value::Null);
+        assert_eq!(
+            translator.usage,
+            json!({"input_tokens":2,"output_tokens":3,"total_tokens":5})
+        );
         translator
             .feed(
                 &frame(json!({"choices":[],"usage":usage.clone()})),
@@ -938,6 +1218,107 @@ mod tests {
                 &mut output,
             )
             .is_err());
+    }
+
+    #[test]
+    fn mirrored_refusal_is_not_duplicated_or_rejected_by_json_mode() {
+        for delta in [
+            json!({"content":"I cannot assist","refusal":"I cannot assist"}),
+            json!({"refusal":"I cannot assist"}),
+        ] {
+            let mut translator = ResponsesSse::new("logical".into(), Value::Null);
+            translator.json_mode = Some(true);
+            let mut pending = VecDeque::new();
+            translator
+                .feed(
+                    &frame(json!({"id":"refusal","created":123,
+                        "choices":[{"index":0,"delta":delta,"finish_reason":"stop"}]})),
+                    &mut pending,
+                )
+                .unwrap();
+            translator.feed(b"data: [DONE]\n\n", &mut pending).unwrap();
+            assert!(translator.done);
+            assert!(translator.has_refusal);
+            assert_eq!(translator.text, "");
+            assert_eq!(translator.refusal, "I cannot assist");
+            let emitted = pending
+                .iter()
+                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                .collect::<Vec<_>>()
+                .join("");
+            assert_eq!(emitted.matches("event: response.refusal.delta").count(), 1);
+            assert_eq!(emitted.matches("event: response.refusal.done").count(), 1);
+            assert!(!emitted.contains("event: response.output_text.delta"));
+            assert!(emitted.contains("event: response.completed"));
+            let last: Value = serde_json::from_str(
+                emitted
+                    .split("event: response.completed\ndata: ")
+                    .nth(1)
+                    .unwrap()
+                    .trim(),
+            )
+            .unwrap();
+            assert_eq!(last["response"]["output_text"], "");
+            assert_eq!(
+                last["response"]["output"][0]["content"][0],
+                json!({"type":"refusal","refusal":"I cannot assist"})
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_text_and_refusal_stream_keep_distinct_content_part_indexes() {
+        let mut translator = ResponsesSse::new("logical".into(), Value::Null);
+        let mut pending = VecDeque::new();
+        translator
+            .feed(
+                &frame(json!({"id":"mixed-refusal","created":123,
+                "choices":[{"index":0,"delta":{"content":"I can discuss safety."},
+                    "finish_reason":null}]})),
+                &mut pending,
+            )
+            .unwrap();
+        translator
+            .feed(
+                &frame(json!({"id":"mixed-refusal",
+                "choices":[{"index":0,"delta":{"refusal":"But I cannot do that."},
+                    "finish_reason":"stop"}]})),
+                &mut pending,
+            )
+            .unwrap();
+        translator.feed(b"data: [DONE]\n\n", &mut pending).unwrap();
+        let emitted = pending
+            .iter()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .collect::<Vec<_>>();
+        let final_event = emitted.last().unwrap();
+        let result: Value =
+            serde_json::from_str(final_event.split_once("data: ").unwrap().1.trim()).unwrap();
+        assert_eq!(result["response"]["output_text"], "I can discuss safety.");
+        assert_eq!(
+            result["response"]["output"][0]["content"],
+            json!([
+                {"type":"output_text","text":"I can discuss safety.","annotations":[]},
+                {"type":"refusal","refusal":"But I cannot do that."}
+            ])
+        );
+        let refusal_delta = emitted
+            .iter()
+            .find(|chunk| chunk.starts_with("event: response.refusal.delta"))
+            .unwrap();
+        let refusal_json: Value =
+            serde_json::from_str(refusal_delta.split_once("data: ").unwrap().1.trim()).unwrap();
+        assert_eq!(refusal_json["content_index"], 1);
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(
+                    |chunk| chunk.starts_with("event: response.output_item.done")
+                        && chunk.contains("\"type\":\"message\"")
+                )
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1012,6 +1393,70 @@ mod tests {
         assert!(last.contains("event: response.incomplete"), "{last}");
         assert!(last.contains("\"reason\":\"content_filter\""), "{last}");
         assert!(!last.contains("response.failed"), "{last}");
+    }
+    #[test]
+    fn incomplete_stream_tool_item_never_claims_completed_arguments() {
+        for (finish, expected_status) in [
+            ("length", "incomplete"),
+            ("content_filter", "incomplete"),
+            ("tool_calls", "completed"),
+        ] {
+            let arguments = if finish == "tool_calls" {
+                "{}"
+            } else {
+                "{\"unfinished\":"
+            };
+            let mut t = ResponsesSse::new("logical".into(), Value::Null);
+            let mut pending = VecDeque::new();
+            t.feed(
+                &frame(json!({"id":"partial-call","created":123,
+                    "choices":[{"index":0,
+                        "delta":{"tool_calls":[{"index":0,"id":"call_partial",
+                            "type":"function",
+                            "function":{"name":"lookup","arguments":arguments}}]},
+                        "finish_reason":null}]})),
+                &mut pending,
+            )
+            .unwrap();
+            t.feed(
+                &frame(json!({"id":"partial-call",
+                    "choices":[{"index":0,"delta":{},"finish_reason":finish}]})),
+                &mut pending,
+            )
+            .unwrap();
+            t.feed(b"data: [DONE]\n\n", &mut pending).unwrap();
+            assert!(t.done);
+            let events = pending
+                .iter()
+                .map(|frame| String::from_utf8_lossy(frame).into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |frame| frame.starts_with("event: response.function_call_arguments.done\n")
+                    )
+                    .count(),
+                usize::from(expected_status == "completed"),
+                "{finish}: incomplete function arguments must never be signaled ready"
+            );
+            let done = events
+                .iter()
+                .find(|frame| {
+                    frame.starts_with("event: response.output_item.done\n")
+                        && frame.contains("\"type\":\"function_call\"")
+                })
+                .unwrap();
+            let item_done: Value =
+                serde_json::from_str(done.split_once("data: ").unwrap().1.trim()).unwrap();
+            assert_eq!(item_done["item"]["status"], expected_status, "{finish}");
+            assert_eq!(item_done["item"]["arguments"], arguments);
+            let final_event = events.last().unwrap();
+            let response: Value =
+                serde_json::from_str(final_event.split_once("data: ").unwrap().1.trim()).unwrap();
+            assert_eq!(response["response"]["status"], expected_status, "{finish}");
+            assert_eq!(response["response"]["output"][0]["status"], expected_status);
+        }
     }
     #[test]
     fn bounded_malformed_and_tools() {

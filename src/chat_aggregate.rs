@@ -1,7 +1,7 @@
 //! Bounded Chat SSE -> non-stream Chat completion synthesis.
 //! Reuses the already hardened ChatSse validator: no alternate framing
 //! logic, no replay after partial content, and no relaxed tool-call rules.
-use crate::sse::ChatSse;
+use crate::{circuit::Ticket, sse::ChatSse};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -22,7 +22,7 @@ const MAX_EVENTS: usize = 262_144;
 // A long prompt can leave a reasoning model silent for more than 15 seconds.
 // The separate 100-second absolute lifetime and shared walk budget still bound
 // resource use and total request latency.
-const STREAM_IDLE: Duration = Duration::from_secs(60);
+pub(super) const STREAM_IDLE: Duration = Duration::from_secs(60);
 // Long generations from SSE-only providers must not inherit the ordinary
 // 90-second JSON-body deadline. The idle timer still rejects stalled streams,
 // and this separate hard cap prevents indefinite drip-fed connections.
@@ -142,8 +142,11 @@ fn apply_event(
             *model = Some(current.to_owned());
         }
     }
+    // The shared ChatSse parser permits provisional usage on content
+    // choices, followed by one authoritative empty-choices usage trailer.
+    // ChatSse itself enforces that a second trailer is invalid.
     if let Some(value_usage) = value.get("usage").filter(|usage| !usage.is_null()) {
-        if !value_usage.is_object() || !usage.is_null() {
+        if !value_usage.is_object() {
             return Err(AggregateError::InvalidStream);
         }
         let prompt = value_usage
@@ -164,6 +167,13 @@ fn apply_event(
         // Usage extras are client-visible JSON as well. The original limit
         // only counted text and tool arguments, allowing a large usage object
         // to bypass the advertised bounded output budget.
+        // The final accounting replaces provisional usage, rather than
+        // accumulating stale copies against the output budget.
+        *used = used.saturating_sub(if usage.is_null() {
+            0
+        } else {
+            usage.to_string().len()
+        });
         account_bounded(used, value_usage.to_string().len())?;
         *usage = value_usage.clone();
     }
@@ -175,10 +185,18 @@ fn apply_event(
         let choice = choices
             .get_mut(usize::try_from(index).map_err(|_| ())?)
             .ok_or(())?;
-        let delta = event_choice
-            .get("delta")
-            .and_then(Value::as_object)
-            .ok_or(())?;
+        let empty_delta = serde_json::Map::new();
+        let delta = match event_choice.get("delta") {
+            Some(Value::Object(delta)) => delta,
+            Some(Value::Null)
+                if event_choice
+                    .get("finish_reason")
+                    .is_some_and(Value::is_string) =>
+            {
+                &empty_delta
+            }
+            _ => return Err(AggregateError::InvalidStream),
+        };
         if let Some(content) = delta.get("content").filter(|content| !content.is_null()) {
             append_bounded(&mut choice.content, content.as_str().ok_or(())?, used)?;
         }
@@ -196,7 +214,11 @@ fn apply_event(
                 }
                 append_bounded(slot.get_or_insert_with(String::new), fragment, used)?;
                 if matches!(field, "reasoning" | "reasoning_content") {
-                    choice.reasoning_ordered.push_str(fragment);
+                    // The same bytes are retained twice: once in the
+                    // upstream-specific field, again in ordered reasoning
+                    // used by Responses conversion. Account for BOTH copies
+                    // or long reasoning streams exceed the 2 MiB memory cap.
+                    append_bounded(&mut choice.reasoning_ordered, fragment, used)?;
                 }
             }
         }
@@ -286,6 +308,7 @@ pub(super) async fn aggregate(
     expected: u64,
     requested_model: &str,
     tool_choice: Option<&Value>,
+    mut circuit_ticket: Option<&mut Ticket>,
 ) -> Result<Value, AggregateError> {
     let mime = upstream
         .headers()
@@ -317,7 +340,17 @@ pub(super) async fn aggregate(
         let bytes = match tokio::time::timeout(STREAM_IDLE, upstream.chunk()).await {
             Err(_) => return Err(AggregateError::IdleTimeout),
             Ok(Err(_)) => return Err(AggregateError::UpstreamTransport),
-            Ok(Ok(None)) => return Err(AggregateError::InvalidStream),
+            Ok(Ok(None)) => {
+                // Some OpenAI-compatible SSE servers end cleanly at EOF
+                // after every choice's finish_reason without the optional
+                // [DONE] sentinel. Match direct Chat streaming behavior,
+                // but never accept a partial line, event or unfinished choice.
+                if parser.finalize_on_eof().is_none() {
+                    return Err(AggregateError::InvalidStream);
+                }
+                parser.finish().map_err(|_| ())?;
+                break;
+            }
             Ok(Ok(Some(bytes))) => bytes,
         };
         if bytes.len() > MAX_CHUNK_BYTES {
@@ -329,7 +362,14 @@ pub(super) async fn aggregate(
         if total_received > MAX_TOTAL_STREAM_BYTES {
             return Err(AggregateError::InputLimit);
         }
-        for frame in parser.push(&bytes).map_err(|_| ())? {
+        let frames = parser.push(&bytes).map_err(|_| {
+            if parser.hit_resource_limit() {
+                AggregateError::InputLimit
+            } else {
+                AggregateError::InvalidStream
+            }
+        })?;
+        for frame in frames {
             account_event(&mut event_count)?;
             if let Some(event) = event_payload(&frame)? {
                 apply_event(
@@ -342,6 +382,14 @@ pub(super) async fn aggregate(
                     &mut model,
                 )?;
             }
+        }
+        // SSE-only JSON aggregation is also a long-lived probe. Only valid
+        // content/tool deltas extend its half-open idle lease; completion
+        // still requires the full, valid stream.
+        if parser.take_progress()
+            && let Some(ticket) = circuit_ticket.as_deref_mut()
+        {
+            ticket.progress();
         }
         if parser.is_done() {
             parser.finish().map_err(|_| ())?;
@@ -398,6 +446,39 @@ pub(super) async fn aggregate(
 #[cfg(test)]
 mod output_budget_tests {
     use super::*;
+    #[test]
+    fn terminal_null_delta_is_valid_but_nonterminal_null_is_not() {
+        let mut choices = vec![Choice::default()];
+        let mut used = 0;
+        let mut usage = Value::Null;
+        let mut id = None;
+        let mut created = None;
+        let mut model = None;
+        let mut feed = |value: Value| {
+            apply_event(
+                &value,
+                &mut choices,
+                &mut used,
+                &mut usage,
+                &mut id,
+                &mut created,
+                &mut model,
+            )
+        };
+        feed(json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}))
+            .unwrap();
+        feed(json!({"choices":[{"index":0,"delta":null,"finish_reason":"stop"}]})).unwrap();
+        assert_eq!(choices[0].content, "ok");
+        assert_eq!(choices[0].finish_reason.as_deref(), Some("stop"));
+        let mut used = 0;
+        assert!(
+            with_event(
+                json!({"choices":[{"index":0,"delta":null,"finish_reason":null}]}),
+                &mut used
+            )
+            .is_err()
+        );
+    }
     fn with_event(value: Value, used: &mut usize) -> Result<(), AggregateError> {
         let mut choices = vec![Choice::default()];
         let mut usage = Value::Null;
@@ -440,6 +521,24 @@ mod output_budget_tests {
             .unwrap();
         }
         assert_eq!(choices[0].reasoning_ordered, "thinking continues mirror");
+        assert_eq!(used, 2 * "thinking continues mirror".len());
+    }
+
+    #[test]
+    fn ordered_reasoning_duplicate_retention_respects_global_output_budget() {
+        let event = json!({
+            "choices":[{"index":0,"delta":{
+                "reasoning_content":"r".repeat(100)
+            },"finish_reason":null}]
+        });
+        let mut used = 0;
+        with_event(event.clone(), &mut used).unwrap();
+        assert_eq!(used, 200, "both retained reasoning copies consume memory");
+        let mut near_limit = MAX_AGGREGATED_OUTPUT_BYTES - 150;
+        assert!(matches!(
+            with_event(event, &mut near_limit),
+            Err(AggregateError::OutputLimit)
+        ));
     }
 
     #[test]

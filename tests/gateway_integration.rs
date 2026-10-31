@@ -8,7 +8,7 @@ use axum::{
 };
 use guvna::{
     config::Config,
-    gateway::{AppState, app},
+    gateway::{AppState, app, app_with_state},
 };
 use serde_json::{Value, json};
 use std::{
@@ -96,6 +96,16 @@ async fn upstream(State(state): State<UpstreamState>, request: Request<Body>) ->
             "missingtoolcalls" => completion["choices"][0]["finish_reason"] = json!("tool_calls"),
             "wrongtoolcalls" => completion["choices"][0]["message"]["tool_calls"] = json!("bad"),
             "nulltoolcalls" => completion["choices"][0]["message"]["tool_calls"] = Value::Null,
+            "truncatedtool" | "filteredtool" => {
+                completion["choices"][0]["finish_reason"] = if mode == "truncatedtool" {
+                    json!("length")
+                } else {
+                    json!("content_filter")
+                };
+                completion["choices"][0]["message"] = json!({"role":"assistant","content":null,
+                    "tool_calls":[{"id":"call_partial","type":"function",
+                        "function":{"name":"lookup","arguments":"{\"partial\":"}}]});
+            }
             _ => unreachable!(),
         }
         return (StatusCode::OK, axum::Json(completion)).into_response();
@@ -176,6 +186,200 @@ chains:
 }
 
 #[tokio::test]
+async fn online_chain_addition_is_recorded_as_verified_model_not_passthrough() {
+    use guvna::gateway::app_with_state;
+    use rusqlite::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let base: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_env: KEY\nchains:\n  - name: fixed\n    steps:\n      - provider: p\n        model: static\n"
+    ))
+    .unwrap();
+    let mut state = AppState::new(
+        base.clone(),
+        HashMap::from([("KEY".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, running) = app_with_state(state);
+    let next: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_env: KEY\nchains:\n  - name: fixed\n    steps:\n      - provider: p\n        model: static\n  - name: dynamic\n    steps:\n      - provider: p\n        model: fresh\n"
+    ))
+    .unwrap();
+    running.replace_route_snapshot(next).unwrap();
+    let (status, result) = call(router.clone(), request("dynamic", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(running.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let (model, verified): (String, i64) = db
+        .query_row(
+            "SELECT model, identity_verified FROM request_events WHERE endpoint='chat'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((model.as_str(), verified), ("fresh", 1));
+    running.replace_route_snapshot(base).unwrap();
+    let (status, result) = call(router, request("dynamic", "", "client")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{result}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn live_auto_candidate_add_and_delete_invalidates_empty_route_cache() {
+    use guvna::gateway::app_with_state;
+
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let base: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_env: KEY\nauto:\n  enabled: true\n  discover_from_chains: true\n  candidates:\n    - provider: p\n      model: impossible\n      min_input_bytes: 9999999\n"
+    ))
+    .unwrap();
+    let (router, state) = app_with_state(
+        AppState::new(
+            base.clone(),
+            HashMap::from([("KEY".into(), "secret".into())]),
+            vec!["client".into()],
+        )
+        .unwrap(),
+    );
+    let (status, _) = call(router.clone(), request("auto", "", "client")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+    let mut added = base.clone();
+    added.chains.push(
+        serde_yaml::from_str("name: online\nsteps:\n  - provider: p\n    model: discovered\n")
+            .unwrap(),
+    );
+    state.replace_route_snapshot(added).unwrap();
+    assert_eq!(state.runtime_status()["auto_candidate_count"], 2);
+    let (status, result) = call(router.clone(), request("auto", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(result["model"], "discovered");
+
+    state.replace_route_snapshot(base).unwrap();
+    assert_eq!(state.runtime_status()["auto_candidate_count"], 1);
+    let (status, _) = call(router, request("auto", "", "client")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "deleted Auto candidate must never be retried from cache"
+    );
+}
+
+#[tokio::test]
+async fn failed_first_candidate_is_correlated_with_one_terminal_request_and_scoring() {
+    use guvna::gateway::app_with_state;
+    use rusqlite::{Connection, params};
+    let dir = tempfile::tempdir().unwrap();
+    let (bad, bad_calls) = start_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let (good, good_calls) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: broken
+    type: openai
+    base_url: {bad}
+    key_env: FIRST
+  - name: healthy
+    type: openai
+    base_url: {good}
+    key_env: SECOND
+chains:
+  - name: demo
+    steps:
+      - provider: broken
+        model: one
+      - provider: healthy
+        model: two
+"#
+    ))
+    .unwrap();
+    let mut state = AppState::new(
+        config,
+        HashMap::from([
+            ("FIRST".into(), "secret-one".into()),
+            ("SECOND".into(), "secret-two".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, shared) = app_with_state(state);
+    let (status, result) = call(router, request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(bad_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(good_calls.load(Ordering::SeqCst), 1);
+    assert!(shared.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let (request_id, attempt, stream): (String, i64, i64) = db
+        .query_row(
+            "SELECT request_id,attempt_index,stream_requested FROM request_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(!request_id.is_empty());
+    assert_eq!((attempt, stream), (2, 0));
+    let (fail_id, fail_attempt, fail_stream): (String, i64, i64) = db
+        .query_row(
+            "SELECT request_id,attempt_index,stream_requested FROM failure_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (fail_id, fail_attempt, fail_stream),
+        (request_id.clone(), 1, 0)
+    );
+    let requests: i64 = db
+        .query_row("SELECT COUNT(*) FROM request_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(requests, 1);
+    let scoring = guvna::scoring::read_scoring(dir.path(), 1).unwrap();
+    assert_eq!(scoring["request_metrics"]["traced_requests"], 1);
+    assert_eq!(scoring["request_metrics"]["requests_with_fallback"], 1);
+    assert_eq!(scoring["request_metrics"]["fallback_rate"], 1.0);
+    assert_eq!(scoring["request_metrics"]["first_attempt_nonstream"], 1);
+    assert_eq!(
+        scoring["request_metrics"]["first_attempt_successes_nonstream"],
+        0
+    );
+    assert_eq!(
+        scoring["request_metrics"]["first_attempt_success_rate_nonstream"],
+        0.0
+    );
+    // A trace is operational metadata, never a source for credentials or prompts.
+    assert!(!request_id.contains("secret"));
+    let unknown: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM request_events WHERE request_id=?1",
+            params![request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unknown, 1);
+    let (penalty, failures): (i64, i64) = db
+        .query_row(
+            "SELECT penalty,consecutive_failures FROM provider_health
+             WHERE provider='broken' AND model='one'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (penalty, failures),
+        (35, 1),
+        "a genuine upstream 5xx must still update persisted provider health"
+    );
+}
+
+#[tokio::test]
 async fn uncatalogued_prefixed_model_strips_only_the_gateway_namespace_on_wire() {
     let (upstream_url, calls) = start_upstream(StatusCode::OK).await;
     let config: Config = serde_yaml::from_str(&format!(
@@ -192,6 +396,134 @@ async fn uncatalogued_prefixed_model_strips_only_the_gateway_namespace_on_wire()
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(result["model"], "openai/gpt-4o");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn embedding_chain_ignores_chat_stream_and_choice_defaults() {
+    let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let observations = Arc::clone(&captured);
+    let upstream = Router::new().route(
+        "/v1/embeddings",
+        post(move |axum::Json(payload): axum::Json<Value>| {
+            let observations = Arc::clone(&observations);
+            async move {
+                observations.lock().await.push(payload);
+                axum::Json(json!({
+                    "object":"list","model":"physical",
+                    "data":[{"object":"embedding","index":0,
+                        "embedding":[0.25,0.5]}]
+                }))
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(socket, upstream).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: KEY
+chains:
+  - name: shared
+    steps:
+      - provider: p
+        model: physical
+        params:
+          stream_options:
+            include_usage: true
+          n: 2
+          tool_choice: required
+          tools:
+            - type: function
+              function:
+                name: lookup
+          parallel_tool_calls: true
+          response_format:
+            type: json_object
+          logprobs: true
+          top_logprobs: 4
+          temperature: 0.7
+          top_p: 0.8
+          max_tokens: 100
+          max_completion_tokens: 101
+          max_output_tokens: 102
+          stop: ["end"]
+          presence_penalty: 0.1
+          frequency_penalty: 0.2
+          seed: 42
+          reasoning_effort: low
+          dimensions: 2
+"#
+    ))
+    .unwrap();
+    let gateway = app(AppState::new(
+        config,
+        HashMap::from([("KEY".into(), "test-secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/embeddings")
+        .header("authorization", "Bearer client")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "model":"shared","input":"hello","stream":false
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let (status, result) = call(gateway.clone(), request).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["data"][0]["embedding"], json!([0.25, 0.5]));
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].get("stream").is_none());
+    assert!(requests[0].get("stream_options").is_none());
+    assert!(requests[0].get("n").is_none());
+    for chat_only in [
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "response_format",
+        "logprobs",
+        "top_logprobs",
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "stop",
+        "presence_penalty",
+        "frequency_penalty",
+        "seed",
+        "reasoning_effort",
+    ] {
+        assert!(
+            requests[0].get(chat_only).is_none(),
+            "{chat_only} leaked into Embeddings"
+        );
+    }
+    assert_eq!(requests[0]["dimensions"], 2);
+    drop(requests);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/embeddings")
+        .header("authorization", "Bearer client")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "model":"shared","input":"hello","stream":true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_ne!(call(gateway, request).await.0, StatusCode::OK);
+    assert_eq!(captured.lock().await.len(), 1);
 }
 
 #[tokio::test]
@@ -274,6 +606,425 @@ fn request(model: &str, extra: &str, key: &str) -> Request<Body> {
             r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}]{extra}}}"#
         )))
         .unwrap()
+}
+
+#[tokio::test]
+async fn issue147_streamed_reasoning_output_replays_in_following_json_turn() {
+    let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let events = Arc::clone(&captured);
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(payload): axum::Json<Value>| {
+            let events = Arc::clone(&events);
+            async move {
+                let streaming = payload["stream"] == true;
+                events.lock().await.push(payload);
+                if streaming {
+                    let first = json!({
+                        "id":"reasoning-stream","created":100,"model":"physical",
+                        "choices":[{"index":0,"delta":{
+                            "role":"assistant","reasoning_content":"internal reasoning",
+                            "content":"visible"
+                        },"finish_reason":null}]
+                    });
+                    let last = json!({
+                        "id":"reasoning-stream","created":100,"model":"physical",
+                        "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]
+                    });
+                    let data = format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n");
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/event-stream")],
+                        data,
+                    )
+                        .into_response()
+                } else {
+                    axum::Json(json!({
+                        "id":"next-reply","created":101,"model":"physical",
+                        "choices":[{"index":0,"message":{
+                            "role":"assistant","content":"continued"
+                        },"finish_reason":"stop"}]
+                    }))
+                    .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: K
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: physical
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "test-secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let stream = router
+        .clone()
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hello","stream":true,"store":false
+        })))
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    let bytes = to_bytes(stream.into_body(), 2 << 20).await.unwrap();
+    let frames = String::from_utf8(bytes.to_vec()).unwrap();
+    let complete = frames
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|payload| serde_json::from_str::<Value>(payload).ok())
+        .find(|event| event["type"] == "response.completed")
+        .expect("stream must complete with a fully replayable Response");
+    let output = complete["response"]["output"].as_array().unwrap();
+    assert_eq!(output[0]["type"], "reasoning");
+    assert_eq!(output[1]["type"], "message");
+    let mut replay = output.clone();
+    replay.push(json!({"role":"user","content":"continue"}));
+    let (status, second) = call(
+        router,
+        responses_stream_req(json!({
+            "model":"demo","input":replay,"stream":false,"store":false
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let seen = captured.lock().await;
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1]["messages"][0]["role"], "assistant");
+    assert_eq!(
+        seen[1]["messages"][0]["reasoning_content"],
+        "internal reasoning"
+    );
+    assert_eq!(seen[1]["messages"][0]["content"], "visible");
+    assert_eq!(seen[1]["messages"][1]["role"], "user");
+    assert_eq!(seen[1]["messages"][1]["content"], "continue");
+    server.abort();
+}
+
+#[tokio::test]
+async fn issue142_native_json_half_open_slow_recovery_accepts_two_next_requests() {
+    use std::time::Duration;
+    let visits = Arc::new(AtomicUsize::new(0));
+    let counts = Arc::clone(&visits);
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counts = Arc::clone(&counts);
+            async move {
+                let visit = counts.fetch_add(1, Ordering::SeqCst);
+                if visit == 0 {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(json!({
+                            "error":"initial outage"
+                        })),
+                    )
+                        .into_response();
+                }
+                if visit == 1 {
+                    // More than the old 20s probe lease, but strictly
+                    // within the 90s upstream attempt deadline.
+                    tokio::time::sleep(Duration::from_secs(22)).await;
+                } else {
+                    // Overlap both post-recovery requests. One would fail
+                    // over if the breaker were still HALF_OPEN.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({
+                        "id":"native-recovered", "created":100, "model":"physical",
+                        "choices":[{"index":0,"message":{
+                            "role":"assistant","content":"healthy native JSON"
+                        },"finish_reason":"stop"}]
+                    })),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let (backup, backup_calls) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: primary
+    type: openai
+    base_url: http://{addr}
+    key_env: FIRST
+    circuit_breaker:
+      enabled: true
+      failure_threshold: 1
+      cooldown: 100ms
+      max_cooldown: 800ms
+  - name: backup
+    type: openai
+    base_url: {backup}
+    key_env: SECOND
+chains:
+  - name: demo
+    steps:
+      - provider: primary
+        model: physical
+      - provider: backup
+        model: fallback
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("FIRST".into(), "primary-secret".into()),
+            ("SECOND".into(), "backup-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, first) = call(router.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["model"], "fallback");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let routed = router.clone();
+    let slow = tokio::spawn(async move { call(routed, request("demo", "", "client")).await });
+    tokio::time::sleep(Duration::from_secs(21)).await;
+    let (status, interleaved) = call(router.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{interleaved}");
+    assert_eq!(interleaved["model"], "fallback");
+    let (status, recovered) = tokio::time::timeout(Duration::from_secs(28), slow)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{recovered}");
+    assert_eq!(recovered["id"], "native-recovered");
+    let (one, two) = tokio::join!(
+        call(router.clone(), request("demo", "", "client")),
+        call(router, request("demo", "", "client")),
+    );
+    assert_eq!(one.0, StatusCode::OK);
+    assert_eq!(two.0, StatusCode::OK);
+    assert_eq!(one.1["id"], "native-recovered");
+    assert_eq!(two.1["id"], "native-recovered");
+    assert_eq!(visits.load(Ordering::SeqCst), 4);
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn issue147_full_reasoning_output_replays_across_two_http_responses_turns() {
+    let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let events = Arc::clone(&captured);
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(payload): axum::Json<Value>| {
+            let events = Arc::clone(&events);
+            async move {
+                events.lock().await.push(payload);
+                axum::Json(json!({
+                    "id":"roundtrip-reasoning", "created":100, "model":"physical",
+                    "choices":[{"index":0,"message":{
+                        "role":"assistant", "content":"visible answer",
+                        "reasoning_content":"separate reasoning text"
+                    },"finish_reason":"stop"}]
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: K
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: physical
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "test-secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, first) = call(
+        router.clone(),
+        responses_stream_req(json!({"model":"demo","input":"hello","store":false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["output"][0]["type"], "reasoning");
+    assert_eq!(first["output"][1]["type"], "message");
+    let mut previous = first["output"].as_array().unwrap().clone();
+    previous.push(json!({"role":"user","content":"continue"}));
+    let (status, second) = call(
+        router,
+        responses_stream_req(json!({"model":"demo","input":previous,"store":false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let seen = captured.lock().await;
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1]["messages"][0]["role"], "assistant");
+    assert_eq!(seen[1]["messages"][0]["content"], "visible answer");
+    assert_eq!(
+        seen[1]["messages"][0]["reasoning_content"],
+        "separate reasoning text"
+    );
+    assert_eq!(seen[1]["messages"][1]["role"], "user");
+    assert_eq!(seen[1]["messages"][1]["content"], "continue");
+    server.abort();
+}
+
+#[tokio::test]
+async fn redirecting_provider_opens_circuit_without_leaking_or_quarantining_key() {
+    use rusqlite::Connection;
+    let (redirected, redirect_hits) = start_upstream(StatusCode::FOUND).await;
+    let (healthy, healthy_hits) = start_upstream(StatusCode::OK).await;
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: redirecting\n    type: openai\n    base_url: {redirected}\n    key_env: REDIRECT_KEY\n    circuit_breaker:\n      enabled: true\n      failure_threshold: 2\n      cooldown: 10s\n      max_cooldown: 10s\n  - name: healthy\n    type: openai\n    base_url: {healthy}\n    key_env: GOOD_KEY\nchains:\n  - name: demo\n    steps:\n      - provider: redirecting\n        model: wrong-endpoint\n      - provider: healthy\n        model: working\n"
+    )).unwrap();
+    cfg.validate().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(
+        cfg,
+        HashMap::from([
+            ("REDIRECT_KEY".into(), "redirect-secret".into()),
+            ("GOOD_KEY".into(), "working-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, running) = app_with_state(state);
+    for _ in 0..5 {
+        let (status, body) = call(router.clone(), request("demo", "", "client")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["model"], "working");
+    }
+    assert_eq!(
+        redirect_hits.load(Ordering::SeqCst),
+        2,
+        "after two forbidden redirects, the circuit must skip the broken provider"
+    );
+    assert_eq!(healthy_hits.load(Ordering::SeqCst), 5);
+    assert!(running.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let (redirects, mislabeled): (i64, i64) = db
+        .query_row(
+            "SELECT
+            COALESCE(SUM(failure_type='upstream_unavailable'),0),
+            COALESCE(SUM(failure_type='provider_5xx'),0)
+         FROM failure_events WHERE provider='redirecting' AND status=302",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        redirects, 2,
+        "real upstream redirects must be retained as outage evidence"
+    );
+    assert_eq!(mislabeled, 0, "HTTP 302 is not a provider 5xx response");
+}
+
+#[tokio::test]
+async fn mixed_caller_rejection_and_provider_outage_never_mislabels_request_as_invalid() {
+    for (first_status, second_status) in [
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (StatusCode::FOUND, StatusCode::UNPROCESSABLE_ENTITY),
+        (
+            StatusCode::from_u16(600).unwrap(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::from_u16(600).unwrap(),
+        ),
+    ] {
+        let (first, first_calls) = start_upstream(first_status).await;
+        let (second, second_calls) = start_upstream(second_status).await;
+        let router = make_app(&first, &second);
+        let (status, body) = call(router, request("demo", "", "client")).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "{first_status} -> {second_status}: {body}"
+        );
+        assert_eq!(body["error"]["code"], "upstream_unavailable");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            2,
+            "the first credential is intentionally rate limited before the second answers"
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_http_200_and_caller_422_in_either_order_cannot_blame_client() {
+    for (first_status, second_status) in [
+        (StatusCode::OK, StatusCode::UNPROCESSABLE_ENTITY),
+        (StatusCode::UNPROCESSABLE_ENTITY, StatusCode::OK),
+    ] {
+        let (first, first_calls) = start_upstream(first_status).await;
+        let (second, second_calls) = start_upstream(second_status).await;
+        let router = make_app(&first, &second);
+        // The OK mock intentionally returns a 200 Chat completion without
+        // choices. A different supplier's 422 cannot retroactively prove
+        // that the request itself was invalid.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"demo",
+                    "messages":[{"role":"user","content":"invalidchat:nochoices"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let (status, body) = call(router, request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "{first_status} -> {second_status}: {body}"
+        );
+        assert_eq!(body["error"]["code"], "upstream_unavailable");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 2);
+    }
 }
 
 #[tokio::test]
@@ -364,6 +1115,49 @@ async fn candidate_payload_overrides_do_not_leak_to_fallback_steps() {
 }
 
 #[tokio::test]
+async fn go_auto_discovered_chain_params_fill_missing_and_never_override_caller_values() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {url}
+    key_env: K
+    models: [x]
+chains:
+  - name: primary
+    steps:
+      - provider: p
+        model: x
+        params: {{temperature: 0.25}}
+default_chain: primary
+auto:
+  enabled: true
+  discover_from_chains: true
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for (extra, expected) in [
+        ("", json!(0.25)),
+        (r#","temperature":0.75"#, json!(0.75)),
+        (r#","temperature":null"#, Value::Null),
+    ] {
+        let (status, result) = call(router.clone(), request("auto", extra, "client")).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["model"], "x");
+        assert_eq!(result["debug_temperature"], expected);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
 async fn default_chain_routes_unknown_model_but_not_named_or_prefixed_models() {
     let (upstream_url, calls) = start_upstream(StatusCode::OK).await;
     let config: Config = serde_yaml::from_str(&format!(
@@ -448,6 +1242,128 @@ chains:
     let (_, metrics) = get_metrics(router, Some("client")).await;
     assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 1);
     assert_eq!(metric_value(&metrics, "upstream_attempts_total"), 3);
+}
+
+#[tokio::test]
+async fn auto_health_only_demotes_after_all_credentials_are_rate_limited() {
+    for healthy_peer_key in [true, false] {
+        let (primary, primary_hits) = start_upstream(StatusCode::OK).await;
+        let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+        let key_configuration = if healthy_peer_key {
+            "key_envs: [BAD, GOOD]"
+        } else {
+            "key_env: BAD"
+        };
+        let config: Config = serde_yaml::from_str(&format!(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {primary}
+    {key_configuration}
+    rotation: sequential
+    quarantine:
+      rate_limit: 10m
+  - name: q
+    type: openai
+    base_url: {backup}
+    key_env: ALT
+auto:
+  enabled: true
+  health_aware: true
+  candidates:
+    - provider: p
+      model: primary-model
+      priority: 1
+    - provider: q
+      model: backup-model
+      priority: 2
+"#
+        ))
+        .unwrap();
+        let gateway = app(AppState::new(
+            config,
+            HashMap::from([
+                ("BAD".into(), "bad".into()),
+                ("GOOD".into(), "good".into()),
+                ("ALT".into(), "alternate".into()),
+            ]),
+            vec!["client".into()],
+        )
+        .unwrap());
+        let payload = json!({"messages":[{"role":"user","content":"hello"}]});
+        let expected = if healthy_peer_key {
+            "primary-model"
+        } else {
+            "backup-model"
+        };
+        for _ in 0..2 {
+            let (status, result) = call(
+                gateway.clone(),
+                auto_request("/v1/auto", "client", payload.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(result["model"], expected);
+        }
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            if healthy_peer_key { 3 } else { 1 },
+            "a successful peer key cannot cause whole-model demotion"
+        );
+        assert_eq!(
+            backup_hits.load(Ordering::SeqCst),
+            if healthy_peer_key { 0 } else { 2 },
+            "all-429 exhaustion must still reroute Auto to the healthy model"
+        );
+    }
+}
+
+#[tokio::test]
+async fn duplicate_key_values_do_not_repeat_the_same_upstream_429_or_inflate_capacity() {
+    use guvna::gateway::app_with_state;
+    let (url, calls) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: only
+    type: openai
+    base_url: {url}
+    key_envs: [ALIAS_A, ALIAS_B]
+    rotation: sequential
+    quarantine:
+      rate_limit: 1h
+chains:
+  - name: demo
+    steps:
+      - provider: only
+        model: one
+"#
+    ))
+    .unwrap();
+    let (router, state) = app_with_state(
+        AppState::new(
+            config,
+            HashMap::from([
+                ("ALIAS_A".into(), "bad".into()),
+                ("ALIAS_B".into(), "bad".into()),
+            ]),
+            vec!["client".into()],
+        )
+        .unwrap(),
+    );
+    assert_eq!(state.runtime_status()["key_health"]["configured"], 1);
+    let (status, body) = call(router.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["code"], "providers_rate_limited");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let (status, _) = call(router, request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "cooldown must block both aliases"
+    );
 }
 
 #[tokio::test]
@@ -712,10 +1628,14 @@ async fn serve_sse(State(state): State<SseUpstream>) -> impl IntoResponse {
 }
 
 async fn start_sse(chunks: Vec<&'static [u8]>) -> (String, Arc<AtomicUsize>) {
+    start_sse_owned(chunks.into_iter().map(Bytes::from_static).collect()).await
+}
+
+async fn start_sse_owned(chunks: Vec<Bytes>) -> (String, Arc<AtomicUsize>) {
     let hits = Arc::new(AtomicUsize::new(0));
     let state = SseUpstream {
         hits: hits.clone(),
-        chunks: chunks.into_iter().map(Bytes::from_static).collect(),
+        chunks,
     };
     let router = Router::new()
         .route("/v1/chat/completions", post(serve_sse))
@@ -734,7 +1654,7 @@ const SSE_END: &[u8] =
 const SSE_DONE: &[u8] = b"data: [DONE]\n\n";
 
 #[tokio::test(flavor = "current_thread")]
-async fn healthy_stream_survives_ninety_seconds_of_regular_progress() {
+async fn healthy_stream_survives_ninety_seconds_of_real_content_progress() {
     use std::time::Duration;
 
     let upstream = Router::new().route(
@@ -746,7 +1666,13 @@ async fn healthy_stream_survives_ninety_seconds_of_regular_progress() {
                     1..=20 => {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         Some((
-                            Ok(Bytes::from_static(b": upstream heartbeat\n\n")),
+                            Ok(if index % 2 == 0 {
+                                Bytes::from_static(
+                                    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\".\"},\"finish_reason\":null}]}\n\n",
+                                )
+                            } else {
+                                Bytes::from_static(b": upstream heartbeat\n\n")
+                            }),
                             index + 1,
                         ))
                     }
@@ -795,6 +1721,56 @@ async fn healthy_stream_survives_ninety_seconds_of_regular_progress() {
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
     assert!(!text.contains("upstream_stream_incomplete"), "{text}");
+}
+
+#[tokio::test]
+async fn heartbeat_only_chat_sse_cannot_hold_a_request_forever() {
+    use std::time::Duration;
+    let (url, hits) = start_progressing_aggregation().await;
+    let router = make_app(&url, &url);
+    let response = router
+        .clone()
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // First valid content has already passed the preflight. The provider
+    // now sends a never-ending heartbeat comment every five seconds.
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let task = tokio::spawn(async move { to_bytes(response.into_body(), 1 << 20).await });
+    for _ in 0..24 {
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        if task.is_finished() {
+            break;
+        }
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        task.is_finished(),
+        "heartbeats still held the SSE permit after {elapsed:?}"
+    );
+    assert!(
+        (Duration::from_secs(60)..Duration::from_secs(75)).contains(&elapsed),
+        "progress watchdog expired too early or too late: {elapsed:?}"
+    );
+    tokio::time::resume();
+    let bytes = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "chat_stream_failed_total"), 1);
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 0);
+    assert_eq!(metric_value(&metrics, "active_requests"), 0);
 }
 
 #[tokio::test]
@@ -866,6 +1842,69 @@ async fn sse_truncated_finish_event_never_claims_success() {
     assert!(text.contains("upstream_stream_incomplete"), "{text}");
     assert!(!text.contains("data: [DONE]"), "{text}");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn unsupported_legacy_sse_delta_fails_over_before_client_sees_output() {
+    for delta in [
+        json!({"function_call":{"name":"legacy","arguments":"{}"}}),
+        json!({"audio":{"id":"audio-1","data":"x"}}),
+    ] {
+        let frame = format!(
+            "data: {}\n\n",
+            json!({
+                "choices":[{"index":0,"delta":delta,"finish_reason":null}]
+            })
+        );
+        let (bad, bad_hits) = start_sse_owned(vec![Bytes::from(frame)]).await;
+        let (good, good_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+        let response = make_app(&bad, &good)
+            .oneshot(request("demo", r#","stream":true"#, "client"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        assert!(!text.contains("function_call"), "{text}");
+        assert!(!text.contains("audio-1"), "{text}");
+        assert_eq!(bad_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(good_hits.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn changed_sse_generation_after_first_chunk_is_incomplete_without_replay() {
+    let first = br#"data: {"id":"generation-one","model":"m1","created":100,"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}
+
+"#;
+    let second = br#"data: {"id":"generation-two","model":"m1","created":100,"choices":[{"index":0,"delta":{"content":"poisoned"},"finish_reason":"stop"}]}
+
+"#;
+    let (bad, bad_hits) = start_sse(vec![first, second, SSE_DONE]).await;
+    let (good, good_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let response = make_app(&bad, &good)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(text.contains("partial"), "{text}");
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("poisoned"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(bad_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        good_hits.load(Ordering::SeqCst),
+        0,
+        "never replay visible text"
+    );
 }
 
 #[tokio::test]
@@ -1013,6 +2052,64 @@ async fn streamed_required_tool_choice_cannot_complete_plain_text() {
 }
 
 #[tokio::test]
+async fn empty_sse_stop_is_not_committed_as_a_successful_chat_answer() {
+    // The downstream has already received SSE headers, so it must receive
+    // an incomplete-stream error rather than a fabricated successful end.
+    let role_only = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
+    let (upstream, hits) = start_sse(vec![role_only, SSE_END, SSE_DONE]).await;
+    let response = make_app(&upstream, &upstream)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // Non-stream callers can still fall back before any answer is exposed.
+    let (stream_only, stream_hits, _) =
+        start_strict_stream_only(vec![SSE_END.to_vec(), SSE_DONE.to_vec()]).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let gateway = app_with_stream_only_and_auto(&stream_only, &backup, false);
+    let (status, output) = call(gateway, request("ordered", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(output["choices"][0]["message"]["content"], "success");
+    assert_eq!(stream_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn malformed_provisional_usage_is_not_a_successful_stream_or_aggregation() {
+    let malformed = aggregate_chat_frame(json!({
+        "choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":6}
+    }));
+    let (upstream, hits) = start_sse_owned(vec![
+        Bytes::from(malformed.clone()),
+        Bytes::from_static(SSE_DONE),
+    ])
+    .await;
+    let response = make_app(&upstream, &upstream)
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(hits.load(Ordering::SeqCst) >= 1);
+
+    let (primary, primary_hits, _) =
+        start_strict_stream_only(vec![malformed, SSE_DONE.to_vec()]).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let gateway = app_with_stream_only_and_auto(&primary, &backup, false);
+    let (status, output) = call(gateway, request("ordered", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(output["choices"][0]["message"]["content"], "success");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn malformed_tool_arguments_cannot_complete_chat_stream() {
     let tool = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"[1]\"}}]},\"finish_reason\":null}]}\n\n";
     let finish =
@@ -1077,12 +2174,412 @@ async fn malformed_sse_after_first_event_does_not_fail_over_or_claim_success() {
 }
 
 #[tokio::test]
+async fn streamed_json_mode_detects_non_json_completion_without_false_success() {
+    let (invalid_url, invalid_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let (backup_url, backup_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let router = make_app(&invalid_url, &backup_url);
+    let response = router
+        .clone()
+        .oneshot(request(
+            "demo",
+            r#","stream":true,"response_format":{"type":"json_object"}"#,
+            "client",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(invalid_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "upstream_success_total"), 0);
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        1
+    );
+
+    let start = format!(
+        "data: {}\n\n",
+        json!({"choices":[{"index":0,
+        "delta":{"content":"{\"ok\":"},"finish_reason":null}]})
+    );
+    let end = format!(
+        "data: {}\n\n",
+        json!({"choices":[{"index":0,
+        "delta":{"content":"true}"},"finish_reason":"stop"}]})
+    );
+    let (valid_url, valid_hits, _) = start_strict_stream_only(vec![
+        start.into_bytes(),
+        end.into_bytes(),
+        SSE_DONE.to_vec(),
+    ])
+    .await;
+    let valid_router = make_app(&valid_url, &valid_url);
+    let response = valid_router
+        .clone()
+        .oneshot(request(
+            "demo",
+            r#","stream":true,"response_format":{"type":"json_object"}"#,
+            "client",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert!(body.ends_with(b"data: [DONE]\n\n"), "{body:?}");
+    assert_eq!(valid_hits.load(Ordering::SeqCst), 1);
+    let (_, metrics) = get_metrics(valid_router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "upstream_success_total"), 1);
+}
+
+#[tokio::test]
+async fn malformed_or_truncated_sse_never_quarantines_a_healthy_credential() {
+    for frames in [
+        vec![SSE_START, b"data: not-json\n\n".as_slice()],
+        vec![SSE_START],
+    ] {
+        let (url, hits) = start_sse(frames).await;
+        let cfg: Config = serde_yaml::from_str(&format!(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {url}
+    key_env: K
+    quarantine:
+      transient: 30s
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: x
+"#
+        ))
+        .unwrap();
+        let app = app(AppState::new(
+            cfg,
+            HashMap::from([("K".into(), "key".into())]),
+            vec!["client".into()],
+        )
+        .unwrap());
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(request("demo", r#","stream":true"#, "client"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("upstream_stream_incomplete"),
+                "{body:?}"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "valid key was quarantined");
+        let (_, metrics) = get_metrics(app, Some("client")).await;
+        assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 0);
+        assert_eq!(
+            metric_value(&metrics, "upstream_transport_failures_total"),
+            0
+        );
+        assert_eq!(
+            metric_value(&metrics, "upstream_invalid_responses_total"),
+            2
+        );
+        assert_eq!(metric_value(&metrics, "chat_stream_failed_total"), 2);
+    }
+}
+
+#[tokio::test]
+async fn native_json_body_reset_is_transport_failure_and_quarantines_key() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let broken = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(|State(hits): State<Arc<AtomicUsize>>| async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let chunks = futures_util::stream::unfold(0u8, |step| async move {
+                    match step {
+                        0 => Some((
+                            Ok::<_, std::io::Error>(Bytes::from_static(b"{\"choices\":[")),
+                            1,
+                        )),
+                        1 => {
+                            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+                            Some((
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    "injected JSON body reset",
+                                )),
+                                2,
+                            ))
+                        }
+                        _ => None,
+                    }
+                });
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    Body::from_stream(chunks),
+                )
+            }),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, broken).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: K
+    quarantine:
+      transient: 30s
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: x
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "key".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, _) = call(router.clone(), request("demo", "", "client")).await;
+    assert_ne!(status, StatusCode::OK);
+    let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(
+        metric_value(&metrics, "upstream_transport_failures_total"),
+        1
+    );
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        0
+    );
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 1);
+    let (status, _) = call(router, request("demo", "", "client")).await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "quarantined key retried");
+}
+
+#[tokio::test]
+async fn first_sse_body_transport_failure_quarantines_key_but_bad_json_does_not() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let broken = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(|State(hits): State<Arc<AtomicUsize>>| async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let chunks = futures_util::stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+                    Err::<Bytes, std::io::Error>(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "injected first SSE body read failure",
+                    ))
+                });
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(chunks),
+                )
+            }),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, broken).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: K
+    quarantine:
+      transient: 30s
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: x
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "key".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let first = router
+        .clone()
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_ne!(first.status(), StatusCode::OK);
+    let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(
+        metric_value(&metrics, "upstream_transport_failures_total"),
+        1
+    );
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        0
+    );
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 1);
+    let again = router
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_ne!(again.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "quarantined key retried");
+
+    let (malformed_url, malformed_hits) = start_sse(vec![b"data: not-json\n\n"]).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {malformed_url}
+    key_env: K
+    quarantine:
+      transient: 30s
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: x
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "key".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for _ in 0..2 {
+        let response = router
+            .clone()
+            .oneshot(request("demo", r#","stream":true"#, "client"))
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(malformed_hits.load(Ordering::SeqCst), 2);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        2
+    );
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 0);
+}
+
+#[tokio::test]
+async fn midstream_tcp_error_quarantines_transient_key_without_replaying_stream() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let broken = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(|State(hits): State<Arc<AtomicUsize>>| async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                // Flush a valid SSE frame before injecting the transport
+                // error, so the preflight has already committed HTTP 200.
+                let chunks = futures_util::stream::unfold(0u8, |step| async move {
+                    match step {
+                        0 => Some((Ok::<_, std::io::Error>(Bytes::from_static(SSE_START)), 1)),
+                        1 => {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            Some((
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    "injected upstream body reset",
+                                )),
+                                2,
+                            ))
+                        }
+                        _ => None,
+                    }
+                });
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(chunks),
+                )
+            }),
+        )
+        .with_state(hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, broken).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: K
+    quarantine:
+      transient: 30s
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: x
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "key".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let response = router
+        .clone()
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 1);
+    assert_eq!(
+        metric_value(&metrics, "upstream_transport_failures_total"),
+        1
+    );
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        0
+    );
+    let rejected = router
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_ne!(rejected.status(), StatusCode::OK);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "quarantined key was retried"
+    );
+}
+
+#[tokio::test]
 async fn multi_event_chunk_preserves_order_and_one_terminal_marker() {
     let mut combined = Vec::new();
     combined.extend_from_slice(SSE_START);
     combined.extend_from_slice(SSE_END);
     combined.extend_from_slice(SSE_DONE);
-    let (upstream, hits) = start_sse(vec![Box::leak(combined.into_boxed_slice())]).await;
+    let (upstream, hits) = start_sse_owned(vec![Bytes::from(combined)]).await;
     let response = make_app(&upstream, &upstream)
         .oneshot(request("demo", r#","stream":true"#, "client"))
         .await
@@ -1100,7 +2597,9 @@ async fn oversized_first_sse_chunk_fails_over_before_response_starts() {
     let oversized: &'static [u8] = Box::leak(vec![b'x'; 2 * 1024 * 1024 + 1].into_boxed_slice());
     let (a, bad_hits) = start_sse(vec![oversized]).await;
     let (b, good_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
-    let response = make_app(&a, &b)
+    let router = make_app(&a, &b);
+    let response = router
+        .clone()
         .oneshot(request("demo", r#","stream":true"#, "client"))
         .await
         .unwrap();
@@ -1109,6 +2608,16 @@ async fn oversized_first_sse_chunk_fails_over_before_response_starts() {
     assert!(bytes.ends_with(SSE_DONE));
     assert_eq!(bad_hits.load(Ordering::SeqCst), 1);
     assert_eq!(good_hits.load(Ordering::SeqCst), 1);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 0);
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        0
+    );
+    assert_eq!(
+        metric_value(&metrics, "upstream_transport_failures_total"),
+        0
+    );
 }
 
 #[tokio::test]
@@ -1131,6 +2640,251 @@ async fn oversized_later_sse_chunk_returns_incomplete_without_failover() {
     assert!(!text.contains("[DONE]"));
     assert_eq!(first_hits.load(Ordering::SeqCst), 1);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn issue137_f03_slow_downstream_large_json_bodies_hold_bounded_capacity() {
+    use std::time::Duration;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream_hits = Arc::clone(&hits);
+    let output = "R".repeat(256 * 1024);
+    let fake = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let hits = Arc::clone(&upstream_hits);
+            let output = output.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({
+                    "id":"large-chat","created":123,"model":"physical",
+                    "choices":[{"index":0,"message":{
+                        "role":"assistant","content":output
+                    },"finish_reason":"stop"}]
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, fake).await.unwrap() });
+    let cfg: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://{addr}
+    key_env: K
+chains:
+  - name: bulk
+    steps:
+      - provider: p
+        model: physical
+"#
+    ))
+    .unwrap();
+    let (router, state) = app_with_state(
+        AppState::new(
+            cfg,
+            HashMap::from([("K".into(), "test-secret".into())]),
+            vec!["client".into()],
+        )
+        .unwrap(),
+    );
+    let response = |path: &'static str| {
+        let payload = if path == "/v1/responses" {
+            json!({"model":"bulk","input":"hello"})
+        } else {
+            json!({"model":"bulk","messages":[{"role":"user","content":"hello"}]})
+        };
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    };
+    // Hold both outbound bodies without reading a byte. A non-streaming
+    // Responses translation must preserve the same reservation as Chat.
+    let first = router
+        .clone()
+        .oneshot(response("/v1/chat/completions"))
+        .await
+        .unwrap();
+    let second = router
+        .clone()
+        .oneshot(response("/v1/responses"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(3),
+        router.clone().oneshot(response("/v1/chat/completions")),
+    )
+    .await
+    .expect("large response backpressure must be bounded")
+    .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(rejected.headers()["retry-after"], "1");
+    let rejected_body: Value =
+        serde_json::from_slice(&to_bytes(rejected.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(rejected_body["error"]["code"], "large_response_busy");
+    assert_eq!(state.runtime_status()["upstream_success"], 2);
+    assert_eq!(state.runtime_status()["upstream_transport_failures"], 0);
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    drop(first);
+    let recovered = router
+        .clone()
+        .oneshot(response("/v1/chat/completions"))
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
+    drop(second);
+    drop(recovered);
+    let next = router
+        .oneshot(response("/v1/chat/completions"))
+        .await
+        .unwrap();
+    assert_eq!(next.status(), StatusCode::OK);
+    let bytes = to_bytes(next.into_body(), 1 << 20).await.unwrap();
+    assert!(bytes.len() > 200 * 1024);
+}
+
+#[tokio::test]
+async fn issue137_f02_large_parsed_requests_hold_memory_slots_through_upstream_wait() {
+    use std::time::Duration;
+    let (upstream, calls) = start_slow_walk_provider(Duration::from_secs(4), StatusCode::OK).await;
+    let router = walk_budget_router(&upstream, &upstream, "9s", false);
+    let big_request = json!({
+        "model":"budget",
+        "messages":[{"role":"user","content":"A".repeat(192 * 1024)}]
+    })
+    .to_string();
+    let send = |router: Router, body: String| async move {
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("authorization", "Bearer client")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    };
+    let mut inflight = Vec::new();
+    for _ in 0..8 {
+        inflight.push(tokio::spawn(send(router.clone(), big_request.clone())));
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while calls.load(Ordering::SeqCst) < 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all eight large parsed trees should remain in flight");
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(2),
+        send(router.clone(), big_request.clone()),
+    )
+    .await
+    .expect("large payload memory must have bounded admission");
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(rejected.headers()["retry-after"], "1");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        8,
+        "ninth large request must not contact upstream with all slots held"
+    );
+    for task in inflight {
+        task.abort();
+        let _ = task.await;
+    }
+    let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(metric_value(&metrics, "active_requests"), 0);
+    // A freed payload slot must accept the next large request rather than
+    // leaking capacity across cancelled upstream calls.
+    let recovered = tokio::time::timeout(Duration::from_secs(7), send(router, big_request))
+        .await
+        .expect("cancelled large requests must release all payload reservations");
+    assert_eq!(recovered.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn parsed_auto_and_responses_keep_large_upload_slots_until_provider_completes() {
+    use std::time::Duration;
+    let (upstream, hits) = start_slow_walk_provider(Duration::from_secs(3), StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {upstream}
+    key_env: K
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: physical
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: physical
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let content = "large".repeat(40_000);
+    let auto = json!({"messages":[{"role":"user","content":content}]});
+    let responses = json!({"model":"demo","input":content});
+    let mut inflight = Vec::new();
+    for index in 0..8 {
+        let router = router.clone();
+        let request = if index % 2 == 0 {
+            auto_request("/v1/auto", "client", auto.clone())
+        } else {
+            auto_request("/v1/responses", "client", responses.clone())
+        };
+        inflight.push(tokio::spawn(async move {
+            router.oneshot(request).await.unwrap()
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while hits.load(Ordering::SeqCst) < 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both parsed routes must hold eight upstream calls open");
+    let rejected = router
+        .clone()
+        .oneshot(auto_request("/v1/auto", "client", auto.clone()))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(rejected.headers()["retry-after"], "1");
+    assert_eq!(hits.load(Ordering::SeqCst), 8);
+    for task in inflight {
+        task.abort();
+        let _ = task.await;
+    }
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(5),
+        router.oneshot(auto_request("/v1/responses", "client", responses)),
+    )
+    .await
+    .expect("cancelled parsed routes must release upload memory")
+    .unwrap();
+    assert_eq!(recovered.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -1327,6 +3081,811 @@ async fn catalog_exposes_configured_provider_models_without_upstream_discovery()
 }
 
 #[tokio::test]
+async fn responses_force_one_choice_even_when_chain_defaults_request_multiple() {
+    let (json_url, json_hits) = start_upstream(StatusCode::OK).await;
+    let (sse_url, sse_hits) = start_sse(vec![
+        b"data: {\"id\":\"chatcmpl-one\",\"created\":123,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+        SSE_END,
+        SSE_DONE,
+    ]).await;
+    for (streaming, url) in [(false, json_url), (true, sse_url)] {
+        let config: Config = serde_yaml::from_str(&format!(
+            r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {url}
+    key_env: KEY
+chains:
+  - name: demo
+    steps:
+      - provider: p
+        model: physical
+        params:
+          n: 2
+"#
+        ))
+        .unwrap();
+        let router = app(AppState::new(
+            config,
+            HashMap::from([("KEY".into(), "safe-test-secret".into())]),
+            vec!["client".into()],
+        )
+        .unwrap());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"demo","input":"hello","stream":streaming
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        if streaming {
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(body.contains("event: response.completed"), "{body}");
+            assert!(!body.contains("response.failed"), "{body}");
+        } else {
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["status"], "completed", "{body}");
+            assert_eq!(body["output_text"], "success");
+            assert!(body["created_at"].is_number());
+        }
+    }
+    assert_eq!(json_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(sse_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn responses_stateless_baseline_envelope_is_consistent_in_json_and_sse() {
+    let (url, _) = start_format_probe("success").await;
+    let gateway = make_app(&url, &url);
+    for stream in [false, true] {
+        let response = gateway
+            .clone()
+            .oneshot(responses_stream_req(json!({
+                "model":"demo","input":"hello","stream":stream,"store":false
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let body: Value = if stream {
+            let events = String::from_utf8(bytes.to_vec()).unwrap();
+            let mut completed = None;
+            for section in events.split("\n\n") {
+                if section.starts_with("event: response.completed\n") {
+                    let data = section
+                        .lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .expect("completed event carries JSON");
+                    completed =
+                        Some(serde_json::from_str::<Value>(data).unwrap()["response"].clone());
+                }
+            }
+            completed.expect("completed response")
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["error"], Value::Null);
+        assert!(body.get("error").is_some());
+        assert_eq!(body["store"], false);
+        assert_eq!(body["background"], false);
+        assert!(body.get("previous_response_id").is_some());
+        assert_eq!(body["previous_response_id"], Value::Null);
+        assert_eq!(body["truncation"], "disabled");
+    }
+}
+
+#[tokio::test]
+async fn responses_inline_pdf_maps_to_chat_file_for_json_and_stream() {
+    let (url, seen) = start_format_probe("document understood").await;
+    let gateway = make_app(&url, &url);
+    for stream in [false, true] {
+        let request = responses_stream_req(json!({
+            "model":"demo","stream":stream,
+            "input":[{"role":"user","content":[
+                {"type":"input_file","filename":"summary.pdf",
+                    "file_data":"data:application/pdf;base64,JVBERi0xLjQK"},
+                {"type":"input_text","text":"Summarize the PDF"}
+            ]}]
+        }));
+        let response = gateway.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        if stream {
+            let events = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(events.contains("event: response.completed"), "{events}");
+        } else {
+            let output: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(output["output_text"], "document understood");
+        }
+    }
+    let requests = seen.lock().await;
+    assert_eq!(requests.len(), 2);
+    for req in requests.iter() {
+        assert_eq!(
+            req["messages"][0]["content"],
+            json!([
+                {"type":"file","file":{"filename":"summary.pdf",
+                    "file_data":"data:application/pdf;base64,JVBERi0xLjQK"}},
+                {"type":"text","text":"Summarize the PDF"}
+            ])
+        );
+    }
+}
+
+#[tokio::test]
+async fn responses_input_audio_preserves_chat_wire_for_json_and_sse() {
+    let (url, seen) = start_format_probe("heard").await;
+    let gateway = make_app(&url, &url);
+    for streaming in [false, true] {
+        let request = responses_stream_req(json!({
+            "model":"demo","stream":streaming,
+            "input":[{"role":"user","content":[
+                {"type":"input_text","text":"listen"},
+                {"type":"input_audio","input_audio":{"data":"YQ==","format":"mp3"}}
+            ]}]
+        }));
+        let response = gateway.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        if streaming {
+            let events = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(events.contains("event: response.completed"), "{events}");
+        } else {
+            let output: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(output["output_text"], "heard");
+        }
+    }
+    let requests = seen.lock().await;
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert_eq!(
+            request["messages"][0]["content"],
+            json!([
+                {"type":"text","text":"listen"},
+                {"type":"input_audio","input_audio":{"data":"YQ==","format":"mp3"}}
+            ])
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_background_queued_is_valid_only_for_opted_in_requests() {
+    let upstream = Router::new().route(
+        "/v1/responses",
+        post(|| async {
+            axum::Json(json!({
+                "id":"resp_pending","object":"response","model":"physical",
+                "created_at":123,"status":"queued","output":[],"error":null,
+                "background":true
+            }))
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(socket, upstream).await.unwrap();
+    });
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: native\n    type: openai\n    base_url: http://{addr}\n    key_env: KEY\n    responses_protocol: native\nchains:\n  - name: demo\n    steps:\n      - provider: native\n        model: physical\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        config,
+        HashMap::from([("KEY".into(), "native-key".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let send = |body: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let (status, pending) = call(
+        gateway.clone(),
+        send(json!({
+            "model":"demo","input":"process","background":true
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pending}");
+    assert_eq!(pending["status"], "queued");
+    assert_eq!(pending["id"], "resp_pending");
+    assert_eq!(pending["model"], "demo");
+    let (status, body) = call(
+        gateway,
+        send(json!({
+            "model":"demo","input":"process"
+        })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn native_only_responses_features_are_never_downgraded_to_chat() {
+    let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let seen = Arc::clone(&captured);
+    let native = Router::new().route(
+        "/v1/responses",
+        post(move |axum::Json(request): axum::Json<Value>| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().await.push(request);
+                axum::Json(json!({
+                    "id":"resp_native_only","object":"response","model":"native-physical",
+                    "status":"completed","created_at":123,"error":null,
+                    "output":[{"type":"image_generation_call","status":"completed",
+                        "result":"YQ=="}]
+                }))
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(socket, native).await.unwrap();
+    });
+    let (chat_url, chat_hits) = start_upstream(StatusCode::OK).await;
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: native\n    type: openai\n    base_url: http://{addr}\n    key_env: NATIVE\n    responses_protocol: native\n  - name: text\n    type: openai\n    base_url: {chat_url}\n    key_env: TEXT\nchains:\n  - name: mixed\n    steps:\n      - provider: native\n        model: native-physical\n      - provider: text\n        model: chat-physical\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        cfg,
+        HashMap::from([
+            ("NATIVE".into(), "native-key".into()),
+            ("TEXT".into(), "chat-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let requests = [
+        json!({"model":"mixed","input":"draw a landscape",
+            "tools":[{"type":"image_generation","size":"1024x1024"}]}),
+        json!({"model":"mixed","input":"continue","previous_response_id":"resp_previous"}),
+        json!({"model":"mixed","input":[{"type":"message","role":"user",
+            "content":[{"type":"input_video","video_url":"https://example.test/movie.mp4"}]}]}),
+        json!({"model":"mixed","input":"show probabilities",
+            "top_logprobs":4,"include":["message.output_text.logprobs"]}),
+        json!({"model":"mixed","input":"call a hosted tool",
+            "max_tool_calls":1}),
+    ];
+    for request in &requests {
+        let http = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(request.to_string()))
+            .unwrap();
+        let (status, result) = call(gateway.clone(), http).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["model"], "mixed");
+        assert_eq!(result["output"][0]["type"], "image_generation_call");
+    }
+    assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
+    let native_requests = captured.lock().await;
+    assert_eq!(native_requests.len(), requests.len());
+    for (native, original) in native_requests.iter().zip(requests.iter()) {
+        assert_eq!(native["input"], original["input"]);
+        assert!(native.get("messages").is_none());
+    }
+    assert_eq!(native_requests[0]["tools"], requests[0]["tools"]);
+    assert_eq!(native_requests[1]["previous_response_id"], "resp_previous");
+    assert_eq!(native_requests[3]["top_logprobs"], 4);
+    assert_eq!(native_requests[4]["max_tool_calls"], 1);
+}
+
+#[tokio::test]
+async fn responses_chat_bridge_accepts_official_nullable_options_and_token_minimum() {
+    let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let seen = Arc::clone(&captured);
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(request): axum::Json<Value>| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().await.push(request);
+                axum::Json(
+                    json!({"id":"chat_ok","object":"chat.completion","model":"physical",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},
+                        "finish_reason":"stop"}]}),
+                )
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(socket, upstream).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: chat\n    type: openai\n    base_url: http://{addr}\n    key_env: KEY\nchains:\n  - name: demo\n    steps:\n      - provider: chat\n        model: physical\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        config,
+        HashMap::from([("KEY".into(), "upstream-key".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let send = |body: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let (status, result) = call(
+        gateway.clone(),
+        send(json!({
+            "model":"demo", "input":"hello", "store":false,
+            "stream":null, "temperature":null, "top_p":null,
+            "max_output_tokens":null, "instructions":null, "user":null,
+            "safety_identifier":null, "prompt_cache_key":null,
+            "service_tier":null, "parallel_tool_calls":null,
+            "tools":null, "tool_choice":null, "background":null,
+            "truncation":null
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["output_text"], "ok");
+    let (status, invalid) = call(
+        gateway.clone(),
+        send(json!({
+            "model":"demo","input":"hello","max_output_tokens":15
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
+    assert_eq!(invalid["error"]["code"], "invalid_max_output_tokens");
+    let (status, valid) = call(
+        gateway,
+        send(json!({
+            "model":"demo","input":"hello","max_output_tokens":16
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{valid}");
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 2);
+    for key in [
+        "stream",
+        "temperature",
+        "top_p",
+        "instructions",
+        "user",
+        "safety_identifier",
+        "prompt_cache_key",
+        "service_tier",
+        "parallel_tool_calls",
+        "tools",
+        "tool_choice",
+        "background",
+        "truncation",
+    ] {
+        assert!(
+            requests[0].get(key).is_none(),
+            "{key} leaked into Chat: {}",
+            requests[0]
+        );
+    }
+    assert!(requests[0].get("max_tokens").is_none());
+    assert_eq!(requests[1]["max_tokens"], 16);
+}
+
+#[tokio::test]
+async fn native_only_auto_filters_real_multimodal_input_and_output_budget() {
+    let blocked_hits = Arc::new(AtomicUsize::new(0));
+    let blocked_count = Arc::clone(&blocked_hits);
+    let blocked = Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let count = Arc::clone(&blocked_count);
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({"id":"blocked","object":"response","model":"blocked",
+                "created_at":1,"status":"completed","output":[],"error":null}))
+            }
+        }),
+    );
+    let blocked_socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let blocked_addr = blocked_socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(blocked_socket, blocked).await.unwrap() });
+
+    let accepted = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let seen = Arc::clone(&accepted);
+    let capable = Router::new().route(
+        "/v1/responses",
+        post(move |axum::Json(request): axum::Json<Value>| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().await.push(request);
+                axum::Json(
+                    json!({"id":"resp_capable","object":"response","model":"physical",
+                    "created_at":1,"status":"completed","output":[],"error":null}),
+                )
+            }
+        }),
+    );
+    let capable_socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let capable_addr = capable_socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(capable_socket, capable).await.unwrap() });
+
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: blocked\n    type: openai\n    base_url: http://{blocked_addr}\n    key_env: BLOCKED\n    responses_protocol: native\n  - name: capable\n    type: openai\n    base_url: http://{capable_addr}\n    key_env: CAPABLE\n    responses_protocol: native\nauto:\n  enabled: true\n  candidates:\n    - provider: blocked\n      model: no-vision\n      priority: 1\n      supports_images: false\n      max_context_tokens: 1024\n    - provider: capable\n      model: vision\n      priority: 2\n      supports_images: true\n      max_context_tokens: 16384\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        config,
+        HashMap::from([
+            ("BLOCKED".into(), "blocked-key".into()),
+            ("CAPABLE".into(), "capable-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let request = |max_output_tokens| {
+        auto_request(
+            "/v1/responses",
+            "client",
+            json!({
+                "model":"auto","max_output_tokens":max_output_tokens,
+                "tools":[{"type":"image_generation","size":"1024x1024"}],
+                "input":[{"type":"message","role":"user","content":[
+                    {"type":"input_text","text":"draw this picture"},
+                    {"type":"input_image","image_url":"https://example.test/image.png"}
+                ]}]
+            }),
+        )
+    };
+    let (status, result) = call(gateway.clone(), request(4096)).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["model"], "auto");
+    assert_eq!(blocked_hits.load(Ordering::SeqCst), 0);
+    let seen = accepted.lock().await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["model"], "vision");
+    assert_eq!(seen[0]["input"][0]["content"][1]["type"], "input_image");
+    drop(seen);
+
+    let (status, result) = call(gateway, request(20000)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{result}");
+    assert_eq!(result["error"]["code"], "auto_no_eligible_candidate");
+    assert_eq!(blocked_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(accepted.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn native_responses_sse_is_not_downgraded_and_can_preflight_fallback() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&calls);
+    let native = Router::new().route("/v1/responses", post(move || {
+        let count = Arc::clone(&count);
+        async move {
+            let first = count.fetch_add(1, Ordering::SeqCst) == 0;
+            let payload = if first {
+                concat!(
+                    "event: response.created\ndata: {\"type\":\"response.created\",",
+                    "\"sequence_number\":0,\"response\":{\"id\":\"resp_sse\",",
+                    "\"object\":\"response\",\"status\":\"in_progress\"}}\n\n",
+                    "event: response.completed\ndata: {\"type\":\"response.completed\",",
+                    "\"sequence_number\":1,\"response\":{\"id\":\"resp_sse\",",
+                    "\"object\":\"response\",\"status\":\"completed\",",
+                    "\"model\":\"real-native\",\"created_at\":123,\"error\":null,",
+                    "\"output\":[{\"type\":\"image_generation_call\",",
+                    "\"status\":\"completed\",\"result\":\"YQ==\"}]}}\n\n"
+                )
+            } else {
+                // Missing required response.created event: reject at preflight.
+                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+            };
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                Body::from(payload),
+            )
+        }
+    }));
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(socket, native).await.unwrap();
+    });
+    let (chat_url, chat_calls) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: native\n    type: openai\n    base_url: http://{addr}\n    key_env: NATIVE\n    responses_protocol: native\n  - name: text\n    type: openai\n    base_url: {chat_url}\n    key_env: TEXT\nchains:\n  - name: mixed\n    steps:\n      - provider: native\n        model: real-native\n      - provider: text\n        model: real-chat\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        cfg,
+        HashMap::from([
+            ("NATIVE".into(), "native-key".into()),
+            ("TEXT".into(), "chat-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let make = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model":"mixed","input":"hello","stream":true}).to_string(),
+            ))
+            .unwrap()
+    };
+    let first = gateway.clone().oneshot(make()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let body = to_bytes(first.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("event: response.created"), "{text}");
+    assert!(text.contains("event: response.completed"), "{text}");
+    assert!(text.contains("image_generation_call"), "{text}");
+    assert_eq!(chat_calls.load(Ordering::SeqCst), 0);
+    let second = gateway.oneshot(make()).await.unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let body = to_bytes(second.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("event: response.completed"), "{text}");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(chat_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn mixed_responses_native_and_chat_share_one_fallback_walk() {
+    let native_calls = Arc::new(AtomicUsize::new(0));
+    let native_payloads = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let calls = Arc::clone(&native_calls);
+    let payloads = Arc::clone(&native_payloads);
+    let native = Router::new().route(
+        "/v1/responses",
+        post(move |axum::Json(body): axum::Json<Value>| {
+            let calls = Arc::clone(&calls);
+            let payloads = Arc::clone(&payloads);
+            async move {
+                payloads.lock().await.push(body);
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    axum::Json(json!({
+                        "id":"resp-native","object":"response","model":"real-native",
+                        "created_at":123,"status":"completed","error":null,
+                        "output":[{"type":"image_generation_call","id":"ig_1",
+                            "status":"completed","result":"YQ=="}],
+                        "output_text":"","usage":{
+                            "input_tokens":3,"output_tokens":2,"total_tokens":5}
+                    }))
+                } else {
+                    // A broken HTTP 200 must not prevent Chat-only failover.
+                    axum::Json(json!({"object":"chat.completion","choices":[]}))
+                }
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(socket, native).await.unwrap() });
+    let (chat_url, chat_calls) = start_upstream(StatusCode::OK).await;
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: native\n    type: openai\n    base_url: http://{addr}\n    key_env: NATIVE\n    responses_protocol: native\n  - name: text\n    type: openai\n    base_url: {chat_url}\n    key_env: TEXT\nchains:\n  - name: mixed\n    steps:\n      - provider: native\n        model: real-native\n      - provider: text\n        model: real-chat\n"
+    )).unwrap();
+    let app = app(AppState::new(
+        cfg,
+        HashMap::from([
+            ("NATIVE".into(), "native-secret".into()),
+            ("TEXT".into(), "chat-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let send = |input: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"mixed","input":input,"stream":false
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    let (status, first) = call(app.clone(), send(json!("describe the scene"))).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["id"], "resp-native");
+    assert_eq!(first["model"], "mixed");
+    assert_eq!(first["output"][0]["type"], "image_generation_call");
+    assert_eq!(first["output"][0]["result"], "YQ==");
+    assert_eq!(chat_calls.load(Ordering::SeqCst), 0);
+    let payloads = native_payloads.lock().await;
+    assert_eq!(payloads[0]["model"], "real-native");
+    assert_eq!(payloads[0]["input"], "describe the scene");
+    assert!(payloads[0].get("messages").is_none());
+    assert!(payloads[0].get("n").is_none());
+    drop(payloads);
+    let (status, second) = call(app, send(json!("hello again"))).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["output_text"], "success");
+    assert_eq!(native_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(chat_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn responses_empty_tools_matches_official_no_tools_semantics() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let gateway = make_app(&url, &url);
+    let request = |payload: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    };
+    let (status, _) = call(
+        gateway.clone(),
+        request(json!({
+            "model":"demo","input":"hello","tools":[],"tool_choice":"required"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    for extra in [
+        json!({"tools":[]}),
+        json!({"tools":[],"tool_choice":"auto"}),
+    ] {
+        let mut payload = json!({"model":"demo","input":"hello"});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (status, output) = call(gateway.clone(), request(payload)).await;
+        assert_eq!(status, StatusCode::OK, "{output}");
+        assert_eq!(output["output_text"], "success");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn responses_auto_audio_skips_explicitly_incompatible_candidate() {
+    let (text_url, text_hits) = start_upstream(StatusCode::OK).await;
+    let (audio_url, audio_hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: text\n    type: openai\n    base_url: {text_url}\n    key_env: TEXT\n    models: [plain]\n  - name: audio\n    type: openai\n    base_url: {audio_url}\n    key_env: AUDIO\n    models: [hearing]\nauto:\n  enabled: true\n  candidates:\n    - provider: text\n      model: plain\n      priority: 1\n      supports_audio: false\n    - provider: audio\n      model: hearing\n      priority: 2\n      supports_audio: true\n"
+    )).unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("TEXT".into(), "good".into()),
+            ("AUDIO".into(), "good".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let body = json!({"model":"auto","input":[{"role":"user","content":[
+        {"type":"input_audio","input_audio":{"data":"YQ==","format":"wav"}}
+    ]}]});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("authorization", "Bearer client")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, output) = call(router, request).await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(output["output_text"], "success");
+    assert_eq!(text_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(audio_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn responses_vision_url_and_base64_reach_upstream_in_json_and_sse() {
+    let recorded = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&recorded);
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(payload): axum::Json<Value>| {
+            let captured = Arc::clone(&captured);
+            async move {
+                let stream = payload["stream"] == true;
+                captured.lock().await.push(payload);
+                if stream {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from(concat!(
+                            "data: {\"id\":\"cmpl-vision\",\"choices\":[{\"index\":0,",
+                            "\"delta\":{\"content\":\"seen\"},\"finish_reason\":null}]}\n\n",
+                            "data: {\"id\":\"cmpl-vision\",\"choices\":[{\"index\":0,",
+                            "\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n"
+                        )),
+                    )
+                        .into_response()
+                } else {
+                    axum::Json(json!({"id":"cmpl-vision","object":"chat.completion",
+                        "model":"physical","choices":[{"index":0,
+                            "message":{"role":"assistant","content":"seen"},
+                            "finish_reason":"stop"}]}))
+                    .into_response()
+                }
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(socket, upstream).await.unwrap();
+    });
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: visual\n    type: openai\n    base_url: http://{address}\n    key_env: KEY\nchains:\n  - name: demo\n    steps:\n      - provider: visual\n        model: physical\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        config,
+        HashMap::from([("KEY".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let parts = json!([{"role":"user","content":[
+        {"type":"input_text","text":"first "},
+        {"type":"input_image","image_url":"https://example.test/a.png","detail":"original"},
+        {"type":"input_text","text":"second "},
+        {"type":"input_image","image_url":"data:image/png;base64,YQ==","detail":"low"}
+    ]}]);
+    for streaming in [false, true] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"demo","input":parts,"stream":streaming
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = gateway.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        if streaming {
+            let output = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(output.contains("event: response.completed"), "{output}");
+        } else {
+            let output: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(output["output_text"], "seen");
+        }
+    }
+    let requests = recorded.lock().await;
+    assert_eq!(requests.len(), 2);
+    let expected = json!([
+        {"type":"text","text":"first "},
+        {"type":"image_url","image_url":{"url":"https://example.test/a.png","detail":"original"}},
+        {"type":"text","text":"second "},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,YQ==","detail":"low"}}
+    ]);
+    for request in requests.iter() {
+        assert_eq!(request["model"], "physical");
+        assert_eq!(request["messages"][0]["role"], "user");
+        assert_eq!(request["messages"][0]["content"], expected);
+    }
+}
+
+#[tokio::test]
 async fn responses_text_bridge_and_unsupported_modes() {
     let (url, hits) = start_upstream(StatusCode::OK).await;
     let router = make_app(&url, &url);
@@ -1389,13 +3948,13 @@ async fn responses_text_bridge_and_unsupported_modes() {
             "{mode}: {rejected}"
         );
     }
-    // Three additional malformed completions now fail gateway validation and
-    // each retries the second configured provider before returning 502.
-    assert_eq!(hits.load(Ordering::SeqCst), 26);
+    // Responses-only validation now runs inside the candidate walker, so all
+    // malformed completions can try the healthy fallback before giving up.
+    assert_eq!(hits.load(Ordering::SeqCst), 32);
     let (status, converted) = call(router.clone(), req(json!({"model":"demo","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hel"},{"type":"input_text","text":"lo"}]}]}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(converted["output_text"], "success");
-    assert_eq!(hits.load(Ordering::SeqCst), 27);
+    assert_eq!(hits.load(Ordering::SeqCst), 33);
     let (status, instructed) = call(
         router.clone(),
         req(json!({"model":"demo","instructions":"Answer briefly","input":"hello"})),
@@ -1403,7 +3962,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(instructed["output_text"], "success");
-    assert_eq!(hits.load(Ordering::SeqCst), 28);
+    assert_eq!(hits.load(Ordering::SeqCst), 34);
     let (status, truncated) = call(
         router.clone(),
         req(json!({"model":"demo","input":"truncate"})),
@@ -1416,7 +3975,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
         truncated["incomplete_details"]["reason"],
         "max_output_tokens"
     );
-    assert_eq!(hits.load(Ordering::SeqCst), 29);
+    assert_eq!(hits.load(Ordering::SeqCst), 35);
     let (status, usage) = call(router.clone(), req(json!({"model":"demo","input":"usage"}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -1429,14 +3988,14 @@ async fn responses_text_bridge_and_unsupported_modes() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(invalid["error"]["code"], "invalid_upstream_usage");
-    assert_eq!(hits.load(Ordering::SeqCst), 31);
+    assert_eq!(invalid["error"]["code"], "upstream_unavailable");
+    assert_eq!(hits.load(Ordering::SeqCst), 38);
     let (status, tool_result) = call(router.clone(), req(json!({"model":"demo","input":"call","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"auto"}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(tool_result["output"][0]["type"], "function_call");
     assert_eq!(tool_result["output"][0]["name"], "lookup");
     assert_eq!(tool_result["output"][0]["call_id"], "call_123");
-    assert_eq!(hits.load(Ordering::SeqCst), 32);
+    assert_eq!(hits.load(Ordering::SeqCst), 39);
     let (status, call_usage) = call(router.clone(), req(json!({"model":"demo","input":"callusage","tools":[{"type":"function","name":"lookup"}]}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -1444,7 +4003,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
         json!({"input_tokens":5,"output_tokens":3,"total_tokens":8})
     );
     assert!(call_usage["incomplete_details"].is_null());
-    assert_eq!(hits.load(Ordering::SeqCst), 33);
+    assert_eq!(hits.load(Ordering::SeqCst), 40);
     let (status, mixed) = call(router.clone(), req(json!({"model":"demo","input":"callmixed","tools":[{"type":"function","name":"lookup"}],"parallel_tool_calls":true}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(mixed["output_text"], "I will look that up");
@@ -1452,7 +4011,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(mixed["output"][0]["type"], "message");
     assert_eq!(mixed["output"][1]["call_id"], "call_1");
     assert_eq!(mixed["output"][2]["call_id"], "call_2");
-    assert_eq!(hits.load(Ordering::SeqCst), 34);
+    assert_eq!(hits.load(Ordering::SeqCst), 41);
     let (status, duplicate) = call(
         router.clone(),
         req(
@@ -1462,14 +4021,14 @@ async fn responses_text_bridge_and_unsupported_modes() {
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(duplicate["error"]["code"], "upstream_unavailable");
-    assert_eq!(hits.load(Ordering::SeqCst), 36);
+    assert_eq!(hits.load(Ordering::SeqCst), 43);
     let (status, continued) = call(router.clone(), req(json!({"model":"demo","input":[{"type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call_123","output":"Paris is in France"}]}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(continued["output_text"], "success");
-    assert_eq!(hits.load(Ordering::SeqCst), 37);
+    assert_eq!(hits.load(Ordering::SeqCst), 44);
     let (status, _) = call(router.clone(), req(json!({"model":"demo","input":[{"type":"function_call_output","call_id":"call_123","output":7}]}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(hits.load(Ordering::SeqCst), 37);
+    assert_eq!(hits.load(Ordering::SeqCst), 44);
     let (status, parallel_history) = call(
         router.clone(),
         req(json!({"model":"demo","input":[
@@ -1483,11 +4042,11 @@ async fn responses_text_bridge_and_unsupported_modes() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(parallel_history["output_text"], "success");
-    assert_eq!(hits.load(Ordering::SeqCst), 38);
+    assert_eq!(hits.load(Ordering::SeqCst), 45);
     let (status, assistant_text) = call(router.clone(), req(json!({"model":"demo","input":[{"role":"assistant","content":[{"type":"output_text","text":"previous response"}]},{"role":"user","content":"follow up"}]}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(assistant_text["output_text"], "success");
-    assert_eq!(hits.load(Ordering::SeqCst), 39);
+    assert_eq!(hits.load(Ordering::SeqCst), 46);
     for invalid_input in [
         json!([{"type":"function_call","call_id":"x","name":"lookup","arguments":"[]"},{"type":"function_call_output","call_id":"x","output":"ok"}]),
         json!([{"type":"function_call","call_id":"x","name":"lookup","arguments":"null"},{"type":"function_call_output","call_id":"x","output":"ok"}]),
@@ -1508,7 +4067,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
-    assert_eq!(hits.load(Ordering::SeqCst), 39);
+    assert_eq!(hits.load(Ordering::SeqCst), 46);
     for bad_request in [
         json!({"model":"demo","input":"hello","tool_choice":"required"}),
         json!({"model":"demo","input":"hello","tool_choice":{"type":"function","name":"lookup"}}),
@@ -1532,13 +4091,12 @@ async fn responses_text_bridge_and_unsupported_modes() {
         let (status, _) = call(router.clone(), req(bad_request)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
-    assert_eq!(hits.load(Ordering::SeqCst), 39);
+    assert_eq!(hits.load(Ordering::SeqCst), 46);
     for payload in [
         json!({"model":"demo","input":"hello","tools":[{"type":"web_search"}]}),
         json!({"model":"demo","input":"hello","n":2}),
         json!({"model":"demo","input":"hello","unknown_option":42}),
         json!({"model":"demo","input":"hello","messages":[]}),
-        json!({"model":"demo","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.org/img.png"}]}]}),
         json!({"model":"demo","input":[{"role":"user","content":"hi","unknown":1}]}),
     ] {
         let (status, _) = call(router.clone(), req(payload)).await;
@@ -1554,7 +4112,7 @@ async fn responses_text_bridge_and_unsupported_modes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = call(router, req(json!({"input":"hello"}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(hits.load(Ordering::SeqCst), 39);
+    assert_eq!(hits.load(Ordering::SeqCst), 46);
 }
 
 #[tokio::test]
@@ -1662,6 +4220,59 @@ async fn responses_stateless_metadata_and_mode_contract() {
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn responses_malformed_present_usage_fails_over_without_false_success() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let invalid = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let calls = Arc::clone(&seen);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({
+                    "id":"wrong-usage","model":"bad","created":123,
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"wrong"},
+                                "finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":1}
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let _task = tokio::spawn(async move { axum::serve(listener, invalid).await.unwrap() });
+    let (backup, backup_calls) = start_upstream(StatusCode::OK).await;
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: bad\n    type: openai\n    base_url: http://{address}\n    key_env: BAD\n  - name: good\n    type: openai\n    base_url: {backup}\n    key_env: GOOD\nchains:\n  - name: demo\n    steps:\n      - provider: bad\n        model: broken\n      - provider: good\n        model: healthy\n"
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        cfg,
+        HashMap::from([
+            ("BAD".into(), "bad-key".into()),
+            ("GOOD".into(), "good-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, output) = call(
+        router.clone(),
+        responses_stream_req(json!({"model":"demo","input":"hi"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(output["output_text"], "success");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(
+        metric_value(&metrics, "upstream_invalid_responses_total"),
+        1
+    );
+    assert_eq!(metric_value(&metrics, "upstream_success_total"), 1);
+}
+
 fn responses_stream_req(payload: Value) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -1670,6 +4281,81 @@ fn responses_stream_req(payload: Value) -> Request<Body> {
         .header("content-type", "application/json")
         .body(Body::from(payload.to_string()))
         .unwrap()
+}
+
+#[tokio::test]
+async fn real_responses_request_does_not_poison_persistent_chat_telemetry() {
+    use rusqlite::Connection;
+    let (upstream, hits) = start_upstream(StatusCode::OK).await;
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {upstream}\n    key_env: K\nchains:\n  - name: demo\n    steps:\n      - provider: p\n        model: physical\n"
+    ))
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(
+        cfg,
+        HashMap::from([("K".into(), "provider-secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, running) = app_with_state(state);
+    let (status, response) = call(
+        router.clone(),
+        responses_stream_req(json!({"model":"demo","input":"hello"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let (status, chat) = call(router, request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{chat}");
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert!(running.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let (responses, chats): (i64, i64) = db
+        .query_row(
+            "SELECT COALESCE(SUM(endpoint='responses'),0),
+                    COALESCE(SUM(endpoint='chat'),0)
+             FROM request_events WHERE provider='p'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (responses, chats),
+        (1, 1),
+        "Responses must remain separate, and must not roll back the following Chat request"
+    );
+    let score = guvna::scoring::read_scoring(dir.path(), 1).unwrap();
+    assert_eq!(
+        score["candidates"][0]["attempts"], 1,
+        "a Responses request must not double-count Chat's physical provider sample"
+    );
+}
+
+#[tokio::test]
+async fn responses_incomplete_tool_arguments_survive_the_real_dispatch_path() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&url, &url);
+    for (marker, reason) in [
+        ("truncatedtool", "max_output_tokens"),
+        ("filteredtool", "content_filter"),
+    ] {
+        let (status, response) = call(
+            router.clone(),
+            responses_stream_req(json!({
+                "model":"demo",
+                "input":format!("invalidchat:{marker}")
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["incomplete_details"]["reason"], reason);
+        assert_eq!(response["output"][0]["type"], "function_call");
+        assert_eq!(response["output"][0]["status"], "incomplete");
+        assert_eq!(response["output"][0]["arguments"], r#"{"partial":"#);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
 const RESP_START_A: &[u8] = b"data: {\"id\":\"chat1\",\"created\":123,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",";
@@ -1735,6 +4421,152 @@ async fn inline_usage_plus_final_trailer_succeeds_for_chat_and_responses() {
     assert_eq!(completed["response"]["usage"]["total_tokens"], 7);
     assert_eq!(completed["response"]["output_text"], "hi!");
     assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn responses_sse_synthesizes_stable_id_for_valid_idless_chat_stream() {
+    let (url, hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let response = make_app(&url, &url)
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hello","stream":true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        body.matches("event: response.completed").count(),
+        1,
+        "{body}"
+    );
+    assert!(!body.contains("event: response.failed"), "{body}");
+    let completed: Value = serde_json::from_str(
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .next_back()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        completed["response"]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("chatcmpl-rs-")),
+        "{completed}"
+    );
+    assert_eq!(completed["response"]["output_text"], "hi");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn responses_sse_preserves_inline_usage_without_final_trailer() {
+    let (url, hits) = start_sse(vec![
+        RESP_START_A,
+        RESP_START_B,
+        RESP_END_WITH_INLINE_USAGE,
+        SSE_DONE,
+    ])
+    .await;
+    let response = make_app(&url, &url)
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hello","stream":true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 4 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        body.matches("event: response.completed").count(),
+        1,
+        "{body}"
+    );
+    assert!(!body.contains("event: response.failed"), "{body}");
+    let completed: Value = serde_json::from_str(
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .next_back()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        completed["response"]["usage"],
+        json!({"input_tokens":4,"output_tokens":2,"total_tokens":6})
+    );
+    assert_eq!(completed["response"]["output_text"], "hi!");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn responses_sse_terminal_persists_under_responses_not_chat() {
+    use rusqlite::Connection;
+    let (upstream, hits) = start_sse(vec![
+        RESP_START_A,
+        RESP_START_B,
+        RESP_END,
+        RESP_USAGE,
+        SSE_DONE,
+    ])
+    .await;
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {upstream}\n    key_env: K\nchains:\n  - name: demo\n    steps:\n      - provider: p\n        model: physical\n"
+    )).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(
+        cfg,
+        HashMap::from([("K".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, running) = app_with_state(state);
+    let response = router
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hello","stream":true
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = to_bytes(response.into_body(), 4 << 20).await.unwrap();
+    assert!(String::from_utf8_lossy(&result).contains("event: response.completed"));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(running.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let (response_starts, chat_starts): (i64, i64) = db
+        .query_row(
+            "SELECT COALESCE(SUM(endpoint='responses'),0),
+                COALESCE(SUM(endpoint='chat'),0)
+         FROM request_events WHERE provider='p'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((response_starts, chat_starts), (1, 0));
+    let (response_hourly, chat_hourly): (i64, i64) = db
+        .query_row(
+            "SELECT COALESCE(SUM(endpoint='responses'),0),
+                COALESCE(SUM(endpoint='chat'),0)
+         FROM hourly_stats WHERE provider='p'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(response_hourly >= 1);
+    assert_eq!(chat_hourly, 0);
+    let terminal: String = db
+        .query_row("SELECT outcome FROM stream_terminals", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(terminal, "success");
 }
 
 #[tokio::test]
@@ -2243,6 +5075,71 @@ async fn metrics_stream_success_failure_and_client_disconnect() {
 }
 
 #[tokio::test]
+async fn cancelled_chat_sse_persists_actual_terminal_with_same_trace_and_no_provider_failure() {
+    use guvna::gateway::app_with_state;
+    use http_body_util::BodyExt;
+    use rusqlite::Connection;
+    let dir = tempfile::tempdir().unwrap();
+    let (url, drops) = start_stalled_sse().await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_env: K\n\
+         chains:\n  - name: demo\n    steps:\n      - provider: p\n        model: m\n"
+    ))
+    .unwrap();
+    let mut state = AppState::new(
+        config,
+        HashMap::from([("K".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, shared) = app_with_state(state);
+    let response = router
+        .oneshot(request("demo", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(first.into_data().unwrap().starts_with(b"data: "));
+    drop(body);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while drops.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(shared.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let (trace, attempt): (String, i64) = db.query_row(
+        "SELECT request_id,attempt_index FROM request_events WHERE failure_type='stream_started'",
+        [], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).unwrap();
+    let (terminal_trace, terminal_attempt, outcome): (String, i64, String) = db
+        .query_row(
+            "SELECT request_id,attempt_index,outcome FROM stream_terminals",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((trace, attempt), (terminal_trace, terminal_attempt));
+    assert_eq!(outcome, "client_cancelled");
+    let failures: i64 = db
+        .query_row("SELECT COUNT(*) FROM failure_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(failures, 0);
+    let provider_health: i64 = db
+        .query_row("SELECT COUNT(*) FROM provider_health", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(provider_health, 0);
+}
+
+#[tokio::test]
 async fn metrics_responses_stream_terminal_outcomes() {
     let (url, _) = start_sse(vec![RESP_START_A, RESP_START_B, RESP_END, SSE_DONE]).await;
     let app = make_app(&url, &url);
@@ -2479,6 +5376,32 @@ async fn transient_5xx_quarantines_only_the_used_credential_for_configured_durat
 }
 
 #[tokio::test]
+async fn upstream_408_timeout_feeds_circuit_and_fails_over_without_echoing_client_error() {
+    let (down, down_hits) = start_upstream(StatusCode::REQUEST_TIMEOUT).await;
+    let (fallback, good_hits) = start_upstream(StatusCode::OK).await;
+    let router = make_app_with_circuit(&down, &fallback, true);
+    for _ in 0..3 {
+        let (status, result) = call(router.clone(), request("demo", "", "client")).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+    }
+    assert_eq!(down_hits.load(Ordering::SeqCst), 3);
+    let (_, metrics) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(metric_value(&metrics, "circuit_openings_total"), 1);
+    assert_eq!(metric_value(&metrics, "circuit_open_providers"), 1);
+    assert_eq!(metric_value(&metrics, "credential_quarantines_total"), 1);
+    let (status, result) = call(router.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(
+        down_hits.load(Ordering::SeqCst),
+        3,
+        "408 timeout must open circuit instead of hammering a slow upstream"
+    );
+    assert_eq!(good_hits.load(Ordering::SeqCst), 5);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&metrics, "circuit_bypasses_total"), 1);
+}
+
+#[tokio::test]
 async fn client_errors_never_open_provider_circuit_or_quarantine_credential() {
     let (down, down_hits) = start_upstream(StatusCode::BAD_REQUEST).await;
     let (fallback, _) = start_upstream(StatusCode::OK).await;
@@ -2591,6 +5514,40 @@ async fn start_format_probe(output: &'static str) -> (String, Arc<tokio::sync::M
 }
 
 #[tokio::test]
+async fn sse_only_fallback_restores_original_large_stream_options_before_backup() {
+    let (failing, failures) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
+    let (healthy, seen) = start_format_probe("success").await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: sse\n    type: openai\n    base_url: {failing}\n    key_env: SSE\n    stream_only: true\n  - name: backup\n    type: openai\n    base_url: {healthy}\n    key_env: BACKUP\nchains:\n  - name: demo\n    steps:\n      - provider: sse\n        model: sse-model\n      - provider: backup\n        model: backup-model\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        config,
+        HashMap::from([
+            ("SSE".into(), "sse-key".into()),
+            ("BACKUP".into(), "backup-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let metadata = "extra".repeat(100 * 1024);
+    let extras = format!(
+        ",\"stream_options\":{}",
+        json!({
+            "include_usage":false,"trace":metadata
+        })
+    );
+    let (status, body) = call(gateway, request("demo", &extras, "client")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(failures.load(Ordering::SeqCst), 1);
+    let captured = seen.lock().await;
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0]["model"], "backup-model");
+    assert_eq!(captured[0]["stream_options"]["include_usage"], false);
+    assert_eq!(captured[0]["stream_options"]["trace"], metadata);
+    assert!(captured[0].get("stream").is_none());
+}
+
+#[tokio::test]
 async fn responses_text_format_maps_all_supported_types_to_real_upstream_payloads() {
     let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
     let app = make_app(&url, &url);
@@ -2674,6 +5631,241 @@ async fn responses_json_schema_and_tools_are_combined_without_loss_or_duplicate_
 }
 
 #[tokio::test]
+async fn responses_large_schema_and_tool_parameters_forward_without_data_loss() {
+    let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
+    let app = make_app(&url, &url);
+    let schema_description = "S".repeat(256 * 1024);
+    let function_description = "T".repeat(256 * 1024);
+    let input = json!({
+        "model":"demo", "input":"describe the payload",
+        "text":{"format":{"type":"json_schema","name":"large",
+            "schema":{"type":"object","description":schema_description},
+            "strict":true}},
+        "tools":[{"type":"function","name":"lookup",
+            "parameters":{"type":"object","description":function_description}}],
+        "tool_choice":"auto"
+    });
+    let (status, response) = call(app, responses_stream_req(input)).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let incoming = seen.lock().await;
+    assert_eq!(incoming.len(), 1);
+    let translated = &incoming[0];
+    assert_eq!(
+        translated["response_format"]["json_schema"]["schema"]["description"],
+        schema_description
+    );
+    assert_eq!(
+        translated["tools"][0]["function"]["parameters"]["description"],
+        function_description
+    );
+    assert!(translated.get("text").is_none());
+    assert_eq!(translated["tools"][0]["function"]["name"], "lookup");
+}
+
+#[tokio::test]
+async fn chat_forced_tool_refusal_is_delivered_without_trying_backup() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream_hits = Arc::clone(&hits);
+    let refusing = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let hits = Arc::clone(&upstream_hits);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({"id":"refusal","object":"chat.completion",
+                    "choices":[{"index":0,"message":{"role":"assistant",
+                        "content":null,"refusal":"Cannot perform that request"},
+                        "finish_reason":"stop"}]}))
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(socket, refusing).await.unwrap() });
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let gateway = make_app(&format!("http://{addr}"), &backup);
+
+    for choice in [
+        json!("required"),
+        json!({"type":"function","function":{"name":"lookup"}}),
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model":"demo",
+                "messages":[{"role":"user","content":"decline"}],
+                "tools":[{"type":"function","function":{"name":"lookup"}}],
+                "tool_choice":choice})
+                .to_string(),
+            ))
+            .unwrap();
+        let (status, output) = call(gateway.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "{output}");
+        assert_eq!(
+            output["choices"][0]["message"]["refusal"],
+            "Cannot perform that request"
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn chat_rejects_malformed_present_completion_metadata() {
+    let (upstream, hits) = start_upstream(StatusCode::OK).await;
+    let gateway = make_app(&upstream, &upstream);
+    for mode in [
+        "emptyid",
+        "negativecreated",
+        "stringcreated",
+        "emptymodel",
+        "numbermodel",
+    ] {
+        let payload = json!({"model":"demo","messages":[{
+            "role":"user","content":format!("invalidchat:{mode}")}]});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let (status, output) = call(gateway.clone(), request).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{mode}: {output}");
+        assert_eq!(output["error"]["code"], "upstream_unavailable");
+    }
+    assert!(hits.load(Ordering::SeqCst) >= 5);
+}
+
+#[tokio::test]
+async fn bad_usage_counts_fail_over_on_both_chat_and_responses() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tracked = calls.clone();
+    let bad = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let calls = tracked.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({"id":"bad-usage","created":123,"model":"one",
+                "choices":[{"index":0,"message":{"role":"assistant","content":"bad accounting"},
+                    "finish_reason":"stop"}],
+                "usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":7}}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, bad).await.unwrap() });
+    let (backup, backup_calls) = start_upstream(StatusCode::OK).await;
+    let gateway = make_app(&format!("http://{addr}"), &backup);
+    let (status, chat) = call(gateway.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{chat}");
+    assert_eq!(chat["choices"][0]["message"]["content"], "success");
+    let (status, responses) = call(
+        gateway,
+        responses_stream_req(json!({
+        "model":"demo","input":"hello"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{responses}");
+    assert_eq!(responses["output_text"], "success");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    // One BAD 429 on the first fallback, then GOOD twice; no BAD retry.
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn invalid_chat_message_field_types_fail_over_before_responses_translation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tracked = calls.clone();
+    let invalid = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let calls = tracked.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({"choices":[{"index":0,"message":{
+                "role":"assistant","content":"apparently valid answer",
+                "reasoning":{"unexpected":"not text"}},"finish_reason":"stop"}]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, invalid).await.unwrap() });
+    let (backup, backup_calls) = start_upstream(StatusCode::OK).await;
+    let router = make_app(&format!("http://{addr}"), &backup);
+
+    let (status, chat) = call(router.clone(), request("demo", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{chat}");
+    assert_eq!(chat["choices"][0]["message"]["content"], "success");
+    let (status, responses) = call(
+        router,
+        responses_stream_req(json!({
+        "model":"demo","input":"hello"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{responses}");
+    assert_eq!(responses["output_text"], "success");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    // A quarantined BAD key remains isolated for the second request.
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn responses_forced_tool_refusal_survives_json_and_sse_without_retry() {
+    let frames = vec![
+        aggregate_chat_frame(json!({"id":"chat-refusal","created":123,
+            "choices":[{"index":0,"delta":{"role":"assistant",
+                "refusal":"Cannot perform that request"},"finish_reason":null}]})),
+        aggregate_chat_frame(json!({"id":"chat-refusal","created":123,
+            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})),
+        b"data: [DONE]\n\n".to_vec(),
+    ];
+    let (url, hits, streamed) = start_strict_stream_only(frames).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let gateway = app_with_stream_only_and_auto(&url, &backup, false);
+
+    for choice in [
+        json!("required"),
+        json!({"type":"function","name":"lookup"}),
+    ] {
+        for stream in [false, true] {
+            let input = json!({"model":"ordered","input":"hello","stream":stream,
+                "tools":[{"type":"function","name":"lookup"}],"tool_choice":choice});
+            if stream {
+                let response = gateway
+                    .clone()
+                    .oneshot(responses_stream_req(input))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let data = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                let events = String::from_utf8(data.to_vec()).unwrap();
+                assert!(events.contains("event: response.refusal.delta"), "{events}");
+                assert!(events.contains("event: response.completed"), "{events}");
+                assert!(!events.contains("event: response.failed"), "{events}");
+            } else {
+                let (status, response) = call(gateway.clone(), responses_stream_req(input)).await;
+                assert_eq!(status, StatusCode::OK, "{response}");
+                assert_eq!(response["output"][0]["content"][0]["type"], "refusal");
+                assert_eq!(
+                    response["output"][0]["content"][0]["refusal"],
+                    "Cannot perform that request"
+                );
+            }
+        }
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    assert_eq!(streamed.load(Ordering::SeqCst), 4);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn responses_forced_tool_choice_ignoring_upstream_fails_over() {
     let (url, seen) = start_format_probe("ordinary text").await;
     let app = make_app(&url, &url);
@@ -2745,6 +5937,125 @@ async fn responses_json_text_format_preserves_stream_lifecycle_and_no_false_term
 }
 
 #[tokio::test]
+async fn responses_shared_openai_control_fields_survive_chat_dispatch() {
+    let (url, seen) = start_format_probe("success").await;
+    let gateway = make_app(&url, &url);
+    for tier in [
+        "auto",
+        "default",
+        "flex",
+        "scale",
+        "priority",
+        "fast",
+        "ultrafast",
+    ] {
+        let payload = json!({
+            "model":"demo","input":"hello",
+            "service_tier":tier,
+            "safety_identifier":"anonymous-42",
+            "prompt_cache_key":"shared-prompt-prefix"
+        });
+        let (status, response) = call(gateway.clone(), responses_stream_req(payload)).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let upstream = seen.lock().await.last().unwrap().clone();
+        assert_eq!(upstream["service_tier"], tier);
+        assert_eq!(upstream["safety_identifier"], "anonymous-42");
+        assert_eq!(upstream["prompt_cache_key"], "shared-prompt-prefix");
+    }
+    for (extra, code) in [
+        (json!({"service_tier":"extra"}), "invalid_service_tier"),
+        (json!({"service_tier":42}), "invalid_service_tier"),
+        (json!({"safety_identifier":42}), "invalid_safety_identifier"),
+        (
+            json!({"safety_identifier":"x".repeat(129)}),
+            "invalid_safety_identifier",
+        ),
+        (json!({"prompt_cache_key":true}), "invalid_prompt_cache_key"),
+    ] {
+        let mut request = json!({"model":"demo","input":"hello"});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (status, response) = call(gateway.clone(), responses_stream_req(request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"]["code"], code);
+    }
+    assert_eq!(
+        seen.lock().await.len(),
+        7,
+        "malformed requests reached provider"
+    );
+}
+
+#[tokio::test]
+async fn responses_reasoning_effort_maps_to_chat_and_survives_streaming() {
+    let (url, seen) = start_format_probe("success").await;
+    let gateway = make_app(&url, &url);
+    for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        let (status, body) = call(
+            gateway.clone(),
+            responses_stream_req(json!({
+                "model":"demo","input":"hello","reasoning":{"effort":effort}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["output_text"], "success");
+        let last = seen.lock().await.last().unwrap().clone();
+        assert_eq!(last["reasoning_effort"], effort);
+        assert!(last.get("reasoning").is_none());
+    }
+    let response = gateway
+        .clone()
+        .oneshot(responses_stream_req(json!({
+            "model":"demo","input":"hello","stream":true,"reasoning":{"effort":"high"}
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("event: response.completed"), "{text}");
+    let last = seen.lock().await.last().unwrap().clone();
+    assert_eq!(last["reasoning_effort"], "high");
+    assert_eq!(last["stream"], true);
+    assert!(last.get("reasoning").is_none());
+}
+
+#[tokio::test]
+async fn responses_official_text_verbosity_maps_in_json_and_sse_modes() {
+    let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
+    let gateway = make_app(&url, &url);
+    for level in ["low", "medium", "high"] {
+        for stream in [false, true] {
+            let request = responses_stream_req(json!({
+                "model":"demo","input":"hello","stream":stream,
+                "text":{"verbosity":level,"format":{"type":"json_object"}}
+            }));
+            let response = gateway.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            if stream {
+                let event_stream = String::from_utf8(bytes.to_vec()).unwrap();
+                assert!(
+                    event_stream.contains("event: response.completed"),
+                    "{event_stream}"
+                );
+            } else {
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["output_text"], r#"{"ok":true}"#);
+            }
+            let upstream = seen.lock().await.last().unwrap().clone();
+            assert_eq!(upstream["verbosity"], level);
+            assert_eq!(upstream["response_format"]["type"], "json_object");
+            assert!(upstream.get("text").is_none());
+        }
+    }
+    assert_eq!(seen.lock().await.len(), 6);
+}
+
+#[tokio::test]
 async fn unsupported_or_corrupt_format_is_rejected_without_any_provider_calls() {
     let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
     let app = make_app(&url, &url);
@@ -2792,9 +6103,9 @@ async fn unsupported_or_corrupt_format_is_rejected_without_any_provider_calls() 
             "responses_text_format_unsupported",
         ),
         (
-            json!({"text":{"verbosity":"low"}}),
-            StatusCode::NOT_IMPLEMENTED,
-            "responses_text_format_unsupported",
+            json!({"text":{"verbosity":"verbose"}}),
+            StatusCode::BAD_REQUEST,
+            "invalid_text_format",
         ),
         (
             json!({"text":{"format":{"type":"json_object","undocumented":true}}}),
@@ -2807,9 +6118,19 @@ async fn unsupported_or_corrupt_format_is_rejected_without_any_provider_calls() 
             "responses_parameter_unsupported",
         ),
         (
-            json!({"reasoning":{"effort":"high"}}),
+            json!({"reasoning":{"effort":"huge"}}),
+            StatusCode::BAD_REQUEST,
+            "invalid_reasoning_effort",
+        ),
+        (
+            json!({"reasoning":{"summary":"detailed"}}),
             StatusCode::NOT_IMPLEMENTED,
             "responses_feature_unsupported",
+        ),
+        (
+            json!({"reasoning":[]}),
+            StatusCode::BAD_REQUEST,
+            "invalid_reasoning",
         ),
     ];
     for (extra, expected_status, expected_code) in cases {
@@ -2870,7 +6191,7 @@ async fn invalid_json_stream_must_never_emit_a_completed_response_or_replay() {
         })))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let frames = String::from_utf8(
         to_bytes(response.into_body(), 2 << 20)
             .await
@@ -2878,28 +6199,40 @@ async fn invalid_json_stream_must_never_emit_a_completed_response_or_replay() {
             .to_vec(),
     )
     .unwrap();
-    assert_eq!(
-        frames.matches("event: response.failed").count(),
-        1,
-        "{frames}"
-    );
+    if status == StatusCode::OK {
+        // First validated delta committed the downstream SSE headers; later
+        // malformed JSON must produce an error without reusing another route.
+        assert_eq!(
+            frames.matches("event: response.failed").count(),
+            1,
+            "{frames}"
+        );
+        assert_eq!(
+            frames.matches("event: response.output_text.delta").count(),
+            1
+        );
+        assert_eq!(seen.lock().await.len(), 1);
+    } else {
+        // When all frames share one upstream chunk, the parser can reject
+        // the response before headers. Only then may the gateway fall back.
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{frames}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&frames).unwrap()["error"]["code"],
+            "upstream_unavailable"
+        );
+        assert_eq!(seen.lock().await.len(), 2);
+    }
     assert_eq!(
         frames.matches("event: response.completed").count(),
         0,
         "{frames}"
     );
-    assert_eq!(
-        frames.matches("event: response.output_text.delta").count(),
-        1
-    );
     assert!(!frames.contains("data: [DONE]"), "{frames}");
-    assert_eq!(
-        seen.lock().await.len(),
-        1,
-        "never retry after emitting deltas"
-    );
     let (_, metrics) = get_metrics(app, Some("client")).await;
-    assert_eq!(metric_value(&metrics, "responses_stream_failed_total"), 1);
+    assert_eq!(
+        metric_value(&metrics, "responses_stream_failed_total"),
+        u64::from(status == StatusCode::OK)
+    );
     assert_eq!(
         metric_value(&metrics, "responses_stream_completed_total"),
         0
@@ -2954,6 +6287,291 @@ fn auto_request(path: &str, bearer: &str, payload: Value) -> Request<Body> {
         .header("content-type", "application/json")
         .body(Body::from(payload.to_string()))
         .unwrap()
+}
+
+#[tokio::test]
+async fn issue129_sixty_four_concurrent_bad_deciders_fail_open_without_selector_fanout() {
+    use std::time::Duration;
+    let (business, business_hits) = start_upstream(StatusCode::OK).await;
+    let selector_hits = Arc::new(AtomicUsize::new(0));
+    let selector_active = Arc::new(AtomicUsize::new(0));
+    let selector_max_active = Arc::new(AtomicUsize::new(0));
+    let selector = Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let hits = Arc::clone(&selector_hits);
+            let active = Arc::clone(&selector_active);
+            let peak = Arc::clone(&selector_max_active);
+            move || {
+                let hits = Arc::clone(&hits);
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    axum::Json(json!({
+                        "choices":[{"message":{"content":r#"{"order":[0,0]}"#}}]
+                    }))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, selector).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: business
+    type: openai
+    base_url: {business}
+    key_env: BUSINESS
+  - name: selector
+    type: openai
+    base_url: http://{addr}
+    key_env: SELECTOR
+auto:
+  enabled: true
+  candidates:
+    - provider: business
+      model: primary
+    - provider: business
+      model: backup
+  decider:
+    enabled: true
+    provider: selector
+    model: chooser
+    timeout_ms: 1000
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("BUSINESS".into(), "business-secret".into()),
+            ("SELECTOR".into(), "selector-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let results = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures_util::future::join_all((0..64).map(|_| {
+            let router = router.clone();
+            async move {
+                call(
+                    router,
+                    auto_request(
+                        "/v1/auto",
+                        "client",
+                        json!({"messages":[{"role":"user","content":"one request"}]}),
+                    ),
+                )
+                .await
+            }
+        })),
+    )
+    .await
+    .expect("64 concurrent business requests must not queue behind the selector");
+    for (status, result) in results {
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["model"], "primary");
+    }
+    assert_eq!(business_hits.load(Ordering::SeqCst), 64);
+    assert!(
+        selector_hits.load(Ordering::SeqCst) >= 1,
+        "the cold selector path should have been exercised"
+    );
+    assert_eq!(
+        selector_max_active.load(Ordering::SeqCst),
+        1,
+        "bad remote ranks must never cause concurrent selector network fanout"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn issue129_slow_foreground_decider_reserves_walk_budget_for_real_upstream() {
+    use std::time::{Duration, Instant};
+    let (good, hits) = start_upstream(StatusCode::OK).await;
+    let selector_calls = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&selector_calls);
+    let selector = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let count = Arc::clone(&count);
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                axum::Json(json!({
+                    "choices":[{"message":{"content":r#"{"order":[1,0]}"#}}]
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let selector_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, selector).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+timeout:
+  walk: 900ms
+providers:
+  - name: business
+    type: openai
+    base_url: {good}
+    key_env: BUSINESS
+  - name: selector
+    type: openai
+    base_url: http://{selector_addr}
+    key_env: SELECTOR
+auto:
+  enabled: true
+  candidates:
+    - provider: business
+      model: first
+    - provider: business
+      model: second
+  decider:
+    enabled: true
+    provider: selector
+    model: chooser
+    timeout_ms: 2000
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("BUSINESS".into(), "business-secret".into()),
+            ("SELECTOR".into(), "selector-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let start = Instant::now();
+    let (status, response) = tokio::time::timeout(
+        Duration::from_secs(2),
+        call(
+            router.clone(),
+            auto_request(
+                "/v1/auto",
+                "client",
+                json!({"messages":[{"role":"user","content":"hi"}]}),
+            ),
+        ),
+    )
+    .await
+    .expect("slow selector must not hold the business request for 3 seconds");
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["model"], "first", "fallback uses static priority");
+    assert!(
+        start.elapsed() < Duration::from_millis(1500),
+        "foreground selector overran the configured 900ms walk budget"
+    );
+    assert_eq!(selector_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let (_, metrics) = get_metrics(router, Some("client")).await;
+    assert_eq!(
+        metric_value(&metrics, "walk_deadline_exhaustions_total"),
+        0,
+        "only real upstream requests can exhaust the candidate walk"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn issue129_llm_decider_changes_order_but_reuses_one_business_failover_walker() {
+    let (good, good_calls) = start_upstream(StatusCode::OK).await;
+    let (failed, failed_calls) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
+    let selector_calls = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::clone(&selector_calls);
+    let selector = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let captured = Arc::clone(&captured);
+            async move {
+                captured.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({
+                    "choices":[{"message":{"content":r#"{"order":[1,0]}"#}}]
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, selector).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: good
+    type: openai
+    base_url: {good}
+    key_env: GOOD
+  - name: bad
+    type: openai
+    base_url: {failed}
+    key_env: BAD
+  - name: selector
+    type: openai
+    base_url: http://{addr}
+    key_env: SELECTOR
+auto:
+  enabled: true
+  candidates:
+    - provider: good
+      model: working
+    - provider: bad
+      model: failing
+  decider:
+    enabled: true
+    provider: selector
+    model: chooser
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("GOOD".into(), "good-secret".into()),
+            ("BAD".into(), "bad-secret".into()),
+            ("SELECTOR".into(), "selector-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let payload = json!({
+        "model":"auto",
+        "messages":[{"role":"user","content":"same context"}]
+    });
+    for endpoint in ["/v1/auto", "/v1/chat/completions"] {
+        let (status, result) = call(
+            router.clone(),
+            auto_request(endpoint, "client", payload.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{endpoint}: {result}");
+        assert_eq!(result["model"], "working", "{endpoint}");
+    }
+    assert_eq!(
+        selector_calls.load(Ordering::SeqCst),
+        1,
+        "selector advice cached"
+    );
+    assert_eq!(
+        failed_calls.load(Ordering::SeqCst),
+        2,
+        "one 503 per real request"
+    );
+    assert_eq!(
+        good_calls.load(Ordering::SeqCst),
+        2,
+        "same fallback loop handles both"
+    );
+    server.abort();
 }
 
 #[tokio::test]
@@ -3080,6 +6698,692 @@ auto:
     )
     .unwrap();
     assert!(config.validate().unwrap_err().contains("enabled: true"));
+}
+
+/// Mock enforces that Go-only Auto selector fields never reach any provider.
+async fn strict_auto_upstream(
+    State(calls): State<Arc<AtomicUsize>>,
+    axum::Json(request): axum::Json<Value>,
+) -> impl IntoResponse {
+    calls.fetch_add(1, Ordering::SeqCst);
+    assert!(
+        request.get("min_context").is_none(),
+        "leaked Auto min_context"
+    );
+    assert!(
+        request.get("max_context").is_none(),
+        "leaked Auto max_context"
+    );
+    axum::Json(json!({
+        "id":"mock-auto-context",
+        "object":"chat.completion",
+        "model":request["model"],
+        "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]
+    }))
+}
+
+async fn start_strict_auto_upstream() -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(strict_auto_upstream))
+        .with_state(calls.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{address}"), calls)
+}
+
+#[tokio::test]
+async fn go_auto_context_filters_are_stripped_and_route_cache_isolated() {
+    let (small, small_calls) = start_strict_auto_upstream().await;
+    let (large, large_calls) = start_strict_auto_upstream().await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: small
+    type: openai
+    base_url: {small}
+    key_env: SMALL_KEY
+    models: [short]
+  - name: large
+    type: openai
+    base_url: {large}
+    key_env: LARGE_KEY
+    models: [long]
+auto:
+  enabled: true
+  candidates:
+    - provider: small
+      model: short
+      max_context_tokens: 4096
+    - provider: large
+      model: long
+      max_context_tokens: 32768
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("SMALL_KEY".into(), "small-secret".into()),
+            ("LARGE_KEY".into(), "large-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let messages = json!([{"role":"user","content":"hello"}]);
+    for (path, context, expected) in [
+        ("/v1/auto", json!({"min_context":8192}), "long"),
+        ("/v1/chat/completions", json!({"max_context":8192}), "short"),
+        (
+            "/v1/auto",
+            json!({"min_context":0,"max_context":0}),
+            "short",
+        ),
+        ("/v1/chat/completions", json!({"min_context":8192}), "long"),
+        ("/v1/auto", json!({"min_context":-1}), "short"),
+    ] {
+        let mut payload = json!({"model":"auto","messages":messages});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(context.as_object().unwrap().clone());
+        let (status, result) = call(router.clone(), auto_request(path, "client", payload)).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {result}");
+        assert_eq!(result["model"], expected, "{path}: {result}");
+    }
+    assert_eq!(small_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(large_calls.load(Ordering::SeqCst), 2);
+    for bounds in [
+        json!({"min_context":1000,"max_context":500}),
+        json!({"min_context":null}),
+        json!({"min_context":"8192"}),
+        json!({"max_context":1.5}),
+        json!({"max_context":true}),
+        json!({"min_context":[]}),
+    ] {
+        let mut payload = json!({"model":"auto","messages":messages});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(bounds.as_object().unwrap().clone());
+        let (status, result) =
+            call(router.clone(), auto_request("/v1/auto", "client", payload)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bounds}: {result}");
+        assert_eq!(result["error"]["code"], "invalid_auto_context");
+    }
+    let (status, result) = call(
+        router,
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({"messages":messages,"min_context":65536}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(result["error"]["code"], "auto_no_eligible_candidate");
+    assert_eq!(small_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(large_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn go_auto_operator_context_floor_can_be_overridden_per_request_without_upstream_leak() {
+    let (small, small_calls) = start_strict_auto_upstream().await;
+    let (large, large_calls) = start_strict_auto_upstream().await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: small
+    type: openai
+    base_url: {small}
+    key_env: SMALL_KEY
+    models: [short]
+  - name: large
+    type: openai
+    base_url: {large}
+    key_env: LARGE_KEY
+    models: [long]
+auto:
+  enabled: true
+  default_min_context: 8192
+  candidates:
+    - provider: small
+      model: short
+      max_context_tokens: 4096
+    - provider: large
+      model: long
+      max_context_tokens: 32768
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("SMALL_KEY".into(), "small-secret".into()),
+            ("LARGE_KEY".into(), "large-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let messages = json!([{"role":"user","content":"hello"}]);
+    for (path, bounds, expected) in [
+        ("/v1/auto", json!({}), "long"),
+        ("/v1/chat/completions", json!({"min_context":1024}), "short"),
+        ("/v1/auto", json!({"min_context":0}), "long"),
+        ("/v1/chat/completions", json!({"min_context":-1}), "long"),
+    ] {
+        let mut request = json!({"model":"auto","messages":messages});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(bounds.as_object().unwrap().clone());
+        let (status, response) = call(router.clone(), auto_request(path, "client", request)).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {response}");
+        assert_eq!(response["model"], expected, "{path}: {response}");
+    }
+    for bounds in [
+        json!({"max_context":4096}),
+        json!({"min_context":8192,"max_context":4096}),
+    ] {
+        let mut request = json!({"model":"auto","messages":messages});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(bounds.as_object().unwrap().clone());
+        let (status, response) =
+            call(router.clone(), auto_request("/v1/auto", "client", request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bounds}: {response}");
+        assert_eq!(response["error"]["code"], "invalid_auto_context");
+    }
+    assert_eq!(small_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(large_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn responses_auto_routes_image_only_to_vision_capable_candidate() {
+    let (text_url, text_seen) = start_format_probe("wrong provider").await;
+    let (vision_url, vision_seen) = start_format_probe("vision success").await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: text\n    type: openai\n    base_url: {text_url}\n    key_env: TEXT\n  - name: vision\n    type: openai\n    base_url: {vision_url}\n    key_env: VISION\nauto:\n  enabled: true\n  candidates:\n    - provider: text\n      model: text-physical\n      supports_images: false\n    - provider: vision\n      model: vision-physical\n      supports_images: true\n"
+    )).unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("TEXT".into(), "text-key".into()),
+            ("VISION".into(), "vision-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let (status, result) = call(
+        router,
+        responses_stream_req(json!({
+            "model":"auto","input":[{"role":"user","content":[
+                {"type":"input_text","text":"describe image"},
+                {"type":"input_image","image_url":"https://example.test/scene.png","detail":"high"}
+            ]}]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["output_text"], "vision success");
+    assert!(
+        text_seen.lock().await.is_empty(),
+        "text-only provider received image"
+    );
+    let calls = vision_seen.lock().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["model"], "vision-physical");
+    assert_eq!(
+        calls[0]["messages"][0]["content"][1],
+        json!({
+            "type":"image_url",
+            "image_url":{"url":"https://example.test/scene.png","detail":"high"}
+        })
+    );
+}
+
+#[tokio::test]
+async fn go_auto_operator_floor_degrades_without_weakening_explicit_bounds_or_capabilities() {
+    let (url, hits) = start_strict_auto_upstream().await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {url}
+    key_env: P_KEY
+    models: [short]
+auto:
+  enabled: true
+  default_min_context: 8192
+  candidates:
+    - provider: p
+      model: short
+      max_context_tokens: 4096
+      supports_images: false
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("P_KEY".into(), "secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for (path, bounds) in [
+        ("/v1/auto", json!({})),
+        ("/v1/chat/completions", json!({"min_context":0})),
+        ("/v1/auto", json!({"max_context":0})),
+        ("/v1/auto", json!({"min_context":1024})),
+    ] {
+        let mut payload = json!({"model":"auto","messages":[{"role":"user","content":"hello"}]});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(bounds.as_object().unwrap().clone());
+        let (status, result) = call(router.clone(), auto_request(path, "client", payload)).await;
+        assert_eq!(status, StatusCode::OK, "{path} {bounds}: {result}");
+        assert_eq!(result["model"], "short");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    for bounds in [
+        json!({"min_context":8192}),
+        json!({"max_context":8192}),
+        json!({"min_context":8192,"max_context":8192}),
+    ] {
+        let mut payload = json!({"model":"auto","messages":[{"role":"user","content":"hello"}]});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(bounds.as_object().unwrap().clone());
+        let (status, result) =
+            call(router.clone(), auto_request("/v1/auto", "client", payload)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{bounds}: {result}"
+        );
+        assert_eq!(result["error"]["code"], "auto_no_eligible_candidate");
+    }
+    let (status, result) = call(
+        router.clone(),
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({
+                "model":"auto",
+                "messages":[{"role":"user","content":[
+                    {"type":"text","text":"hello"},
+                    {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+                ]}]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{result}");
+    assert_eq!(result["error"]["code"], "auto_no_eligible_candidate");
+    // The Responses image adapter must not bypass the same vision-capability
+    // filter merely because its incoming image part uses input_image instead
+    // of Chat's image_url. Reject before any provider receives those bytes.
+    let (status, result) = call(
+        router.clone(),
+        responses_stream_req(json!({
+            "model":"auto",
+            "input":[{"role":"user","content":[
+                {"type":"input_text","text":"what is in this picture?"},
+                {"type":"input_image","image_url":"data:image/png;base64,YQ=="}
+            ]}]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{result}");
+    assert_eq!(result["error"]["code"], "auto_no_eligible_candidate");
+    // Chat file parts derived from Responses inline PDFs need the same
+    // vision-capable route as an image, not a known text-only provider.
+    let (status, result) = call(
+        router.clone(),
+        responses_stream_req(json!({
+            "model":"auto",
+            "input":[{"role":"user","content":[
+                {"type":"input_text","text":"summarize the PDF"},
+                {"type":"input_file","filename":"report.pdf",
+                    "file_data":"data:application/pdf;base64,JVBERi0xLjQK"}
+            ]}]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{result}");
+    assert_eq!(result["error"]["code"], "auto_no_eligible_candidate");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        4,
+        "rejected requests reached upstream"
+    );
+}
+
+#[tokio::test]
+async fn auto_default_output_budget_filters_before_network_for_chat_and_responses() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: p
+    type: openai
+    base_url: {url}
+    key_env: FIRST
+    models: [x]
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: x
+      max_context_tokens: 4096
+      params:
+        max_tokens: 10000
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("FIRST".into(), "first".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let chat = json!({"model":"auto","messages":[{"role":"user","content":"hi"}]});
+    let responses = json!({"model":"auto","input":"hi"});
+    for (path, payload) in [
+        ("/v1/chat/completions", chat.clone()),
+        ("/v1/responses", responses.clone()),
+    ] {
+        let (status, body) = call(router.clone(), auto_request(path, "client", payload)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "auto_no_eligible_candidate");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+    // Explicit per-field caller values override large candidate defaults.
+    for (path, payload) in [
+        (
+            "/v1/chat/completions",
+            json!({"model":"auto","messages":[{"role":"user","content":"hi"}],"max_tokens":16}),
+        ),
+        (
+            "/v1/responses",
+            json!({"model":"auto","input":"hi","max_output_tokens":16}),
+        ),
+    ] {
+        let (status, body) = call(router.clone(), auto_request(path, "client", payload)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn auto_legacy_function_defaults_never_call_text_only_upstream() {
+    let (text_url, text_hits) = start_upstream(StatusCode::OK).await;
+    let (tool_url, tool_hits) = start_upstream(StatusCode::OK).await;
+    for defaults in [
+        "        functions:\n          - name: lookup\n            parameters:\n              type: object\n",
+        "        function_call:\n          name: lookup\n",
+    ] {
+        let config: Config = serde_yaml::from_str(&format!(
+            "providers:\n  - name: text\n    type: openai\n    base_url: {text_url}\n    key_env: TEXT\n  - name: tools\n    type: openai\n    base_url: {tool_url}\n    key_env: TOOLS\nauto:\n  enabled: true\n  max_candidates: 1\n  candidates:\n    - provider: text\n      model: text-model\n      supports_tools: false\n      params:\n{defaults}    - provider: tools\n      model: tool-model\n      supports_tools: true\n"
+        ))
+        .unwrap();
+        let router = app(AppState::new(
+            config,
+            HashMap::from([
+                ("TEXT".into(), "text-key".into()),
+                ("TOOLS".into(), "tool-key".into()),
+            ]),
+            vec!["client".into()],
+        )
+        .unwrap());
+        let (status, body) = call(
+            router,
+            auto_request(
+                "/v1/auto",
+                "client",
+                json!({"model":"auto","messages":[{"role":"user","content":"hi"}]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{defaults}: {body}");
+        assert_eq!(body["model"], "tool-model");
+    }
+    assert_eq!(
+        text_hits.load(Ordering::SeqCst),
+        0,
+        "even default-injected legacy calls must never reach a text-only model"
+    );
+    assert_eq!(tool_hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn auto_legacy_function_requests_never_select_declared_text_only_model() {
+    let (text_url, text_hits) = start_upstream(StatusCode::OK).await;
+    let (tool_url, tool_hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: text\n    type: openai\n    base_url: {text_url}\n    key_env: TEXT\n  - name: tools\n    type: openai\n    base_url: {tool_url}\n    key_env: TOOLS\nauto:\n  enabled: true\n  max_candidates: 1\n  candidates:\n    - provider: text\n      model: text-model\n      priority: 0\n      supports_tools: false\n    - provider: tools\n      model: tool-model\n      priority: 10\n      supports_tools: true\n"
+    )).unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("TEXT".into(), "text-key".into()),
+            ("TOOLS".into(), "tool-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for payload in [
+        json!({"model":"auto","messages":[{"role":"user","content":"hi"}],
+            "functions":[{"name":"lookup","parameters":{"type":"object"}}]}),
+        json!({"model":"auto","messages":[{"role":"user","content":"hi"}],
+            "function_call":{"name":"lookup"}}),
+        json!({"model":"auto","messages":[{"role":"assistant",
+            "function_call":{"name":"lookup","arguments":"{}"}}]}),
+        json!({"model":"auto","messages":[{"role":"function","name":"lookup","content":"ok"}]}),
+    ] {
+        let (status, body) = call(
+            router.clone(),
+            auto_request("/v1/auto", "client", payload.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}: {body}");
+        assert_eq!(body["model"], "tool-model");
+    }
+    assert_eq!(text_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(tool_hits.load(Ordering::SeqCst), 4);
+    let (status, body) = call(
+        router,
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({"model":"auto","messages":[{"role":"user","content":"hi"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "text-model");
+    assert_eq!(text_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn auto_candidate_default_override_cache_never_routes_oversized_alias() {
+    let (upstream, hits) = start_upstream(StatusCode::OK).await;
+    let explicit = json!({
+        "model":"auto","messages":[{"role":"user","content":"hi"}],
+        "max_tokens":80,"user":"x".repeat(11)
+    });
+    let implicit = json!({
+        "model":"auto","messages":[{"role":"user","content":"hi"}],
+        "max_completion_tokens":80,"user":""
+    });
+    let mut physical = explicit.clone();
+    physical["model"] = json!("short");
+    let context_cap = guvna::routing::auto_context_estimate(&physical) + 100;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {upstream}\n    key_env: K\nauto:\n  enabled: true\n  candidates:\n    - provider: p\n      model: short\n      max_context_tokens: {context_cap}\n      params:\n        max_tokens: 1000\n"
+    )).unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("K".into(), "key".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for path in ["/v1/auto", "/v1/chat/completions"] {
+        let (status, response) = call(
+            router.clone(),
+            auto_request(path, "client", explicit.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {response}");
+        assert_eq!(response["model"], "short");
+        let (status, response) = call(
+            router.clone(),
+            auto_request(path, "client", implicit.clone()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{path}: {response}"
+        );
+        assert_eq!(response["error"]["code"], "auto_no_eligible_candidate");
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "two oversized max_completion_tokens requests must be rejected before networking"
+    );
+}
+
+#[tokio::test]
+async fn auto_cached_routes_filter_long_physical_model_before_network_and_keep_safe_fallback() {
+    let (primary, primary_calls) = start_upstream(StatusCode::OK).await;
+    let (backup, backup_calls) = start_upstream(StatusCode::OK).await;
+    let long_model = "physical-model-".repeat(45);
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: primary\n    type: openai\n    base_url: {primary}\n    key_env: FIRST\n  - name: backup\n    type: openai\n    base_url: {backup}\n    key_env: SECOND\nauto:\n  enabled: true\n  max_candidates: 1\n  candidates:\n    - provider: primary\n      model: {long_model}\n      priority: 0\n      max_context_tokens: 450\n    - provider: backup\n      model: short\n      priority: 10\n      max_context_tokens: 450\n"
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("FIRST".into(), "first-key".into()),
+            ("SECOND".into(), "second-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for path in ["/v1/auto", "/v1/chat/completions"] {
+        let (status, response) = call(
+            router.clone(),
+            auto_request(
+                path,
+                "client",
+                json!({"model":"auto","messages":[{"role":"user","content":"hi"}],"max_tokens":80}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {response}");
+        assert_eq!(response["model"], "short");
+    }
+    assert_eq!(
+        primary_calls.load(Ordering::SeqCst),
+        0,
+        "oversized physical model was never eligible"
+    );
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 2);
+    let (status, response) = call(
+        router.clone(),
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({"model":"auto","messages":[{"role":"user","content":"large".repeat(300)}],
+                "max_tokens":80}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+    assert_eq!(response["error"]["code"], "auto_no_eligible_candidate");
+    assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn auto_excludes_sse_only_candidate_when_forced_stream_field_exceeds_window() {
+    let (sse_url, sse_calls) = start_upstream(StatusCode::OK).await;
+    let (json_url, json_calls) = start_upstream(StatusCode::OK).await;
+    let payload =
+        json!({"model":"auto","messages":[{"role":"user","content":"hi"}],"max_tokens":80});
+    let mut physical = payload.clone();
+    physical["model"] = json!("sse");
+    let limit = guvna::routing::auto_context_estimate(&physical) + 1;
+    physical["stream"] = json!(true);
+    assert!(guvna::routing::auto_context_estimate(&physical) > limit);
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: sse\n    type: openai\n    base_url: {sse_url}\n    key_env: SSE\n    stream_only: true\n  - name: json\n    type: openai\n    base_url: {json_url}\n    key_env: JSON\nauto:\n  enabled: true\n  max_candidates: 1\n  candidates:\n    - provider: sse\n      model: sse\n      priority: 0\n      max_context_tokens: {limit}\n    - provider: json\n      model: short\n      priority: 10\n      max_context_tokens: 8192\n"
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        cfg,
+        HashMap::from([
+            ("SSE".into(), "sse-key".into()),
+            ("JSON".into(), "json-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for _ in 0..2 {
+        let (status, response) = call(
+            router.clone(),
+            auto_request("/v1/auto", "client", payload.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["model"], "short");
+    }
+    assert_eq!(sse_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(json_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn auto_stream_only_forced_usage_options_cannot_bypass_context_window() {
+    let (sse_url, sse_hits) = start_upstream(StatusCode::OK).await;
+    let (backup_url, backup_hits) = start_upstream(StatusCode::OK).await;
+    let payload = json!({"model":"auto",
+        "messages":[{"role":"user","content":"hi"}],"max_tokens":80});
+    let mut partial_wire = payload.clone();
+    partial_wire["model"] = json!("sse");
+    partial_wire["stream"] = json!(true);
+    let cap = guvna::routing::auto_context_estimate(&partial_wire) + 1;
+    partial_wire["stream_options"] = json!({"include_usage":true});
+    assert!(guvna::routing::auto_context_estimate(&partial_wire) > cap);
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: sse\n    type: openai\n    base_url: {sse_url}\n    key_env: SSE\n    stream_only: true\n  - name: backup\n    type: openai\n    base_url: {backup_url}\n    key_env: BACKUP\nauto:\n  enabled: true\n  max_candidates: 1\n  candidates:\n    - provider: sse\n      model: sse\n      priority: 0\n      max_context_tokens: {cap}\n    - provider: backup\n      model: short\n      priority: 10\n      max_context_tokens: 8192\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        cfg,
+        HashMap::from([
+            ("SSE".into(), "sse-key".into()),
+            ("BACKUP".into(), "backup-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    for _ in 0..2 {
+        let (status, response) = call(
+            gateway.clone(),
+            auto_request("/v1/auto", "client", payload.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["model"], "short");
+    }
+    assert_eq!(sse_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -3547,6 +7851,42 @@ async fn sse_only_large_usage_metadata_is_included_in_output_budget() {
 }
 
 #[tokio::test]
+async fn sse_only_complete_eof_without_done_matches_direct_streaming_but_rejects_partial() {
+    let (url, calls, forced_stream) =
+        start_strict_stream_only(vec![SSE_START.to_vec(), SSE_END.to_vec()]).await;
+    let (backup, backup_calls) = start_upstream(StatusCode::OK).await;
+    let router = app_with_stream_only_and_auto(&url, &backup, false);
+
+    let (status, answer) = call(router.clone(), request("ordered", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["choices"][0]["message"]["content"], "hi");
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+
+    let streamed = router
+        .oneshot(request("ordered", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(streamed.status(), StatusCode::OK);
+    let body = to_bytes(streamed.into_body(), 1 << 20).await.unwrap();
+    assert!(body.ends_with(b"data: [DONE]\n\n"), "{body:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(forced_stream.load(Ordering::SeqCst), 2);
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+
+    // A clean TCP EOF alone must never make a missing finish_reason a success.
+    let (partial_url, partial_calls, _) = start_strict_stream_only(vec![SSE_START.to_vec()]).await;
+    let (status, fallback) = call(
+        app_with_stream_only_and_auto(&partial_url, &backup, false),
+        request("ordered", "", "client"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fallback}");
+    assert_eq!(fallback["choices"][0]["message"]["content"], "success");
+    assert_eq!(partial_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn stream_only_provider_completes_nonstream_chat_with_fragmented_sse_and_tool_arguments() {
     let frames = vec![
         br#"data: {"id":"chat-123","model":"stream-model","created":45,"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}
@@ -3700,6 +8040,655 @@ async fn chain_default_n_is_used_by_stream_and_stream_only_aggregation() {
     assert_eq!(aggregated["choices"].as_array().unwrap().len(), 2);
     assert_eq!(aggregated["choices"][1]["message"]["content"], "two");
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn shadow_selector_backpressure_skips_unbounded_tasks_without_affecting_live_requests() {
+    use guvna::gateway::app_with_state;
+    use std::time::Duration;
+    let (live, live_hits) = start_upstream(StatusCode::OK).await;
+    let selector_hits = Arc::new(AtomicUsize::new(0));
+    let released = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::clone(&selector_hits);
+    let release = Arc::clone(&released);
+    let selector = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let calls = Arc::clone(&calls);
+            let release = Arc::clone(&release);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+                axum::Json(json!({"choices":[{"message":{"content":r#"{"order":[1,0]}"#}}]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, selector).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: live
+    type: openai
+    base_url: {live}
+    key_env: LIVE
+  - name: selector
+    type: openai
+    base_url: http://{address}
+    key_env: SELECTOR
+auto:
+  enabled: true
+  candidates:
+    - provider: live
+      model: first
+    - provider: live
+      model: second
+  decider:
+    enabled: true
+    provider: selector
+    model: ranker
+    shadow_only: true
+    timeout_ms: 2000
+"#
+    ))
+    .unwrap();
+    let (router, state) = app_with_state(
+        AppState::new(
+            config,
+            HashMap::from([
+                ("LIVE".into(), "live-key".into()),
+                ("SELECTOR".into(), "selector-key".into()),
+            ]),
+            vec!["client".into()],
+        )
+        .unwrap(),
+    );
+    let payload = json!({"model":"auto","messages":[{"role":"user","content":"hello"}]});
+    let (status, body) = call(
+        router.clone(),
+        auto_request("/v1/auto", "client", payload.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while selector_hits.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("one selector should start");
+    let tasks = (0..32).map(|_| {
+        let router = router.clone();
+        let payload = payload.clone();
+        async move { call(router, auto_request("/v1/auto", "client", payload)).await }
+    });
+    let responses = tokio::time::timeout(
+        Duration::from_secs(3),
+        futures_util::future::join_all(tasks),
+    )
+    .await
+    .expect("shadow backpressure must not block live traffic");
+    for (status, body) in responses {
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(selector_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(live_hits.load(Ordering::SeqCst), 33);
+    let before = state.runtime_status();
+    assert_eq!(before["auto_shadow_total"], 0);
+    assert_eq!(before["auto_shadow_unavailable"], 32);
+    released.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.runtime_status()["auto_shadow_total"] != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first selector must finish and release the permit");
+    assert_eq!(state.runtime_status()["auto_shadow_disagreements"], 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn online_provider_reorder_is_visible_to_decider_without_stale_identity() {
+    use guvna::gateway::app_with_state;
+
+    let (first_url, first_hits) = start_upstream(StatusCode::OK).await;
+    let (second_url, second_hits) = start_upstream(StatusCode::OK).await;
+    let captured = Arc::new(tokio::sync::Mutex::new(None::<Value>));
+    let capture = Arc::clone(&captured);
+    let selector = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(body): axum::Json<Value>| {
+            let capture = Arc::clone(&capture);
+            async move {
+                *capture.lock().await = Some(body);
+                axum::Json(json!({"choices":[{"message":{"content":r#"{"order":[0,1]}"#}}]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, selector).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: first
+    type: openai
+    base_url: {first_url}
+    key_env: FIRST
+  - name: second
+    type: openai
+    base_url: {second_url}
+    key_env: SECOND
+  - name: selector
+    type: openai
+    base_url: http://{address}
+    key_env: SELECTOR
+auto:
+  enabled: true
+  candidates:
+    - provider: first
+      model: one
+    - provider: second
+      model: two
+  decider:
+    enabled: true
+    provider: selector
+    model: ranker
+"#
+    ))
+    .unwrap();
+    let (router, state) = app_with_state(
+        AppState::new(
+            config.clone(),
+            HashMap::from([
+                ("FIRST".into(), "first-key".into()),
+                ("SECOND".into(), "second-key".into()),
+                ("SELECTOR".into(), "selector-key".into()),
+            ]),
+            vec!["client".into()],
+        )
+        .unwrap(),
+    );
+    // A live config generation can change provider indexes without changing
+    // candidate names. Selector prompts must use the admitted snapshot.
+    let mut reordered = config;
+    reordered.providers.swap(0, 1);
+    state.replace_route_snapshot(reordered).unwrap();
+    let (status, body) = call(
+        router,
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({"model":"auto","messages":[{"role":"user","content":"hello"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        first_hits.load(Ordering::SeqCst) + second_hits.load(Ordering::SeqCst),
+        1
+    );
+    let selector_request = captured.lock().await.take().expect("selector called");
+    let summary: Value =
+        serde_json::from_str(selector_request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    let candidates = summary["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2);
+    for candidate in candidates {
+        match candidate["model"].as_str().unwrap() {
+            "one" => assert_eq!(candidate["provider"], "first"),
+            "two" => assert_eq!(candidate["provider"], "second"),
+            other => panic!("unexpected candidate model: {other}"),
+        }
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_provider_reorder_keeps_physical_credentials_and_circuits_bound_to_identity() {
+    use guvna::gateway::app_with_state;
+
+    async fn auth_upstream(expected: &'static str, calls: Arc<AtomicUsize>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let service =
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move |request: Request<Body>| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        if request
+                            .headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            != Some(expected)
+                        {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                axum::Json(json!({"error":"wrong key"})),
+                            )
+                                .into_response();
+                        }
+                        let body = to_bytes(request.into_body(), 1 << 20).await.unwrap();
+                        let payload: Value = serde_json::from_slice(&body).unwrap();
+                        (StatusCode::OK, axum::Json(json!({
+                        "id":"keyed","object":"chat.completion","model":payload["model"],
+                        "choices":[{"index":0,"message":{"role":"assistant","content":expected},
+                            "finish_reason":"stop"}]
+                    }))).into_response()
+                    }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    let first_hits = Arc::new(AtomicUsize::new(0));
+    let second_hits = Arc::new(AtomicUsize::new(0));
+    let first = auth_upstream("Bearer first-secret", Arc::clone(&first_hits)).await;
+    let second = auth_upstream("Bearer second-secret", Arc::clone(&second_hits)).await;
+    let base: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: first
+    type: openai
+    base_url: {first}
+    key_env: FIRST
+    circuit_breaker:
+      enabled: true
+  - name: second
+    type: openai
+    base_url: {second}
+    key_env: SECOND
+    circuit_breaker:
+      enabled: true
+chains:
+  - name: first-route
+    steps:
+      - provider: first
+        model: first-model
+  - name: second-route
+    steps:
+      - provider: second
+        model: second-model
+"#
+    ))
+    .unwrap();
+    let (router, state) = app_with_state(
+        AppState::new(
+            base.clone(),
+            HashMap::from([
+                ("FIRST".into(), "first-secret".into()),
+                ("SECOND".into(), "second-secret".into()),
+            ]),
+            vec!["client".into()],
+        )
+        .unwrap(),
+    );
+    let mut reordered = base.clone();
+    reordered.providers.swap(0, 1);
+    state.replace_route_snapshot(reordered).unwrap();
+    assert_eq!(state.route_snapshot().providers[0].name, "first");
+    assert_eq!(state.route_snapshot().providers[1].name, "second");
+    for (route, expected) in [
+        ("first-route", "Bearer first-secret"),
+        ("second-route", "Bearer second-secret"),
+    ] {
+        let (status, body) = call(router.clone(), request(route, "", "client")).await;
+        assert_eq!(status, StatusCode::OK, "{route}: {body}");
+        assert_eq!(body["choices"][0]["message"]["content"], expected);
+    }
+    assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+
+    // Changes to the physical pool/endpoint contract cannot be activated by
+    // swapping an Arc of route metadata. Failed replacement is atomic.
+    let baseline = state.route_snapshot();
+    let mut changed_url = base.clone();
+    changed_url.providers[0].base_url = "http://127.0.0.1:1".into();
+    assert!(
+        state
+            .replace_route_snapshot(changed_url)
+            .unwrap_err()
+            .contains("restart")
+    );
+    let mut changed_key = base.clone();
+    changed_key.providers[0].key_env = "SECOND".into();
+    assert!(
+        state
+            .replace_route_snapshot(changed_key)
+            .unwrap_err()
+            .contains("restart")
+    );
+    let mut changed_timeout = base.clone();
+    changed_timeout.timeout.walk = "7m".into();
+    assert!(
+        state
+            .replace_route_snapshot(changed_timeout)
+            .unwrap_err()
+            .contains("restart")
+    );
+    let mut changed_auto = base.clone();
+    // A valid, inactive selector setting is still startup-only state.
+    changed_auto.auto.decider.timeout_ms = 1200;
+    assert!(
+        state
+            .replace_route_snapshot(changed_auto)
+            .unwrap_err()
+            .contains("restart")
+    );
+    let mut removed_provider = base.clone();
+    removed_provider.providers.pop();
+    removed_provider
+        .chains
+        .retain(|chain| chain.name == "first-route");
+    assert!(
+        state
+            .replace_route_snapshot(removed_provider)
+            .unwrap_err()
+            .contains("restart")
+    );
+    assert_eq!(
+        state.route_snapshot().providers[0].base_url,
+        baseline.providers[0].base_url
+    );
+    let (status, body) = call(router, request("first-route", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(first_hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn live_provider_reorder_keeps_cancelled_stream_telemetry_on_original_identity() {
+    use guvna::gateway::app_with_state;
+    use http_body_util::BodyExt;
+    use rusqlite::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (first, first_hits) = start_upstream(StatusCode::OK).await;
+    let (second, upstream_drops) = start_stalled_sse().await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: first
+    type: openai
+    base_url: {first}
+    key_env: FIRST
+  - name: second
+    type: openai
+    base_url: {second}
+    key_env: SECOND
+chains:
+  - name: slow-second
+    steps:
+      - provider: second
+        model: isolated
+"#
+    ))
+    .unwrap();
+    let mut state = AppState::new(
+        config.clone(),
+        HashMap::from([
+            ("FIRST".into(), "first-secret".into()),
+            ("SECOND".into(), "second-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, shared) = app_with_state(state);
+    let mut reordered = config.clone();
+    reordered.providers.swap(0, 1);
+    shared.replace_route_snapshot(reordered).unwrap();
+    let response = router
+        .oneshot(request("slow-second", r#","stream":true"#, "client"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let first_frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(first_frame.into_data().unwrap().starts_with(b"data: "));
+    // Mutation after stream admission must not change its telemetry name.
+    shared.replace_route_snapshot(config).unwrap();
+    drop(body);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while upstream_drops.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(shared.flush_telemetry(std::time::Duration::from_secs(3)));
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let outcome: (String, String, String) = db
+        .query_row(
+            "SELECT provider,model,outcome FROM stream_terminals LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        (
+            "second".into(),
+            "isolated".into(),
+            "client_cancelled".into()
+        )
+    );
+    assert_eq!(first_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn missing_optional_decider_key_does_not_block_auto_or_gateway_boot() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: business
+    type: openai
+    base_url: {url}
+    key_env: BUSINESS_KEY
+  - name: selector
+    type: openai
+    base_url: http://127.0.0.1:1
+    key_env: MISSING_SELECTOR_KEY
+auto:
+  enabled: true
+  candidates:
+    - provider: business
+      model: primary
+    - provider: business
+      model: secondary
+  decider:
+    enabled: true
+    provider: selector
+    model: ranker
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([("BUSINESS_KEY".into(), "business-secret".into())]),
+        vec!["client".into()],
+    )
+    .expect("optional selector key must not prevent gateway startup"));
+    let (status, response) = call(
+        router,
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({"model":"auto","messages":[{"role":"user","content":"hello"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["choices"][0]["message"]["content"], "success");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn missing_shadow_selector_key_is_counted_without_changing_live_route() {
+    use guvna::gateway::app_with_state;
+
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: business
+    type: openai
+    base_url: {url}
+    key_env: BUSINESS_KEY
+  - name: selector
+    type: openai
+    base_url: http://127.0.0.1:1
+    key_env: MISSING_SELECTOR_KEY
+auto:
+  enabled: true
+  candidates:
+    - provider: business
+      model: primary
+    - provider: business
+      model: secondary
+  decider:
+    enabled: true
+    shadow_only: true
+    provider: selector
+    model: ranker
+"#
+    ))
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut app_state = AppState::new(
+        config,
+        HashMap::from([("BUSINESS_KEY".into(), "business-secret".into())]),
+        vec!["client".into()],
+    )
+    .unwrap();
+    app_state.enable_telemetry(dir.path()).unwrap();
+    let (router, state) = app_with_state(app_state);
+    let (status, body) = call(
+        router,
+        auto_request(
+            "/v1/auto",
+            "client",
+            json!({"model":"auto","messages":[{"role":"user","content":"hello"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(state.runtime_status()["auto_shadow_total"], 0);
+    assert_eq!(state.runtime_status()["auto_shadow_unavailable"], 1);
+    assert!(state.flush_telemetry(std::time::Duration::from_secs(3)));
+    let conn = rusqlite::Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let shadow: (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(available), 0) FROM shadow_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        shadow,
+        (1, 0),
+        "missing selector is an unavailable shadow observation"
+    );
+}
+
+#[tokio::test]
+async fn streaming_auto_never_waits_for_a_cold_llm_decider() {
+    let (live, hits, _) = start_strict_stream_only(vec![
+        SSE_START.to_vec(),
+        SSE_END.to_vec(),
+        SSE_DONE.to_vec(),
+    ])
+    .await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let selector_hits = Arc::new(AtomicUsize::new(0));
+    let selector_calls = Arc::clone(&selector_hits);
+    let selector = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let selector_calls = Arc::clone(&selector_calls);
+            async move {
+                selector_calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+                axum::Json(json!({"choices":[{"message":{"content":r#"{"order":[1,0]}"#}}]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let selector_addr = listener.local_addr().unwrap();
+    let selector_task = tokio::spawn(async move {
+        axum::serve(listener, selector).await.unwrap();
+    });
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: live
+    type: openai
+    base_url: {live}
+    key_env: LIVE
+    stream_only: true
+  - name: backup
+    type: openai
+    base_url: {backup}
+    key_env: BACKUP
+  - name: selector
+    type: openai
+    base_url: http://{selector_addr}
+    key_env: SELECTOR
+auto:
+  enabled: true
+  candidates:
+    - provider: live
+      model: primary
+      priority: 1
+    - provider: backup
+      model: fallback
+      priority: 2
+  decider:
+    enabled: true
+    provider: selector
+    model: ranker
+    timeout_ms: 1500
+    cache_ttl_secs: 30
+"#
+    ))
+    .unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("LIVE".into(), "live-key".into()),
+            ("BACKUP".into(), "backup-key".into()),
+            ("SELECTOR".into(), "selector-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(700),
+        router.oneshot(auto_request(
+            "/v1/auto",
+            "client",
+            json!({"model":"auto","stream":true,"messages":[{"role":"user","content":"hello"}]}),
+        )),
+    )
+    .await
+    .expect("SSE headers must not wait for the 1100ms selector")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("data: [DONE]"));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(selector_hits.load(Ordering::SeqCst), 1);
+    selector_task.abort();
 }
 
 #[tokio::test]
@@ -3870,6 +8859,52 @@ fn aggregate_chat_frame(event: Value) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn forced_tool_refusal_matches_direct_sse_and_sse_only_json_aggregation() {
+    let frames = vec![
+        aggregate_chat_frame(json!({"choices":[{"index":0,
+            "delta":{"role":"assistant","refusal":"Cannot perform that request"},
+            "finish_reason":null}]})),
+        aggregate_chat_frame(json!({"choices":[{"index":0,
+            "delta":{},"finish_reason":"stop"}]})),
+        b"data: [DONE]\n\n".to_vec(),
+    ];
+    let (url, hits, streamed) = start_strict_stream_only(frames).await;
+    let (backup_url, backup_hits) = start_upstream(StatusCode::OK).await;
+    let gateway = app_with_stream_only_and_auto(&url, &backup_url, false);
+
+    for choice in [
+        r#""required""#,
+        r#"{"type":"function","function":{"name":"lookup"}}"#,
+    ] {
+        let extra = format!(
+            ",\"tools\":[{{\"type\":\"function\",\"function\":{{\"name\":\"lookup\"}}}}],\"tool_choice\":{choice}"
+        );
+        let (status, body) = call(gateway.clone(), request("ordered", &extra, "client")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["choices"][0]["message"]["refusal"],
+            "Cannot perform that request"
+        );
+
+        let streaming_extra = format!("{extra},\"stream\":true");
+        let response = gateway
+            .clone()
+            .oneshot(request("ordered", &streaming_extra, "client"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let data = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8(data.to_vec()).unwrap();
+        assert!(text.contains("Cannot perform that request"), "{text}");
+        assert!(text.contains("data: [DONE]"), "{text}");
+        assert!(!text.contains("upstream_stream_incomplete"), "{text}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    assert_eq!(streamed.load(Ordering::SeqCst), 4);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn sse_only_aggregate_preserves_reasoning_and_refusal_without_replaying_to_backup() {
     let scenarios = [
         (
@@ -4005,6 +9040,93 @@ chains:
     let (_, metrics) = get_metrics(router, Some("client")).await;
     assert_eq!(metric_value(&metrics, "circuit_openings_total"), 0);
     assert_eq!(metric_value(&metrics, "aggregation_failures_total"), 8);
+}
+
+#[tokio::test]
+async fn local_aggregation_policy_does_not_poison_auto_health_or_sqlite_restart() {
+    use guvna::gateway::app_with_state;
+    use rusqlite::Connection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let invalid = aggregate_chat_frame(json!({"choices":[{"index":0,
+        "delta":{"audio":{"data":"unsupported"}},"finish_reason":null}]}));
+    let (primary, primary_hits, _) =
+        start_strict_stream_only(vec![invalid, b"data: [DONE]\n\n".to_vec()]).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        r#"
+providers:
+  - name: streaming
+    type: openai
+    base_url: {primary}
+    key_env: STREAM_KEY
+    stream_only: true
+  - name: backup
+    type: openai
+    base_url: {backup}
+    key_env: BACKUP_KEY
+auto:
+  enabled: true
+  health_aware: true
+  candidates:
+    - provider: streaming
+      model: stream-model
+      priority: 1
+    - provider: backup
+      model: backup-model
+      priority: 2
+"#
+    ))
+    .unwrap();
+    let credentials = HashMap::from([
+        ("STREAM_KEY".into(), "stream-secret".into()),
+        ("BACKUP_KEY".into(), "backup-secret".into()),
+    ]);
+    let mut state =
+        AppState::new(config.clone(), credentials.clone(), vec!["client".into()]).unwrap();
+    state.enable_telemetry(dir.path()).unwrap();
+    let (router, shared) = app_with_state(state);
+    for _ in 0..3 {
+        let (status, output) = call(router.clone(), request("auto", "", "client")).await;
+        assert_eq!(status, StatusCode::OK, "{output}");
+    }
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 3);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 3);
+    assert!(shared.flush_telemetry(std::time::Duration::from_secs(3)));
+
+    let db = Connection::open(dir.path().join("telemetry/requests.sqlite3")).unwrap();
+    let poisoned: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM provider_health WHERE provider='streaming' AND model='stream-model'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        poisoned, 0,
+        "local SSE-to-JSON aggregation policy cannot silently demote a provider after restart"
+    );
+    let recorded: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM failure_events WHERE provider='streaming' AND model='stream-model'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 3, "diagnostic failures still appear in telemetry");
+    drop(db);
+
+    let mut restarted = AppState::new(config, credentials, vec!["client".into()]).unwrap();
+    restarted.enable_telemetry(dir.path()).unwrap();
+    let (router, _) = app_with_state(restarted);
+    let (status, output) = call(router, request("auto", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(
+        primary_hits.load(Ordering::SeqCst),
+        4,
+        "SQLite restart must not reintroduce an unsupported aggregation health penalty"
+    );
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 4);
 }
 
 #[tokio::test]
@@ -4166,6 +9288,107 @@ async fn sse_only_logprobs_request_never_returns_silently_lost_logprobs() {
     assert_eq!(output["error"]["code"], "upstream_unavailable");
     assert_eq!(primary_hits.load(Ordering::SeqCst), 0);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn sse_only_upstream_explicit_error_event_falls_back_immediately() {
+    let error_event = b"event: error\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fake\"},\"finish_reason\":\"stop\"}]}\n\n";
+    let (primary, primary_hits, _) =
+        start_strict_stream_only(vec![error_event.to_vec(), SSE_DONE.to_vec()]).await;
+    let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+    let router = app_with_stream_only_and_auto(&primary, &backup, false);
+    let (status, body) = call(router, request("ordered", "", "client")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["choices"][0]["message"]["content"], "success");
+    assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn direct_sse_logprobs_request_must_not_silently_lose_token_probabilities() {
+    let (missing, missing_hits) = start_sse(vec![SSE_START, SSE_END, SSE_DONE]).await;
+    let response = make_app(&missing, &missing)
+        .oneshot(request(
+            "demo",
+            r#","stream":true,"logprobs":true"#,
+            "client",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("upstream_stream_incomplete"), "{text}");
+    assert!(!text.contains("data: [DONE]"), "{text}");
+    assert_eq!(missing_hits.load(Ordering::SeqCst), 1);
+
+    let with_logprobs = Bytes::from(format!(
+        "data: {}\n\n",
+        json!({"choices":[{"index":0,"delta":{"content":"hi"},
+            "logprobs":{"content":[{"token":"hi","logprob":-0.1}]},
+            "finish_reason":null}]})
+    ));
+    let (valid, valid_hits) = start_sse_owned(vec![
+        with_logprobs,
+        Bytes::from_static(SSE_END),
+        Bytes::from_static(SSE_DONE),
+    ])
+    .await;
+    let response = make_app(&valid, &valid)
+        .oneshot(request(
+            "demo",
+            r#","stream":true,"logprobs":true"#,
+            "client",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("data: [DONE]"), "{text}");
+    assert_eq!(valid_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn sse_only_aggregation_skips_untranslatable_chain_logprobs_defaults() {
+    for (defaults, extra, skip_primary) in [
+        ("logprobs: true", "", true),
+        ("top_logprobs: 4", "", true),
+        ("logprobs: true", r#","logprobs":false"#, false),
+    ] {
+        let (primary, primary_hits, _) = start_strict_stream_only(vec![
+            SSE_START.to_vec(),
+            SSE_END.to_vec(),
+            SSE_DONE.to_vec(),
+        ])
+        .await;
+        let (backup, backup_hits) = start_upstream(StatusCode::OK).await;
+        let yaml = format!(
+            "providers:\n  - name: streaming\n    type: openai\n    base_url: {primary}\n    key_env: STREAM_KEY\n    stream_only: true\n  - name: backup\n    type: openai\n    base_url: {backup}\n    key_env: BACKUP_KEY\nchains:\n  - name: ordered\n    steps:\n      - provider: streaming\n        model: streaming-model\n        params:\n          {defaults}\n      - provider: backup\n        model: backup-model\n"
+        );
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        let gateway = app(AppState::new(
+            config,
+            HashMap::from([
+                ("STREAM_KEY".into(), "stream-secret".into()),
+                ("BACKUP_KEY".into(), "backup-secret".into()),
+            ]),
+            vec!["client".into()],
+        )
+        .unwrap());
+        let (status, body) = call(gateway, request("ordered", extra, "client")).await;
+        assert_eq!(status, StatusCode::OK, "{defaults}, {extra}: {body}");
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            if skip_primary { 0 } else { 1 },
+            "{defaults}, {extra}"
+        );
+        assert_eq!(
+            backup_hits.load(Ordering::SeqCst),
+            if skip_primary { 1 } else { 0 },
+            "{defaults}, {extra}"
+        );
+    }
 }
 
 async fn start_variable_choice_upstream() -> (String, Arc<AtomicUsize>) {

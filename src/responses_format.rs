@@ -21,27 +21,52 @@ fn unsupported() -> Failure {
     )
 }
 
-pub(super) fn translate(text: Option<&Value>) -> Result<Option<Value>, Failure> {
+#[cfg(test)]
+fn translate(text: Option<&Value>) -> Result<Option<Value>, Failure> {
+    translate_owned(text.cloned())
+}
+
+/// Move the Responses text.verbosity level to the identical Chat field.
+pub(super) fn take_verbosity(text: &mut Option<Value>) -> Result<Option<Value>, Failure> {
+    let Some(Value::Object(wrapper)) = text.as_mut() else {
+        return Ok(None); // translate_owned validates non-object configurations.
+    };
+    match wrapper.remove("verbosity") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(level)) if matches!(level.as_str(), "low" | "medium" | "high") => {
+            Ok(Some(Value::String(level)))
+        }
+        _ => Err(malformed()),
+    }
+}
+
+/// The Responses handler owns its input tree. Move the JSON Schema into the
+/// Chat envelope instead of cloning a potentially multi-megabyte schema.
+pub(super) fn translate_owned(text: Option<Value>) -> Result<Option<Value>, Failure> {
     let Some(text) = text else {
         return Ok(None);
     };
-    let Some(wrapper) = text.as_object() else {
+    let Value::Object(mut wrapper) = text else {
         return Err(malformed());
     };
-    // verbosity and other Responses-specific options must not vanish silently.
+    // Other Responses-specific options must not vanish silently.
     if wrapper.keys().any(|key| key != "format") {
         return Err(unsupported());
     }
-    let Some(raw) = wrapper.get("format") else {
+    let Some(raw) = wrapper.remove("format") else {
         return Ok(None); // Explicit {} behaves like the default text format.
     };
-    let Some(format) = raw.as_object() else {
+    let Value::Object(mut format) = raw else {
         return Err(malformed());
     };
-    let Some(kind) = format.get("type").and_then(Value::as_str) else {
+    let Some(kind) = format
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
         return Err(malformed());
     };
-    match kind {
+    match kind.as_str() {
         "text" | "json_object" => {
             if format.len() != 1 {
                 return Err(unsupported());
@@ -75,15 +100,16 @@ pub(super) fn translate(text: Option<&Value>) -> Result<Option<Value>, Failure> 
             {
                 return Err(malformed());
             }
-            let mut nested = Map::new();
-            for key in ["name", "description", "schema", "strict"] {
-                if let Some(value) = format.get(key) {
-                    nested.insert(key.into(), value.clone());
-                }
-            }
+            format.remove("type");
+            let nested = format;
             // Do not flatten or stringify the supplied schema: deep objects,
             // large JSON integer values and optional strict all retain type.
-            Ok(Some(json!({"type":"json_schema","json_schema":nested})))
+            // json! borrows nested Values when serializing and clones their
+            // Strings. Build the two-field envelope by ownership transfer.
+            let mut output = Map::new();
+            output.insert("type".into(), Value::String("json_schema".into()));
+            output.insert("json_schema".into(), Value::Object(nested));
+            Ok(Some(Value::Object(output)))
         }
         _ => Err(unsupported()),
     }
@@ -92,6 +118,25 @@ pub(super) fn translate(text: Option<&Value>) -> Result<Option<Value>, Failure> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owned_schema_translation_reuses_large_text_allocation() {
+        let description = "schema".repeat(128 * 1024);
+        let input = json!({
+            "format": {"type":"json_schema","name":"result",
+                "schema":{"type":"object","description":description},
+                "strict":true}
+        });
+        let source = input["format"]["schema"]["description"].as_str().unwrap();
+        let source_ptr = source.as_ptr();
+        let result = translate_owned(Some(input)).unwrap().unwrap();
+        let target = result["json_schema"]["schema"]["description"]
+            .as_str()
+            .unwrap();
+        assert_eq!(target.as_ptr(), source_ptr);
+        assert_eq!(target.len(), 6 * 128 * 1024);
+        assert_eq!(result["json_schema"]["strict"], true);
+    }
+
     #[test]
     fn equivalent_modes_map_without_dropping_schema_fields() {
         assert_eq!(translate(None), Ok(None));
@@ -116,6 +161,26 @@ mod tests {
         assert_eq!(mapped["json_schema"]["strict"], true);
         assert_eq!(mapped["json_schema"]["description"], "Schema for data");
     }
+    #[test]
+    fn text_verbosity_maps_with_existing_format() {
+        for level in ["low", "medium", "high"] {
+            let mut config = Some(json!({"verbosity":level,
+                "format":{"type":"json_object"}}));
+            assert_eq!(take_verbosity(&mut config).unwrap(), Some(json!(level)));
+            assert_eq!(
+                translate_owned(config),
+                Ok(Some(json!({"type":"json_object"})))
+            );
+        }
+        let mut nullable = Some(json!({"verbosity":null}));
+        assert_eq!(take_verbosity(&mut nullable).unwrap(), None);
+        assert_eq!(translate_owned(nullable), Ok(None));
+        for invalid in [json!("verbose"), json!(4), json!(false)] {
+            let mut config = Some(json!({"verbosity":invalid}));
+            assert!(take_verbosity(&mut config).is_err());
+        }
+    }
+
     #[test]
     fn malformed_and_unsupported_modes_fail_closed() {
         for item in [

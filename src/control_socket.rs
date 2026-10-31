@@ -1,12 +1,12 @@
 //! Permission-restricted, read-only local runtime status over a Unix domain socket.
-//! No TCP management listener and no mutating command is exposed.
-use guvna::gateway::AppState;
+//! Same-UID Unix socket supports limited runtime chain edits. No TCP admin.
+use guvna::{chain_store, config::Config, gateway::AppState};
 use serde_json::{Value, json};
 use std::{
     fs, io,
     os::unix::{
         ffi::OsStrExt,
-        fs::{FileTypeExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     sync::Arc,
@@ -15,37 +15,42 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    sync::Semaphore,
+    sync::{Mutex, Semaphore},
     task::JoinHandle,
     time::timeout,
 };
 
 const SOCKET_NAME: &str = "control.sock";
 const MAX_CONTROL_LINE: usize = 4096;
+const MAX_CONTROL_RESPONSE_LINE: usize = 32768;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CLIENTS: usize = 4;
+const SCORING_TIMEOUT: Duration = Duration::from_millis(800);
 
 struct ControlSocket {
     listener: UnixListener,
     path: PathBuf,
+    socket_identity: (u64, u64),
+    directory: PathBuf,
     state: Arc<AppState>,
+    base_config: Arc<Config>,
 }
 
 impl ControlSocket {
-    async fn bind(data_dir: &Path, state: Arc<AppState>) -> Result<Self, String> {
+    async fn bind(
+        data_dir: &Path,
+        state: Arc<AppState>,
+        base_config: Arc<Config>,
+    ) -> Result<Self, String> {
         let path = socket_path(data_dir)?;
         let newly_created = !data_dir.exists();
         fs::create_dir_all(data_dir)
             .map_err(|error| format!("create local control directory: {error}"))?;
-        let directory_metadata = fs::symlink_metadata(data_dir)
-            .map_err(|error| format!("inspect local control directory: {error}"))?;
-        if !directory_metadata.file_type().is_dir() {
-            return Err("GUVNA_DATA_DIR must be a real directory, not a symlink".into());
-        }
         if newly_created {
             fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700))
                 .map_err(|error| format!("secure local control directory: {error}"))?;
         }
+        ensure_private_control_directory(data_dir)?;
         ensure_socket_available(&path).await?;
         let listener = UnixListener::bind(&path)
             .map_err(|error| format!("bind local control socket {}: {error}", path.display()))?;
@@ -53,15 +58,25 @@ impl ControlSocket {
             let _ = fs::remove_file(&path);
             return Err(format!("secure local control socket: {error}"));
         }
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect bound control socket: {error}"))?;
+        let socket_identity = (metadata.dev(), metadata.ino());
         Ok(Self {
             listener,
             path,
+            socket_identity,
+            directory: data_dir.to_path_buf(),
             state,
+            base_config,
         })
     }
 
     async fn run(self) {
         let permits = Arc::new(Semaphore::new(MAX_CLIENTS));
+        let mutation_gate = Arc::new(Mutex::new(()));
+        // Timed-out blocking SQLite reads are not cancelled by Tokio.
+        // Bound the underlying work, not just the socket handlers.
+        let scoring_gate = Arc::new(Semaphore::new(1));
         loop {
             let (stream, _) = match self.listener.accept().await {
                 Ok(connection) => connection,
@@ -72,19 +87,29 @@ impl ControlSocket {
                 Err(_) => break,
             };
             let state = Arc::clone(&self.state);
+            let directory = self.directory.clone();
+            let base_config = Arc::clone(&self.base_config);
+            let gate = Arc::clone(&mutation_gate);
+            let scoring = Arc::clone(&scoring_gate);
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = handle_client(stream, state).await;
+                let _ = handle_client(stream, state, directory, base_config, gate, scoring).await;
             });
         }
     }
 }
 
+fn unlink_owned_socket(path: &Path, identity: (u64, u64)) {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_socket() && (metadata.dev(), metadata.ino()) == identity
+    }) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 impl Drop for ControlSocket {
     fn drop(&mut self) {
-        if fs::symlink_metadata(&self.path).is_ok_and(|metadata| metadata.file_type().is_socket()) {
-            let _ = fs::remove_file(&self.path);
-        }
+        unlink_owned_socket(&self.path, self.socket_identity);
     }
 }
 
@@ -99,6 +124,24 @@ fn socket_path(data_dir: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn ensure_private_control_directory(data_dir: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(data_dir)
+        .map_err(|error| format!("inspect local control directory: {error}"))?;
+    if !metadata.file_type().is_dir() {
+        return Err("GUVNA_DATA_DIR must be a real directory, not a symlink".into());
+    }
+    // A writable parent lets another local UID unlink/rebind even a 0600
+    // socket. A spoofed daemon could then capture CLI mutations or status
+    // responses. Preserve safe existing permissions; reject unsafe ones.
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+        return Err(
+            "local control directory must be owned by the service UID and not group/world writable"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 async fn ensure_socket_available(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -106,7 +149,7 @@ async fn ensure_socket_available(path: &Path) -> Result<(), String> {
         Ok(metadata) if !metadata.file_type().is_socket() => {
             Err("control socket path exists but is not a socket; refusing to replace it".into())
         }
-        Ok(_) => match timeout(CONTROL_TIMEOUT, UnixStream::connect(path)).await {
+        Ok(metadata) => match timeout(CONTROL_TIMEOUT, UnixStream::connect(path)).await {
             Ok(Ok(_)) => Err("another guvna process already owns the local control socket".into()),
             Ok(Err(error))
                 if matches!(
@@ -114,10 +157,21 @@ async fn ensure_socket_available(path: &Path) -> Result<(), String> {
                     io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
                 ) =>
             {
-                match fs::remove_file(path) {
-                    Ok(()) => Ok(()),
+                // Do not unlink a socket installed by a new daemon while
+                // our connection attempt was waiting on a stale pathname.
+                let current = fs::symlink_metadata(path);
+                match current {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                    Err(error) => Err(format!("remove stale local control socket: {error}")),
+                    Ok(current)
+                        if current.file_type().is_socket()
+                            && (current.dev(), current.ino())
+                                == (metadata.dev(), metadata.ino()) =>
+                    {
+                        fs::remove_file(path)
+                            .map_err(|error| format!("remove stale local control socket: {error}"))
+                    }
+                    Ok(_) => Err("control socket changed during stale socket check".into()),
+                    Err(error) => Err(format!("recheck stale local control socket: {error}")),
                 }
             }
             Ok(Err(error)) => Err(format!("check local control socket: {error}")),
@@ -126,34 +180,85 @@ async fn ensure_socket_available(path: &Path) -> Result<(), String> {
     }
 }
 
-pub async fn spawn(data_dir: &Path, state: Arc<AppState>) -> Result<JoinHandle<()>, String> {
-    let server = ControlSocket::bind(data_dir, state).await?;
+pub async fn spawn(
+    data_dir: &Path,
+    state: Arc<AppState>,
+    base_config: Arc<Config>,
+) -> Result<JoinHandle<()>, String> {
+    let server = ControlSocket::bind(data_dir, state, base_config).await?;
     Ok(tokio::spawn(server.run()))
 }
 
-async fn read_line_bounded<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, &'static str> {
+async fn read_line_bounded<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<Vec<u8>, &'static str> {
     let mut bytes = Vec::with_capacity(128);
+    let mut chunk = [0_u8; 1024];
     loop {
-        let mut byte = [0_u8; 1];
-        let read = reader.read(&mut byte).await.map_err(|_| "read_failed")?;
+        // The protocol carries one JSON line per connection. Reading in
+        // chunks avoids thousands of individual reads for scoring responses.
+        let read = reader.read(&mut chunk).await.map_err(|_| "read_failed")?;
         if read == 0 {
+            return if bytes.is_empty() {
+                Err("empty_request")
+            } else {
+                // The protocol is newline-delimited. A peer closing mid-frame
+                // must never turn a partial command into an executable mutation.
+                Err("truncated_control_line")
+            };
+        }
+        let line_end = chunk[..read].iter().position(|byte| *byte == b'\n');
+        let content_len = line_end.unwrap_or(read);
+        if content_len > limit.saturating_sub(bytes.len()) {
+            return Err("request_too_large");
+        }
+        bytes.extend_from_slice(&chunk[..content_len]);
+        if line_end.is_some() {
             return if bytes.is_empty() {
                 Err("empty_request")
             } else {
                 Ok(bytes)
             };
         }
-        if byte[0] == b'\n' {
-            return Ok(bytes);
-        }
-        if bytes.len() >= MAX_CONTROL_LINE {
-            return Err("request_too_large");
-        }
-        bytes.push(byte[0]);
     }
 }
 
-async fn handle_client(mut stream: UnixStream, state: Arc<AppState>) -> Result<(), String> {
+async fn bounded_scoring<F>(gate: Arc<Semaphore>, deadline: Duration, read: F) -> Value
+where
+    F: FnOnce() -> Result<Value, String> + Send + 'static,
+{
+    let Ok(permit) = gate.try_acquire_owned() else {
+        return json!({"error":"scoring_busy"});
+    };
+    // The blocking reader outlives the response deadline on timeout. Its
+    // owned permit remains held until that work actually exits.
+    let work = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read()
+    });
+    match timeout(deadline, work).await {
+        Ok(Ok(Ok(report))) => report,
+        _ => json!({"error":"scoring_unavailable"}),
+    }
+}
+
+fn scoring_window(request: &Value) -> Option<u32> {
+    let hours = request
+        .get("hours")
+        .map(Value::as_u64)
+        .unwrap_or(Some(24))?;
+    [1_u64, 6, 24, 168].contains(&hours).then_some(hours as u32)
+}
+
+async fn handle_client(
+    mut stream: UnixStream,
+    state: Arc<AppState>,
+    directory: PathBuf,
+    base_config: Arc<Config>,
+    mutation_gate: Arc<Mutex<()>>,
+    scoring_gate: Arc<Semaphore>,
+) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     if stream
         .peer_cred()
@@ -163,17 +268,83 @@ async fn handle_client(mut stream: UnixStream, state: Arc<AppState>) -> Result<(
     {
         return Err("control peer uid mismatch".into());
     }
-    let bytes = timeout(CONTROL_TIMEOUT, read_line_bounded(&mut stream))
-        .await
-        .map_err(|_| "control request timed out")?
-        .map_err(str::to_string)?;
+    let bytes = timeout(
+        CONTROL_TIMEOUT,
+        read_line_bounded(&mut stream, MAX_CONTROL_LINE),
+    )
+    .await
+    .map_err(|_| "control request timed out")?
+    .map_err(str::to_string)?;
     let request: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid control JSON")?;
-    let response = if request.get("command").and_then(Value::as_str) == Some("status") {
-        state.runtime_status()
-    } else {
-        json!({"error":"unsupported_command"})
+    if !request.is_object() {
+        return Err("control command must be a JSON object".into());
+    }
+    let response = match request.get("command").and_then(Value::as_str) {
+        Some("status") => state.runtime_status(),
+        Some("chains_list") => {
+            let snapshot = state.route_snapshot();
+            json!({"chains":snapshot.chains.iter().map(|c| &c.name).collect::<Vec<_>>()})
+        }
+        Some("chains_set" | "chains_delete") => {
+            let action = request.get("command").and_then(Value::as_str).unwrap_or("");
+            let value = request
+                .get("argument")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if value.is_empty() || value.len() > 2048 || value.contains('\0') {
+                json!({"error":"invalid_chain_argument"})
+            } else {
+                let cmd = if action == "chains_set" {
+                    chain_store::Command::Set(PathBuf::from(value))
+                } else {
+                    chain_store::Command::Delete(value.to_owned())
+                };
+                // The original write and subsequent in-memory publish must
+                // be serialized. Dropping a timeout around spawn_blocking is
+                // essential: orphaned filesystem writes cannot race a newer
+                // snapshot into the older in-memory state.
+                match mutation_gate.try_lock() {
+                    Ok(_serial) => {
+                        let base = Arc::clone(&base_config);
+                        let local_dir = directory.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let output = chain_store::execute(&base, &local_dir, cmd)?;
+                            let routes = base.as_ref().clone().with_runtime_chains(&local_dir)?;
+                            Ok::<_, String>((output, routes))
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok((output, routes))) => {
+                                match state.replace_route_snapshot(routes) {
+                                    Ok(()) => json!({"ok":true,"online":true,"result":output}),
+                                    Err(_) => json!({"error":"route_reload_failed"}),
+                                }
+                            }
+                            _ => json!({"error":"chain_update_failed"}),
+                        }
+                    }
+                    Err(_) => json!({"error":"chain_update_busy"}),
+                }
+            }
+        }
+        Some("scoring") => {
+            if let Some(hours) = scoring_window(&request) {
+                bounded_scoring(scoring_gate, SCORING_TIMEOUT, move || {
+                    guvna::scoring::read_scoring(&directory, hours)
+                })
+                .await
+            } else {
+                json!({"error":"invalid_scoring_window"})
+            }
+        }
+        _ => json!({"error":"unsupported_command"}),
     };
     let mut output = serde_json::to_vec(&response).map_err(|_| "encode control response")?;
+    // The newline is a framing byte and is not counted by read_line_bounded.
+    if output.len() > MAX_CONTROL_RESPONSE_LINE {
+        output = serde_json::to_vec(&json!({"error":"control_response_too_large"}))
+            .map_err(|_| "encode bounded control response")?;
+    }
     output.push(b'\n');
     timeout(CONTROL_TIMEOUT, stream.write_all(&output))
         .await
@@ -184,6 +355,36 @@ async fn handle_client(mut stream: UnixStream, state: Arc<AppState>) -> Result<(
 
 /// Returns None only when no socket is installed (legacy HTTP health probe fallback).
 pub async fn query(data_dir: &Path) -> Result<Option<String>, String> {
+    query_request(data_dir, json!({"command":"status"}), CONTROL_TIMEOUT).await
+}
+pub async fn query_scoring(data_dir: &Path, hours: u32) -> Result<Option<String>, String> {
+    query_request(
+        data_dir,
+        json!({"command":"scoring","hours":hours}),
+        CONTROL_TIMEOUT,
+    )
+    .await
+}
+pub async fn query_chain_mutation(
+    data_dir: &Path,
+    action: &str,
+    argument: &str,
+) -> Result<Option<String>, String> {
+    if !["chains_set", "chains_delete"].contains(&action) {
+        return Err("unsupported local chain operation".into());
+    }
+    query_request(
+        data_dir,
+        json!({"command":action,"argument":argument}),
+        Duration::from_secs(5),
+    )
+    .await
+}
+async fn query_request(
+    data_dir: &Path,
+    request: Value,
+    reply_timeout: Duration,
+) -> Result<Option<String>, String> {
     let path = socket_path(data_dir)?;
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -193,26 +394,47 @@ pub async fn query(data_dir: &Path) -> Result<Option<String>, String> {
         }
         Ok(_) => {}
     }
+    ensure_private_control_directory(data_dir)?;
     let mut stream = match timeout(CONTROL_TIMEOUT, UnixStream::connect(&path)).await {
         Ok(Ok(stream)) => stream,
-        Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => {
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
             // A stale socket is equivalent to absence for status probing.
             return Ok(None);
         }
         Ok(Err(error)) => return Err(format!("connect local control socket: {error}")),
         Err(_) => return Err("timed out connecting to local control socket".into()),
     };
-    timeout(
-        CONTROL_TIMEOUT,
-        stream.write_all(b"{\"command\":\"status\"}\n"),
+    #[cfg(target_os = "linux")]
+    if stream
+        .peer_cred()
+        .map_err(|_| "local control server credentials unavailable")?
+        .uid()
+        != unsafe { libc::geteuid() }
+    {
+        return Err("local control server uid mismatch".into());
+    }
+    let mut request =
+        serde_json::to_vec(&request).map_err(|_| "cannot serialize control request")?;
+    if request.len() > MAX_CONTROL_LINE {
+        return Err("local control request exceeds maximum frame size".into());
+    }
+    request.push(b'\n');
+    timeout(CONTROL_TIMEOUT, stream.write_all(&request))
+        .await
+        .map_err(|_| "local status request timed out")?
+        .map_err(|_| "write local status request")?;
+    let bytes = timeout(
+        reply_timeout,
+        read_line_bounded(&mut stream, MAX_CONTROL_RESPONSE_LINE),
     )
     .await
-    .map_err(|_| "local status request timed out")?
-    .map_err(|_| "write local status request")?;
-    let bytes = timeout(CONTROL_TIMEOUT, read_line_bounded(&mut stream))
-        .await
-        .map_err(|_| "local status response timed out")?
-        .map_err(str::to_string)?;
+    .map_err(|_| "local status response timed out")?
+    .map_err(str::to_string)?;
     let response: Value =
         serde_json::from_slice(&bytes).map_err(|_| "invalid local status response")?;
     if let Some(error) = response.get("error").and_then(Value::as_str) {
@@ -226,6 +448,42 @@ pub async fn query(data_dir: &Path) -> Result<Option<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn timed_out_scoring_reader_holds_slot_until_blocking_work_exits() {
+        let gate = Arc::new(Semaphore::new(1));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let result = bounded_scoring(Arc::clone(&gate), Duration::from_millis(20), move || {
+            wait.recv_timeout(Duration::from_secs(3))
+                .map_err(|_| "mock scoring reader stalled".to_string())?;
+            Ok(json!({"ok":true}))
+        })
+        .await;
+        assert_eq!(result["error"], "scoring_unavailable");
+        // The lost response does NOT free the worker's permit or queue more
+        // SQLite jobs. Even repeated readers must fail fast while it runs.
+        for _ in 0..64 {
+            let busy = bounded_scoring(Arc::clone(&gate), Duration::from_secs(1), || {
+                Ok(json!({"unexpected":true}))
+            })
+            .await;
+            assert_eq!(busy["error"], "scoring_busy");
+        }
+        release.send(()).unwrap();
+        timeout(Duration::from_secs(3), async {
+            while gate.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader releases slot after completing its work");
+        let recovered = bounded_scoring(Arc::clone(&gate), Duration::from_secs(1), || {
+            Ok(json!({"recovered":true}))
+        })
+        .await;
+        assert_eq!(recovered["recovered"], true);
+    }
+
     #[tokio::test]
     async fn local_status_round_trip_is_private_and_reports_runtime_counters() {
         use guvna::config::Config;
@@ -239,7 +497,7 @@ mod tests {
         ).unwrap();
         let state = Arc::new(
             AppState::new(
-                config,
+                config.clone(),
                 HashMap::from([(
                     "UPSTREAM_SECRET_ENV".to_string(),
                     "provider-secret".to_string(),
@@ -248,7 +506,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let server = spawn(dir.path(), state).await.unwrap();
+        let server = spawn(dir.path(), state, Arc::new(config)).await.unwrap();
         let socket = dir.path().join(SOCKET_NAME);
         let mode = fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -262,16 +520,214 @@ mod tests {
         let value: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["status"], "running");
         assert_eq!(value["providers_configured"], 1);
+        assert_eq!(value["key_health"]["configured"], 1);
+        assert_eq!(value["key_health"]["available"], 1);
+        assert_eq!(value["key_health"]["auth_quarantined"], 0);
+        assert_eq!(value["key_health"]["total_uses"], 0);
         assert_eq!(value["requests_dispatched"], 0);
         assert!(!response.contains("provider-secret"));
         assert!(!response.contains("client-secret"));
         assert!(!response.contains("private-provider"));
         assert!(!response.contains("UPSTREAM_SECRET_ENV"));
 
+        let scoring = query_scoring(dir.path(), 1).await.unwrap().unwrap();
+        let scoring_data: Value = serde_json::from_str(&scoring).unwrap();
+        assert_eq!(scoring_data["enabled"], false);
+        assert_eq!(scoring_data["window_hours"], 1);
+        assert!(query_scoring(dir.path(), 2).await.is_err());
+
         server.abort();
         let _ = server.await;
         assert!(!socket.exists());
     }
+
+    #[tokio::test]
+    async fn insecure_existing_control_directory_rejects_daemon_and_spoofed_client() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(SOCKET_NAME);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let config: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: http://127.0.0.1:1\n    key_env: K\n",
+        )
+        .unwrap();
+        let state = Arc::new(
+            AppState::new(
+                config.clone(),
+                HashMap::from([("K".to_owned(), "test-key".to_owned())]),
+                vec!["client-key".to_owned()],
+            )
+            .unwrap(),
+        );
+        for mode in [0o777, 0o770] {
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
+            let error = query(dir.path()).await.unwrap_err();
+            assert!(error.contains("not group/world writable"), "{error}");
+            let error = spawn(dir.path(), Arc::clone(&state), Arc::new(config.clone()))
+                .await
+                .expect_err("daemon must reject an unsafe pre-existing control directory");
+            assert!(error.contains("not group/world writable"), "{error}");
+            assert!(socket.exists(), "must not unlink someone else's socket");
+        }
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_control_directory(dir.path()).unwrap();
+        drop(listener);
+    }
+
+    #[test]
+    fn symlinked_control_directory_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        assert!(
+            ensure_private_control_directory(&link)
+                .unwrap_err()
+                .contains("not a symlink")
+        );
+    }
+
+    #[tokio::test]
+    async fn online_chain_mutations_update_live_routes_without_touching_static_routes() {
+        use guvna::{config::Config, routing};
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: http://127.0.0.1:1\n    key_env: K\nchains:\n  - name: immutable\n    steps:\n      - provider: p\n        model: static\n"
+        ).unwrap();
+        let state = Arc::new(
+            AppState::new(
+                config.clone(),
+                HashMap::from([("K".to_owned(), "placeholder".to_owned())]),
+                vec!["local-client".to_owned()],
+            )
+            .unwrap(),
+        );
+        let server = spawn(dir.path(), Arc::clone(&state), Arc::new(config))
+            .await
+            .unwrap();
+        let definition = dir.path().join("new-chain.yaml");
+        fs::write(
+            &definition,
+            "name: dynamic\nsteps:\n  - provider: p\n    model: fresh\n",
+        )
+        .unwrap();
+        let before = state.route_snapshot();
+        assert!(routing::resolve(&before, "dynamic").is_err());
+        let result = query_chain_mutation(dir.path(), "chains_set", definition.to_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.contains("online"));
+        let after = state.route_snapshot();
+        assert_eq!(
+            routing::resolve(&after, "dynamic").unwrap()[0].model,
+            "fresh"
+        );
+        assert_eq!(
+            routing::resolve(&before, "immutable").unwrap()[0].model,
+            "static"
+        );
+        assert!(routing::resolve(&before, "dynamic").is_err());
+        assert!(after.chains.iter().any(|chain| chain.name == "dynamic"));
+        let delete = query_chain_mutation(dir.path(), "chains_delete", "dynamic")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(delete.contains("online"));
+        let latest = state.route_snapshot();
+        assert!(routing::resolve(&latest, "dynamic").is_err());
+        assert!(routing::resolve(&latest, "immutable").is_ok());
+        let forbidden = query_chain_mutation(dir.path(), "chains_delete", "immutable")
+            .await
+            .unwrap_err();
+        assert!(forbidden.contains("chain_update_failed"));
+        assert!(routing::resolve(&state.route_snapshot(), "immutable").is_ok());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_online_mutations_keep_disk_and_live_snapshot_in_sync() {
+        use guvna::config::Config;
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config: Config = serde_yaml::from_str(
+            "providers:\n  - name: p\n    type: openai\n    base_url: http://127.0.0.1:1\n    key_env: K\nchains:\n  - name: static\n    steps:\n      - provider: p\n        model: fixed\n"
+        ).unwrap();
+        let state = Arc::new(
+            AppState::new(
+                config.clone(),
+                HashMap::from([("K".to_owned(), "test-key".to_owned())]),
+                vec!["client-key".to_owned()],
+            )
+            .unwrap(),
+        );
+        let server = spawn(dir.path(), state.clone(), Arc::new(config.clone()))
+            .await
+            .unwrap();
+        let first = dir.path().join("first.yaml");
+        let second = dir.path().join("second.yaml");
+        fs::write(
+            &first,
+            "name: first\nsteps:\n  - provider: p\n    model: one\n",
+        )
+        .unwrap();
+        fs::write(
+            &second,
+            "name: second\nsteps:\n  - provider: p\n    model: two\n",
+        )
+        .unwrap();
+        let a = query_chain_mutation(dir.path(), "chains_set", first.to_str().unwrap());
+        let b = query_chain_mutation(dir.path(), "chains_set", second.to_str().unwrap());
+        let (a, b) = tokio::join!(a, b);
+        for (output, path) in [(a, &first), (b, &second)] {
+            // A busy mutation is rejected rather than queued behind a
+            // potentially blocked disk writer; the local client converts
+            // the JSON error into Result::Err before its caller can inspect
+            // it. The test must retry that error, never unwrap it as data.
+            let output = match output {
+                Ok(Some(result)) => result,
+                Err(error) if error.contains("chain_update_busy") => {
+                    query_chain_mutation(dir.path(), "chains_set", path.to_str().unwrap())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }
+                other => panic!("unexpected concurrent chain update result: {other:?}"),
+            };
+            assert!(
+                output.contains("\"online\": true") || output.contains("\"online\":true"),
+                "{output}"
+            );
+        }
+        let current = state.route_snapshot();
+        let on_disk = config.with_runtime_chains(dir.path()).unwrap();
+        for name in ["static", "first", "second"] {
+            assert_eq!(
+                current
+                    .chains
+                    .iter()
+                    .find(|chain| chain.name == name)
+                    .unwrap()
+                    .steps[0]
+                    .model,
+                on_disk
+                    .chains
+                    .iter()
+                    .find(|chain| chain.name == name)
+                    .unwrap()
+                    .steps[0]
+                    .model,
+                "{name}",
+            );
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
     #[tokio::test]
     async fn oversized_control_lines_are_rejected() {
         let (mut writer, mut reader) = tokio::io::duplex(MAX_CONTROL_LINE + 32);
@@ -280,9 +736,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            read_line_bounded(&mut reader).await,
+            read_line_bounded(&mut reader, MAX_CONTROL_LINE).await,
             Err("request_too_large")
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_line_handles_chunk_boundaries_and_trailing_bytes() {
+        for len in [1, 1023, 1024, 1025, 4096] {
+            let mut input = vec![b'a'; len];
+            input.extend_from_slice(b"\nignored-after-first-line");
+            let mut reader = std::io::Cursor::new(input);
+            let line = read_line_bounded(&mut reader, 4096).await.unwrap();
+            assert_eq!(line, vec![b'a'; len]);
+        }
+        let mut too_long = std::io::Cursor::new(vec![b'a'; 4097]);
+        assert_eq!(
+            read_line_bounded(&mut too_long, 4096).await,
+            Err("request_too_large")
+        );
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        assert_eq!(
+            read_line_bounded(&mut empty, 4096).await,
+            Err("empty_request")
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_without_newline_never_executes_partial_control_command() {
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        writer
+            .write_all(br#"{"command":"chains_delete","argument":"important"}"#)
+            .await
+            .unwrap();
+        drop(writer);
+        assert_eq!(
+            read_line_bounded(&mut reader, MAX_CONTROL_LINE).await,
+            Err("truncated_control_line")
+        );
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        writer
+            .write_all(b"{\"command\":\"status\"}\n")
+            .await
+            .unwrap();
+        drop(writer);
+        assert_eq!(
+            read_line_bounded(&mut reader, MAX_CONTROL_LINE)
+                .await
+                .unwrap(),
+            br#"{"command":"status"}"#
+        );
+    }
+
+    #[test]
+    fn scoring_window_rejects_wrong_types_without_silent_default() {
+        assert_eq!(scoring_window(&json!({"command":"scoring"})), Some(24));
+        for value in [
+            json!(null),
+            json!("24"),
+            json!(24.0),
+            json!(-1),
+            json!(true),
+            json!(2),
+        ] {
+            assert_eq!(scoring_window(&json!({"hours":value})), None);
+        }
+        assert_eq!(scoring_window(&json!({"hours":168})), Some(168));
+    }
+
+    #[tokio::test]
+    async fn blank_control_frames_are_rejected_before_dispatch() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer.write_all(b"\n").await.unwrap();
+        assert_eq!(
+            read_line_bounded(&mut reader, 4096).await,
+            Err("empty_request")
+        );
+    }
+
+    #[tokio::test]
+    async fn exactly_maximum_length_control_frame_is_accepted() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer.write_all(b"1234\n").await.unwrap();
+        assert_eq!(read_line_bounded(&mut reader, 4).await.unwrap(), b"1234");
+    }
+
+    #[tokio::test]
+    async fn stale_owner_cannot_unlink_rebound_control_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SOCKET_NAME);
+        let old = UnixListener::bind(&path).unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let old_identity = (metadata.dev(), metadata.ino());
+        fs::remove_file(&path).unwrap();
+        let replacement = UnixListener::bind(&path).unwrap();
+        unlink_owned_socket(&path, old_identity);
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        unlink_owned_socket(&path, (metadata.dev(), metadata.ino()));
+        assert!(!path.exists());
+        drop((old, replacement));
     }
 
     #[tokio::test]
@@ -307,6 +860,37 @@ mod tests {
         assert!(ensure_socket_available(&active).await.is_err());
         assert!(active.exists());
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn stale_socket_symlink_is_never_followed_or_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.sock");
+        drop(UnixListener::bind(&target).unwrap());
+        let alias = dir.path().join(SOCKET_NAME);
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let error = ensure_socket_available(&alias).await.unwrap_err();
+        assert!(error.contains("not a socket"), "{error}");
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+    }
+
+    #[tokio::test]
+    async fn control_socket_refuses_directory_with_group_write_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o770)).unwrap();
+        let error = ensure_private_control_directory(dir.path()).unwrap_err();
+        assert!(error.contains("group/world writable"), "{error}");
     }
 
     #[test]

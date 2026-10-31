@@ -22,6 +22,13 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+# Eight simultaneous 7 MiB request bodies already exceed the standard 48 MiB
+# transient RSS budget before JSON parsing or transport buffers are counted.
+# Keep the ordinary 48 MiB pressure-wave gate unchanged; independently cap
+# this documented near-limit payload scenario, including retained idle RSS.
+LARGE_PAYLOAD_MAX_PEAK_RSS_MIB = 256
+LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB = 128
+
 
 class Stub(ThreadingHTTPServer):
     daemon_threads = True
@@ -36,6 +43,14 @@ class Stub(ThreadingHTTPServer):
         self.response_delay = 0.0
         self.faults = {"503": 0, "invalid_200": 0, "truncated_200": 0}
         self.structured = []
+        # #137/F03: only the dedicated Release/TCP gate allocates this
+        # deliberately large response. Ordinary chaos fixtures stay tiny.
+        self.large_response = (json.dumps({
+            "id": "large-tcp", "object": "chat.completion", "created": 100,
+            "choices": [{"index": 0, "message": {
+                "role": "assistant", "content": "R" * (12 * 1024 * 1024)},
+                "finish_reason": "stop"}]
+        }, separators=(",", ":")).encode()) if role == "large_response" else None
         super().__init__(("127.0.0.1", 0), StubHandler)
 
     def count(self):
@@ -62,6 +77,29 @@ class StubHandler(BaseHTTPRequestHandler):
             self.send_response(400)
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        if self.server.large_response is not None:
+            payload = self.server.large_response
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            try:
+                self.wfile.write(payload)
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+            return
+        if self.server.role == "inflated_length":
+            # The attacker controls the HTTP header, not actual bytes.
+            # Hold several connections after one tiny chunk to expose any
+            # allocation based solely on a fabricated 32 MiB length.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(32 * 1024 * 1024))
+            self.end_headers()
+            self.wfile.write(b"{")
+            self.wfile.flush()
+            time.sleep(1.5)
             return
         if self.server.response_delay:
             time.sleep(self.server.response_delay)
@@ -1083,7 +1121,12 @@ auto:
         check(request_rows == 64, f"SQLite request rows={request_rows}, expected 64")
         check(failed_candidates == 64,
               f"fallback provider failures were not retained: {failed_candidates} / {failure_breakdown}")
-        check(failure_breakdown == [(200, "invalid_response", 8),
+        # A syntactically invalid complete HTTP 200 is a provider response
+        # error; a body terminated before its advertised Content-Length is
+        # a transport reset, not malformed model output. Keep the exact
+        # counts strict so neither regression can hide behind their sum.
+        check(failure_breakdown == [(200, "invalid_response", 4),
+                                    (200, "transport_error", 4),
                                     (503, "provider_5xx", 56)],
               f"adversarial 503/invalid/truncated fault classes mismatched: {failure_breakdown}")
         check(down_hourly == (64, 64),
@@ -1221,9 +1264,19 @@ def verify_structured_output_on_release(endpoint: str, healthy_stub: Stub) -> di
           f"ignored JSON mode was reported as completed: {code}, {raw}")
     code, raw = submit(dict(common, input="badjson", stream=True,
                             text={"format":{"type":"json_object"}}), streaming=True)
-    check(code == 200 and raw.count("event: response.failed") == 1
-          and "event: response.completed" not in raw,
-          f"ignored streaming JSON mode claimed completed: {code}, {raw[:1200]}")
+    if code == 200:
+        # If a valid first token was already emitted, later rejection must
+        # terminate the SSE with one truthful error and no success marker.
+        check(raw.count("event: response.failed") == 1
+              and "event: response.completed" not in raw,
+              f"ignored streaming JSON mode claimed completed: {code}, {raw[:1200]}")
+    else:
+        # If the full invalid upstream chunk arrived during preflight, fail
+        # safely *before* committing HTTP 200. This is preferable to a
+        # downstream stream that starts and then immediately fails.
+        check(code == 502
+              and json.loads(raw)["error"]["code"] == "upstream_unavailable",
+              f"invalid JSON was accepted or misclassified: {code}, {raw[:1200]}")
 
     with healthy_stub.lock:
         observed = list(healthy_stub.structured)
@@ -1245,7 +1298,8 @@ def verify_release_large_payload_memory(binary: str, root: str, env: dict) -> di
     """Exercise the real release binary with eight concurrent near-limit JSON bodies.
 
     Keep this in a separate process from the normal 48 MiB RSS wave so the
-    large-payload peak has its own explicit, measured budget.
+    large-payload peak has its own explicit, measured budget. The ordinary
+    small-request 48 MiB limit remains enforced in the parent process.
     """
     upstream = Stub("healthy")
     upstream.response_delay = 0.5
@@ -1310,14 +1364,344 @@ chains:
         check(upstream.calls == 8,
               f"large-payload upstream attempts {upstream.calls} != 8")
         usage = proc_info(proc.pid)
-        check(usage["VmHWM"] <= 384 * 1024,
-              f"eight concurrent 7 MiB requests exceeded 384 MiB peak RSS: {usage['VmHWM'] / 1024:.1f} MiB")
+        check(usage["VmHWM"] <= LARGE_PAYLOAD_MAX_PEAK_RSS_MIB * 1024,
+              f"eight concurrent 7 MiB requests exceeded {LARGE_PAYLOAD_MAX_PEAK_RSS_MIB} MiB peak RSS: {usage['VmHWM'] / 1024:.1f} MiB")
+        check(usage["VmRSS"] <= LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB * 1024,
+              f"eight concurrent 7 MiB requests retained more than {LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB} MiB RSS: {usage['VmRSS'] / 1024:.1f} MiB")
         check(usage["fd"] <= 32, "large-payload gate leaked file descriptors")
         check(usage["Threads"] <= 32, "large-payload gate leaked threads")
         return {"passed": True, "payload_bytes": len(payload), "concurrent_requests": 8,
                 "successes": statuses.count(200), "peak_rss_mib": round(usage["VmHWM"] / 1024, 2),
+                "peak_limit_mib": LARGE_PAYLOAD_MAX_PEAK_RSS_MIB,
+                "retained_limit_mib": LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB,
                 "rss_after_kib": usage["VmRSS"], "fds": usage["fd"],
                 "threads": usage["Threads"]}
+    finally:
+        proc.terminate()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate(timeout=5)
+        upstream.shutdown()
+        upstream.server_close()
+
+
+def verify_release_slow_tcp_response_memory(binary: str, root: str, env: dict) -> dict:
+    """#137/F03: real HTTP sockets that stop reading 12 MiB Chat/Responses JSON.
+
+    The router-in-process tests check RAII lifetime; only this Linux Release
+    scenario proves downstream TCP backpressure holds both JSON reservations,
+    rejects a third response locally, and releases permits on client EOF/drop.
+    Its peak/retained RSS limits are SEPARATE from the normal 48 MiB wave.
+    """
+    upstream = Stub("large_response")
+    worker = threading.Thread(target=upstream.serve_forever, daemon=True)
+    worker.start()
+    gateway_port = port()
+    config = Path(root) / "slow-tcp-response.yaml"
+    config.write_text(f"""port: {gateway_port}
+providers:
+  - name: large
+    type: openai
+    base_url: http://127.0.0.1:{upstream.server_address[1]}
+    key_env: LARGE_KEY
+    circuit_breaker:
+      enabled: true
+      failure_threshold: 1
+      cooldown: 100ms
+      max_cooldown: 800ms
+chains:
+  - name: big
+    steps:
+      - provider: large
+        model: physical
+""", encoding="utf-8")
+    data = Path(root) / "slow-tcp-response-data"
+    data.mkdir()
+    gateway_env = dict(env, API_KEYS="only-for-local-test",
+                       LARGE_KEY="fake-large-key", GUVNA_BIND_ADDR="127.0.0.1")
+    proc = subprocess.Popen(
+        [str(Path(binary).resolve()), "serve", "-config", str(config), "-data", str(data)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=gateway_env)
+    sockets = []
+    max_rss = 0
+    try:
+        health = f"http://127.0.0.1:{gateway_port}/healthz"
+        started = time.monotonic()
+        while time.monotonic() - started < 3:
+            check(proc.poll() is None, "slow TCP gateway terminated at startup")
+            if get_status(health, timeout=0.1) == 200:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("slow TCP gateway startup timeout")
+        before = proc_info(proc.pid)
+        endpoint = f"http://127.0.0.1:{gateway_port}/v1/chat/completions"
+
+        def paused_socket(path: str, payload: dict) -> socket.socket:
+            body = json.dumps(payload, separators=(",", ":")).encode()
+            request = (
+                f"POST {path} HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{gateway_port}\r\n"
+                "Authorization: Bearer only-for-local-test\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: keep-alive\r\n\r\n"
+            ).encode() + body
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            sock.settimeout(20)
+            try:
+                sock.connect(("127.0.0.1", gateway_port))
+                sock.sendall(request)
+                # Read only the headers, never the 12 MiB response payload.
+                # This proves both gateway responses actually reached the
+                # downstream TCP socket before asserting memory admission.
+                headers = bytearray()
+                while b"\r\n\r\n" not in headers:
+                    fragment = sock.recv(512)
+                    check(fragment, "slow TCP connection ended before response headers")
+                    headers.extend(fragment)
+                    check(len(headers) <= 8192, "oversized TCP response headers")
+                check(b"HTTP/1.1 200" in headers.split(b"\r\n", 1)[0],
+                      f"slow TCP response did not return 200: {headers[:120]!r}")
+                return sock
+            except BaseException:
+                sock.close()
+                raise
+
+        sockets.append(paused_socket(
+            "/v1/chat/completions",
+            {"model": "big", "messages": [{"role": "user", "content": "hello"}]}))
+        sockets.append(paused_socket("/v1/responses",
+                                     {"model": "big", "input": "hello"}))
+        # Real clients now hold the two response Body reservations. Large
+        # socket buffers can mask this on fast hosts: RCVBUF=4096 and 12 MiB
+        # response make sending the whole payload impossible without reads.
+        time.sleep(0.1)
+        max_rss = max(max_rss, proc_info(proc.pid)["VmRSS"])
+
+        request = Request(endpoint, method="POST", headers={
+            "Authorization": "Bearer only-for-local-test",
+            "Content-Type": "application/json",
+        }, data=json.dumps({"model": "big", "messages": [
+            {"role": "user", "content": "third"}]}).encode())
+        try:
+            with urlopen(request, timeout=8) as response:
+                third_status = response.status
+                third_result = json.load(response)
+                third_retry = response.headers.get("Retry-After")
+        except HTTPError as error:
+            third_status = error.code
+            third_result = json.load(error)
+            third_retry = error.headers.get("Retry-After")
+        check(third_status == 503
+              and third_result.get("error", {}).get("code") == "large_response_busy"
+              and third_retry == "1",
+              f"large body backpressure failed: {third_status}, {third_result}")
+        max_rss = max(max_rss, proc_info(proc.pid)["VmRSS"])
+
+        # Cancellation must release the FIRST paused response; the second
+        # stays unconsumed, so permit accounting (not merely one-shot data
+        # copying) is observable from a fourth large HTTP request.
+        sockets[0].shutdown(socket.SHUT_RDWR)
+        sockets[0].close()
+        sockets.pop(0)
+        recovered = None
+        for attempt in range(5):
+            if attempt:
+                time.sleep(0.3)
+            try:
+                with urlopen(request, timeout=12) as response:
+                    check(response.status == 200, "released response was not accepted")
+                    decoded = json.load(response)
+                    check(decoded["id"] == "large-tcp", "response lost content")
+                    recovered = response.status
+                    break
+            except HTTPError as error:
+                check(error.code == 503,
+                      f"recovered request unexpectedly failed: {error.code}")
+        check(recovered == 200,
+              "client TCP close did not free a large JSON response reservation")
+        max_rss = max(max_rss, proc_info(proc.pid)["VmRSS"])
+        sockets[0].shutdown(socket.SHUT_RDWR)
+        sockets[0].close()
+        sockets.clear()
+        time.sleep(0.3)
+        # Completing the downstream HTTP body is a different release path
+        # from cancellation. Consume an entire new 12 MiB response slowly
+        # over the real TCP socket without retaining it in the test client.
+        slow_read_bytes = None
+        for attempt in range(5):
+            if attempt:
+                time.sleep(0.25)
+            try:
+                with urlopen(request, timeout=20) as response:
+                    check(response.status == 200, "slow reader HTTP response failed")
+                    total = 0
+                    while chunk := response.read(8192):
+                        total += len(chunk)
+                        time.sleep(0.0005)
+                    slow_read_bytes = total
+                    break
+            except HTTPError as error:
+                check(error.code == 503,
+                      f"unexpected recovery status during slow read: {error.code}")
+                error.close()
+        check(slow_read_bytes is not None
+              and slow_read_bytes >= len(upstream.large_response),
+              "slow reading failed to drain a complete large HTTP body")
+        metrics_req = Request(
+            f"http://127.0.0.1:{gateway_port}/metrics",
+            headers={"Authorization": "Bearer only-for-local-test"})
+        with urlopen(metrics_req, timeout=3) as response:
+            metrics_text = response.read(16 << 10).decode("utf-8")
+        metrics = {
+            key: int(value) for line in metrics_text.splitlines()
+            if line.startswith("guvna_")
+            for key, sep, value in [line.partition(" ")] if sep
+        }
+        for metric in ("guvna_upstream_transport_failures_total",
+                       "guvna_credential_quarantines_total",
+                       "guvna_upstream_invalid_responses_total"):
+            check(metrics.get(metric) == 0,
+                  f"slow downstream TCP was incorrectly blamed on provider: {metric}")
+        # An actual TCP disconnect is delivered asynchronously to Hyper.
+        # Sample bounded post-close cleanup rather than assuming all
+        # transport tasks have observed cancellation in exactly 300ms.
+        # Keep the ORIGINAL 128 MiB retained cap; do not make RSS pass by
+        # relaxing the measured acceptance threshold.
+        rss_after_close = []
+        for _ in range(20):
+            after = proc_info(proc.pid)
+            rss_after_close.append(after["VmRSS"])
+            if len(rss_after_close) >= 2 and after["VmRSS"] <= (
+                LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB * 1024
+            ):
+                break
+            time.sleep(0.25)
+        check(after["VmRSS"] <= LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB * 1024,
+              f"large TCP responses retained {after['VmRSS'] / 1024:.1f} MiB RSS "
+              f"after bounded cleanup; RSS timeline KiB: {rss_after_close}")
+        check(after["VmHWM"] <= LARGE_PAYLOAD_MAX_PEAK_RSS_MIB * 1024,
+              f"large TCP responses peaked at {after['VmHWM'] / 1024:.1f} MiB RSS")
+        check(after["fd"] - before["fd"] <= 8, "slow TCP clients leaked file descriptors")
+        check(upstream.calls >= 4, "not all provider attempts were exercised")
+        return {
+            "passed": True, "transport": "real Linux TCP sockets",
+            "tcp_response_bytes": len(upstream.large_response),
+            "unread_large_clients": 2,
+            "third_status": third_status,
+            "third_error": third_result["error"]["code"],
+            "retry_after_seconds": third_retry,
+            "recovered_status": recovered,
+            "slow_read_full_body_bytes": slow_read_bytes,
+            "provider_health_metrics": {
+                metric: metrics[metric] for metric in (
+                    "guvna_upstream_transport_failures_total",
+                    "guvna_credential_quarantines_total",
+                    "guvna_upstream_invalid_responses_total")},
+            "primary_attempts": upstream.calls,
+            "rss_before_kib": before["VmRSS"],
+            "rss_high_watermark_kib": after["VmHWM"],
+            "rss_after_kib": after["VmRSS"],
+            "rss_cleanup_samples_kib": rss_after_close,
+            "peak_limit_mib": LARGE_PAYLOAD_MAX_PEAK_RSS_MIB,
+            "retained_limit_mib": LARGE_PAYLOAD_MAX_RETAINED_RSS_MIB,
+            "fd_before": before["fd"], "fd_after": after["fd"],
+        }
+    finally:
+        for sock in sockets:
+            sock.close()
+        proc.terminate()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate(timeout=5)
+        upstream.shutdown()
+        upstream.server_close()
+
+
+def verify_untrusted_content_length_memory(binary: str, root: str, env: dict) -> dict:
+    """A forged 32MiB length + one byte must not preallocate 32MiB per client."""
+    upstream = Stub("inflated_length")
+    worker = threading.Thread(target=upstream.serve_forever, daemon=True)
+    worker.start()
+    gateway_port = port()
+    config = Path(root) / "inflated-content-length.yaml"
+    config.write_text(f"""port: {gateway_port}
+providers:
+  - name: inflated
+    type: openai
+    base_url: http://127.0.0.1:{upstream.server_address[1]}
+    key_env: INFLATED_KEY
+chains:
+  - name: large-lie
+    steps:
+      - provider: inflated
+        model: bogus
+""", encoding="utf-8")
+    data = Path(root) / "inflated-content-length-data"
+    data.mkdir()
+    gateway_env = dict(env, API_KEYS="only-for-local-test",
+                       INFLATED_KEY="fake-inflated-key", GUVNA_BIND_ADDR="127.0.0.1")
+    proc = subprocess.Popen(
+        [str(Path(binary).resolve()), "serve", "-config", str(config), "-data", str(data)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=gateway_env)
+    clients = 16
+    try:
+        health = f"http://127.0.0.1:{gateway_port}/healthz"
+        for _ in range(150):
+            check(proc.poll() is None, "inflated-length gateway exited")
+            if get_status(health, timeout=0.1) == 200:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("inflated-length gateway startup timeout")
+
+        request = Request(
+            f"http://127.0.0.1:{gateway_port}/v1/chat/completions",
+            method="POST",
+            headers={"Authorization": "Bearer only-for-local-test",
+                     "Content-Type": "application/json"},
+            data=b'{"model":"large-lie","messages":[{"role":"user","content":"x"}]}')
+
+        def submit(_: int) -> int:
+            try:
+                with urlopen(request, timeout=8) as response:
+                    response.read()
+                    return response.status
+            except HTTPError as error:
+                error.close()
+                return error.code
+
+        peak_rss = proc_info(proc.pid)["VmRSS"]
+        with ThreadPoolExecutor(max_workers=clients) as pool:
+            futures = [pool.submit(submit, i) for i in range(clients)]
+            deadline = time.monotonic() + 7
+            while not all(future.done() for future in futures):
+                check(time.monotonic() < deadline,
+                      "inflated-length body completion exceeded test bound")
+                peak_rss = max(peak_rss, proc_info(proc.pid)["VmRSS"])
+                time.sleep(0.02)
+            statuses = [future.result() for future in futures]
+
+        after = proc_info(proc.pid)
+        # 16 * 32MiB declared lengths previously meant >512MiB of unguarded
+        # reserve() even though the provider only sent one byte per request.
+        check(peak_rss <= 96 * 1024,
+              f"untrusted upstream lengths allocated {peak_rss / 1024:.1f} MiB RSS")
+        check(all(status != 200 for status in statuses),
+              f"incomplete upstream JSON was returned as successful: {statuses}")
+        check(upstream.calls == clients,
+              f"declared-length requests silently skipped: {upstream.calls}/{clients}")
+        return {"passed": True, "clients": clients,
+                "declared_bytes_per_client": 32 * 1024 * 1024,
+                "actual_body_bytes_per_client": 1,
+                "peak_rss_kib": peak_rss, "rss_after_kib": after["VmRSS"],
+                "statuses": sorted(set(statuses)), "upstream_calls": upstream.calls}
     finally:
         proc.terminate()
         try:
@@ -1459,6 +1843,10 @@ chains:
                 summary["structured_output_gate"] = verify_structured_output_on_release(
                     response_endpoint, mock2)
                 summary["large_payload_memory_gate"] = verify_release_large_payload_memory(
+                    a.binary, directory, env)
+                summary["large_response_tcp_gate"] = verify_release_slow_tcp_response_memory(
+                    a.binary, directory, env)
+                summary["untrusted_content_length_gate"] = verify_untrusted_content_length_memory(
                     a.binary, directory, env)
                 summary["post_structured_idle"] = idle(proc.pid, a.idle_seconds)
                 check(summary["post_structured_idle"]["rss_kib_max"] <=

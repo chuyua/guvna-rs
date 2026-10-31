@@ -2,6 +2,13 @@
 use bytes::Bytes;
 use serde_json::Value;
 
+/// Shared Chat/Responses JSON output-mode validation. Retain the strict Value
+/// parser: IgnoredAny misses malformed UTF-16 escape sequences like an
+/// unpaired surrogate, so it cannot be used as a compliance success gate.
+pub(crate) fn valid_json_output(text: &str, object_required: bool) -> bool {
+    serde_json::from_str::<Value>(text).is_ok_and(|value| !object_required || value.is_object())
+}
+
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 // Track only tool calls, and cap the cumulative memory retained across frames.
 // Each of up to 64 choices may contain 32 tool calls. Keep the global cap
@@ -10,6 +17,9 @@ const MAX_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_TOOL_CALLS: usize = 64 * 32;
 const MAX_STREAM_TOOL_ARGUMENTS: usize = 1024 * 1024;
 const MAX_TOOL_IDENTIFIER_BYTES: usize = 256;
+// JSON-mode streams retain only a bounded aggregate across all choices.
+const MAX_STREAM_JSON_VALIDATION_BYTES: usize = 1024 * 1024;
+const MAX_STREAM_METADATA_BYTES: usize = 1024;
 
 #[derive(Debug)]
 struct StreamToolCall {
@@ -36,12 +46,28 @@ enum ToolChoice {
 pub struct ChatSse {
     line: Vec<u8>,
     data: Vec<u8>,
+    error_event: bool,
+    // Streaming and SSE->JSON aggregation must agree on event identity.
+    // An upstream cannot splice frames from another generation/model into
+    // one successful Chat Completion. Retain only small metadata strings.
+    stream_id: Option<String>,
+    stream_model: Option<String>,
+    stream_created: Option<u64>,
+    progress_since_push: bool,
     finished_mask: u64,
     tool_calls_mask: u64,
+    logprobs_mask: u64,
+    logprobs_required: bool,
+    output_mask: u64,
     tool_calls: Vec<StreamToolCall>,
     tool_argument_bytes: usize,
     usage_seen: bool,
     tool_choice: Option<ToolChoice>,
+    json_mode: Option<bool>,
+    json_text: Vec<String>,
+    json_text_bytes: usize,
+    refusal_mask: u64,
+    resource_limit: bool,
     expected: u64,
     done: bool,
 }
@@ -59,6 +85,15 @@ impl ChatSse {
 
     pub fn is_done(&self) -> bool {
         self.done
+    }
+    /// Only validated content/tool deltas count as useful upstream progress.
+    pub fn take_progress(&mut self) -> bool {
+        std::mem::take(&mut self.progress_since_push)
+    }
+    /// Distinguish local bounded-memory protection from malformed upstream
+    /// semantics without changing the shared low-allocation error type.
+    pub fn hit_resource_limit(&self) -> bool {
+        self.resource_limit
     }
     /// Some OpenAI-compatible SSE providers close at EOF after every choice's
     /// finish_reason without sending the optional [DONE] sentinel. Only
@@ -90,6 +125,29 @@ impl ChatSse {
         self
     }
 
+    /// Direct SSE JSON mode is an actual provider output contract.
+    pub fn with_json_format(mut self, format: Option<&Value>) -> Self {
+        self.json_mode = format
+            .and_then(|format| format.get("type"))
+            .and_then(Value::as_str)
+            .and_then(|kind| match kind {
+                "json_object" => Some(true),
+                "json_schema" => Some(false),
+                _ => None,
+            });
+        if self.json_mode.is_some() {
+            self.json_text = vec![String::new(); self.expected as usize];
+        }
+        self
+    }
+
+    /// Match native JSON Chat: requested token logprobs must actually be
+    /// present in every completed choice. Retain only one bit per choice.
+    pub fn with_logprobs(mut self, required: bool) -> Self {
+        self.logprobs_required = required;
+        self
+    }
+
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Bytes>, SseError> {
         let mut emitted = Vec::new();
         if self.done && !chunk.is_empty() {
@@ -104,6 +162,7 @@ impl ChatSse {
                 self.process_line(line.strip_suffix(b"\r").unwrap_or(&line), &mut emitted)?;
             } else {
                 if self.line.len() >= MAX_EVENT_BYTES {
+                    self.resource_limit = true;
                     return Err(SseError);
                 }
                 self.line.push(byte);
@@ -114,6 +173,12 @@ impl ChatSse {
 
     fn process_line(&mut self, line: &[u8], emitted: &mut Vec<Bytes>) -> Result<(), SseError> {
         if line.is_empty() {
+            // An explicit event: error label can carry data that resembles
+            // an ordinary Chat chunk; never forward it as a success.
+            let error_event = std::mem::take(&mut self.error_event);
+            if error_event {
+                return Err(SseError);
+            }
             if self.data.is_empty() {
                 return Ok(());
             }
@@ -136,18 +201,44 @@ impl ChatSse {
 
     fn process_event(&mut self, data: Vec<u8>, emitted: &mut Vec<Bytes>) -> Result<(), SseError> {
         let event: Value = serde_json::from_slice(&data).map_err(|_| SseError)?;
+        if event.get("error").is_some_and(|error| !error.is_null()) {
+            return Err(SseError);
+        }
+        for (key, cached) in [
+            ("id", &mut self.stream_id),
+            ("model", &mut self.stream_model),
+        ] {
+            if let Some(value) = event.get(key) {
+                let value = value.as_str().filter(|s| !s.is_empty()).ok_or(SseError)?;
+                if value.len() > MAX_STREAM_METADATA_BYTES {
+                    self.resource_limit = true;
+                    return Err(SseError);
+                }
+                if cached.as_deref().is_some_and(|previous| previous != value) {
+                    return Err(SseError);
+                }
+                if cached.is_none() {
+                    *cached = Some(value.to_owned());
+                }
+            }
+        }
+        if let Some(value) = event.get("created") {
+            let value = value.as_u64().ok_or(SseError)?;
+            if self
+                .stream_created
+                .is_some_and(|previous| previous != value)
+            {
+                return Err(SseError);
+            }
+            self.stream_created = Some(value);
+        }
         let choices = event
             .get("choices")
             .and_then(Value::as_array)
             .ok_or(SseError)?;
-        if choices.is_empty() {
-            // Stream usage is optional, but if present it must be complete
-            // and occur only once after every choice has finished. Otherwise
-            // malformed accounting can be forwarded as a successful response.
-            if self.finished_mask.count_ones() as u64 != self.expected || self.usage_seen {
-                return Err(SseError);
-            }
-            let usage = event.get("usage").ok_or(SseError)?;
+        // Compatible providers may attach provisional usage to content
+        // frames. Reject malformed counts there too, not only in trailers.
+        if let Some(usage) = event.get("usage").filter(|usage| !usage.is_null()) {
             let (Some(prompt), Some(completion), Some(total)) = (
                 usage.get("prompt_tokens").and_then(Value::as_u64),
                 usage.get("completion_tokens").and_then(Value::as_u64),
@@ -156,6 +247,17 @@ impl ChatSse {
                 return Err(SseError);
             };
             if prompt.checked_add(completion) != Some(total) {
+                return Err(SseError);
+            }
+        }
+        if choices.is_empty() {
+            // Stream usage is optional, but if present it must be complete
+            // and occur only once after every choice has finished. Otherwise
+            // malformed accounting can be forwarded as a successful response.
+            if self.finished_mask.count_ones() as u64 != self.expected
+                || self.usage_seen
+                || !event.get("usage").is_some_and(|usage| !usage.is_null())
+            {
                 return Err(SseError);
             }
             self.usage_seen = true;
@@ -212,10 +314,69 @@ impl ChatSse {
             || delta
                 .get("content")
                 .is_some_and(|content| !content.is_null() && !content.is_string())
+            || ["reasoning", "reasoning_content", "refusal"]
+                .iter()
+                .any(|field| {
+                    delta
+                        .get(*field)
+                        .is_some_and(|value| !value.is_null() && !value.is_string())
+                })
+            // The JSON aggregation path rejects unsupported non-null
+            // extensions rather than silently losing them. Direct SSE must
+            // enforce the same contract: a legacy function_call, multimodal
+            // audio or vendor-specific output cannot become a reported
+            // successful Chat Completion simply because it arrived as SSE.
+            || delta.iter().any(|(field, value)| {
+                !value.is_null()
+                    && !matches!(
+                        field.as_str(),
+                        "role"
+                            | "content"
+                            | "reasoning"
+                            | "reasoning_content"
+                            | "refusal"
+                            | "tool_calls"
+                    )
+            })
         {
             return Err(SseError);
         }
+        let choice_bit = 1u64 << index;
+        if choice.get("logprobs").is_some_and(Value::is_object) {
+            self.logprobs_mask |= choice_bit;
+        }
+        let has_refusal = delta
+            .get("refusal")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty());
+        if has_refusal {
+            self.refusal_mask |= choice_bit;
+        }
+        let has_output = ["content", "reasoning", "reasoning_content"]
+            .iter()
+            .any(|field| {
+                delta
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+            });
+        if has_output {
+            self.output_mask |= choice_bit;
+        }
+        if self.json_mode.is_some()
+            && let Some(fragment) = delta.get("content").and_then(Value::as_str)
+        {
+            if fragment.len()
+                > MAX_STREAM_JSON_VALIDATION_BYTES.saturating_sub(self.json_text_bytes)
+            {
+                self.resource_limit = true;
+                return Err(SseError);
+            }
+            self.json_text[index as usize].push_str(fragment);
+            self.json_text_bytes += fragment.len();
+        }
         let mut has_tool_delta = false;
+        let mut tool_progress = false;
         if let Some(calls) = delta.get("tool_calls") {
             // Reject before forwarding: consumers may act on tool deltas
             // before an eventual finish event arrives.
@@ -229,11 +390,17 @@ impl ChatSse {
             has_tool_delta = true;
             for call in calls {
                 let call = call.as_object().ok_or(SseError)?;
-                self.process_tool_call(index, call)?;
+                tool_progress |= self.process_tool_call(index, call)?;
             }
+        }
+        if tool_progress || has_output || has_refusal {
+            self.progress_since_push = true;
         }
         if let Some(reason) = choice.get("finish_reason").filter(|v| !v.is_null()) {
             let reason = reason.as_str().ok_or(SseError)?;
+            if self.logprobs_required && self.logprobs_mask & choice_bit == 0 {
+                return Err(SseError);
+            }
             if !["stop", "length", "tool_calls", "content_filter"].contains(&reason) {
                 return Err(SseError);
             }
@@ -244,13 +411,33 @@ impl ChatSse {
             if (reason == "tool_calls" && !has_tools) || (reason == "stop" && has_tools) {
                 return Err(SseError);
             }
+            // Do not report an empty, cleanly stopped stream as a valid
+            // answer. Explicit refusals and reasoning-only completions are
+            // legitimate; partial length/content_filter endings are unchanged.
+            if reason == "stop"
+                && !has_tools
+                && self.output_mask & choice_bit == 0
+                && self.refusal_mask & choice_bit == 0
+            {
+                return Err(SseError);
+            }
+            if reason == "stop"
+                && !has_tools
+                && self.refusal_mask & choice_bit == 0
+                && let Some(object_only) = self.json_mode
+                && !valid_json_output(&self.json_text[index as usize], object_only)
+            {
+                return Err(SseError);
+            }
             match &self.tool_choice {
                 Some(ToolChoice::None) if has_tools => return Err(SseError),
-                Some(ToolChoice::Required) if !has_tools && reason == "stop" => {
+                Some(ToolChoice::Required)
+                    if !has_tools && reason == "stop" && self.refusal_mask & choice_bit == 0 =>
+                {
                     return Err(SseError);
                 }
                 Some(ToolChoice::Named(name))
-                    if (!has_tools && reason == "stop")
+                    if (!has_tools && reason == "stop" && self.refusal_mask & choice_bit == 0)
                         || self.tool_calls.iter().any(|tool| {
                             tool.choice == index && tool.name.as_deref() != Some(name.as_str())
                         }) =>
@@ -270,8 +457,7 @@ impl ChatSse {
                             || !tool.function_type
                             || !tool.arguments_seen
                             || (!tool.arguments.is_empty()
-                                && !serde_json::from_str::<Value>(&tool.arguments)
-                                    .is_ok_and(|value| value.is_object()))
+                                && !valid_json_output(&tool.arguments, true))
                     })
             {
                 return Err(SseError);
@@ -284,7 +470,7 @@ impl ChatSse {
         &mut self,
         choice: u64,
         call: &serde_json::Map<String, Value>,
-    ) -> Result<(), SseError> {
+    ) -> Result<bool, SseError> {
         let index = call.get("index").and_then(Value::as_u64).ok_or(SseError)?;
         if index >= 32 || call.get("type").is_some_and(|kind| kind != "function") {
             return Err(SseError);
@@ -327,13 +513,16 @@ impl ChatSse {
         let position = match position {
             Some(position) => position,
             None => {
-                if self.tool_calls.len() >= MAX_STREAM_TOOL_CALLS
-                    || self
-                        .tool_calls
-                        .iter()
-                        .filter(|tool| tool.choice == choice)
-                        .count()
-                        != index as usize
+                if self.tool_calls.len() >= MAX_STREAM_TOOL_CALLS {
+                    self.resource_limit = true;
+                    return Err(SseError);
+                }
+                if self
+                    .tool_calls
+                    .iter()
+                    .filter(|tool| tool.choice == choice)
+                    .count()
+                    != index as usize
                 {
                     return Err(SseError);
                 }
@@ -364,8 +553,15 @@ impl ChatSse {
         if fragment.is_some_and(|part| {
             part.len() > MAX_STREAM_TOOL_ARGUMENTS.saturating_sub(self.tool_argument_bytes)
         }) {
+            self.resource_limit = true;
             return Err(SseError);
         }
+        // Identical ID/name echoes and empty argument fragments are legal
+        // but carry no meaningful model progress. They must not renew an SSE
+        // lease indefinitely when a provider is stalled.
+        let progressed = (id.is_some() && tool.id.is_none())
+            || (name.is_some() && tool.name.is_none())
+            || fragment.is_some_and(|part| !part.is_empty());
         let tool = &mut self.tool_calls[position];
         if let Some(id) = id {
             tool.id.get_or_insert_with(|| id.to_owned());
@@ -379,23 +575,26 @@ impl ChatSse {
             tool.arguments.push_str(part);
             self.tool_argument_bytes += part.len();
         }
-        Ok(())
+        Ok(progressed)
     }
 
     fn process_field(&mut self, line: &[u8]) -> Result<(), SseError> {
         if self.done {
             return Err(SseError);
         }
-        if line.starts_with(b":")
-            || line.starts_with(b"event:")
-            || line.starts_with(b"id:")
-            || line.starts_with(b"retry:")
-        {
+        if let Some(name) = line.strip_prefix(b"event:") {
+            let name = name.strip_prefix(b" ").unwrap_or(name);
+            // The latest event field wins, including across TCP chunks.
+            self.error_event = name == b"error";
+            return Ok(());
+        }
+        if line.starts_with(b":") || line.starts_with(b"id:") || line.starts_with(b"retry:") {
             return Ok(());
         }
         if let Some(value) = line.strip_prefix(b"data:") {
             let value = value.strip_prefix(b" ").unwrap_or(value);
             if self.data.len() + value.len() + 1 > MAX_EVENT_BYTES {
+                self.resource_limit = true;
                 return Err(SseError);
             }
             if !self.data.is_empty() {
@@ -419,6 +618,76 @@ impl ChatSse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn explicitly_labeled_sse_error_must_never_be_a_chat_success() {
+        let valid_shape = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n";
+        for error_label in [b"event: error\n".as_slice(), b"event:error\n"] {
+            let mut parser = ChatSse::new(1).unwrap();
+            parser.push(error_label).unwrap();
+            assert!(
+                parser.push(valid_shape).is_err(),
+                "accepted an explicitly labeled upstream error"
+            );
+        }
+        let mut empty_error = ChatSse::new(1).unwrap();
+        assert!(empty_error.push(b"event: error\n\n").is_err());
+
+        // The last event field wins, and ordinary named messages still work.
+        let mut ordinary = ChatSse::new(1).unwrap();
+        ordinary.push(b"event: error\nevent: message\n").unwrap();
+        ordinary.push(valid_shape).unwrap();
+        ordinary.push(b"data: [DONE]\n\n").unwrap();
+        ordinary.finish().unwrap();
+
+        let mut fragmented = ChatSse::new(1).unwrap();
+        fragmented.push(b"ev").unwrap();
+        fragmented.push(b"ent: error\n").unwrap();
+        assert!(fragmented.push(valid_shape).is_err());
+    }
+
+    #[test]
+    fn shared_json_validation_matches_the_original_value_parser_contract() {
+        let cases = [
+            "{}",
+            "{\"nested\":[1,true,null,\"hello\"]}",
+            "  {\"unicode\":\"中🌿文\"}\n",
+            "[]",
+            "[1,2,3]",
+            "null",
+            "true",
+            "42",
+            "-0.000001",
+            "1e309",
+            "\"escaped\\ntext\"",
+            "{\"a\":1,\"a\":2}",
+            "",
+            "  ",
+            "{}{}",
+            "{bad}",
+            "{\"a\":NaN}",
+            "{\"a\":Infinity}",
+            "{\"a\":1,}",
+            "{\"a\":\"unfinished}",
+            "[1,]",
+            "/* comment */ {}",
+            "\"\\uD800\"",
+        ];
+        for source in cases {
+            let original = serde_json::from_str::<Value>(source).ok();
+            for object_required in [false, true] {
+                assert_eq!(
+                    valid_json_output(source, object_required),
+                    original
+                        .as_ref()
+                        .is_some_and(|value| !object_required || value.is_object()),
+                    "validation parity lost for {source:?}, object_required={object_required}"
+                );
+            }
+        }
+    }
+
     const START: &[u8] =
         br#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
 
@@ -426,6 +695,177 @@ mod tests {
     const END: &[u8] = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 "#;
+    #[test]
+    fn requested_logprobs_must_reach_every_completed_choice() {
+        for (logprobs, accepted) in [
+            (None, false),
+            (Some(Value::Null), false),
+            (Some(json!("unexpected")), false),
+            (Some(json!({"content": []})), true),
+        ] {
+            let mut parser = ChatSse::new(1).unwrap().with_logprobs(true);
+            let first = json!({"choices":[{"index":0,"delta":{"content":"answer"},
+                "logprobs":logprobs,"finish_reason":null}]});
+            parser
+                .push(format!("data: {first}\n\n").as_bytes())
+                .unwrap();
+            assert_eq!(parser.push(END).is_ok(), accepted, "{first}");
+            if accepted {
+                parser.push(b"data: [DONE]\n\n").unwrap();
+                parser.finish().unwrap();
+            }
+        }
+        let mut unrequested = ChatSse::new(1).unwrap();
+        unrequested.push(START).unwrap();
+        unrequested.push(END).unwrap();
+        unrequested.push(b"data: [DONE]\n\n").unwrap();
+
+        let mut multiple = ChatSse::new(2).unwrap().with_logprobs(true);
+        for (index, with_probabilities) in [(0, true), (1, false)] {
+            let first = json!({"choices":[{"index":index,"delta":{"content":"text"},
+                "logprobs":if with_probabilities { json!({"content":[]}) } else { Value::Null },
+                "finish_reason":null}]});
+            multiple
+                .push(format!("data: {first}\n\n").as_bytes())
+                .unwrap();
+        }
+        let second = json!({"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]});
+        assert!(
+            multiple
+                .push(format!("data: {second}\n\n").as_bytes())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn direct_json_mode_validates_each_choice_at_completion() {
+        for (format, fragments, finish, accepted) in [
+            ("json_object", vec!["{\"ok\":", "true}"], "stop", true),
+            ("json_object", vec!["plain prose"], "stop", false),
+            ("json_object", vec!["[1]"], "stop", false),
+            ("json_schema", vec!["[1]"], "stop", true),
+            ("json_schema", vec!["not JSON"], "stop", false),
+            ("json_object", vec!["{\"unfinished\":"], "length", true),
+        ] {
+            let mut parser = ChatSse::new(1)
+                .unwrap()
+                .with_json_format(Some(&json!({"type":format})));
+            let mut failed = false;
+            for (i, part) in fragments.iter().enumerate() {
+                let reason = if i + 1 == fragments.len() {
+                    json!(finish)
+                } else {
+                    Value::Null
+                };
+                let event = format!(
+                    "data: {}\n\n",
+                    json!({"choices":[{"index":0,"delta":{"content":part},"finish_reason":reason}]})
+                );
+                if parser.push(event.as_bytes()).is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            assert_eq!(!failed, accepted, "{format} {fragments:?} {finish}");
+            if accepted {
+                assert!(parser.push(b"data: [DONE]\n\n").is_ok());
+            }
+        }
+        // A legitimate provider refusal is not an ordinary JSON answer.
+        let mut refusal = ChatSse::new(1)
+            .unwrap()
+            .with_json_format(Some(&json!({"type":"json_object"})));
+        let event = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"index":0,
+            "delta":{"content":"cannot assist","refusal":"cannot assist"},
+            "finish_reason":"stop"}]})
+        );
+        refusal.push(event.as_bytes()).unwrap();
+        refusal.push(b"data: [DONE]\n\n").unwrap();
+    }
+
+    #[test]
+    fn json_mode_stream_retain_limit_is_bounded_across_deltas() {
+        let mut parser = ChatSse::new(1)
+            .unwrap()
+            .with_json_format(Some(&json!({"type":"json_object"})));
+        let large = "a".repeat(MAX_STREAM_JSON_VALIDATION_BYTES / 2 + 1);
+        let event = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"index":0,
+            "delta":{"content":large},"finish_reason":null}]})
+        );
+        assert!(parser.push(event.as_bytes()).is_ok());
+        assert!(parser.push(event.as_bytes()).is_err());
+        assert!(parser.hit_resource_limit());
+    }
+
+    #[test]
+    fn oversized_fragmented_sse_frame_is_local_limit_not_malformed_protocol() {
+        let mut oversized = ChatSse::new(1).unwrap();
+        let half = vec![b'x'; MAX_EVENT_BYTES / 2 + 1];
+        assert!(oversized.push(&half).is_ok());
+        assert!(oversized.push(&half).is_err());
+        assert!(oversized.hit_resource_limit());
+
+        let mut malformed = ChatSse::new(1).unwrap();
+        assert!(malformed.push(b"data: not-json\n\n").is_err());
+        assert!(!malformed.hit_resource_limit());
+    }
+
+    #[test]
+    fn known_reasoning_and_refusal_fields_must_be_text_or_null() {
+        for field in ["reasoning", "reasoning_content", "refusal"] {
+            let mut parser = ChatSse::new(1).unwrap();
+            let mut delta = serde_json::Map::new();
+            delta.insert(field.to_owned(), json!({"bad":"object"}));
+            let malformed = format!(
+                "data: {}\n\n",
+                json!({"choices":[{"index":0,"delta":delta,"finish_reason":null}]})
+            );
+            assert!(parser.push(malformed.as_bytes()).is_err(), "{field}");
+            assert!(
+                !parser.take_progress(),
+                "{field}: malformed data renewed probe"
+            );
+        }
+        let mut parser = ChatSse::new(1).unwrap();
+        let valid = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":null},\"finish_reason\":null}]}\n\n";
+        assert!(parser.push(valid).is_ok());
+        assert!(!parser.take_progress());
+    }
+
+    #[test]
+    fn only_valid_content_or_tool_deltas_refresh_probe_progress() {
+        let mut parser = ChatSse::new(1).unwrap();
+        let role =
+            br#"data: {"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+"#;
+        parser.push(role).unwrap();
+        assert!(
+            !parser.take_progress(),
+            "a role-only frame is not useful progress"
+        );
+        parser.push(START).unwrap();
+        assert!(parser.take_progress());
+        assert!(!parser.take_progress(), "progress must be consumed once");
+        let reasoning = br#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"still thinking"},"finish_reason":null}]}
+
+"#;
+        parser.push(reasoning).unwrap();
+        assert!(
+            parser.take_progress(),
+            "a valid reasoning delta is useful progress"
+        );
+        parser.push(END).unwrap();
+        assert!(
+            !parser.take_progress(),
+            "terminal bookkeeping cannot renew a probe"
+        );
+    }
+
     #[test]
     fn fragmented_frames_complete_only_with_finish_and_done() {
         let mut parser = ChatSse::new(1).unwrap();
@@ -481,6 +921,90 @@ mod tests {
             );
             assert!(parser.push(frame.as_bytes()).is_err(), "accepted {delta}");
         }
+    }
+
+    #[test]
+    fn direct_sse_rejects_unsupported_extensions_before_forwarding_them() {
+        for delta in [
+            json!({"function_call":{"name":"legacy","arguments":"{}"}}),
+            json!({"audio":{"id":"audio-1","data":"b64"}}),
+            json!({"image":{"url":"https://example.test/image"}}),
+            json!({"reasoning_details":[{"text":"secret"}]}),
+            json!({"content":"hello","function_call":{"name":"legacy","arguments":"{}"}}),
+        ] {
+            let mut parser = ChatSse::new(1).unwrap();
+            let frame = format!(
+                "data: {}\n\n",
+                json!({
+                    "choices":[{"index":0,"delta":delta,"finish_reason":null}]
+                })
+            );
+            assert!(parser.push(frame.as_bytes()).is_err(), "accepted {delta}");
+        }
+        // Optional null extensions contain no information to silently lose.
+        let mut parser = ChatSse::new(1).unwrap();
+        let frame = format!(
+            "data: {}\n\n",
+            json!({
+                "choices":[{"index":0,"delta":{
+                    "content":"supported","function_call":null,"audio":null
+                },"finish_reason":"stop"}]
+            })
+        );
+        assert!(parser.push(frame.as_bytes()).is_ok());
+        assert!(parser.push(b"data: [DONE]\n\n").is_ok());
+    }
+
+    #[test]
+    fn sse_model_id_created_and_error_are_bounded_and_consistent() {
+        let first = json!({
+            "id":"chatcmpl-original","model":"physical-model","created":100,
+            "choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]
+        });
+        let terminal = json!({
+            "id":"chatcmpl-original","model":"physical-model","created":100,
+            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]
+        });
+        let mut healthy = ChatSse::new(1).unwrap();
+        for event in [first.clone(), terminal] {
+            assert!(
+                healthy
+                    .push(format!("data: {event}\n\n").as_bytes())
+                    .is_ok()
+            );
+        }
+        assert!(healthy.push(b"data: [DONE]\n\n").is_ok());
+        for replacement in [
+            json!({"id":"another-generation"}),
+            json!({"model":"different-physical-model"}),
+            json!({"created":101}),
+            json!({"error":{"code":"model_failed"}}),
+            json!({"id":null}),
+            json!({"model":"m".repeat(MAX_STREAM_METADATA_BYTES + 1)}),
+        ] {
+            let mut parser = ChatSse::new(1).unwrap();
+            parser
+                .push(format!("data: {first}\n\n").as_bytes())
+                .unwrap();
+            let mut changed = first.clone();
+            for (key, value) in replacement.as_object().unwrap() {
+                changed[key] = value.clone();
+            }
+            assert!(
+                parser
+                    .push(format!("data: {changed}\n\n").as_bytes())
+                    .is_err(),
+                "accepted changed metadata {replacement}"
+            );
+            assert!(!parser.is_done());
+        }
+        // Providers may omit metadata from subsequent chunks or usage trailers.
+        let mut parser = ChatSse::new(1).unwrap();
+        parser
+            .push(format!("data: {first}\n\n").as_bytes())
+            .unwrap();
+        parser.push(END).unwrap();
+        parser.push(b"data: [DONE]\n\n").unwrap();
     }
 
     #[test]
@@ -581,6 +1105,67 @@ mod tests {
     }
 
     #[test]
+    fn repeated_empty_tool_call_deltas_cannot_refresh_stream_progress_forever() {
+        let mut parser = ChatSse::new(1).unwrap();
+        let initial = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_1","type":"function",
+             "function":{"name":"lookup","arguments":""}}
+        ]},"finish_reason":null}]});
+        parser
+            .push(format!("data: {initial}\n\n").as_bytes())
+            .unwrap();
+        assert!(parser.take_progress(), "new tool identity is real progress");
+        let repeated = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_1","type":"function",
+             "function":{"name":"lookup","arguments":""}}
+        ]},"finish_reason":null}]});
+        for _ in 0..4 {
+            parser
+                .push(format!("data: {repeated}\n\n").as_bytes())
+                .unwrap();
+            assert!(
+                !parser.take_progress(),
+                "identical empty tool fragments bypassed meaningful-progress timeout"
+            );
+        }
+        let meaningful = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":"{\"query\":\"hi\"}"}}
+        ]},"finish_reason":null}]});
+        parser
+            .push(format!("data: {meaningful}\n\n").as_bytes())
+            .unwrap();
+        assert!(
+            parser.take_progress(),
+            "new argument bytes were not counted"
+        );
+    }
+
+    #[test]
+    fn fragmented_tool_arguments_exceeding_cap_are_a_local_resource_limit() {
+        let mut parser = ChatSse::new(1).unwrap();
+        let part = "x".repeat(MAX_STREAM_TOOL_ARGUMENTS / 2 + 10);
+        let first = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call_1","type":"function",
+             "function":{"name":"query","arguments":part}}
+        ]},"finish_reason":null}]});
+        let first = format!("data: {first}\n\n");
+        assert!(parser.push(first.as_bytes()).is_ok());
+        let second = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":part}}
+        ]},"finish_reason":null}]});
+        let second = format!("data: {second}\n\n");
+        assert!(parser.push(second.as_bytes()).is_err());
+        assert!(parser.hit_resource_limit());
+        // An invalid tool index is a protocol fault, not an OOM guard.
+        let mut invalid = ChatSse::new(1).unwrap();
+        let bad = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":1,"type":"function","function":{"name":"query","arguments":"{}"}}
+        ]},"finish_reason":null}]});
+        assert!(invalid.push(format!("data: {bad}\n\n").as_bytes()).is_err());
+        assert!(!invalid.hit_resource_limit());
+    }
+
+    #[test]
     fn multi_choice_tool_calls_do_not_hit_an_unadvertised_global_128_cap() {
         let mut parser = ChatSse::new(5).unwrap();
         for choice in 0..5u64 {
@@ -631,7 +1216,8 @@ mod tests {
 
     #[test]
     fn usage_frames_must_be_complete_consistent_and_unique() {
-        let finished = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+        let finished =
+            br#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}
 
 "#;
         let valid_usage = br#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}
@@ -665,6 +1251,42 @@ mod tests {
         parser.push(valid_usage).unwrap();
         parser.push(b"data: [DONE]\n\n").unwrap();
         assert!(parser.finish().is_ok());
+    }
+
+    #[test]
+    fn provisional_usage_in_content_frames_must_obey_trailer_contract() {
+        for usage in [
+            json!({}),
+            json!("unknown"),
+            json!({"prompt_tokens":2,"completion_tokens":3,"total_tokens":6}),
+            json!({"prompt_tokens":-1,"completion_tokens":3,"total_tokens":2}),
+            json!({"prompt_tokens":u64::MAX,"completion_tokens":1,"total_tokens":0}),
+        ] {
+            let frame = format!(
+                "data: {}\n\n",
+                json!({"choices":[{"index":0,"delta":{"content":"answer"},
+                    "finish_reason":"stop"}],"usage":usage})
+            );
+            let mut parser = ChatSse::new(1).unwrap();
+            assert!(
+                parser.push(frame.as_bytes()).is_err(),
+                "accepted usage {usage}"
+            );
+        }
+        for usage in [
+            Value::Null,
+            json!({"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}),
+        ] {
+            let frame = format!(
+                "data: {}\n\n",
+                json!({"choices":[{"index":0,"delta":{"content":"answer"},
+                    "finish_reason":"stop"}],"usage":usage})
+            );
+            let mut parser = ChatSse::new(1).unwrap();
+            parser.push(frame.as_bytes()).unwrap();
+            parser.push(b"data: [DONE]\n\n").unwrap();
+            parser.finish().unwrap();
+        }
     }
 
     #[test]
@@ -705,6 +1327,43 @@ mod tests {
         valid.push(finish).unwrap();
         valid.push(b"data: [DONE]\n\n").unwrap();
         assert!(valid.finish().is_ok());
+    }
+
+    #[test]
+    fn explicit_refusal_satisfies_forced_tool_stream_without_allowing_plain_text() {
+        let refusal = br#"data: {"choices":[{"index":0,"delta":{"role":"assistant","refusal":"Cannot help"},"finish_reason":null}]}
+
+"#;
+        let empty_refusal =
+            br#"data: {"choices":[{"index":0,"delta":{"refusal":""},"finish_reason":null}]}
+
+"#;
+        let finish = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+"#;
+        for tool_choice in [
+            serde_json::json!("required"),
+            serde_json::json!({"type":"function","function":{"name":"lookup"}}),
+        ] {
+            let mut allowed = ChatSse::new(1)
+                .unwrap()
+                .with_tool_choice(Some(&tool_choice));
+            allowed.push(refusal).unwrap();
+            allowed.push(finish).unwrap();
+            allowed.push(b"data: [DONE]\n\n").unwrap();
+            allowed.finish().unwrap();
+
+            for invalid_delta in [empty_refusal.as_slice(), START] {
+                let mut rejected = ChatSse::new(1)
+                    .unwrap()
+                    .with_tool_choice(Some(&tool_choice));
+                rejected.push(invalid_delta).unwrap();
+                assert!(
+                    rejected.push(finish).is_err(),
+                    "non-refusal cannot bypass required tool"
+                );
+            }
+        }
     }
 
     #[test]
@@ -770,8 +1429,48 @@ mod tests {
     }
 
     #[test]
+    fn clean_stop_requires_text_reasoning_or_refusal() {
+        for (delta, allowed) in [
+            (json!({}), false),
+            (json!({"role":"assistant"}), false),
+            (
+                json!({"content":"","reasoning_content":"","refusal":""}),
+                false,
+            ),
+            (json!({"content":"ok"}), true),
+            (json!({"reasoning_content":"thought"}), true),
+            (json!({"reasoning":"thought"}), true),
+            (json!({"refusal":"Cannot help"}), true),
+        ] {
+            let mut parser = ChatSse::new(1).unwrap();
+            let frame = format!(
+                "data: {}\n\n",
+                json!({"choices":[{"index":0,"delta":delta,"finish_reason":"stop"}]})
+            );
+            assert_eq!(parser.push(frame.as_bytes()).is_ok(), allowed, "{frame}");
+        }
+        let mut parser = ChatSse::new(1).unwrap();
+        parser.push(br#"data: {"choices":[{"index":0,"delta":{"refusal":"Cannot help"},"finish_reason":null}]}
+
+"#).unwrap();
+        assert!(parser.take_progress());
+        parser
+            .push(
+                br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":null}]}
+
+"#,
+            )
+            .unwrap();
+        assert!(
+            !parser.take_progress(),
+            "empty frame is not renewed progress"
+        );
+    }
+
+    #[test]
     fn duplicate_done_is_rejected() {
         let mut parser = ChatSse::new(1).unwrap();
+        parser.push(START).unwrap();
         parser.push(END).unwrap();
         parser.push(b"data: [DONE]\n\n").unwrap();
         assert!(parser.push(b"data: [DONE]\n\n").is_err());
@@ -780,7 +1479,7 @@ mod tests {
     #[test]
     fn invalid_later_choice_cannot_commit_earlier_finish() {
         let mut parser = ChatSse::new(2).unwrap();
-        let bad = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"},{"index":1,"delta":null,"finish_reason":null}]}
+        let bad = br#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"},{"index":1,"delta":null,"finish_reason":null}]}
 
 "#;
         assert!(parser.push(bad).is_err());
@@ -790,9 +1489,11 @@ mod tests {
     #[test]
     fn rejects_trailing_bytes_after_done_in_same_and_later_chunk() {
         let mut parser = ChatSse::new(1).unwrap();
+        parser.push(START).unwrap();
         parser.push(END).unwrap();
         assert!(parser.push(b"data: [DONE]\n\nextra").is_err());
         let mut parser = ChatSse::new(1).unwrap();
+        parser.push(START).unwrap();
         parser.push(END).unwrap();
         parser.push(b"data: [DONE]\n\n").unwrap();
         assert!(parser.push(b"extra").is_err());
@@ -802,11 +1503,11 @@ mod tests {
         let mut parser = ChatSse::new(64).unwrap();
         let high: Vec<Value> = (32..64)
             .rev()
-            .map(|index| serde_json::json!({"index":index,"delta":{},"finish_reason":"stop"}))
+            .map(|index| serde_json::json!({"index":index,"delta":{"content":"ok"},"finish_reason":"stop"}))
             .collect();
         let low: Vec<Value> = (0..32)
             .rev()
-            .map(|index| serde_json::json!({"index":index,"delta":{},"finish_reason":"stop"}))
+            .map(|index| serde_json::json!({"index":index,"delta":{"content":"ok"},"finish_reason":"stop"}))
             .collect();
         assert_eq!(high.len(), 32);
         let first = format!("data: {}\n\n", serde_json::json!({"choices":high}));

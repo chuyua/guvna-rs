@@ -10,10 +10,14 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_CHAIN_FILE_BYTES: usize = 1024 * 1024;
+// Offline updates fsync the backup, new file and directory while holding an
+// OS lock. Allow concurrent local writers to serialize even on slow disks.
+const MUTATION_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 pub enum Command {
     List,
@@ -46,7 +50,10 @@ fn read_limited(path: &Path) -> Result<Option<Vec<u8>>, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        // A regular file can be replaced with a FIFO after the pathname
+        // check. O_NONBLOCK makes that swap fail without hanging the daemon.
+        // It has no effect on normal regular-file reads.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = match options.open(path) {
         Ok(file) => file,
@@ -148,7 +155,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn lock_directory(data_dir: &Path) -> Result<(PathBuf, File), String> {
+fn lock_directory(data_dir: &Path, wait: Duration) -> Result<(PathBuf, File), String> {
     fs::create_dir_all(data_dir)
         .map_err(|e| format!("creating data directory {}: {e}", data_dir.display()))?;
     let directory = fs::canonicalize(data_dir)
@@ -168,20 +175,62 @@ fn lock_directory(data_dir: &Path) -> Result<(PathBuf, File), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+        // O_NONBLOCK also prevents a FIFO swapped into the lock pathname
+        // from stalling a writer before the inode type can be verified.
+        options
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .mode(0o600);
     }
     let lock = options
         .open(&path)
         .map_err(|e| format!("opening {}: {e}", path.display()))?;
-    if !lock
-        .metadata()
-        .map_err(|e| format!("lock metadata: {e}"))?
-        .is_file()
-    {
+    let metadata = lock.metadata().map_err(|e| format!("lock metadata: {e}"))?;
+    if !metadata.is_file() {
         return Err(format!("lock {} must be a regular file", path.display()));
     }
-    lock.lock_exclusive()
-        .map_err(|e| format!("locking {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(format!("lock {} must not have hard links", path.display()));
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err(format!(
+                "lock {} must not be group/world writable",
+                path.display()
+            ));
+        }
+    }
+    // A stalled second writer must not block the CLI forever.
+    let lock_deadline = Instant::now() + wait;
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= lock_deadline {
+                    return Err(format!("lock {} is busy", path.display()));
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => return Err(format!("locking {}: {err}", path.display())),
+        }
+    }
+    // The pathname must still identify the locked inode. Otherwise a
+    // concurrent unlink/recreate could give two writers different locks.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current = fs::symlink_metadata(&path)
+            .map_err(|e| format!("checking locked file {}: {e}", path.display()))?;
+        if !current.file_type().is_file()
+            || (current.dev(), current.ino()) != (metadata.dev(), metadata.ino())
+        {
+            return Err(format!(
+                "lock file {} changed while locking",
+                path.display()
+            ));
+        }
+    }
     Ok((directory, lock))
 }
 
@@ -205,7 +254,28 @@ fn serialize(state: &RuntimeChains) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn preserve_original(dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+/// Guard the persistent restart contract before writing a changed chains.yaml.
+/// AppState rejects enabled Auto with zero materialized candidates at boot;
+/// allowing the last discoverable chain to be deleted would leave a running
+/// daemon apparently healthy but unable to restart. Explicit candidates
+/// remain valid even when no runtime chains are present.
+fn ensure_restartable_auto(config: &Config, runtime: &RuntimeChains) -> Result<(), String> {
+    if !config.auto.enabled {
+        return Ok(());
+    }
+    let mut effective = config.clone();
+    effective.chains.extend(runtime.chains.iter().cloned());
+    effective.discover_auto_candidates();
+    if effective.auto.candidates.is_empty() {
+        return Err(
+            "chain mutation would leave enabled Auto without eligible candidates; chains.yaml unchanged"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn preserve_original(dir: &Path, source: &Path) -> Result<PathBuf, String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| format!("system clock: {e}"))?
@@ -214,19 +284,35 @@ fn preserve_original(dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
         "chains.yaml.before-recovery-{}-{now}.bak",
         std::process::id()
     ));
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
+    // Recovery is the one operation that must accept an oversized corrupt
+    // live file. Stream its bytes to a private file instead of materializing
+    // the whole file in RAM or using the 1 MiB validation reader.
+    let mut reader = OpenOptions::new();
+    reader.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        reader.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = opts
-        .open(&path)
-        .map_err(|e| format!("preserving {}: {e}", path.display()))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| format!("writing preserved original {}: {e}", path.display()))?;
+    let mut original = reader
+        .open(source)
+        .map_err(|e| format!("opening live file {} for recovery: {e}", source.display()))?;
+    if !original
+        .metadata()
+        .map_err(|e| format!("checking original file: {e}"))?
+        .is_file()
+    {
+        return Err("recovery original must be a regular file".into());
+    }
+    let mut temp =
+        tempfile::NamedTempFile::new_in(dir).map_err(|e| format!("creating forensic copy: {e}"))?;
+    std::io::copy(&mut original, temp.as_file_mut())
+        .map_err(|e| format!("copying original file: {e}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|e| format!("syncing forensic copy: {e}"))?;
+    temp.persist_noclobber(&path)
+        .map_err(|e| format!("preserving {}: {}", path.display(), e.error))?;
     #[cfg(unix)]
     File::open(dir)
         .and_then(|parent| parent.sync_all())
@@ -298,7 +384,7 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
                 return Err("chain name auto is reserved when Auto is enabled".into());
             }
             config.validate_chain(&chain)?;
-            let (directory, _lock) = lock_directory(data_dir)?;
+            let (directory, _lock) = lock_directory(data_dir, MUTATION_LOCK_WAIT)?;
             let target = runtime_path(&directory);
             let original = read_limited(&target)?;
             let mut state = validate_data(original.as_deref(), config)?;
@@ -310,6 +396,7 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
                 state.chains.push(chain);
                 false
             };
+            ensure_restartable_auto(config, &state)?;
             let next = serialize(&state)?;
             if let Some(bytes) = &original {
                 atomic_write(&directory.join("chains.yaml.bak"), bytes)?;
@@ -324,7 +411,7 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
             if name.is_empty() {
                 return Err("delete requires a nonempty chain name".into());
             }
-            let (directory, _lock) = lock_directory(data_dir)?;
+            let (directory, _lock) = lock_directory(data_dir, MUTATION_LOCK_WAIT)?;
             let target = runtime_path(&directory);
             let original = read_limited(&target)?;
             let mut state = validate_data(original.as_deref(), config)?;
@@ -335,6 +422,7 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
                     "runtime chain {name:?} not found; config.yaml chains are read-only"
                 ));
             }
+            ensure_restartable_auto(config, &state)?;
             let next = serialize(&state)?;
             if let Some(bytes) = &original {
                 atomic_write(&directory.join("chains.yaml.bak"), bytes)?;
@@ -345,19 +433,23 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
             ))
         }
         Command::Recover(source) => {
-            let (directory, _lock) = lock_directory(data_dir)?;
+            let (directory, _lock) = lock_directory(data_dir, MUTATION_LOCK_WAIT)?;
             let target = runtime_path(&directory);
             let backup = source.unwrap_or_else(|| directory.join("chains.yaml.bak"));
             let incoming = read_limited(&backup)?
                 .ok_or_else(|| format!("recovery source {} not found", backup.display()))?;
             let validated = validate_data(Some(&incoming), config)?;
+            ensure_restartable_auto(config, &validated)?;
             let next = serialize(&validated)?;
             // Preserve even a corrupt original byte-for-byte and report its
             // name. Never rewrite a failed recovery source or the live file.
-            let original = read_limited(&target)?;
-            let preserved = match original {
-                Some(ref original) => Some(preserve_original(&directory, original)?),
-                None => None,
+            let preserved = match fs::symlink_metadata(&target) {
+                Ok(meta) if meta.file_type().is_file() => {
+                    Some(preserve_original(&directory, &target)?)
+                }
+                Ok(_) => return Err("recovery live file is not a regular file".into()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => return Err(format!("checking live file before recovery: {err}")),
             };
             atomic_write(&target, &next)?;
             Ok(format!(
@@ -367,5 +459,108 @@ pub fn execute(config: &Config, data_dir: &Path, command: Command) -> Result<Str
                 preserved.map_or_else(|| "none".into(), |p| p.display().to_string())
             ))
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_security_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn fifo_is_rejected_without_waiting_for_a_writer() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("chains.yaml");
+        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(
+            read_limited(&fifo)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+        // Simulate the result of an attacker replacing a regular file with
+        // this FIFO between lstat and open. The open must not block.
+        let mut opts = OpenOptions::new();
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let opened = opts.open(&fifo).unwrap();
+        assert!(!opened.metadata().unwrap().file_type().is_file());
+        let lock = dir.path().join(".chains.yaml.lock");
+        let lock_name = CString::new(lock.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(lock_name.as_ptr(), 0o600) }, 0);
+        assert!(
+            lock_directory(dir.path(), Duration::from_millis(750))
+                .unwrap_err()
+                .contains("non-regular")
+        );
+        let mut opts = OpenOptions::new();
+        opts.read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let opened = opts.open(&lock).unwrap();
+        assert!(!opened.metadata().unwrap().file_type().is_file());
+    }
+
+    #[test]
+    fn shared_writable_lock_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".chains.yaml.lock");
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(lock_directory(dir.path(), Duration::from_millis(750)).is_err());
+    }
+
+    #[test]
+    fn ordinary_private_lock_remains_usable_across_sequential_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first_directory, first) =
+            lock_directory(dir.path(), Duration::from_millis(750)).unwrap();
+        assert_eq!(first_directory, fs::canonicalize(dir.path()).unwrap());
+        drop(first);
+        let (second_directory, second) =
+            lock_directory(dir.path(), Duration::from_millis(750)).unwrap();
+        assert_eq!(first_directory, second_directory);
+        drop(second);
+    }
+
+    #[test]
+    fn held_chain_lock_fails_bounded_then_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, held) = lock_directory(dir.path(), Duration::from_millis(750)).unwrap();
+        let start = Instant::now();
+        let failure = lock_directory(dir.path(), Duration::from_millis(750)).unwrap_err();
+        assert!(failure.contains("busy"), "{failure}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        drop(held);
+        assert!(lock_directory(dir.path(), Duration::from_millis(750)).is_ok());
+    }
+
+    #[test]
+    fn chain_mutation_waits_for_fsync_contention_before_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, held) = lock_directory(dir.path(), Duration::from_millis(750)).unwrap();
+        let contender_dir = dir.path().to_path_buf();
+        let contender = thread::spawn(move || {
+            lock_directory(&contender_dir, MUTATION_LOCK_WAIT).map(|(_, lock)| drop(lock))
+        });
+        // A second offline writer must not fail just because the first still
+        // has a legitimate backup and directory fsync in progress.
+        thread::sleep(Duration::from_millis(1000));
+        drop(held);
+        assert!(
+            contender.join().unwrap().is_ok(),
+            "a local mutation should wait for a legitimate writer to finish"
+        );
+    }
+
+    #[test]
+    fn hardlinked_lock_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".chains.yaml.lock");
+        fs::write(&path, b"").unwrap();
+        fs::hard_link(&path, dir.path().join("another-link")).unwrap();
+        assert!(lock_directory(dir.path(), Duration::from_millis(750)).is_err());
     }
 }

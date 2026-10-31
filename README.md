@@ -58,9 +58,40 @@ precision. The gateway validates parseable JSON before reporting completion
 has been sent). JSON-schema adherence beyond JSON syntax remains the
 responsibility of the upstream model/provider.
 
-Unsupported reasoning, image, audio, stateful continuation, and other
-advanced Responses modes remain explicitly unsupported. The gateway must not
-be treated as full OpenAI Responses parity or a production drop-in replacement.
+Responses user-image URL and base64 data-URI input are translated to Chat
+vision parts, preserving image order, text, and detail. User input_audio
+(mp3/wav base64) is also forwarded to Chat providers. File-ID images,
+image-generation tools, audio output and streaming, advanced reasoning controls, stateful
+continuation, and other advanced Responses modes remain unsupported.
+Inline input_file PDF data URLs (without PDF-specific detail) map to Chat file
+parts. Non-PDF files, file_url, and file_id are not portable to Chat chains and
+are explicitly rejected.
+The supported reasoning.effort values are translated to Chat reasoning_effort;
+reasoning summaries, context modes and other reasoning options remain unsupported.
+Responses text.verbosity is mapped to the equivalent Chat verbosity field.
+Request-level service_tier, safety_identifier and prompt_cache_key are
+validated and forwarded to Chat providers without inventing response metadata.
+Successful JSON and SSE Responses envelopes declare the actual stateless mode:
+store=false, background=false, previous_response_id=null, truncation=disabled,
+and error=null.
+The gateway is not a full OpenAI Responses implementation or a production
+drop-in replacement.
+
+Mixed Responses upstreams: set `responses_protocol: native` on a provider
+whose OpenAI-compatible upstream implements `POST /v1/responses`. The
+default is `chat`, which keeps the validated Chat Completions bridge for
+Chat-only providers. Native responses preserve provider output items,
+including native-only item types. Native SSE events pass through a bounded
+Responses event validator; Chat-only providers retain the Chat SSE bridge.
+Both paths share candidate/key fallback, preflight, cancellation accounting
+and circuit health, without spawning a second candidate walk.
+Native advanced request options remain subject to the bridge's current input
+validation limits only on Chat fallback candidates. Built-in tool declarations,
+stateful references and unsupported Chat input types are forwarded unchanged
+only to native-capable providers; they never silently fall back to Chat. An
+existing conversation or previous-response reference is pinned to its first
+native provider in a single request walk to prevent cross-provider replay.
+Do not claim full official Responses parity yet.
 
 Not yet shipped: learned Auto scoring, complete Go protocol parity and full multi-modal streaming.
 The current Auto cache stores only route metadata (128 entries, 30s TTL); it does not learn from or retain prompts.

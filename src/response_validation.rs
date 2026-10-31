@@ -6,6 +6,74 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
 
+/// Accept only complete, structurally plausible native Responses JSON.
+/// Native output items are not downgraded into Chat choices.
+pub(super) fn valid_native_responses(value: &Value) -> bool {
+    valid_native_responses_with_background(value, false)
+}
+
+/// Background requests legitimately return queued/in_progress Responses.
+/// A normal foreground request must never count either as completed success.
+pub(super) fn valid_native_responses_with_background(value: &Value, background: bool) -> bool {
+    value.get("object").and_then(Value::as_str) == Some("response")
+        && value
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        && value
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|model| !model.is_empty())
+        && value.get("created_at").and_then(Value::as_u64).is_some()
+        && (matches!(
+            value.get("status").and_then(Value::as_str),
+            Some("completed" | "incomplete")
+        ) || (background
+            && matches!(
+                value.get("status").and_then(Value::as_str),
+                Some("queued" | "in_progress")
+            )))
+        && value.get("output").and_then(Value::as_array).is_some()
+        && value.get("error").is_none_or(Value::is_null)
+        && value.get("usage").is_none_or(|usage| {
+            usage.is_null()
+                || (usage.get("input_tokens").and_then(Value::as_u64).is_some()
+                    && usage.get("output_tokens").and_then(Value::as_u64).is_some()
+                    && usage.get("total_tokens").and_then(Value::as_u64).is_some())
+        })
+}
+
+#[cfg(test)]
+mod native_background_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn native_pending_status_requires_background_opt_in() {
+        for status in ["queued", "in_progress"] {
+            let pending = json!({
+                "id":"resp_bg","object":"response","created_at":123,
+                "model":"native-model","status":status,"output":[],"error":null
+            });
+            assert!(!valid_native_responses(&pending));
+            assert!(valid_native_responses_with_background(&pending, true));
+            let mut invalid = pending;
+            invalid["output"] = json!("not an array");
+            assert!(!valid_native_responses_with_background(&invalid, true));
+        }
+        let complete = json!({
+            "id":"resp_ok","object":"response","created_at":123,
+            "model":"native-model","status":"completed","output":[],"error":null
+        });
+        assert!(valid_native_responses(&complete));
+        assert!(valid_native_responses_with_background(&complete, true));
+        let mut failed = complete;
+        failed["status"] = json!("failed");
+        failed["error"] = json!({"message":"refused"});
+        assert!(!valid_native_responses_with_background(&failed, true));
+    }
+}
+
 #[cfg(test)]
 pub(super) fn valid_result(endpoint: Endpoint, request: &Value, response: &Value) -> bool {
     valid_result_with_params(endpoint, request, &BTreeMap::new(), response)
@@ -19,6 +87,10 @@ pub(super) fn valid_result_with_params(
 ) -> bool {
     match endpoint {
         Endpoint::Chat => validate_chat_with_params(request, params, response),
+        Endpoint::Responses => {
+            validate_chat_with_params(request, params, response)
+                && super::responses::translatable_chat_result(response)
+        }
         Endpoint::Embeddings => validate_embeddings_with_params(request, params, response),
     }
 }
@@ -44,6 +116,27 @@ fn validate_chat_with_params(
     params: &BTreeMap<String, Value>,
     response: &Value,
 ) -> bool {
+    // Chat, Responses and Chat SSE must agree on the optional usage
+    // contract. A present but inconsistent token count is not a valid
+    // upstream success, even if the content itself is well formed.
+    if super::responses::parse_chat_usage(response).is_err() {
+        return false;
+    }
+    // Keep legacy upstreams that omit optional Chat metadata, but reject
+    // values that are present and malformed. Direct SSE already enforces
+    // the same types before declaring an upstream response successful.
+    if response
+        .get("id")
+        .is_some_and(|id| id.as_str().is_none_or(str::is_empty))
+        || response
+            .get("model")
+            .is_some_and(|model| model.as_str().is_none_or(str::is_empty))
+        || response
+            .get("created")
+            .is_some_and(|created| created.as_u64().is_none())
+    {
+        return false;
+    }
     let Some(choices) = response.get("choices").and_then(Value::as_array) else {
         return false;
     };
@@ -80,6 +173,24 @@ fn validate_chat_with_params(
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
             return false;
         }
+        // A valid text or tool result must not mask a malformed sibling
+        // field. Otherwise an upstream HTTP 200 can pass validation even
+        // though callers (or the Responses adapter) cannot interpret the
+        // non-string message field. Direct SSE rejects these same shapes.
+        if ["content", "refusal", "reasoning", "reasoning_content"]
+            .iter()
+            .any(|field| {
+                message
+                    .get(*field)
+                    .is_some_and(|value| !value.is_null() && !value.is_string())
+            })
+        {
+            return false;
+        }
+        let explicitly_refused = message
+            .get("refusal")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty());
         if !choice
             .get("finish_reason")
             .and_then(Value::as_str)
@@ -93,10 +204,7 @@ fn validate_chat_with_params(
                 .get("content")
                 .and_then(Value::as_str)
                 .is_some_and(|s| !s.is_empty())
-            && !message
-                .get("refusal")
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty())
+            && !explicitly_refused
             && !message
                 .get("tool_calls")
                 .and_then(Value::as_array)
@@ -142,9 +250,8 @@ fn validate_chat_with_params(
             let valid_json = message
                 .get("content")
                 .and_then(Value::as_str)
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-                .is_some_and(|parsed| format != "json_object" || parsed.is_object());
-            if !valid_json {
+                .is_some_and(|text| crate::sse::valid_json_output(text, format == "json_object"));
+            if !valid_json && !explicitly_refused {
                 return false;
             }
         }
@@ -159,7 +266,8 @@ fn validate_chat_with_params(
             || ((tool_choice.and_then(Value::as_str) == Some("required")
                 || required_name.is_some())
                 && reason == Some("stop")
-                && !finished_with_tools)
+                && !finished_with_tools
+                && !explicitly_refused)
         {
             return false;
         }
@@ -189,8 +297,7 @@ fn validate_chat_with_params(
                         .is_some_and(|s| {
                             matches!(reason, Some("length" | "content_filter"))
                                 || s.is_empty()
-                                || serde_json::from_str::<Value>(s)
-                                    .is_ok_and(|args| args.is_object())
+                                || crate::sse::valid_json_output(s, true)
                         });
                 if !valid {
                     return false;
@@ -202,6 +309,35 @@ fn validate_chat_with_params(
 }
 
 // Do not accept duplicate / missing embeddings, mixed dimensions or corrupt vectors.
+// JSON already owns the entire encoded string; keep decoder scratch fixed
+// instead of allocating a second large decoded vector for each response.
+fn base64_embedding_dimension(encoded: &str) -> Option<usize> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    const ENCODED_CHUNK: usize = 4096;
+    const DECODED_CHUNK: usize = ENCODED_CHUNK * 3 / 4;
+    let mut scratch = [0u8; DECODED_CHUNK];
+    let mut total_bytes = 0usize;
+    let mut chunks = encoded.as_bytes().chunks(ENCODED_CHUNK).peekable();
+    while let Some(chunk) = chunks.next() {
+        // Padding belongs only at the end of the complete encoded vector.
+        if chunks.peek().is_some() && chunk.contains(&b'=') {
+            return None;
+        }
+        let len = STANDARD.decode_slice(chunk, &mut scratch).ok()?;
+        if len % 4 != 0
+            || !scratch[..len]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|word| f32::from_le_bytes(*word).is_finite())
+        {
+            return None;
+        }
+        total_bytes = total_bytes.checked_add(len)?;
+    }
+    (total_bytes > 0).then_some(total_bytes / 4)
+}
+
 #[cfg(test)]
 fn validate_embeddings(request: &Value, response: &Value) -> bool {
     validate_embeddings_with_params(request, &BTreeMap::new(), response)
@@ -264,21 +400,10 @@ fn validate_embeddings_with_params(
                 }
             }
             Value::String(data) if !data.is_empty() => {
-                use base64::{Engine, engine::general_purpose::STANDARD};
-                let Ok(raw) = STANDARD.decode(data) else {
+                let Some(dim) = base64_embedding_dimension(data) else {
                     return false;
                 };
-                if raw.is_empty()
-                    || raw.len() % 4 != 0
-                    || !raw
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .all(|part| f32::from_le_bytes(*part).is_finite())
-                {
-                    return false;
-                }
-                ("base64", raw.len() / 4)
+                ("base64", dim)
             }
             _ => return false,
         };
@@ -395,6 +520,87 @@ mod response_contract_tests {
     }
 
     #[test]
+    fn malformed_present_chat_metadata_cannot_be_accepted_as_success() {
+        let mut result = json!({"choices":[assistant(0)]});
+        assert!(validate_chat(&json!({}), &result));
+        result["id"] = json!("chatcmpl-test");
+        result["model"] = json!("model-a");
+        result["created"] = json!(123);
+        assert!(validate_chat(&json!({}), &result));
+        for (name, invalid) in [
+            ("id", json!("")),
+            ("id", json!(42)),
+            ("model", json!("")),
+            ("model", json!(false)),
+            ("created", json!(-1)),
+            ("created", json!("yesterday")),
+        ] {
+            let mut response = result.clone();
+            response[name] = invalid;
+            assert!(
+                !validate_chat(&json!({}), &response),
+                "malformed present metadata {name} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_present_chat_usage_cannot_be_accepted_as_success() {
+        let valid = json!({"choices":[assistant(0)]});
+        assert!(validate_chat(&json!({}), &valid));
+        let mut response = valid.clone();
+        response["usage"] = Value::Null;
+        assert!(validate_chat(&json!({}), &response));
+        response["usage"] = json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":8});
+        assert!(validate_chat(&json!({}), &response));
+        for invalid in [
+            json!({}),
+            json!("unknown"),
+            json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":7}),
+            json!({"prompt_tokens":-1,"completion_tokens":3,"total_tokens":2}),
+            json!({"prompt_tokens":18446744073709551615_u64,
+                "completion_tokens":1,"total_tokens":0}),
+        ] {
+            response["usage"] = invalid;
+            assert!(
+                !validate_chat(&json!({}), &response),
+                "bad usage accepted: {response}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_nonstring_assistant_fields_cannot_hide_behind_valid_output() {
+        let valid_text = json!({"choices":[{"index":0,"message":{
+            "role":"assistant","content":"ok","refusal":null,"reasoning":null,
+            "reasoning_content":null},"finish_reason":"stop"}]});
+        let valid_tool = json!({"choices":[{"index":0,"message":{
+            "role":"assistant","content":null,"tool_calls":[{
+                "id":"call_1","type":"function",
+                "function":{"name":"lookup","arguments":"{}"}}]},
+            "finish_reason":"tool_calls"}]});
+        assert!(validate_chat(&json!({}), &valid_text));
+        assert!(validate_chat(&json!({}), &valid_tool));
+        for field in ["content", "refusal", "reasoning", "reasoning_content"] {
+            for invalid in [
+                json!({"unexpected":true}),
+                json!(["text"]),
+                json!(42),
+                json!(true),
+            ] {
+                for baseline in [&valid_text, &valid_tool] {
+                    let mut response = baseline.clone();
+                    response["choices"][0]["message"][field] = invalid.clone();
+                    assert!(
+                        !validate_chat(&json!({}), &response),
+                        "non-string {field} accepted alongside another valid field"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn chat_tool_finish_must_match_actual_calls() {
         let tool = json!({
             "id":"call_1", "type":"function",
@@ -494,6 +700,26 @@ mod response_contract_tests {
     }
 
     #[test]
+    fn explicit_refusal_can_complete_forced_tool_choice() {
+        let refused = json!({"choices":[{"index":0,
+            "message":{"role":"assistant","content":null,"refusal":"Cannot perform this request"},
+            "finish_reason":"stop"}]});
+        let empty_refusal = json!({"choices":[{"index":0,
+            "message":{"role":"assistant","content":null,"refusal":""},
+            "finish_reason":"stop"}]});
+        let ordinary_text = json!({"choices":[assistant(0)]});
+        for tool_choice in [
+            json!("required"),
+            json!({"type":"function","function":{"name":"lookup"}}),
+        ] {
+            let request = json!({"tool_choice":tool_choice});
+            assert!(validate_chat(&request, &refused));
+            assert!(!validate_chat(&request, &empty_refusal));
+            assert!(!validate_chat(&request, &ordinary_text));
+        }
+    }
+
+    #[test]
     fn completed_tool_calls_require_valid_json_arguments() {
         let request = json!({"n":1});
         let item = |args: &str| {
@@ -572,6 +798,20 @@ mod response_contract_tests {
             assert!(validate_chat(&request, &chat(r#"{"ok":true}"#, "stop")));
             assert!(!validate_chat(&request, &chat("ordinary prose", "stop")));
             assert!(!validate_chat(&request, &chat("{broken", "stop")));
+            // An explicit refusal is not a JSON-format compliance failure.
+            assert!(validate_chat(
+                &request,
+                &json!({"choices":[{"index":0,
+                "message":{"role":"assistant","content":null,"refusal":"I cannot help with that"},
+                "finish_reason":"stop"}]})
+            ));
+            // A missing/empty refusal must not bypass JSON validation.
+            assert!(!validate_chat(
+                &request,
+                &json!({"choices":[{"index":0,
+                "message":{"role":"assistant","content":"ordinary prose","refusal":""},
+                "finish_reason":"stop"}]})
+            ));
             // The original meaning of length is incomplete output, not
             // a validation failure requiring replay of truncated tokens.
             assert!(validate_chat(&request, &chat("{", "length")));
@@ -582,6 +822,27 @@ mod response_contract_tests {
         let schema_mode = json!({"response_format":{"type":"json_schema"}});
         assert!(validate_chat(&schema_mode, &chat("[1,2]", "stop")));
         assert!(validate_chat(&json!({}), &chat("ordinary prose", "stop")));
+    }
+
+    #[test]
+    fn json_validator_checks_a_megabyte_without_losing_syntax_checks() {
+        use crate::sse::valid_json_output;
+        let large = json!({"nested":{"payload":"x".repeat(1024 * 1024)}}).to_string();
+        assert!(valid_json_output(&large, true));
+        assert!(valid_json_output(&large, false));
+        assert!(valid_json_output(" \n\t {\"ok\":true}\r", true));
+        for malformed in [
+            "{} trailing",
+            "{\"ok\":true,}",
+            "{\"ok\": 1} {\"more\":2}",
+            "{\"unterminated\":\"string}",
+            "[1,2] trailing",
+        ] {
+            assert!(!valid_json_output(malformed, false), "{malformed}");
+        }
+        assert!(!valid_json_output("[1,2]", true));
+        assert!(valid_json_output("[1,2]", false));
+        assert!(!valid_json_output("null", true));
     }
 
     #[test]
@@ -632,5 +893,52 @@ mod response_contract_tests {
             &request,
             &json!({"data":[{"embedding":nan}]})
         ));
+    }
+
+    #[test]
+    fn bounded_base64_embedding_decoder_preserves_full_decoder_semantics() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        for dimensions in [1usize, 2, 3, 767, 768, 769, 1023, 1024, 1536, 2048, 3072] {
+            let mut raw = Vec::with_capacity(dimensions * 4);
+            for i in 0..dimensions {
+                raw.extend_from_slice(&((i as f32) / 100.0).to_le_bytes());
+            }
+            let encoded = STANDARD.encode(&raw);
+            assert_eq!(base64_embedding_dimension(&encoded), Some(dimensions));
+            assert!(validate_embeddings(
+                &json!({"input":"hello","dimensions":dimensions,"encoding_format":"base64"}),
+                &json!({"data":[{"index":0,"embedding":encoded}]})
+            ));
+            if dimensions >= 1024 {
+                raw[800 * 4..800 * 4 + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+                assert_eq!(base64_embedding_dimension(&STANDARD.encode(&raw)), None);
+            }
+        }
+        let mut invalid_padding = STANDARD.encode(vec![0u8; 8192]);
+        invalid_padding.replace_range(4095..4096, "=");
+        let incomplete = "a".repeat(4095);
+        for encoded in [
+            "",
+            "A",
+            "%%%",
+            "AAAAA",
+            "AQ==AAAA",
+            "AAAA====",
+            "AAAAAA==",
+            incomplete.as_str(),
+            invalid_padding.as_str(),
+        ] {
+            let old = STANDARD.decode(encoded).ok().and_then(|bytes| {
+                (!bytes.is_empty()
+                    && bytes.len() % 4 == 0
+                    && bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|word| f32::from_le_bytes(*word).is_finite()))
+                .then_some(bytes.len() / 4)
+            });
+            assert_eq!(base64_embedding_dimension(encoded), old, "{encoded}");
+        }
     }
 }

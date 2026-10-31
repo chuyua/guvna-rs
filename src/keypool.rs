@@ -28,6 +28,30 @@ pub struct Lease {
     epoch: u64,
 }
 
+/// Aggregate counters only: no key names, values, providers or cooldown timestamps.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, PartialEq, Eq)]
+pub struct KeyHealthSnapshot {
+    pub configured: usize,
+    pub available: usize,
+    pub auth_quarantined: usize,
+    pub rate_limited: usize,
+    pub transient_quarantined: usize,
+    pub total_uses: u64,
+}
+
+impl std::ops::AddAssign for KeyHealthSnapshot {
+    fn add_assign(&mut self, other: Self) {
+        self.configured = self.configured.saturating_add(other.configured);
+        self.available = self.available.saturating_add(other.available);
+        self.auth_quarantined = self.auth_quarantined.saturating_add(other.auth_quarantined);
+        self.rate_limited = self.rate_limited.saturating_add(other.rate_limited);
+        self.transient_quarantined = self
+            .transient_quarantined
+            .saturating_add(other.transient_quarantined);
+        self.total_uses = self.total_uses.saturating_add(other.total_uses);
+    }
+}
+
 pub struct KeyPool {
     inner: Mutex<Inner>,
     rotation: String,
@@ -38,12 +62,18 @@ pub struct KeyPool {
 
 impl KeyPool {
     pub fn new(provider: &Provider, keys: &HashMap<String, String>) -> Result<Self, String> {
+        // Different environment variable names can refer to the very same
+        // provider credential. Sending it a second time after an HTTP 429 or
+        // 401 is a guaranteed useless retry and overstates available quota.
+        // Deduplicate only WITHIN one physical provider. Preserve the first
+        // configured alias without ever logging or hashing keys externally.
+        let mut seen_secrets = HashSet::new();
         let credentials = provider
             .key_names()
             .into_iter()
             .filter_map(|env| {
                 let value = keys.get(&env)?;
-                if value.is_empty() {
+                if value.is_empty() || !seen_secrets.insert(value.as_str()) {
                     return None;
                 }
                 Some(Credential {
@@ -73,6 +103,30 @@ impl KeyPool {
                 .map(|_| provider.quarantine.transient())
                 .transpose()?,
         })
+    }
+
+    /// Local CLI status snapshot; a brief mutex read, never acquire a lease.
+    /// Expired cooldowns are counted as available even before their next use.
+    pub fn health_snapshot(&self) -> KeyHealthSnapshot {
+        let now = Instant::now();
+        let inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        let mut result = KeyHealthSnapshot {
+            configured: inner.credentials.len(),
+            ..KeyHealthSnapshot::default()
+        };
+        for key in &inner.credentials {
+            result.total_uses = result.total_uses.saturating_add(key.uses);
+            if key.blocked_until.is_none_or(|until| until <= now) {
+                result.available += 1;
+            } else {
+                match key.blocked_for {
+                    Some(Outcome::CredentialAuth) => result.auth_quarantined += 1,
+                    Some(Outcome::RateLimited) => result.rate_limited += 1,
+                    _ => result.transient_quarantined += 1,
+                }
+            }
+        }
+        result
     }
 
     pub fn acquire(&self, excluded: &HashSet<String>) -> Option<Lease> {
@@ -219,6 +273,79 @@ quarantine:
 "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn local_health_snapshot_is_aggregate_and_respects_fenced_cooldowns() {
+        let pool = KeyPool::new(
+            &provider(),
+            &HashMap::from([
+                ("A".into(), "sensitive-alpha".into()),
+                ("B".into(), "sensitive-beta".into()),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(pool.health_snapshot().configured, 2);
+        assert_eq!(pool.health_snapshot().available, 2);
+        let first = pool.acquire(&HashSet::new()).unwrap();
+        assert!(pool.record(&first, Outcome::CredentialAuth));
+        let second = pool.acquire(&HashSet::new()).unwrap();
+        assert!(pool.record(&second, Outcome::RateLimited));
+        let snapshot = pool.health_snapshot();
+        assert_eq!(snapshot.configured, 2);
+        assert_eq!(snapshot.available, 0);
+        assert_eq!(snapshot.auth_quarantined, 1);
+        assert_eq!(snapshot.rate_limited, 1);
+        assert_eq!(snapshot.transient_quarantined, 0);
+        assert_eq!(snapshot.total_uses, 2);
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        for secret in ["sensitive-alpha", "sensitive-beta", "A", "B"] {
+            assert!(!serialized.contains(secret), "key metadata leaked");
+        }
+        // Stale successful callbacks cannot remove quarantine or skew status.
+        pool.record_success(&first);
+        assert_eq!(pool.health_snapshot(), snapshot);
+    }
+
+    #[test]
+    fn local_health_snapshot_does_not_report_missing_keys_as_available() {
+        let pool = KeyPool::new(&provider(), &HashMap::new()).unwrap();
+        let snapshot = pool.health_snapshot();
+        assert_eq!(snapshot.configured, 0);
+        assert_eq!(snapshot.available, 0);
+        assert_eq!(snapshot.total_uses, 0);
+    }
+
+    #[test]
+    fn duplicate_environment_aliases_do_not_retry_one_physical_credential() {
+        let same_secret = "only-one-real-credential".to_owned();
+        let pool = KeyPool::new(
+            &provider(),
+            &HashMap::from([
+                ("A".into(), same_secret.clone()),
+                ("B".into(), same_secret.clone()),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(pool.health_snapshot().configured, 1);
+        let first = pool.acquire(&HashSet::new()).unwrap();
+        assert_eq!(first.env, "A");
+        assert!(pool.record(&first, Outcome::RateLimited));
+        assert!(
+            pool.acquire(&HashSet::from([first.env.clone()])).is_none(),
+            "another environment alias must not retry the same 429 credential"
+        );
+        assert!(pool.all_keys_rate_limited_for().is_some());
+        assert_eq!(pool.health_snapshot().rate_limited, 1);
+        let pool = KeyPool::new(
+            &provider(),
+            &HashMap::from([
+                ("A".into(), same_secret),
+                ("B".into(), "a-different-real-key".into()),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(pool.health_snapshot().configured, 2);
     }
 
     #[test]
@@ -436,7 +563,9 @@ mod contention_tests {
         ).unwrap();
         let mut inputs = HashMap::new();
         for key in ["A", "B", "C", "D"] {
-            inputs.insert(key.to_string(), "fake".to_string());
+            // Round-robin fairness is measured over distinct credentials.
+            // Duplicate aliases are intentionally deduplicated on startup.
+            inputs.insert(key.to_string(), format!("test-secret-{key}"));
         }
         let pool = Arc::new(KeyPool::new(&p, &inputs).unwrap());
         let counts = Arc::new(Mutex::new(HashMap::<String, usize>::new()));

@@ -67,6 +67,71 @@ pub struct AutoConfig {
     pub max_candidates: Option<usize>,
     /// Opt-in live failure-weighted priority (defaults to V1 deterministic order).
     pub health_aware: bool,
+    /// Opt-in discovery of additional candidates from validated named chains.
+    pub discover_from_chains: bool,
+    /// External model selector, disabled by default and fail-open.
+    pub decider: AutoDeciderConfig,
+    /// Opt-in Go-compatible conservative context/vision capability estimates.
+    pub use_model_registry: bool,
+    /// Optional Go-style service default; request min_context still takes precedence.
+    pub default_min_context: Option<usize>,
+    pub capability_overrides: BTreeMap<String, ModelCapabilityOverride>,
+    /// Opt-in, operator-approved SQLite-derived routing; never reads SQL per request.
+    pub telemetry_ranking: TelemetryRankingConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoDeciderConfig {
+    pub enabled: bool,
+    pub provider: String,
+    pub model: String,
+    /// Hard cap, including selector connect and response body.
+    pub timeout_ms: u64,
+    /// Cache a valid ranking, never a prompt or downstream response.
+    pub cache_ttl_secs: u64,
+    /// Background comparison only, never change live model order.
+    pub shadow_only: bool,
+}
+impl Default for AutoDeciderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: String::new(),
+            model: String::new(),
+            timeout_ms: 750,
+            cache_ttl_secs: 30,
+            shadow_only: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetryRankingConfig {
+    pub enabled: bool,
+    /// Explicit operator approval is required; there is no automatic promotion.
+    pub approved: bool,
+    pub window_hours: u32,
+    pub max_snapshot_age_secs: u64,
+}
+impl Default for TelemetryRankingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            approved: false,
+            window_hours: 24,
+            max_snapshot_age_secs: 300,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCapabilityOverride {
+    pub context_tokens: Option<usize>,
+    pub supports_images: Option<bool>,
+    pub supports_audio: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -84,7 +149,11 @@ pub struct AutoCandidate {
     /// None means unknown and preserves legacy routing behavior.
     pub supports_tools: Option<bool>,
     pub supports_images: Option<bool>,
+    pub supports_audio: Option<bool>,
     pub supports_json_schema: Option<bool>,
+    /// Go-style candidate defaults: caller fields always take precedence.
+    #[serde(default)]
+    pub params: BTreeMap<String, Value>,
 }
 
 fn default_auto_priority() -> u16 {
@@ -116,6 +185,9 @@ pub struct Provider {
     pub namespace_on_wire: bool,
     #[serde(default)]
     pub stream_only: bool,
+    /// Default chat bridges Responses to Chat. Native routes target /v1/responses.
+    #[serde(default)]
+    pub responses_protocol: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -278,13 +350,33 @@ impl Provider {
     }
 }
 
+fn parse_auto_min_context_env(value: Option<&str>) -> Option<usize> {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0 && *value <= 16_777_216)
+}
+
+/// Validate only top-level JSON field names; reject routing-control overrides.
+fn valid_step_param_key(key: &str) -> bool {
+    !key.is_empty()
+        && !matches!(key, "model" | "stream" | "messages")
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self, String> {
         // Gate G01: explicit path only, with no HOME fallback.
         let src =
             fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-        let cfg: Self =
+        let mut cfg: Self =
             serde_yaml::from_str(&src).map_err(|e| format!("parsing {}: {e}", path.display()))?;
+        // Match Go's GUVNA_AUTO_MIN_CONTEXT operator override, captured once
+        // at configuration load rather than read on every request. Explicit
+        // YAML wins; invalid/zero environment values preserve old defaults.
+        if cfg.auto.default_min_context.is_none() {
+            cfg.auto.default_min_context =
+                parse_auto_min_context_env(std::env::var("GUVNA_AUTO_MIN_CONTEXT").ok().as_deref());
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -302,6 +394,12 @@ impl Config {
             }
             if p.kind != "openai" && p.kind != "gemini" {
                 return Err(format!("unsupported provider type {:?}", p.kind));
+            }
+            if !matches!(p.responses_protocol.as_str(), "" | "chat" | "native") {
+                return Err(format!(
+                    "provider {}: responses_protocol must be chat or native",
+                    p.name
+                ));
             }
             let url = reqwest::Url::parse(&p.base_url)
                 .map_err(|e| format!("provider {} invalid URL: {e}", p.name))?;
@@ -350,18 +448,66 @@ impl Config {
         {
             return Err("auto max_candidates must be 1..=32".into());
         }
+        if self
+            .auto
+            .default_min_context
+            .is_some_and(|value| value == 0 || value > 16_777_216)
+        {
+            return Err("auto default_min_context must be 1..=16777216".into());
+        }
+        if self
+            .auto
+            .capability_overrides
+            .values()
+            .any(|entry| entry.context_tokens == Some(0))
+        {
+            return Err("model capability context_tokens must be greater than zero".into());
+        }
+        let rank = &self.auto.telemetry_ranking;
+        if rank.enabled {
+            if !rank.approved
+                || !self.auto.enabled
+                || ![1, 6, 24, 168].contains(&rank.window_hours)
+                || !(30..=3_600).contains(&rank.max_snapshot_age_secs)
+                || (self.auto.decider.enabled && !self.auto.decider.shadow_only)
+            {
+                return Err("telemetry ranking requires explicit approval, enabled Auto, window 1h/6h/24h/7d, age 30..3600 seconds, and no active LLM Decider".into());
+            }
+        } else if rank.approved {
+            return Err("telemetry ranking approval requires enabled: true".into());
+        }
+        if self.auto.decider.shadow_only && !self.auto.decider.enabled {
+            return Err("auto decider shadow_only requires enabled: true".into());
+        }
+        if self.auto.decider.enabled {
+            let d = &self.auto.decider;
+            if !self.auto.enabled
+                || d.model.is_empty()
+                || d.model == "auto"
+                || !self
+                    .providers
+                    .iter()
+                    .any(|p| p.name == d.provider && !p.stream_only)
+                || !(100..=2_000).contains(&d.timeout_ms)
+                || !(1..=120).contains(&d.cache_ttl_secs)
+            {
+                return Err("auto decider requires enabled Auto, a non-stream-only provider, valid model, timeout_ms 100..2000, cache_ttl_secs 1..120".into());
+            }
+        }
         if self.auto.health_aware && !self.auto.enabled {
             return Err("auto health_aware requires enabled: true".into());
         }
         if self.auto.enabled {
-            if self.auto.candidates.is_empty() || self.auto.candidates.len() > 32 {
+            if (self.auto.candidates.is_empty() && !self.auto.discover_from_chains)
+                || self.auto.candidates.len() > 32
+            {
                 return Err("auto enabled requires 1..32 configured candidates".into());
             }
             if self.chains.iter().any(|chain| chain.name == "auto") {
                 return Err("configured chain name auto is reserved when Auto is enabled".into());
             }
-        } else if !self.auto.candidates.is_empty() {
-            return Err("auto candidates require enabled: true".into());
+        } else if !self.auto.candidates.is_empty() || self.auto.discover_from_chains {
+            return Err("auto candidates/discovery require enabled: true".into());
         }
         let mut auto_keys = HashSet::new();
         for candidate in &self.auto.candidates {
@@ -377,6 +523,13 @@ impl Config {
                 || candidate.max_context_tokens == Some(0)
             {
                 return Err("auto candidate invalid input length range".into());
+            }
+            for key in candidate.params.keys() {
+                if !valid_step_param_key(key)
+                    || matches!(key.as_str(), "min_context" | "max_context")
+                {
+                    return Err(format!("auto candidate: forbidden param key {key:?}"));
+                }
             }
             if !auto_keys.insert((candidate.provider.as_str(), candidate.model.as_str())) {
                 return Err("auto has duplicate provider/model candidates".into());
@@ -396,6 +549,68 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    /// Materialize a stable bounded snapshot before dispatch, never on the request hot path.
+    /// Explicit candidates take precedence; only parameter-free, catalogue-compatible
+    /// named-chain steps can be discovered without silently dropping step parameters.
+    pub fn discover_auto_candidates(&mut self) {
+        if !self.auto.enabled || !self.auto.discover_from_chains {
+            return;
+        }
+        let mut seen: HashSet<(String, String)> = self
+            .auto
+            .candidates
+            .iter()
+            .map(|c| (c.provider.clone(), c.model.clone()))
+            .collect();
+        let mut chains: Vec<_> = self.chains.iter().collect();
+        chains.sort_by_key(|chain| {
+            if chain.name == self.default_chain {
+                0
+            } else {
+                1
+            }
+        });
+        for chain in chains {
+            for step in &chain.steps {
+                if self.auto.candidates.len() >= 32 {
+                    return;
+                }
+                if step.model.is_empty()
+                    || step
+                        .params
+                        .keys()
+                        .any(|key| matches!(key.as_str(), "min_context" | "max_context"))
+                {
+                    // Auto-only selection knobs must never be injected upstream.
+                    continue;
+                }
+                let Some(provider) = self.providers.iter().find(|p| p.name == step.provider) else {
+                    continue;
+                };
+                if !provider.models.is_empty() && !provider.models.contains(&step.model) {
+                    continue;
+                }
+                if !seen.insert((step.provider.clone(), step.model.clone())) {
+                    continue;
+                }
+                let priority = 100_u16.saturating_add(self.auto.candidates.len() as u16);
+                self.auto.candidates.push(AutoCandidate {
+                    provider: step.provider.clone(),
+                    model: step.model.clone(),
+                    priority,
+                    min_input_bytes: 0,
+                    max_input_bytes: None,
+                    max_context_tokens: None,
+                    supports_tools: None,
+                    supports_images: None,
+                    supports_audio: None,
+                    supports_json_schema: None,
+                    params: step.params.clone(),
+                });
+            }
+        }
     }
 
     pub(crate) fn validate_chain(&self, chain: &Chain) -> Result<(), String> {
@@ -422,10 +637,7 @@ impl Config {
                 ));
             }
             for key in step.params.keys() {
-                if key.is_empty()
-                    || ["model", "stream", "messages"].contains(&key.as_str())
-                    || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                {
+                if !valid_step_param_key(key) {
                     return Err(format!(
                         "chain {}: forbidden param key {:?}",
                         chain.name, key
@@ -446,6 +658,144 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_discovery_deduplicates_default_chain_and_skips_parameterized_or_unknown_models() {
+        let config = r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://upstream.example
+    key_env: KEY
+    models: [known, next, explicit]
+chains:
+  - name: other
+    steps:
+      - provider: p
+        model: next
+      - provider: p
+        model: known
+      - provider: p
+        model: unknown
+  - name: primary
+    steps:
+      - provider: p
+        model: known
+        params: {temperature: 0.5}
+      - provider: p
+        model: special
+        params: {temperature: 0.9}
+default_chain: primary
+auto:
+  enabled: true
+  discover_from_chains: true
+  candidates:
+    - provider: p
+      model: explicit
+      priority: 1
+"#;
+        let mut cfg: Config = serde_yaml::from_str(config).unwrap();
+        cfg.validate().unwrap();
+        cfg.discover_auto_candidates();
+        let list: Vec<_> = cfg
+            .auto
+            .candidates
+            .iter()
+            .map(|c| c.model.as_str())
+            .collect();
+        assert_eq!(list, vec!["explicit", "known", "next"]);
+        assert_eq!(cfg.auto.candidates[0].priority, 1);
+        assert_eq!(
+            cfg.auto.candidates[1].params["temperature"],
+            serde_json::json!(0.5)
+        );
+        assert!(cfg.auto.candidates[2].params.is_empty());
+        cfg.discover_auto_candidates();
+        assert_eq!(cfg.auto.candidates.len(), 3);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn auto_candidate_params_reject_routing_and_selection_control_fields() {
+        let yaml = r#"
+providers:
+  - name: p
+    type: openai
+    base_url: https://example.invalid
+    key_env: K
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: x
+      params: {temperature: 0.2}
+"#;
+        let valid: Config = serde_yaml::from_str(yaml).unwrap();
+        valid.validate().unwrap();
+        for key in [
+            "model",
+            "messages",
+            "stream",
+            "min_context",
+            "max_context",
+            "bad-key",
+        ] {
+            let bad: Config =
+                serde_yaml::from_str(&yaml.replace("temperature: 0.2", &format!("{key}: 0.2")))
+                    .unwrap();
+            assert!(bad.validate().is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn decider_requires_explicit_auto_valid_provider_and_bounded_timeout() {
+        let base = r#"
+providers:
+  - name: p
+    type: openai
+    base_url: http://localhost:1234
+    key_env: K
+auto:
+  enabled: true
+  candidates:
+    - provider: p
+      model: alpha
+  decider:
+    enabled: true
+    provider: p
+    model: ranker
+"#;
+        let valid: Config = serde_yaml::from_str(base).unwrap();
+        assert!(valid.validate().is_ok());
+        for changed in [
+            base.replace(
+                "provider: p\n    model: ranker",
+                "provider: missing\n    model: ranker",
+            ),
+            base.replace("model: ranker", "model: auto"),
+            base.replace("key_env: K", "key_env: K\n    stream_only: true"),
+            base.replace("model: ranker", "model: ranker\n    timeout_ms: 5"),
+            base.replace(
+                "enabled: true\n  candidates:",
+                "enabled: false\n  candidates:",
+            ),
+        ] {
+            let cfg: Config = serde_yaml::from_str(&changed).unwrap();
+            assert!(cfg.validate().is_err(), "{changed}");
+        }
+    }
+
+    #[test]
+    fn discovery_requires_explicit_enable_and_missing_routes_fail_at_state_construction() {
+        let disabled: Config = serde_yaml::from_str("auto: {discover_from_chains: true}").unwrap();
+        assert!(disabled.validate().is_err());
+        let allowed_for_runtime: Config =
+            serde_yaml::from_str("auto: {enabled: true, discover_from_chains: true}").unwrap();
+        assert!(allowed_for_runtime.validate().is_ok());
+        let mut cfg = allowed_for_runtime;
+        cfg.discover_auto_candidates();
+        assert!(cfg.auto.candidates.is_empty());
+    }
 
     #[test]
     fn fail_closed_invalid_ports_quarantine_and_duplicate_chain_steps() {
@@ -536,6 +886,29 @@ chains:
         value["model"] = Value::String("physical".into());
         assert_eq!(value["seed"].as_u64(), Some(12_345_678_901_234_567_890));
         assert!(value.to_string().contains("12345678901234567890"));
+    }
+
+    #[test]
+    fn go_auto_min_context_environment_override_is_bounded_and_nonfatal() {
+        for invalid in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-9"),
+            Some("invalid"),
+            Some("16777217"),
+            Some("184467440737095516160"),
+        ] {
+            assert_eq!(parse_auto_min_context_env(invalid), None);
+        }
+        assert_eq!(parse_auto_min_context_env(Some(" 262144 ")), Some(262_144));
+        let config: Config = serde_yaml::from_str("auto: {default_min_context: 0}").unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("default_min_context")
+        );
     }
 
     #[test]

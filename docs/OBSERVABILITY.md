@@ -142,6 +142,11 @@ health_aware enabled, per-provider/model health summaries are restored from SQLi
 when the last failure is within the 300-second freshness window. Live routing
 uses bounded candidate-level scores,
 not a learned model. The telemetry directory is local and limited to the service user.
+The startup health restore opens only an existing regular database, with
+SQLite read-only/no-follow flags; an absent, unreadable or symlinked database
+provides no restored health hints. Startup health restore does not open the
+main database for writes or create a new database.
+Only the separate telemetry writer owns writable connections and migration.
 The daemon sets umask 0077 before creating SQLite or binding its control
 socket; main DB, WAL and SHM are owner-only (0600) and an existing database
 symlink is rejected to avoid opening an unexpected target.
@@ -152,8 +157,10 @@ directory is set to mode 0700 and the socket to 0600. guvna status sends one
 bounded JSON-line status command and prints a runtime snapshot containing
 uptime, in-flight count, open-circuit count, provider count, Auto/SQLite flags
 and fixed request/telemetry counters. No provider names, model names, secrets,
-credentials or request bodies are returned. Only the read-only status command
-is supported; there is no mutation protocol and no additional TCP listener.
+credentials or request bodies are returned. Status queries are read-only; the
+same-UID socket also supports bounded chains set/delete
+operations that atomically persist and publish runtime routing. No remote
+management TCP listener is added.
 If the socket is absent, status retains the legacy loopback HTTP health probe.
 Stale sockets are cleaned on startup only after confirming the path is a Unix
 socket and a connection is refused; non-socket files and active sockets are
@@ -163,3 +170,63 @@ An unavailable or stale control socket causes `guvna status` to use the
 loopback health probe. Existing user-supplied data directories retain their
 permissions; newly created ones are secured at 0700. The control socket is
 secured at 0600 and peer credentials are verified on Linux.
+## Issue #129: local historical scoring inspection
+
+Use guvna status --scoring --window 1h|6h|24h|7d --data DIR on Linux.
+The request uses only the same-UID, permission-restricted Unix control socket;
+the service opens a separate read-only SQLite connection with a short busy
+timeout and bounded response size. It never queries SQLite on the public
+HTTP request path. Summaries include actual candidate attempt/failure counts,
+mean attempt time and up to 512 samples per candidate of downstream-completion
+p95. The totals come from hour buckets (window start is rounded down);
+the downstream p95 is not an upstream attempt p95. Results are advisory only
+and only qualify candidates after at least 20 attempts. This does not
+silently activate telemetry-based model ordering or expose another TCP port.
+Only one blocking scoring reader may run at a time. If a read takes more
+than 800 ms, the caller gets scoring_unavailable, but the reader keeps its
+slot until its actual SQLite work exits. Concurrent scoring requests fail
+fast with scoring_busy instead of accumulating orphaned blocking jobs. This
+does not block ordinary status, in-flight API requests or chain management.
+
+
+### Conservative provider attribution (Issue #129)
+
+Local scoring keeps the original raw attempts, failures and success_rate for
+compatibility, but these raw figures include caller/local errors and stream
+header starts. They must not be used as a model quality ranking. New
+observed_success_rate counts confirmed nonstream upstream successes and
+actual upstream provider failures (5xx, transport, invalid response, timeout,
+unavailable); excludes caller errors, local capacity failures, credential
+errors, 429 cooldown and stream starts. The qualified gate requires at least
+20 such observed samples; zero samples return null, not a fabricated 100%.
+Stream terminal failures with no additional upstream attempt are excluded
+from this conservative score, pending request-correlated outcome telemetry.
+downstream_p95_ms now measures nonstream downstream completions only.
+stream_header_p95_ms reports SSE response-header time separately, not full
+stream duration. Both derive from a bounded latest-512-row combined sample.
+Shadow comparisons remain advisory and never claim counterfactual success.
+
+### SSE terminal correlation (Issue #129)
+
+The opt-in SQLite writer stores actual Chat SSE terminal outcomes in
+stream_terminals with the same random request ID and attempt index as the
+initial stream_started row. Outcomes are success, transport_error or
+client_cancelled; a dropped downstream body records client_cancelled
+without penalizing the provider, circuit breaker or key pool. Only one
+terminal record is kept per request/attempt. No prompt or credential is
+persisted. guvna status --scoring exposes stream_terminal_metrics
+including actual completions, upstream failures and client cancellations.
+The completion rate excludes client cancellations from its denominator;
+it does not infer completion from SSE headers. Old SQLite databases without
+this table report null until the writer upgrades them. Terminal details
+expire after seven days and participate in bounded full-disk recovery.
+
+
+### Local credential health counters
+
+The existing Unix Socket status command reports key_health as aggregate
+configured/available/auth_quarantined/rate_limited/transient_quarantined
+counts plus total_uses. Expired cooldowns are counted as available. The
+snapshot never includes key values, key environment variable names, provider
+names, timestamps or other credential-identifying labels. Missing keys are
+not counted as configured. No extra TCP management route is added.
