@@ -9,6 +9,12 @@ use std::collections::{BTreeMap, HashSet};
 /// Accept only complete, structurally plausible native Responses JSON.
 /// Native output items are not downgraded into Chat choices.
 pub(super) fn valid_native_responses(value: &Value) -> bool {
+    valid_native_responses_with_background(value, false)
+}
+
+/// Background requests legitimately return queued/in_progress Responses.
+/// A normal foreground request must never count either as completed success.
+pub(super) fn valid_native_responses_with_background(value: &Value, background: bool) -> bool {
     value.get("object").and_then(Value::as_str) == Some("response")
         && value
             .get("id")
@@ -19,10 +25,14 @@ pub(super) fn valid_native_responses(value: &Value) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|model| !model.is_empty())
         && value.get("created_at").and_then(Value::as_u64).is_some()
-        && matches!(
+        && (matches!(
             value.get("status").and_then(Value::as_str),
             Some("completed" | "incomplete")
-        )
+        ) || (background
+            && matches!(
+                value.get("status").and_then(Value::as_str),
+                Some("queued" | "in_progress")
+            )))
         && value.get("output").and_then(Value::as_array).is_some()
         && value.get("error").is_none_or(Value::is_null)
         && value.get("usage").is_none_or(|usage| {
@@ -31,6 +41,37 @@ pub(super) fn valid_native_responses(value: &Value) -> bool {
                     && usage.get("output_tokens").and_then(Value::as_u64).is_some()
                     && usage.get("total_tokens").and_then(Value::as_u64).is_some())
         })
+}
+
+#[cfg(test)]
+mod native_background_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn native_pending_status_requires_background_opt_in() {
+        for status in ["queued", "in_progress"] {
+            let pending = json!({
+                "id":"resp_bg","object":"response","created_at":123,
+                "model":"native-model","status":status,"output":[],"error":null
+            });
+            assert!(!valid_native_responses(&pending));
+            assert!(valid_native_responses_with_background(&pending, true));
+            let mut invalid = pending;
+            invalid["output"] = json!("not an array");
+            assert!(!valid_native_responses_with_background(&invalid, true));
+        }
+        let complete = json!({
+            "id":"resp_ok","object":"response","created_at":123,
+            "model":"native-model","status":"completed","output":[],"error":null
+        });
+        assert!(valid_native_responses(&complete));
+        assert!(valid_native_responses_with_background(&complete, true));
+        let mut failed = complete;
+        failed["status"] = json!("failed");
+        failed["error"] = json!({"message":"refused"});
+        assert!(!valid_native_responses_with_background(&failed, true));
+    }
 }
 
 #[cfg(test)]

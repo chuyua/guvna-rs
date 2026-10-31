@@ -3259,6 +3259,62 @@ async fn responses_input_audio_preserves_chat_wire_for_json_and_sse() {
 }
 
 #[tokio::test]
+async fn native_background_queued_is_valid_only_for_opted_in_requests() {
+    let upstream = Router::new().route(
+        "/v1/responses",
+        post(|| async {
+            axum::Json(json!({
+                "id":"resp_pending","object":"response","model":"physical",
+                "created_at":123,"status":"queued","output":[],"error":null,
+                "background":true
+            }))
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(socket, upstream).await.unwrap();
+    });
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: native\n    type: openai\n    base_url: http://{addr}\n    key_env: KEY\n    responses_protocol: native\nchains:\n  - name: demo\n    steps:\n      - provider: native\n        model: physical\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        config,
+        HashMap::from([("KEY".into(), "native-key".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let send = |body: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let (status, pending) = call(
+        gateway.clone(),
+        send(json!({
+            "model":"demo","input":"process","background":true
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pending}");
+    assert_eq!(pending["status"], "queued");
+    assert_eq!(pending["id"], "resp_pending");
+    assert_eq!(pending["model"], "demo");
+    let (status, body) = call(
+        gateway,
+        send(json!({
+            "model":"demo","input":"process"
+        })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
 async fn native_only_responses_features_are_never_downgraded_to_chat() {
     let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
     let seen = Arc::clone(&captured);

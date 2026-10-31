@@ -1501,7 +1501,12 @@ async fn dispatch_inner(
                 match result {
                     Ok(Ok((value, response_reservation)))
                         if (native_responses
-                            && response_validation::valid_native_responses(&value))
+                            && response_validation::valid_native_responses_with_background(
+                                &value,
+                                native_request.as_ref().is_some_and(|request| {
+                                    request.get("background") == Some(&Value::Bool(true))
+                                }),
+                            ))
                             || (!native_responses
                                 && response_validation::valid_result_with_params(
                                     endpoint,
