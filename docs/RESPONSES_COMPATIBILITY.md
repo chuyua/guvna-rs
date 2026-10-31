@@ -89,6 +89,6 @@ JSON Schema 使用标准 `jsonschema` 引擎，关闭默认网络/文件解析�
 
 `tests/responses_protocol.rs` 覆盖客户端端点 × Chat/native/dual × stream_only × stream，以及账号隔离、故障、schema 和 SDK。官方 Python 3.42.0 / Node 7.47.0 用本地真实 HTTP fixture 验证 create/retrieve/delete/cancel/input_items/input_tokens/compact 和流式解析；不调用收费 API。
 
-Ubuntu 24.04 CI 保留既有 2,000 请求 / 64 clients 与 16/48/6 MiB 门禁。新增 `lowload_gate.py` 在同一机器构建 PR151 `1936b53` 和候选 Release，测串行双协议、1/2/4/8/16/64 阶梯、2,000 轮混合老化和 1,200 个状态 ID，归档 p50/p95/p99、CPU/RSS/fd/线程数、Tokio 存活任务数/worker数/全局调度队列采样和二进制 SHA256。Linux glibc 默认 mmap 分配阈值设为 8 KiB，减少突发流量后空闲 arena 的保留；尊重现有 MALLOC_MMAP_THRESHOLD_ / GLIBC_TUNABLES 覆盖。任务数通过鉴权 metrics 读取；多线程运行时读数是瞬时快照，压测报告给出采样最大值与闲置后的增长。
+Ubuntu 24.04 CI 保留既有 2,000 请求 / 64 clients 与 16/48/6 MiB 门禁。新增 `lowload_gate.py` 在同一机器构建 PR151 `1936b53` 和候选 Release，复用线程内 HTTP 客户端，串行每通道 500 次请求，计时不包含逐次 TLS 上下文构造；测双协议、1/2/4/8/16/64 阶梯、2,000 轮混合老化和 1,200 个状态 ID，归档 p50/p95/p99、CPU/RSS/fd/线程数、Tokio 存活任务数/worker数/全局调度队列采样和二进制 SHA256。Linux glibc 默认 mmap 分配阈值设为 8 KiB，减少突发流量后空闲 arena 的保留；尊重现有 MALLOC_MMAP_THRESHOLD_ / GLIBC_TUNABLES 覆盖。任务数通过鉴权 metrics 读取；多线程运行时读数是瞬时快照，压测报告给出采样最大值与闲置后的增长。
 
 CI 的 loopback mock 不是目标 VPS、真实供应商、IPv6/TLS/systemd 或生产稳定性证据。最终待执行门槛见 [Issue152 验收表](audit/ISSUE152_ACCEPTANCE.md)。本 PR 不自动合并 main、关闭 #129/#152 或发布版本。

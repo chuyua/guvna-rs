@@ -19,6 +19,16 @@ from urllib.error import HTTPError
 
 from quality_gate import port, proc_info, idle, check
 
+_clients = threading.local()
+
+
+def http_client():
+    if not hasattr(_clients, 'opener'):
+        # build_opener constructs an HTTPS SSLContext even for HTTP URLs.
+        # Initialize it once per worker outside the request latency timer.
+        _clients.opener = build_opener(ProxyHandler({}))
+    return _clients.opener
+
 
 class Stub(ThreadingHTTPServer):
     daemon_threads = True
@@ -59,11 +69,12 @@ def query(base, lane, number=0, *, stored=False, size=0):
     else:
         path, value = '/responses', {'model': 'native' if lane == 'native' else 'demo',
                                    'input': 'x' * size if size else 'ping', 'store': stored}
+    client = http_client()
     started = time.perf_counter()
     request = Request(base + path, data=json.dumps(value).encode(), headers={
         'Authorization': 'Bearer only-for-local-test', 'Content-Type': 'application/json'})
     try:
-        with build_opener(ProxyHandler({})).open(request, timeout=15) as reply:
+        with client.open(request, timeout=15) as reply:
             result = json.load(reply)
             content = (result['choices'][0]['message']['content'] if lane == 'chat'
                        else result['output'][0]['content'][0]['text'])
@@ -75,7 +86,7 @@ def query(base, lane, number=0, *, stored=False, size=0):
 def runtime_gauges(base):
     request = Request(base.removesuffix('/v1') + '/metrics', headers={
         'Authorization': 'Bearer only-for-local-test'})
-    with build_opener(ProxyHandler({})).open(request, timeout=3) as reply:
+    with http_client().open(request, timeout=3) as reply:
         return {line.split()[0].removeprefix('guvna_tokio_runtime_'): int(line.split()[1])
                 for line in reply.read(8192).decode().splitlines()
                 if line.startswith('guvna_tokio_runtime_')}
@@ -176,7 +187,7 @@ auto:
             result['startup_seconds'] = round(time.monotonic() - started, 3)
             result['idle_before'] = idle(process.pid, 3)
             result['tokio_runtime_before'] = runtime_gauges(base)
-            result['serial'] = [wave(base, process.pid, lane, 1, 100) for lane in ['chat', 'responses', 'native', 'auto']]
+            result['serial'] = [wave(base, process.pid, lane, 1, 500) for lane in ['chat', 'responses', 'native', 'auto']]
             if full:
                 result['ladder'] = [wave(base, process.pid, 'mixed', level, 200, mixed=True)
                                     for level in [1, 2, 4, 8, 16, 64]]
@@ -229,6 +240,13 @@ def main():
         if args.baseline:
             summary['p95_ratios'] = {after['lane']: round(after['p95_ms']/before['p95_ms'], 3)
                                      for before, after in zip(summary['baseline']['serial'], summary['candidate']['serial'])}
+            summary['p95_delta_ms'] = {after['lane']: round(after['p95_ms']-before['p95_ms'], 3)
+                                       for before, after in zip(summary['baseline']['serial'], summary['candidate']['serial'])}
+            # Shared-runner noise at sub-millisecond scales is not a model
+            # latency claim. Block a reproducible, material loopback slowdown.
+            check(not any(summary['p95_ratios'][lane] > 1.5 and delta > 5
+                          for lane, delta in summary['p95_delta_ms'].items()),
+                  'serial p95 regression exceeded both 50% and 5 ms')
         summary['passed'] = True
     except Exception as error:
         summary['error'] = str(error)

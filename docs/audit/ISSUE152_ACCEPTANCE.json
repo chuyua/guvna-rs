@@ -799,7 +799,7 @@
       "evidence": [
         "scripts/lowload_gate.py"
       ],
-      "result": "串行Chat/RE-bridge/RE-native/Auto，启动和前后闲置CPU/RSS/fd/线程，100请求每通道。"
+      "result": "串行Chat/RE-bridge/RE-native/Auto，启动和前后闲置CPU/RSS/fd/线程，500请求每通道；复用线程内HTTP客户端，计时不含每次创建TLS上下文。"
     },
     {
       "id": "F03",
@@ -879,7 +879,7 @@
         ".github/workflows/ci.yml",
         "scripts/lowload_gate.py"
       ],
-      "result": "同Ubuntu环境构建1936b53与候选Release，保留双方二进制SHA和逐通道p95比值；不是Go性能对比。"
+      "result": "同Ubuntu环境构建1936b53与候选Release，保留双方二进制SHA和逐通道p95比值/差值；串行p95同时退化>50%且>5ms则阻断；不是Go性能对比。"
     },
     {
       "id": "F11",

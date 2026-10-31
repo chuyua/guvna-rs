@@ -90,7 +90,7 @@
 | E11 | ci | `src/metrics.rs`；`src/ops_log.rs`；`scripts/quality_gate.py`：有界日志与无标签指标、低资源/压力观测；不引入Go远程管理历史表面功能。 |
 | E12 | contract | `docs/audit/ISSUE152_ACCEPTANCE.md`：固定 Go a640b18 → Rust PR151 1936b53 → PR153最终测试SHA；下面列目录/文件责任对照，不声称Go每条分支逐字等价。 |
 | F01 | ci | `.github/workflows/ci.yml`；`scripts/quality_gate.py`：原16/48/6MiB、2000请求64clients门禁不变；近限大payload独立256/128MiB门禁也不放宽。 |
-| F02 | ci | `scripts/lowload_gate.py`：串行Chat/RE-bridge/RE-native/Auto，启动和前后闲置CPU/RSS/fd/线程，100请求每通道。 |
+| F02 | ci | `scripts/lowload_gate.py`：串行Chat/RE-bridge/RE-native/Auto，启动和前后闲置CPU/RSS/fd/线程，500请求每通道；线程内复用HTTP客户端，计时不包含逐次TLS上下文构造。 |
 | F03 | ci | `scripts/lowload_gate.py`：1/2/4/8/16/64各200混合请求、2000老化；状态码/延迟/RSS均归档。 |
 | F04 | contract | `scripts/quality_gate.py`；`scripts/lowload_gate.py`：1MiB原生输入、7MiB近限8并发、12MiB回复与伪32MiB长度；入站8MiB硬上限，超限不承诺接收。 |
 | F05 | ci | `scripts/quality_gate.py`；`tests/gateway_integration.rs`：429/5xx/坏2xx/慢流/断流/全候选不可用的有限尝试与内存门禁。真实DNS故障恢复另见G06。 |
@@ -98,7 +98,7 @@
 | F07 | automated | `src/auto_decider.rs`；`src/routing.rs`；`scripts/quality_gate.py`：TTL/LRU容量与后台selector上界、失败冷却、idle CPU门禁。 |
 | F08 | ci | `src/dispatch.rs`；`scripts/quality_gate.py`：四聚合名额、大payload/回复准入、schema独立四槽和取消回收；低资源门禁真实进程执行。 |
 | F09 | automated | `src/response_routes.rs`；`scripts/lowload_gate.py`：1024条索引/ID长度/TTL/冲突单元回归，1200状态ID洪泛测有界增长。 |
-| F10 | ci | `.github/workflows/ci.yml`；`scripts/lowload_gate.py`：同Ubuntu环境构建1936b53与候选Release，保留双方二进制SHA和逐通道p95比值；不是Go性能对比。 |
+| F10 | ci | `.github/workflows/ci.yml`；`scripts/lowload_gate.py`：同Ubuntu环境构建1936b53与候选Release，保留双方二进制SHA和逐通道p95比值/差值；p95同时退化>50%且>5ms则阻断；不是Go性能对比。 |
 | F11 | ci | `scripts/lowload_gate.py`；`scripts/quality_gate.py`：p50/p95/p99、CPU/RSS/fd/线程与状态码数值报告；鉴权metrics提供真实Tokio存活任务数/worker数/全局队列深度，混合压测采样峰值，闲置后检查任务数回落。 |
 | G01 | external | `https://github.com/chuyua/guvna-rs/issues/152`：技术回归与有限兼容契约逐项记录；最终发布封板仍受G06–G10外部真实证据约束。 |
 | G02 | automated | `tests/responses_protocol.rs`；`src/dispatch.rs`：新增真实HTTP失败复现/正常/异常/取消/跨账号测试；翻译模块不拥有独立业务重试循环。 |
