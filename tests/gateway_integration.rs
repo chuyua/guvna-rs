@@ -4964,6 +4964,23 @@ fn metric_value(text: &str, name: &str) -> u64 {
 }
 
 #[tokio::test]
+async fn runtime_task_gauge_observes_spawn_and_cancellation() {
+    let router = make_app("http://127.0.0.1:9", "http://127.0.0.1:9");
+    let (_, before) = get_metrics(router.clone(), Some("client")).await;
+    let count = metric_value(&before, "tokio_runtime_alive_tasks");
+    let task = tokio::spawn(std::future::pending::<()>());
+    let (_, during) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(
+        metric_value(&during, "tokio_runtime_alive_tasks"),
+        count + 1
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let (_, after) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&after, "tokio_runtime_alive_tasks"), count);
+}
+
+#[tokio::test]
 async fn metrics_auth_privacy_retry_fallback_and_credential_quarantine() {
     let (primary, primary_calls) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
     let (secondary, secondary_calls) = start_upstream(StatusCode::OK).await;
@@ -5000,7 +5017,10 @@ async fn metrics_auth_privacy_retry_fallback_and_credential_quarantine() {
     assert_eq!(metric_value(&after, "upstream_invalid_responses_total"), 0);
     assert!(!after.contains("secret"));
     assert!(!after.contains("BAD"));
-    assert_eq!(after.matches("# TYPE guvna_").count(), 30);
+    assert_eq!(after.matches("# TYPE guvna_").count(), 33);
+    assert!(metric_value(&after, "tokio_runtime_workers") >= 1);
+    let _ = metric_value(&after, "tokio_runtime_alive_tasks");
+    let _ = metric_value(&after, "tokio_runtime_global_queue_depth");
     assert_eq!(metric_value(&after, "aggregation_failures_total"), 0);
     assert_eq!(metric_value(&after, "walk_deadline_exhaustions_total"), 0);
     assert_eq!(metric_value(&after, "circuit_open_providers"), 0);

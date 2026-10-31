@@ -887,9 +887,10 @@
       "status": "ci",
       "evidence": [
         "scripts/lowload_gate.py",
-        "scripts/quality_gate.py"
+        "scripts/quality_gate.py",
+        "src/gateway.rs"
       ],
-      "result": "p50/p95/p99、CPU/RSS/fd/线程与状态码数值报告；线程数不是未测量的Tokio任务数。"
+      "result": "p50/p95/p99、CPU/RSS/fd/线程与状态码数值报告；鉴权metrics增加真实Tokio存活任务数/worker数/全局队列深度，混合压测采样峰值，闲置后检查任务数回落。"
     },
     {
       "id": "G01",

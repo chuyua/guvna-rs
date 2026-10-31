@@ -11,9 +11,10 @@ use std::{
 };
 
 fn main() {
-    // glibc otherwise raises its mmap threshold after freeing large JSON
-    // buffers, leaving later large allocations on a retained heap. Use
-    // independent mmap-backed buffers for the single-user Linux gateway.
+    // glibc otherwise retains freed HTTP/JSON buffers across its arenas.
+    // A 64-client wave retained about 6 MiB of free arena blocks with a
+    // 512 KiB cutoff. Prefer mmap for 8 KiB+ buffers so freed mappings
+    // return pages directly rather than raising idle RSS after a burst.
     // Respect operator-provided glibc allocator overrides.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     if env::var_os("MALLOC_MMAP_THRESHOLD_").is_none()
@@ -26,7 +27,7 @@ fn main() {
     {
         // SAFETY: this glibc initialization happens before Tokio creates
         // its runtime or other worker threads.
-        if unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 512 * 1024) } == 0 {
+        if unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 8 * 1024) } == 0 {
             eprintln!("guvna: warning: glibc mmap threshold tuning unavailable");
         }
     }

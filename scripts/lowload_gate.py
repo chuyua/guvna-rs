@@ -72,28 +72,57 @@ def query(base, lane, number=0, *, stored=False, size=0):
         return error.code, 'http_error', (time.perf_counter() - started) * 1000
 
 
+def runtime_gauges(base):
+    request = Request(base.removesuffix('/v1') + '/metrics', headers={
+        'Authorization': 'Bearer only-for-local-test'})
+    with build_opener(ProxyHandler({})).open(request, timeout=3) as reply:
+        return {line.split()[0].removeprefix('guvna_tokio_runtime_'): int(line.split()[1])
+                for line in reply.read(8192).decode().splitlines()
+                if line.startswith('guvna_tokio_runtime_')}
+
+
 def wave(base, pid, lane, clients, count, *, mixed=False, stored=False):
-    latencies, statuses, rss = [], {}, []
+    latencies, statuses, rss, runtime_samples = [], {}, [], []
     start = time.monotonic()
     cpu_before = proc_info(pid)['cpu_ticks']
-    with ThreadPoolExecutor(max_workers=clients) as pool:
-        futures = [pool.submit(query, base, ['chat', 'responses', 'native', 'auto'][i % 4]
-                               if mixed else lane, i, stored=stored) for i in range(count)]
-        for future in as_completed(futures):
-            status, content, latency = future.result()
-            label = f'{status}:{content}'
-            statuses[label] = statuses.get(label, 0) + 1
-            latencies.append(latency)
-            rss.append(proc_info(pid)['VmRSS'])
+    def one(number):
+        return query(base, ['chat', 'responses', 'native', 'auto'][number % 4]
+                     if mixed else lane, number, stored=stored)
+    def observations():
+        # Truly serial traffic: run the request and /proc sampling on the
+        # same thread, keeping sampler GIL contention outside its latency.
+        if clients == 1:
+            for number in range(count):
+                yield one(number)
+        else:
+            with ThreadPoolExecutor(max_workers=clients) as pool:
+                futures = [pool.submit(one, number) for number in range(count)]
+                for future in as_completed(futures):
+                    yield future.result()
+    for status, content, latency in observations():
+        label = f'{status}:{content}'
+        statuses[label] = statuses.get(label, 0) + 1
+        latencies.append(latency)
+        rss.append(proc_info(pid)['VmRSS'])
+        if mixed and len(latencies) % 16 == 0:
+            runtime_samples.append(runtime_gauges(base))
     elapsed = time.monotonic() - start
     cpu_after = proc_info(pid)['cpu_ticks']
     check(statuses == {'200:ok': count}, f'{lane} returned {statuses}')
     latencies.sort()
     percentile = lambda q: round(latencies[int((len(latencies)-1) * q)], 3)
-    return {'lane': lane, 'clients': clients, 'requests': count, 'seconds': round(elapsed, 3),
+    result = {'lane': lane, 'clients': clients, 'requests': count, 'seconds': round(elapsed, 3),
             'p50_ms': percentile(.5), 'p95_ms': percentile(.95), 'p99_ms': percentile(.99),
             'cpu_percent_single_core': round(100 * (cpu_after-cpu_before) / os.sysconf('SC_CLK_TCK') / elapsed, 3),
             'rss_kib_max': max(rss), 'statuses': statuses}
+    if mixed:
+        check(runtime_samples and all('alive_tasks' in s for s in runtime_samples),
+              'Tokio task gauges are missing')
+        result['tokio_runtime_sample_max'] = {
+            name: max(sample[name] for sample in runtime_samples)
+            for name in ['alive_tasks', 'workers', 'global_queue_depth']}
+        result['tokio_runtime_samples'] = len(runtime_samples)
+    return result
 
 
 def measure(binary, upstream, *, full):
@@ -146,6 +175,7 @@ auto:
                 raise AssertionError('gateway did not become ready')
             result['startup_seconds'] = round(time.monotonic() - started, 3)
             result['idle_before'] = idle(process.pid, 3)
+            result['tokio_runtime_before'] = runtime_gauges(base)
             result['serial'] = [wave(base, process.pid, lane, 1, 100) for lane in ['chat', 'responses', 'native', 'auto']]
             if full:
                 result['ladder'] = [wave(base, process.pid, 'mixed', level, 200, mixed=True)
@@ -155,6 +185,13 @@ auto:
                 result['one_mib_input'] = query(base, 'native', size=1024*1024)[0]
                 check(result['one_mib_input'] == 200, '1 MiB native input was rejected')
             result['idle_after'] = idle(process.pid, 3)
+            result['tokio_runtime_after'] = runtime_gauges(base)
+            if full:
+                check('alive_tasks' in result['tokio_runtime_before'] and
+                      'alive_tasks' in result['tokio_runtime_after'], 'Tokio task gauges are missing')
+                result['tokio_tasks_growth'] = (result['tokio_runtime_after']['alive_tasks'] -
+                                                result['tokio_runtime_before']['alive_tasks'])
+                check(result['tokio_tasks_growth'] <= 8, 'Tokio task growth exceeded 8 after idle')
             result['rss_growth_kib'] = result['idle_after']['rss_kib_last'] - result['idle_before']['rss_kib_last']
             result['fd_growth'] = result['idle_after']['fds'] - result['idle_before']['fds']
             result['threads_growth'] = result['idle_after']['threads'] - result['idle_before']['threads']

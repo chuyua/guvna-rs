@@ -780,20 +780,34 @@ async fn metrics_endpoint(State(state): State<Arc<AppState>>, headers: HeaderMap
     // Metrics contain no user/provider labels or secrets. The endpoint is authenticated
     // because even aggregate traffic counts are operationally sensitive.
     let active = MAX_INFLIGHT_REQUESTS - state.inflight.available_permits();
+    let mut rendered = state.metrics.prometheus(
+        active,
+        state
+            .circuits
+            .iter()
+            .filter_map(Option::as_ref)
+            .filter(|c| c.is_open())
+            .count(),
+    );
+    let runtime = tokio::runtime::Handle::current().metrics();
+    for (name, value) in [
+        ("tokio_runtime_alive_tasks", runtime.num_alive_tasks()),
+        ("tokio_runtime_workers", runtime.num_workers()),
+        (
+            "tokio_runtime_global_queue_depth",
+            runtime.global_queue_depth(),
+        ),
+    ] {
+        rendered.push_str(&format!(
+            "# TYPE guvna_{name} gauge\nguvna_{name} {value}\n"
+        ));
+    }
     (
         [
             ("content-type", "text/plain; version=0.0.4; charset=utf-8"),
             ("cache-control", "no-store"),
         ],
-        state.metrics.prometheus(
-            active,
-            state
-                .circuits
-                .iter()
-                .filter_map(Option::as_ref)
-                .filter(|c| c.is_open())
-                .count(),
-        ),
+        rendered,
     )
         .into_response()
 }

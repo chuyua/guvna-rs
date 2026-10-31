@@ -99,7 +99,7 @@
 | F08 | ci | `src/dispatch.rs`；`scripts/quality_gate.py`：四聚合名额、大payload/回复准入、schema独立四槽和取消回收；低资源门禁真实进程执行。 |
 | F09 | automated | `src/response_routes.rs`；`scripts/lowload_gate.py`：1024条索引/ID长度/TTL/冲突单元回归，1200状态ID洪泛测有界增长。 |
 | F10 | ci | `.github/workflows/ci.yml`；`scripts/lowload_gate.py`：同Ubuntu环境构建1936b53与候选Release，保留双方二进制SHA和逐通道p95比值；不是Go性能对比。 |
-| F11 | ci | `scripts/lowload_gate.py`；`scripts/quality_gate.py`：p50/p95/p99、CPU/RSS/fd/线程与状态码数值报告；线程数不是未测量的Tokio任务数。 |
+| F11 | ci | `scripts/lowload_gate.py`；`scripts/quality_gate.py`：p50/p95/p99、CPU/RSS/fd/线程与状态码数值报告；鉴权metrics提供真实Tokio存活任务数/worker数/全局队列深度，混合压测采样峰值，闲置后检查任务数回落。 |
 | G01 | external | `https://github.com/chuyua/guvna-rs/issues/152`：技术回归与有限兼容契约逐项记录；最终发布封板仍受G06–G10外部真实证据约束。 |
 | G02 | automated | `tests/responses_protocol.rs`；`src/dispatch.rs`：新增真实HTTP失败复现/正常/异常/取消/跨账号测试；翻译模块不拥有独立业务重试循环。 |
 | G03 | external | `https://github.com/chuyua/guvna-rs/pull/153`：用户授权独立PR，目标#151；最终集成到#151和main仍待评审，不自动合并。 |
