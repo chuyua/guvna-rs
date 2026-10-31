@@ -23,6 +23,9 @@ use std::sync::Arc;
 
 // Strict stateless Responses compatibility adapter; unsupported modes fail closed.
 pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
+    let Some(owner) = state.client_identity(request.headers()) else {
+        return super::unauthorized();
+    };
     let (body, permit, payload_permit) = match authenticated_body(&state, request).await {
         Ok(result) => result,
         Err(error) => return error.into_response(),
@@ -37,6 +40,66 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             );
         }
     };
+    // Common schema checks run before choosing native passthrough as well as
+    // the Chat bridge. Capability selection must not bypass caller validation.
+    for key in ["stream", "store", "background", "parallel_tool_calls"] {
+        if value
+            .get(key)
+            .is_some_and(|v| !v.is_null() && !v.is_boolean())
+        {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_boolean_parameter",
+                "Expected a boolean or null",
+            );
+        }
+    }
+    for (key, min, max) in [("temperature", 0.0, 2.0), ("top_p", 0.0, 1.0)] {
+        if value.get(key).is_some_and(|v| {
+            !v.is_null()
+                && v.as_f64()
+                    .is_none_or(|v| v < min || v > max || !v.is_finite())
+        }) {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_sampling_parameter",
+                "Sampling parameter is outside its valid range",
+            );
+        }
+    }
+    if value
+        .get("max_output_tokens")
+        .is_some_and(|v| !v.is_null() && v.as_u64().is_none_or(|n| n < 16))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_max_output_tokens",
+            "max_output_tokens must be an integer of at least 16",
+        );
+    }
+    if value
+        .get("top_logprobs")
+        .is_some_and(|v| !v.is_null() && v.as_u64().is_none_or(|n| n > 20))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_top_logprobs",
+            "top_logprobs must be between 0 and 20",
+        );
+    }
+    if value
+        .get("tools")
+        .is_some_and(|v| !v.is_null() && !v.is_array())
+        || value
+            .get("input")
+            .is_some_and(|v| !v.is_null() && !v.is_string() && !v.is_array())
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_responses_input",
+            "Invalid Responses input or tools",
+        );
+    }
     // The translated Value owns its data; do not retain the original body
     // buffer while validating and dispatching the translated request.
     let large_payload = body.len() >= super::LARGE_REQUEST_BODY_BYTES;
@@ -80,37 +143,95 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
         .config
         .providers
         .iter()
-        .any(|p| p.responses_protocol == "native");
-    let native_only = has_native
-        && ([
-            "previous_response_id",
-            "conversation",
-            "prompt",
-            "include",
-            "modalities",
-            "top_logprobs",
-            "max_tool_calls",
-            "prompt_cache_retention",
-            "stream_options",
-        ]
-        .iter()
-        .any(|key| value.get(*key).is_some())
+        .any(|p| p.has_native_responses());
+    let context = match super::responses_lifecycle::context(&state, owner, &value) {
+        Ok(context) => context,
+        Err(response) => return *response,
+    };
+    let bridge_fields = [
+        "model",
+        "n",
+        "input",
+        "stream",
+        "text",
+        "max_output_tokens",
+        "temperature",
+        "top_p",
+        "user",
+        "service_tier",
+        "safety_identifier",
+        "prompt_cache_key",
+        "instructions",
+        "reasoning",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "metadata",
+        "store",
+        "background",
+        "truncation",
+        "min_context",
+        "max_context",
+    ];
+    let native_only =
+        value
+            .as_object()
+            .expect("object")
+            .iter()
+            .any(|(key, value)| !value.is_null() && !bridge_fields.contains(&key.as_str()))
             || value.get("background") == Some(&Value::Bool(true))
             || value.get("store") == Some(&Value::Bool(true))
             || value
+                .get("truncation")
+                .is_some_and(|v| !v.is_null() && v != "disabled")
+            || value
                 .get("tools")
                 .and_then(Value::as_array)
-                .is_some_and(|tools| {
-                    tools
-                        .iter()
-                        .any(|tool| tool.get("type").and_then(Value::as_str) != Some("function"))
-                })
+                .is_some_and(|tools| tools.iter().any(|tool| tool["type"] != "function"))
+            || value
+                .get("tool_choice")
+                .and_then(Value::as_object)
+                .is_some_and(|choice| choice.get("type").is_some_and(|v| v != "function"))
             || value
                 .get("reasoning")
                 .and_then(Value::as_object)
-                .is_some_and(|options| options.keys().any(|key| key != "effort")));
+                .is_some_and(|options| options.keys().any(|key| key != "effort"))
+            || value
+                .get("text")
+                .and_then(Value::as_object)
+                .is_some_and(|text| {
+                    text.keys()
+                        .any(|key| !matches!(key.as_str(), "format" | "verbosity"))
+                        || text
+                            .get("format")
+                            .and_then(Value::as_object)
+                            .is_some_and(|format| {
+                                format.keys().any(|key| {
+                                    !["type", "name", "schema", "strict", "description"]
+                                        .contains(&key.as_str())
+                                }) || format.get("type").and_then(Value::as_str).is_some_and(
+                                    |kind| !matches!(kind, "text" | "json_object" | "json_schema"),
+                                )
+                            })
+                })
+                && has_native
+            || has_native
+                && value
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| {
+                        tools.iter().any(|tool| {
+                            tool.as_object().is_some_and(|fields| {
+                                fields.keys().any(|key| {
+                                    !["type", "name", "description", "parameters", "strict"]
+                                        .contains(&key.as_str())
+                                })
+                            })
+                        })
+                    });
     if native_only {
-        return handle_native_only(state, value, logical_model, large_payload, permit).await;
+        return handle_native_only(state, value, logical_model, large_payload, permit, context)
+            .await;
     }
     // Only clone the original wire tree when a native supplier exists.
     let native_request = has_native.then(|| value.clone());
@@ -133,6 +254,10 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
         "tool_choice",
         "background",
         "truncation",
+        "previous_response_id",
+        "conversation",
+        "include",
+        "top_logprobs",
     ] {
         if value.get(key).is_some_and(Value::is_null) {
             value.as_object_mut().expect("checked above").remove(key);
@@ -157,8 +282,15 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
         Ok(messages) => messages,
         Err(response) => {
             if let Some(native) = native_request {
-                return handle_native_only(state, native, logical_model, large_payload, permit)
-                    .await;
+                return handle_native_only(
+                    state,
+                    native,
+                    logical_model,
+                    large_payload,
+                    permit,
+                    context,
+                )
+                .await;
             }
             return *response;
         }
@@ -568,8 +700,16 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     // routing-chain default injects n > 1 for ordinary Chat requests.
     object.insert("n".into(), Value::from(1));
     let response_metrics = state.metrics.clone();
-    let response =
-        dispatch_responses_parsed(state, value, native_request, false, large_payload, permit).await;
+    let response = dispatch_responses_parsed(
+        state,
+        value,
+        native_request,
+        false,
+        large_payload,
+        permit,
+        context,
+    )
+    .await;
     if response.status() != StatusCode::OK {
         return response;
     }
@@ -629,16 +769,30 @@ async fn handle_native_only(
     logical_model: String,
     large_payload: bool,
     permit: tokio::sync::OwnedSemaphorePermit,
+    context: super::response_routes::Context,
 ) -> Response {
     let streaming = raw.get("stream") == Some(&Value::Bool(true));
-    let route = json!({
+    let mut route = json!({
         "model":logical_model,
         "messages":[{"role":"user","content":""}],
         "n":1,
         "stream":streaming,
     });
-    let response =
-        dispatch_responses_parsed(state, route, Some(raw), true, large_payload, permit).await;
+    for key in ["min_context", "max_context"] {
+        if let Some(value) = raw.get(key) {
+            route[key] = value.clone();
+        }
+    }
+    let response = dispatch_responses_parsed(
+        state,
+        route,
+        Some(raw),
+        true,
+        large_payload,
+        permit,
+        context,
+    )
+    .await;
     if response.status() != StatusCode::OK {
         return response;
     }

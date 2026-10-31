@@ -3354,7 +3354,7 @@ async fn native_only_responses_features_are_never_downgraded_to_chat() {
     let requests = [
         json!({"model":"mixed","input":"draw a landscape",
             "tools":[{"type":"image_generation","size":"1024x1024"}]}),
-        json!({"model":"mixed","input":"continue","previous_response_id":"resp_previous"}),
+        json!({"model":"mixed","input":"continue","previous_response_id":"resp_native_only"}),
         json!({"model":"mixed","input":[{"type":"message","role":"user",
             "content":[{"type":"input_video","video_url":"https://example.test/movie.mp4"}]}]}),
         json!({"model":"mixed","input":"show probabilities",
@@ -3383,7 +3383,10 @@ async fn native_only_responses_features_are_never_downgraded_to_chat() {
         assert!(native.get("messages").is_none());
     }
     assert_eq!(native_requests[0]["tools"], requests[0]["tools"]);
-    assert_eq!(native_requests[1]["previous_response_id"], "resp_previous");
+    assert_eq!(
+        native_requests[1]["previous_response_id"],
+        "resp_native_only"
+    );
     assert_eq!(native_requests[3]["top_logprobs"], 4);
     assert_eq!(native_requests[4]["max_tool_calls"], 1);
 }
@@ -4961,6 +4964,23 @@ fn metric_value(text: &str, name: &str) -> u64 {
 }
 
 #[tokio::test]
+async fn runtime_task_gauge_observes_spawn_and_cancellation() {
+    let router = make_app("http://127.0.0.1:9", "http://127.0.0.1:9");
+    let (_, before) = get_metrics(router.clone(), Some("client")).await;
+    let count = metric_value(&before, "tokio_runtime_alive_tasks");
+    let task = tokio::spawn(std::future::pending::<()>());
+    let (_, during) = get_metrics(router.clone(), Some("client")).await;
+    assert_eq!(
+        metric_value(&during, "tokio_runtime_alive_tasks"),
+        count + 1
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let (_, after) = get_metrics(router, Some("client")).await;
+    assert_eq!(metric_value(&after, "tokio_runtime_alive_tasks"), count);
+}
+
+#[tokio::test]
 async fn metrics_auth_privacy_retry_fallback_and_credential_quarantine() {
     let (primary, primary_calls) = start_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
     let (secondary, secondary_calls) = start_upstream(StatusCode::OK).await;
@@ -4997,7 +5017,10 @@ async fn metrics_auth_privacy_retry_fallback_and_credential_quarantine() {
     assert_eq!(metric_value(&after, "upstream_invalid_responses_total"), 0);
     assert!(!after.contains("secret"));
     assert!(!after.contains("BAD"));
-    assert_eq!(after.matches("# TYPE guvna_").count(), 30);
+    assert_eq!(after.matches("# TYPE guvna_").count(), 33);
+    assert!(metric_value(&after, "tokio_runtime_workers") >= 1);
+    let _ = metric_value(&after, "tokio_runtime_alive_tasks");
+    let _ = metric_value(&after, "tokio_runtime_global_queue_depth");
     assert_eq!(metric_value(&after, "aggregation_failures_total"), 0);
     assert_eq!(metric_value(&after, "walk_deadline_exhaustions_total"), 0);
     assert_eq!(metric_value(&after, "circuit_open_providers"), 0);
@@ -5549,7 +5572,7 @@ async fn sse_only_fallback_restores_original_large_stream_options_before_backup(
 
 #[tokio::test]
 async fn responses_text_format_maps_all_supported_types_to_real_upstream_payloads() {
-    let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
+    let (url, seen) = start_format_probe(r#"{"large":12345678901234567890}"#).await;
     let app = make_app(&url, &url);
     let schema = json!({
         "type":"json_schema",
@@ -5586,7 +5609,7 @@ async fn responses_text_format_maps_all_supported_types_to_real_upstream_payload
         extras["input"] = json!("hello");
         let (status, value) = call(app.clone(), responses_stream_req(extras)).await;
         assert_eq!(status, StatusCode::OK, "{value}");
-        assert_eq!(value["output_text"], r#"{"ok":true}"#);
+        assert_eq!(value["output_text"], r#"{"large":12345678901234567890}"#);
         let latest = seen.lock().await.last().unwrap().clone();
         assert_eq!(latest["response_format"], expected);
         assert!(
@@ -6115,7 +6138,7 @@ async fn unsupported_or_corrupt_format_is_rejected_without_any_provider_calls() 
         (
             json!({"response_format":{"type":"json_object"}}),
             StatusCode::NOT_IMPLEMENTED,
-            "responses_parameter_unsupported",
+            "protocol_capability_unsupported",
         ),
         (
             json!({"reasoning":{"effort":"huge"}}),
@@ -6125,7 +6148,7 @@ async fn unsupported_or_corrupt_format_is_rejected_without_any_provider_calls() 
         (
             json!({"reasoning":{"summary":"detailed"}}),
             StatusCode::NOT_IMPLEMENTED,
-            "responses_feature_unsupported",
+            "protocol_capability_unsupported",
         ),
         (
             json!({"reasoning":[]}),
@@ -7245,17 +7268,18 @@ async fn auto_candidate_default_override_cache_never_routes_oversized_alias() {
             auto_request(path, "client", implicit.clone()),
         )
         .await;
-        assert_eq!(
-            status,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "{path}: {response}"
-        );
+        assert_eq!(status, StatusCode::OK, "{path}: {response}");
+        let mut oversized = implicit.clone();
+        oversized["max_completion_tokens"] = json!(64000);
+        let (status, response) =
+            call(router.clone(), auto_request(path, "client", oversized)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
         assert_eq!(response["error"]["code"], "auto_no_eligible_candidate");
     }
     assert_eq!(
         hits.load(Ordering::SeqCst),
-        2,
-        "two oversized max_completion_tokens requests must be rejected before networking"
+        4,
+        "only the actual oversized caller budgets must be rejected before networking"
     );
 }
 

@@ -19,13 +19,26 @@ pub(crate) struct NativeResponsesSse {
     progress: bool,
     limit_hit: bool,
     last_sequence: Option<u64>,
+    logical_model: Option<String>,
+    output_format: Option<crate::structured_output::OutputFormat>,
 }
 
 impl NativeResponsesSse {
     pub fn new() -> Self {
         Self::default()
     }
+    pub fn with_logical_model(mut self, model: String) -> Self {
+        self.logical_model = Some(model);
+        self
+    }
 
+    pub(crate) fn with_output_contract(
+        mut self,
+        format: Option<crate::structured_output::OutputFormat>,
+    ) -> Self {
+        self.output_format = format;
+        self
+    }
     pub fn is_done(&self) -> bool {
         self.done
     }
@@ -84,7 +97,7 @@ impl NativeResponsesSse {
             if data == b"[DONE]" {
                 return Err(SseError);
             }
-            let value: Value = serde_json::from_slice(&data).map_err(|_| SseError)?;
+            let mut value: Value = serde_json::from_slice(&data).map_err(|_| SseError)?;
             if value.get("type").and_then(Value::as_str) != Some(kind.as_str()) {
                 return Err(SseError);
             }
@@ -110,9 +123,15 @@ impl NativeResponsesSse {
                 }
                 self.response_id = Some(id.to_owned());
                 self.seen_created = true;
+            } else if kind == "response.created" {
+                return Err(SseError);
             } else if kind == "response.completed" || kind == "response.incomplete" {
                 let response = value.get("response").ok_or(SseError)?;
-                if !crate::gateway::valid_native_responses(response)
+                if self
+                    .output_format
+                    .as_ref()
+                    .is_some_and(|format| !format.accepts_native(response))
+                    || !crate::gateway::valid_native_responses(response)
                     || response.get("status").and_then(Value::as_str)
                         != Some(if kind == "response.completed" {
                             "completed"
@@ -124,11 +143,38 @@ impl NativeResponsesSse {
                     return Err(SseError);
                 }
                 self.done = true;
-            } else if kind == "response.failed" || kind == "error" || !kind.starts_with("response.")
-            {
+            } else if kind == "response.failed" || kind == "response.cancelled" {
+                let response = value.get("response").ok_or(SseError)?;
+                if response.get("id").and_then(Value::as_str) != self.response_id.as_deref()
+                    || response["object"] != "response"
+                    || !response["output"].is_array()
+                    || response["status"]
+                        != if kind == "response.failed" {
+                            "failed"
+                        } else {
+                            "cancelled"
+                        }
+                    || (kind == "response.failed" && !response["error"].is_object())
+                {
+                    return Err(SseError);
+                }
+                self.done = true;
+            } else if kind == "error" || !kind.starts_with("response.") {
                 return Err(SseError);
             }
             self.progress = true;
+            // JSON and SSE must expose the same client-facing logical model.
+            // Preserve every other native field, including unknown extensions.
+            let data = if let Some(model) = &self.logical_model {
+                if let Some(response) = value.get_mut("response").and_then(Value::as_object_mut)
+                    && response.contains_key("model")
+                {
+                    response.insert("model".into(), Value::String(model.clone()));
+                }
+                serde_json::to_vec(&value).map_err(|_| SseError)?
+            } else {
+                data
+            };
             let mut frame = Vec::with_capacity(data.len() + kind.len() + 20);
             frame.extend_from_slice(b"event: ");
             frame.extend_from_slice(kind.as_bytes());
@@ -166,6 +212,11 @@ impl NativeResponsesSse {
     pub fn is_completion_event(&self, chunk: &Bytes) -> bool {
         chunk.starts_with(b"event: response.completed\n")
             || chunk.starts_with(b"event: response.incomplete\n")
+    }
+
+    pub fn is_failure_event(&self, chunk: &Bytes) -> bool {
+        chunk.starts_with(b"event: response.failed\n")
+            || chunk.starts_with(b"event: response.cancelled\n")
     }
 }
 

@@ -36,16 +36,26 @@ use crate::{
 // narrow pub(super) bridge methods are shared, not a second public API.
 #[path = "chat_aggregate.rs"]
 mod chat_aggregate;
+#[path = "chat_responses.rs"]
+mod chat_responses;
+#[path = "chat_responses_stream.rs"]
+mod chat_responses_stream;
 #[path = "chat_stream.rs"]
 mod chat_stream;
 #[path = "dispatch.rs"]
 mod dispatch;
+#[path = "native_files.rs"]
+mod native_files;
+#[path = "response_routes.rs"]
+mod response_routes;
 #[path = "response_validation.rs"]
 mod response_validation;
 #[path = "responses.rs"]
 mod responses;
 #[path = "responses_format.rs"]
 mod responses_format;
+#[path = "responses_lifecycle.rs"]
+mod responses_lifecycle;
 
 // Share the exact usage conversion with the crate-level SSE wrapper without
 // making the private Responses adapter module visible outside this gateway.
@@ -55,6 +65,13 @@ pub(crate) fn translated_responses_usage(chat: &Value) -> Result<Value, ()> {
 
 pub(crate) fn valid_native_responses(value: &Value) -> bool {
     response_validation::valid_native_responses(value)
+}
+
+pub(crate) fn selector_native_request(value: &Value) -> Result<Value, ()> {
+    chat_responses::request(value)
+}
+pub(crate) fn selector_native_result(value: &Value, model: &str) -> Result<Value, ()> {
+    chat_responses::result(value, model)
 }
 
 const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -85,10 +102,12 @@ pub struct AppState {
     pools: Vec<KeyPool>,
     circuits: Vec<Option<Arc<Circuit>>>,
     client_keys: Vec<String>,
+    response_routes: response_routes::ResponseRoutes,
     inflight: Arc<Semaphore>,
     payload_slots: Arc<Semaphore>,
     large_response_slots: Arc<Semaphore>,
     aggregation_slots: Arc<Semaphore>,
+    schema_slots: Arc<Semaphore>,
     auto_background_slots: Arc<Semaphore>,
     metrics: Arc<Metrics>,
     telemetry: Option<Telemetry>,
@@ -264,10 +283,12 @@ impl AppState {
             pools,
             circuits,
             client_keys,
+            response_routes: response_routes::ResponseRoutes::default(),
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             payload_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_PAYLOADS)),
             large_response_slots: Arc::new(Semaphore::new(MAX_LARGE_RESPONSE_BODIES)),
             aggregation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_AGGREGATIONS)),
+            schema_slots: Arc::new(Semaphore::new(4)),
             auto_background_slots: Arc::new(Semaphore::new(MAX_BACKGROUND_DECIDERS)),
             metrics: Arc::new(Metrics::default()),
             telemetry: None,
@@ -548,16 +569,16 @@ impl AppState {
         })
     }
     fn allowed(&self, headers: &HeaderMap) -> bool {
-        let Some(header) = headers
+        self.client_identity(headers).is_some()
+    }
+    fn client_identity(&self, headers: &HeaderMap) -> Option<usize> {
+        let header = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-        else {
-            return false;
-        };
+            .and_then(|value| value.strip_prefix("Bearer "))?;
         self.client_keys
             .iter()
-            .any(|key| constant_time_equal(key.as_bytes(), header.as_bytes()))
+            .position(|key| constant_time_equal(key.as_bytes(), header.as_bytes()))
     }
 }
 
@@ -722,7 +743,27 @@ pub fn app_with_state(state: AppState) -> (Router, Arc<AppState>) {
         .route("/v1/chat/completions", post(chat))
         .route("/v1/auto", post(auto))
         .route("/v1/embeddings", post(embeddings))
-        .route("/v1/responses", post(responses::handle))
+        .route(
+            "/v1/responses",
+            post(responses::handle).get(responses_lifecycle::unsupported_transport),
+        )
+        .route("/v1/responses/compact", post(responses_lifecycle::compact))
+        .route(
+            "/v1/responses/input_tokens",
+            post(responses_lifecycle::input_tokens),
+        )
+        .route(
+            "/v1/responses/{id}",
+            get(responses_lifecycle::retrieve).delete(responses_lifecycle::delete),
+        )
+        .route(
+            "/v1/responses/{id}/cancel",
+            post(responses_lifecycle::cancel),
+        )
+        .route(
+            "/v1/responses/{id}/input_items",
+            get(responses_lifecycle::input_items),
+        )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(Arc::clone(&state));
     (app, state)
@@ -739,20 +780,34 @@ async fn metrics_endpoint(State(state): State<Arc<AppState>>, headers: HeaderMap
     // Metrics contain no user/provider labels or secrets. The endpoint is authenticated
     // because even aggregate traffic counts are operationally sensitive.
     let active = MAX_INFLIGHT_REQUESTS - state.inflight.available_permits();
+    let mut rendered = state.metrics.prometheus(
+        active,
+        state
+            .circuits
+            .iter()
+            .filter_map(Option::as_ref)
+            .filter(|c| c.is_open())
+            .count(),
+    );
+    let runtime = tokio::runtime::Handle::current().metrics();
+    for (name, value) in [
+        ("tokio_runtime_alive_tasks", runtime.num_alive_tasks()),
+        ("tokio_runtime_workers", runtime.num_workers()),
+        (
+            "tokio_runtime_global_queue_depth",
+            runtime.global_queue_depth(),
+        ),
+    ] {
+        rendered.push_str(&format!(
+            "# TYPE guvna_{name} gauge\nguvna_{name} {value}\n"
+        ));
+    }
     (
         [
             ("content-type", "text/plain; version=0.0.4; charset=utf-8"),
             ("cache-control", "no-store"),
         ],
-        state.metrics.prometheus(
-            active,
-            state
-                .circuits
-                .iter()
-                .filter_map(Option::as_ref)
-                .filter(|c| c.is_open())
-                .count(),
-        ),
+        rendered,
     )
         .into_response()
 }

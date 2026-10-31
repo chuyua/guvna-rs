@@ -12,6 +12,16 @@ pub(super) fn valid_native_responses(value: &Value) -> bool {
     valid_native_responses_with_background(value, false)
 }
 
+pub(super) fn valid_native_terminal_failure(value: &Value) -> bool {
+    value["object"] == "response"
+        && value["id"].as_str().is_some_and(|v| !v.is_empty())
+        && value["model"].as_str().is_some_and(|v| !v.is_empty())
+        && value["created_at"].as_u64().is_some()
+        && value["output"].is_array()
+        && ((value["status"] == "failed" && value["error"].is_object())
+            || (value["status"] == "cancelled" && value.get("error").is_none_or(Value::is_null)))
+}
+
 /// Background requests legitimately return queued/in_progress Responses.
 /// A normal foreground request must never count either as completed success.
 pub(super) fn valid_native_responses_with_background(value: &Value, background: bool) -> bool {
@@ -36,10 +46,9 @@ pub(super) fn valid_native_responses_with_background(value: &Value, background: 
         && value.get("output").and_then(Value::as_array).is_some()
         && value.get("error").is_none_or(Value::is_null)
         && value.get("usage").is_none_or(|usage| {
-            usage.is_null()
-                || (usage.get("input_tokens").and_then(Value::as_u64).is_some()
-                    && usage.get("output_tokens").and_then(Value::as_u64).is_some()
-                    && usage.get("total_tokens").and_then(Value::as_u64).is_some())
+            usage.is_null() || matches!((usage.get("input_tokens").and_then(Value::as_u64),
+                usage.get("output_tokens").and_then(Value::as_u64),usage.get("total_tokens").and_then(Value::as_u64)),
+                (Some(input),Some(output),Some(total)) if input.checked_add(output)==Some(total))
         })
 }
 
@@ -79,19 +88,50 @@ pub(super) fn valid_result(endpoint: Endpoint, request: &Value, response: &Value
     valid_result_with_params(endpoint, request, &BTreeMap::new(), response)
 }
 
+#[cfg(test)]
 pub(super) fn valid_result_with_params(
     endpoint: Endpoint,
     request: &Value,
     params: &BTreeMap<String, Value>,
     response: &Value,
 ) -> bool {
+    let contract = crate::structured_output::OutputFormat::chat(request_value(
+        request,
+        params,
+        "response_format",
+    ));
+    contract.is_ok_and(|contract| {
+        valid_result_with_contract(endpoint, request, params, response, contract.as_ref())
+    })
+}
+
+pub(super) fn valid_result_with_contract(
+    endpoint: Endpoint,
+    request: &Value,
+    params: &BTreeMap<String, Value>,
+    response: &Value,
+    contract: Option<&crate::structured_output::OutputFormat>,
+) -> bool {
     match endpoint {
-        Endpoint::Chat => validate_chat_with_params(request, params, response),
+        Endpoint::Chat => validate_chat_with_params(request, params, response, contract),
         Endpoint::Responses => {
-            validate_chat_with_params(request, params, response)
+            validate_chat_with_params(request, params, response, contract)
                 && super::responses::translatable_chat_result(response)
         }
         Endpoint::Embeddings => validate_embeddings_with_params(request, params, response),
+        Endpoint::Compact => {
+            response["object"] == "response.compaction"
+                && response["id"].as_str().is_some_and(|v| !v.is_empty())
+                && response["created_at"].as_u64().is_some()
+                && response["output"].is_array()
+        }
+        Endpoint::InputTokens => {
+            response.get("object").and_then(Value::as_str) == Some("response.input_tokens")
+                && response
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .is_some()
+        }
     }
 }
 
@@ -108,13 +148,14 @@ fn request_value<'a>(
 // A result is only usable when every choice completed; a partial 2xx is NOT success.
 #[cfg(test)]
 fn validate_chat(request: &Value, response: &Value) -> bool {
-    validate_chat_with_params(request, &BTreeMap::new(), response)
+    valid_result_with_params(Endpoint::Chat, request, &BTreeMap::new(), response)
 }
 
 fn validate_chat_with_params(
     request: &Value,
     params: &BTreeMap<String, Value>,
     response: &Value,
+    contract: Option<&crate::structured_output::OutputFormat>,
 ) -> bool {
     // Chat, Responses and Chat SSE must agree on the optional usage
     // contract. A present but inconsistent token count is not a valid
@@ -250,7 +291,12 @@ fn validate_chat_with_params(
             let valid_json = message
                 .get("content")
                 .and_then(Value::as_str)
-                .is_some_and(|text| crate::sse::valid_json_output(text, format == "json_object"));
+                .is_some_and(|text| {
+                    contract.map_or_else(
+                        || crate::sse::valid_json_output(text, format == "json_object"),
+                        |contract| contract.accepts(text),
+                    )
+                });
             if !valid_json && !explicitly_refused {
                 return false;
             }
@@ -794,7 +840,7 @@ mod response_contract_tests {
                 "finish_reason":reason}]})
         };
         for format in ["json_object", "json_schema"] {
-            let request = json!({"response_format":{"type":format}});
+            let request = json!({"response_format":{"type":format,"json_schema":{"schema":{}}}});
             assert!(validate_chat(&request, &chat(r#"{"ok":true}"#, "stop")));
             assert!(!validate_chat(&request, &chat("ordinary prose", "stop")));
             assert!(!validate_chat(&request, &chat("{broken", "stop")));
@@ -819,7 +865,7 @@ mod response_contract_tests {
         let object_mode = json!({"response_format":{"type":"json_object"}});
         assert!(!validate_chat(&object_mode, &chat("[1,2]", "stop")));
         assert!(!validate_chat(&object_mode, &chat("null", "stop")));
-        let schema_mode = json!({"response_format":{"type":"json_schema"}});
+        let schema_mode = json!({"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"array"}}}});
         assert!(validate_chat(&schema_mode, &chat("[1,2]", "stop")));
         assert!(validate_chat(&json!({}), &chat("ordinary prose", "stop")));
     }

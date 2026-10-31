@@ -18,3 +18,4 @@ pub(crate) mod telemetry_rank;
 
 pub(crate) mod native_responses_sse;
 pub(crate) mod responses_sse;
+pub(crate) mod structured_output;

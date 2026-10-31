@@ -29,6 +29,7 @@ pub(super) enum PreflightError {
     TransportFailure,
     Timeout,
     LocalLimit,
+    UnsupportedProtocol,
 }
 impl PreflightError {
     pub(super) fn failure_type(self) -> &'static str {
@@ -37,6 +38,7 @@ impl PreflightError {
             Self::TransportFailure => "transport_error",
             Self::Timeout => "timeout",
             Self::LocalLimit => "local_error",
+            Self::UnsupportedProtocol => "capability_mismatch",
         }
     }
 
@@ -53,6 +55,9 @@ pub(super) struct StreamRoute {
     pub(super) live: Arc<LiveRouteSnapshot>,
     pub(super) request_id: String,
     pub(super) attempt_index: u16,
+    pub(super) response_owner: Option<super::response_routes::NativeOwner>,
+    pub(super) logical_model: String,
+    pub(super) output_format: Option<crate::structured_output::OutputFormat>,
 }
 
 #[derive(Clone)]
@@ -61,6 +66,7 @@ pub(super) struct NativeResponseStream;
 enum StreamParser {
     Chat(ChatSse),
     Native(NativeResponsesSse),
+    Bridge(Box<super::chat_responses_stream::ChatResponsesStream>),
 }
 
 impl StreamParser {
@@ -68,40 +74,51 @@ impl StreamParser {
         match self {
             Self::Chat(parser) => parser.push(chunk),
             Self::Native(parser) => parser.push(chunk),
+            Self::Bridge(parser) => parser.push(chunk),
         }
     }
     fn is_done(&self) -> bool {
         match self {
             Self::Chat(parser) => parser.is_done(),
             Self::Native(parser) => parser.is_done(),
+            Self::Bridge(parser) => parser.is_done(),
         }
     }
     fn take_progress(&mut self) -> bool {
         match self {
             Self::Chat(parser) => parser.take_progress(),
             Self::Native(parser) => parser.take_progress(),
+            Self::Bridge(parser) => parser.take_progress(),
         }
     }
     fn hit_resource_limit(&self) -> bool {
         match self {
             Self::Chat(parser) => parser.hit_resource_limit(),
             Self::Native(parser) => parser.hit_resource_limit(),
+            Self::Bridge(parser) => parser.hit_resource_limit(),
         }
     }
     fn finalize_on_eof(&mut self) -> Option<Bytes> {
         match self {
             Self::Chat(parser) => parser.finalize_on_eof(),
             Self::Native(parser) => parser.finalize_on_eof(),
+            Self::Bridge(_) => None,
         }
     }
     fn is_completion_event(&self, event: &Bytes) -> bool {
         match self {
-            Self::Chat(_) => event.as_ref() == b"data: [DONE]\n\n",
+            Self::Chat(_) | Self::Bridge(_) => event.as_ref() == b"data: [DONE]\n\n",
             Self::Native(parser) => parser.is_completion_event(event),
         }
     }
     fn is_native(&self) -> bool {
         matches!(self, Self::Native(_))
+    }
+    fn is_failure_event(&self, event: &Bytes) -> bool {
+        matches!(self,Self::Native(parser) if parser.is_failure_event(event))
+    }
+    fn incompatible(&self) -> bool {
+        matches!(self,Self::Bridge(parser) if parser.incompatible())
     }
 }
 struct ChatStreamState {
@@ -113,6 +130,7 @@ struct ChatStreamState {
     live: Arc<LiveRouteSnapshot>,
     request_id: String,
     attempt_index: u16,
+    response_owner: Option<super::response_routes::NativeOwner>,
     started_at: tokio::time::Instant,
     last_progress_at: tokio::time::Instant,
     lease: Lease,
@@ -184,9 +202,12 @@ pub(super) async fn start_native(
     permit: &mut Option<OwnedSemaphorePermit>,
     circuit_ticket: &mut Option<Ticket>,
 ) -> Result<Response, PreflightError> {
+    let parser = NativeResponsesSse::new()
+        .with_logical_model(route.logical_model.clone())
+        .with_output_contract(route.output_format.clone());
     let mut response = start_with_parser(
         upstream,
-        StreamParser::Native(NativeResponsesSse::new()),
+        StreamParser::Native(parser),
         owner,
         route,
         lease,
@@ -196,6 +217,27 @@ pub(super) async fn start_native(
     .await?;
     response.extensions_mut().insert(NativeResponseStream);
     Ok(response)
+}
+
+pub(super) async fn start_bridge(
+    upstream: reqwest::Response,
+    parser: super::chat_responses_stream::ChatResponsesStream,
+    owner: Arc<AppState>,
+    route: StreamRoute,
+    lease: Lease,
+    permit: &mut Option<OwnedSemaphorePermit>,
+    circuit_ticket: &mut Option<Ticket>,
+) -> Result<Response, PreflightError> {
+    start_with_parser(
+        upstream,
+        StreamParser::Bridge(Box::new(parser)),
+        owner,
+        route,
+        lease,
+        permit,
+        circuit_ticket,
+    )
+    .await
 }
 
 async fn start_with_parser(
@@ -228,6 +270,7 @@ async fn start_with_parser(
         live: route.live,
         request_id: route.request_id,
         attempt_index: route.attempt_index,
+        response_owner: route.response_owner,
         started_at: tokio::time::Instant::now(),
         last_progress_at: tokio::time::Instant::now(),
         lease,
@@ -267,6 +310,8 @@ async fn preflight_stream(state: &mut ChatStreamState) -> Result<(), PreflightEr
             let events = state.parser.push(&chunk).map_err(|_| {
                 if state.parser.hit_resource_limit() {
                     PreflightError::LocalLimit
+                } else if state.parser.incompatible() {
+                    PreflightError::UnsupportedProtocol
                 } else {
                     PreflightError::InvalidStream
                 }
@@ -285,7 +330,59 @@ fn stream_response(state: ChatStreamState) -> Response {
     let output = futures_util::stream::unfold(state, |mut state| async move {
         loop {
             if let Some(event) = state.pending.pop_front() {
+                if state.parser.is_failure_event(&event) {
+                    // A real upstream terminal failure is forwarded exactly
+                    // once, never recorded as success or retried after output.
+                    state.terminal_reported = true;
+                    state.terminated = true;
+                    Metrics::inc(&state.owner.metrics.chat_stream_failed);
+                    if let Some(telemetry) = &state.owner.telemetry {
+                        telemetry.observe_stream_health(
+                            (
+                                state.endpoint,
+                                &state.owner.config.providers[state.provider_index].name,
+                            ),
+                            &state.telemetry_model,
+                            "upstream_failed",
+                            state.started_at.elapsed(),
+                            (&state.request_id, state.attempt_index),
+                            &state.owner.metrics,
+                        );
+                    }
+                    return Some((Ok(event), state));
+                }
                 if state.parser.is_completion_event(&event) {
+                    if let Some(origin) = &state.response_owner {
+                        let data = event
+                            .split(|b| *b == b'\n')
+                            .find_map(|line| line.strip_prefix(b"data: "));
+                        let value = data.and_then(|data| {
+                            serde_json::from_slice::<serde_json::Value>(data).ok()
+                        });
+                        let binding = super::response_routes::Binding {
+                            provider: state.provider_index,
+                            credential: state.lease.env.clone(),
+                            model: state.model.clone(),
+                            logical_model: origin.logical_model.clone(),
+                            background: origin.background,
+                        };
+                        if value.as_ref().is_none_or(|v| {
+                            super::responses_lifecycle::remember(
+                                &state.owner,
+                                origin.owner,
+                                &v["response"],
+                                binding,
+                                origin.stored,
+                            )
+                            .is_err()
+                        }) {
+                            state.terminal_reported = true;
+                            state.terminated = true;
+                            state.pending.clear();
+                            Metrics::inc(&state.owner.metrics.chat_stream_failed);
+                            return Some((Ok(stream_error(true)), state));
+                        }
+                    }
                     state.owner.pools[state.provider_index].record_success(&state.lease);
                     record_circuit_success(&mut state.circuit_ticket, &state.owner.metrics);
                     Metrics::inc(&state.owner.metrics.upstream_success);
@@ -342,6 +439,8 @@ fn stream_response(state: ChatStreamState) -> Response {
                             Err(_) => {
                                 if state.parser.hit_resource_limit() {
                                     state.failure_type = "local_error";
+                                } else if state.parser.incompatible() {
+                                    state.failure_type = "capability_mismatch";
                                 }
                                 state.terminated = true;
                             }

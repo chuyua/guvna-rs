@@ -188,6 +188,25 @@ pub struct Provider {
     /// Default chat bridges Responses to Chat. Native routes target /v1/responses.
     #[serde(default)]
     pub responses_protocol: String,
+    /// `responses` declares a RE-only provider; empty/chat preserves Chat wire.
+    #[serde(default)]
+    pub chat_protocol: String,
+    /// Physical-model overrides also apply to named chains and passthrough.
+    #[serde(default)]
+    pub model_capabilities: BTreeMap<String, ProviderModelCapabilities>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderModelCapabilities {
+    pub chat_protocol: Option<String>,
+    pub responses_protocol: Option<String>,
+    pub context_tokens: Option<usize>,
+    pub supports_tools: Option<bool>,
+    pub supports_images: Option<bool>,
+    pub supports_audio: Option<bool>,
+    pub supports_json_schema: Option<bool>,
+    pub supports_reasoning: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -322,6 +341,27 @@ pub(crate) struct RuntimeChains {
 }
 
 impl Provider {
+    pub fn native_responses(&self, model: &str) -> bool {
+        self.model_capabilities
+            .get(model)
+            .and_then(|v| v.responses_protocol.as_deref())
+            .unwrap_or(&self.responses_protocol)
+            == "native"
+    }
+    pub fn chat_via_responses(&self, model: &str) -> bool {
+        self.model_capabilities
+            .get(model)
+            .and_then(|v| v.chat_protocol.as_deref())
+            .unwrap_or(&self.chat_protocol)
+            == "responses"
+    }
+    pub fn has_native_responses(&self) -> bool {
+        self.responses_protocol == "native"
+            || self
+                .model_capabilities
+                .values()
+                .any(|v| v.responses_protocol.as_deref() == Some("native"))
+    }
     pub fn key_names(&self) -> Vec<String> {
         if !self.key_envs.is_empty() {
             self.key_envs.clone()
@@ -400,6 +440,33 @@ impl Config {
                     "provider {}: responses_protocol must be chat or native",
                     p.name
                 ));
+            }
+            if !matches!(p.chat_protocol.as_str(), "" | "chat" | "responses")
+                || (p.chat_protocol == "responses" && p.responses_protocol != "native")
+            {
+                return Err(format!(
+                    "provider {}: chat_protocol must be chat or responses; responses requires responses_protocol: native",
+                    p.name
+                ));
+            }
+            for (model, capability) in &p.model_capabilities {
+                if model.is_empty()
+                    || capability.context_tokens == Some(0)
+                    || capability
+                        .chat_protocol
+                        .as_deref()
+                        .is_some_and(|v| !matches!(v, "chat" | "responses"))
+                    || capability
+                        .responses_protocol
+                        .as_deref()
+                        .is_some_and(|v| !matches!(v, "chat" | "native"))
+                    || (p.chat_via_responses(model) && !p.native_responses(model))
+                {
+                    return Err(format!(
+                        "provider {} has invalid model capabilities for {model}",
+                        p.name
+                    ));
+                }
             }
             let url = reqwest::Url::parse(&p.base_url)
                 .map_err(|e| format!("provider {} invalid URL: {e}", p.name))?;

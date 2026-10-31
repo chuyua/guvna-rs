@@ -250,7 +250,7 @@ def proc_info(pid: int) -> dict:
     status = Path(f"/proc/{pid}/status").read_text()
     d = {}
     for line in status.splitlines():
-        if line.startswith(("VmRSS:", "VmHWM:", "Threads:")):
+        if line.startswith(("VmRSS:", "VmHWM:", "Threads:", "RssAnon:", "RssFile:", "RssShmem:")):
             key, value = line.split(":", 1)
             d[key] = int(value.strip().split()[0])
     d["fd"] = len(list(Path(f"/proc/{pid}/fd").iterdir()))
@@ -1210,6 +1210,9 @@ def idle(pid: int, seconds: float):
         "seconds": seconds,
         "rss_kib_max": max(x["VmRSS"] for x in samples),
         "rss_kib_last": samples[-1]["VmRSS"],
+        "rss_anon_kib_last": samples[-1].get("RssAnon"),
+        "rss_file_kib_last": samples[-1].get("RssFile"),
+        "rss_shmem_kib_last": samples[-1].get("RssShmem"),
         "cpu_percent_single_core": round(percent, 3),
         "fds": samples[-1]["fd"], "threads": samples[-1]["Threads"],
     }

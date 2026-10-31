@@ -82,6 +82,7 @@ fn touch_cache(entries: &mut VecDeque<Cache>, key: u64) -> Option<&Cache> {
 pub struct AutoDecider {
     client: reqwest::Client,
     endpoint: String,
+    responses: bool,
     model: String,
     key: String,
     timeout: Duration,
@@ -119,7 +120,12 @@ impl AutoDecider {
             return Ok(None);
         };
         Ok(Some(Self {
-            endpoint: provider.endpoint("/chat/completions"),
+            endpoint: provider.endpoint(if provider.chat_via_responses(&settings.model) {
+                "/responses"
+            } else {
+                "/chat/completions"
+            }),
+            responses: provider.chat_via_responses(&settings.model),
             model: settings.model.clone(),
             key,
             timeout: Duration::from_millis(settings.timeout_ms),
@@ -342,6 +348,11 @@ impl AutoDecider {
         });
         // The summary is not the wire payload: system instructions and JSON
         // escaping add bytes. Enforce the cap on the final encoded request.
+        let body = if self.responses {
+            crate::gateway::selector_native_request(&body).ok()?
+        } else {
+            body
+        };
         let encoded = bounded_selector_body(&body)?;
         let req = self
             .client
@@ -367,6 +378,11 @@ impl AutoDecider {
                 data.extend_from_slice(&part);
             }
             let value: Value = serde_json::from_slice(&data).ok()?;
+            let value = if self.responses {
+                crate::gateway::selector_native_result(&value, &self.model).ok()?
+            } else {
+                value
+            };
             let message = value.pointer("/choices/0/message/content")?.as_str()?;
             validate_order(&serde_json::from_str::<Value>(message).ok()?, steps.len())
         })
@@ -614,6 +630,7 @@ mod tests {
         let decider = AutoDecider {
             client: reqwest::Client::new(),
             endpoint: String::new(),
+            responses: false,
             model: "ranker".into(),
             key: String::new(),
             timeout: Duration::from_secs(1),
@@ -668,6 +685,7 @@ mod tests {
         let decider = Arc::new(AutoDecider {
             client: reqwest::Client::new(),
             endpoint: String::new(),
+            responses: false,
             model: "ranker".into(),
             key: String::new(),
             timeout: Duration::from_secs(1),
@@ -894,6 +912,7 @@ auto:
         let decider = AutoDecider {
             client: reqwest::Client::new(),
             endpoint: String::new(),
+            responses: false,
             model: String::new(),
             key: String::new(),
             timeout: Duration::from_secs(1),
@@ -971,6 +990,7 @@ auto:
         let decider = Arc::new(AutoDecider {
             client: reqwest::Client::new(),
             endpoint: format!("http://{addr}/v1/chat/completions"),
+            responses: false,
             model: "ranker".into(),
             key: "fake-key".into(),
             timeout: Duration::from_secs(5),

@@ -20,6 +20,39 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --release --locked
       - run: target/release/guvna --version
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pinned official SDKs for local mock acceptance
+        run: |
+          python3 -m venv .ci-sdk-python
+          .ci-sdk-python/bin/pip install openai==3.42.0
+          npm --prefix .ci-sdk-node install openai@7.47.0 --ignore-scripts --no-fund --no-audit
+      - name: Official Python and Node SDK HTTP roundtrips
+        env:
+          GUVNA_SDK_PYTHON: ${{ github.workspace }}/.ci-sdk-python/bin/python
+          GUVNA_SDK_NODE_PACKAGE: ${{ github.workspace }}/.ci-sdk-node/node_modules/openai
+        run: cargo test --locked --test responses_protocol official_python_and_node_sdk_roundtrips -- --ignored --nocapture
+      - name: Record exact tested source
+        if: always()
+        env:
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          Path('tested-source.json').write_text(json.dumps({
+              'checkout': subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip(),
+              'pr_head': os.environ['PR_HEAD'], 'pr_base': os.environ['PR_BASE']}, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: guvna-protocol-sdk-acceptance
+          path: |
+            sdk-results.json
+            tested-source.json
 
   adversarial-resource-gate:
     name: Adversarial Linux resource gate
@@ -38,3 +71,28 @@ jobs:
           name: guvna-linux-resource-gate
           path: quality-results.json
           if-no-files-found: warn
+
+  lowload-protocol-gate:
+    name: Serial dual-protocol and Release A/B
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build candidate and locked PR151 baseline in the same environment
+        run: |
+          cargo build --release --locked
+          cp target/release/guvna candidate-guvna
+          git fetch --no-tags --depth=1 origin 1936b53a4eb4c356cb47aa8d734a6063c1973ca8
+          git worktree add --detach .ci-baseline 1936b53a4eb4c356cb47aa8d734a6063c1973ca8
+          cargo build --release --locked --manifest-path .ci-baseline/Cargo.toml --target-dir target
+          sha256sum candidate-guvna target/release/guvna > lowload-binaries.sha256
+      - name: Measure serial traffic, concurrency ladder, state flood and aging
+        run: python3 scripts/lowload_gate.py --binary candidate-guvna --baseline target/release/guvna --out lowload-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: guvna-linux-lowload-ab
+          path: |
+            lowload-results.json
+            lowload-binaries.sha256
