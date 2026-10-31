@@ -52,7 +52,10 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     };
     let streaming = value.get("stream") == Some(&Value::Bool(true));
 
-    if value.get("stream").is_some_and(|v| !v.is_boolean()) {
+    if value
+        .get("stream")
+        .is_some_and(|v| !v.is_boolean() && !v.is_null())
+    {
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_stream",
@@ -85,6 +88,10 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             "prompt",
             "include",
             "modalities",
+            "top_logprobs",
+            "max_tool_calls",
+            "prompt_cache_retention",
+            "stream_options",
         ]
         .iter()
         .any(|key| value.get(*key).is_some())
@@ -107,6 +114,30 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     }
     // Only clone the original wire tree when a native supplier exists.
     let native_request = has_native.then(|| value.clone());
+    // The Responses schema permits null for optional controls. On a Chat
+    // bridge null means use the provider default, not send a null-valued Chat
+    // option (which some Chat-only suppliers reject). Preserve the untouched
+    // native request above for lossless native-provider fallback.
+    for key in [
+        "stream",
+        "temperature",
+        "top_p",
+        "max_output_tokens",
+        "instructions",
+        "user",
+        "safety_identifier",
+        "prompt_cache_key",
+        "service_tier",
+        "parallel_tool_calls",
+        "tools",
+        "tool_choice",
+        "background",
+        "truncation",
+    ] {
+        if value.get(key).is_some_and(Value::is_null) {
+            value.as_object_mut().expect("checked above").remove(key);
+        }
+    }
     // Input can be a multi-megabyte conversation. Move its JSON tree into the
     // translator instead of cloning the entire tree while the parsed request
     // still owns the original. The field is removed before upstream dispatch
@@ -147,12 +178,12 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     }
     if value
         .get("max_output_tokens")
-        .is_some_and(|v| v.as_u64().is_none_or(|n| n == 0))
+        .is_some_and(|v| v.as_u64().is_none_or(|n| n < 16))
     {
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_max_output_tokens",
-            "max_output_tokens must be a positive integer",
+            "max_output_tokens must be an integer of at least 16",
         );
     }
     if value.get("user").is_some_and(|v| !v.is_string()) {

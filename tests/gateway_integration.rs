@@ -3357,6 +3357,10 @@ async fn native_only_responses_features_are_never_downgraded_to_chat() {
         json!({"model":"mixed","input":"continue","previous_response_id":"resp_previous"}),
         json!({"model":"mixed","input":[{"type":"message","role":"user",
             "content":[{"type":"input_video","video_url":"https://example.test/movie.mp4"}]}]}),
+        json!({"model":"mixed","input":"show probabilities",
+            "top_logprobs":4,"include":["message.output_text.logprobs"]}),
+        json!({"model":"mixed","input":"call a hosted tool",
+            "max_tool_calls":1}),
     ];
     for request in &requests {
         let http = Request::builder()
@@ -3380,6 +3384,106 @@ async fn native_only_responses_features_are_never_downgraded_to_chat() {
     }
     assert_eq!(native_requests[0]["tools"], requests[0]["tools"]);
     assert_eq!(native_requests[1]["previous_response_id"], "resp_previous");
+    assert_eq!(native_requests[3]["top_logprobs"], 4);
+    assert_eq!(native_requests[4]["max_tool_calls"], 1);
+}
+
+#[tokio::test]
+async fn responses_chat_bridge_accepts_official_nullable_options_and_token_minimum() {
+    let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let seen = Arc::clone(&captured);
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(request): axum::Json<Value>| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().await.push(request);
+                axum::Json(
+                    json!({"id":"chat_ok","object":"chat.completion","model":"physical",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},
+                        "finish_reason":"stop"}]}),
+                )
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(socket, upstream).await.unwrap() });
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: chat\n    type: openai\n    base_url: http://{addr}\n    key_env: KEY\nchains:\n  - name: demo\n    steps:\n      - provider: chat\n        model: physical\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        config,
+        HashMap::from([("KEY".into(), "upstream-key".into())]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let send = |body: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let (status, result) = call(
+        gateway.clone(),
+        send(json!({
+            "model":"demo", "input":"hello", "store":false,
+            "stream":null, "temperature":null, "top_p":null,
+            "max_output_tokens":null, "instructions":null, "user":null,
+            "safety_identifier":null, "prompt_cache_key":null,
+            "service_tier":null, "parallel_tool_calls":null,
+            "tools":null, "tool_choice":null, "background":null,
+            "truncation":null
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["output_text"], "ok");
+    let (status, invalid) = call(
+        gateway.clone(),
+        send(json!({
+            "model":"demo","input":"hello","max_output_tokens":15
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
+    assert_eq!(invalid["error"]["code"], "invalid_max_output_tokens");
+    let (status, valid) = call(
+        gateway,
+        send(json!({
+            "model":"demo","input":"hello","max_output_tokens":16
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{valid}");
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 2);
+    for key in [
+        "stream",
+        "temperature",
+        "top_p",
+        "instructions",
+        "user",
+        "safety_identifier",
+        "prompt_cache_key",
+        "service_tier",
+        "parallel_tool_calls",
+        "tools",
+        "tool_choice",
+        "background",
+        "truncation",
+    ] {
+        assert!(
+            requests[0].get(key).is_none(),
+            "{key} leaked into Chat: {}",
+            requests[0]
+        );
+    }
+    assert!(requests[0].get("max_tokens").is_none());
+    assert_eq!(requests[1]["max_tokens"], 16);
 }
 
 #[tokio::test]
