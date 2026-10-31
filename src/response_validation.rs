@@ -36,10 +36,9 @@ pub(super) fn valid_native_responses_with_background(value: &Value, background: 
         && value.get("output").and_then(Value::as_array).is_some()
         && value.get("error").is_none_or(Value::is_null)
         && value.get("usage").is_none_or(|usage| {
-            usage.is_null()
-                || (usage.get("input_tokens").and_then(Value::as_u64).is_some()
-                    && usage.get("output_tokens").and_then(Value::as_u64).is_some()
-                    && usage.get("total_tokens").and_then(Value::as_u64).is_some())
+            usage.is_null() || matches!((usage.get("input_tokens").and_then(Value::as_u64),
+                usage.get("output_tokens").and_then(Value::as_u64),usage.get("total_tokens").and_then(Value::as_u64)),
+                (Some(input),Some(output),Some(total)) if input.checked_add(output)==Some(total))
         })
 }
 
@@ -92,6 +91,13 @@ pub(super) fn valid_result_with_params(
                 && super::responses::translatable_chat_result(response)
         }
         Endpoint::Embeddings => validate_embeddings_with_params(request, params, response),
+        Endpoint::InputTokens => {
+            response.get("object").and_then(Value::as_str) == Some("response.input_tokens")
+                && response
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .is_some()
+        }
     }
 }
 

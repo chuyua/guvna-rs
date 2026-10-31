@@ -130,6 +130,15 @@ impl KeyPool {
     }
 
     pub fn acquire(&self, excluded: &HashSet<String>) -> Option<Lease> {
+        self.acquire_pinned(excluded, None)
+    }
+
+    /// Server-side state is scoped to an upstream account as well as provider.
+    pub(crate) fn acquire_pinned(
+        &self,
+        excluded: &HashSet<String>,
+        credential: Option<&str>,
+    ) -> Option<Lease> {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
         let count = inner.credentials.len();
@@ -146,7 +155,10 @@ impl KeyPool {
         for offset in 0..count {
             let index = (start + offset) % count;
             let key = &inner.credentials[index];
-            if excluded.contains(&key.env) || key.blocked_until.is_some_and(|until| until > now) {
+            if credential.is_some_and(|name| name != key.env)
+                || excluded.contains(&key.env)
+                || key.blocked_until.is_some_and(|until| until > now)
+            {
                 continue;
             }
             if self.rotation != "least_used" {

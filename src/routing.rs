@@ -719,6 +719,16 @@ fn auto_candidate_eligible_for_request(
     request_bytes: usize,
     requirements: AutoRequirements,
 ) -> bool {
+    if config
+        .providers
+        .iter()
+        .find(|p| p.name == candidate.provider)
+        .is_some_and(|provider| {
+            !provider_request_eligible(provider, &candidate.model, &candidate.params, request)
+        })
+    {
+        return false;
+    }
     let effective = |name: &str| request.get(name).or_else(|| candidate.params.get(name));
     // Dispatch always writes the physical model, even when /v1/auto callers
     // omit model entirely. Account for that replacement in the same pass.
@@ -851,6 +861,69 @@ fn auto_candidate_eligible_for_request(
             ..requirements
         },
     )
+}
+
+/// Operator-declared model restrictions apply before leasing any credential,
+/// including ordinary named chains. Unknown capabilities keep legacy behavior.
+pub(crate) fn provider_request_eligible(
+    provider: &crate::config::Provider,
+    model: &str,
+    params: &BTreeMap<String, Value>,
+    request: &Value,
+) -> bool {
+    let Some(cap) = provider.model_capabilities.get(model) else {
+        return true;
+    };
+    let features = if request.get("input").is_some() {
+        auto_requirements_responses(request)
+    } else {
+        auto_requirements(request)
+    };
+    let effective = |name: &str| request.get(name).or_else(|| params.get(name));
+    let tools = features.tools
+        || effective("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|v| !v.is_empty())
+        || effective("functions")
+            .and_then(Value::as_array)
+            .is_some_and(|v| !v.is_empty())
+        || effective("tool_choice").is_some_and(|v| !v.is_null() && v != "auto" && v != "none");
+    let schema = features.json_schema
+        || effective("response_format").is_some_and(|v| v["type"] == "json_schema");
+    let reasoning = effective("reasoning").is_some_and(|v| !v.is_null())
+        || effective("reasoning_effort").is_some_and(|v| !v.is_null());
+    if (tools && cap.supports_tools == Some(false))
+        || (features.images && cap.supports_images == Some(false))
+        || (features.audio && cap.supports_audio == Some(false))
+        || (schema && cap.supports_json_schema == Some(false))
+        || (reasoning && cap.supports_reasoning == Some(false))
+    {
+        return false;
+    }
+    if let Some(window) = cap.context_tokens {
+        let mut bytes = encoded_json_bytes(Some(request));
+        for (key, value) in params {
+            if request.get(key).is_none() {
+                bytes = bytes
+                    .saturating_add(encoded_json_bytes_of(key.as_str()))
+                    .saturating_add(encoded_json_bytes(Some(value)))
+                    .saturating_add(2);
+            }
+        }
+        bytes = bytes.saturating_add(encoded_json_bytes_of(model));
+        let output = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+            .iter()
+            .filter_map(|k| effective(k).and_then(Value::as_u64))
+            .max()
+            .unwrap_or(1024);
+        if with_context_safety_margin(bytes)
+            .saturating_add(usize::try_from(output).unwrap_or(usize::MAX))
+            > window
+        {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn auto_operator_default_can_degrade_for_request(

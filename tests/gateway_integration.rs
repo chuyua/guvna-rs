@@ -3354,7 +3354,7 @@ async fn native_only_responses_features_are_never_downgraded_to_chat() {
     let requests = [
         json!({"model":"mixed","input":"draw a landscape",
             "tools":[{"type":"image_generation","size":"1024x1024"}]}),
-        json!({"model":"mixed","input":"continue","previous_response_id":"resp_previous"}),
+        json!({"model":"mixed","input":"continue","previous_response_id":"resp_native_only"}),
         json!({"model":"mixed","input":[{"type":"message","role":"user",
             "content":[{"type":"input_video","video_url":"https://example.test/movie.mp4"}]}]}),
         json!({"model":"mixed","input":"show probabilities",
@@ -3383,7 +3383,10 @@ async fn native_only_responses_features_are_never_downgraded_to_chat() {
         assert!(native.get("messages").is_none());
     }
     assert_eq!(native_requests[0]["tools"], requests[0]["tools"]);
-    assert_eq!(native_requests[1]["previous_response_id"], "resp_previous");
+    assert_eq!(
+        native_requests[1]["previous_response_id"],
+        "resp_native_only"
+    );
     assert_eq!(native_requests[3]["top_logprobs"], 4);
     assert_eq!(native_requests[4]["max_tool_calls"], 1);
 }
@@ -6115,7 +6118,7 @@ async fn unsupported_or_corrupt_format_is_rejected_without_any_provider_calls() 
         (
             json!({"response_format":{"type":"json_object"}}),
             StatusCode::NOT_IMPLEMENTED,
-            "responses_parameter_unsupported",
+            "protocol_capability_unsupported",
         ),
         (
             json!({"reasoning":{"effort":"huge"}}),
@@ -6125,7 +6128,7 @@ async fn unsupported_or_corrupt_format_is_rejected_without_any_provider_calls() 
         (
             json!({"reasoning":{"summary":"detailed"}}),
             StatusCode::NOT_IMPLEMENTED,
-            "responses_feature_unsupported",
+            "protocol_capability_unsupported",
         ),
         (
             json!({"reasoning":[]}),

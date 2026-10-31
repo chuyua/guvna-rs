@@ -19,6 +19,66 @@ const MAX_AGGREGATED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 // makes this event limit a secondary defensive bound, not a promised number
 // of accepted frames.
 const MAX_EVENTS: usize = 262_144;
+
+/// The terminal native snapshot is authoritative; never synthesize missing
+/// output items from partial deltas. Share the same framing validator and
+/// global aggregation permits as the Chat path.
+pub(super) async fn aggregate_native(
+    mut upstream: reqwest::Response,
+    mut ticket: Option<&mut Ticket>,
+) -> Result<Value, AggregateError> {
+    if !upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
+        })
+    {
+        return Err(AggregateError::InvalidStream);
+    }
+    let mut parser = crate::native_responses_sse::NativeResponsesSse::new();
+    let mut bytes = 0usize;
+    let mut count = 0usize;
+    let mut progress = tokio::time::Instant::now();
+    loop {
+        let chunk = tokio::time::timeout_at(progress + STREAM_IDLE, upstream.chunk())
+            .await
+            .map_err(|_| AggregateError::IdleTimeout)?
+            .map_err(|_| AggregateError::UpstreamTransport)?
+            .ok_or(AggregateError::InvalidStream)?;
+        bytes = bytes.saturating_add(chunk.len());
+        if chunk.len() > MAX_CHUNK_BYTES || bytes > MAX_TOTAL_STREAM_BYTES {
+            return Err(AggregateError::InputLimit);
+        }
+        let events = parser
+            .push(&chunk)
+            .map_err(|_| AggregateError::InvalidStream)?;
+        if parser.take_progress() {
+            progress = tokio::time::Instant::now();
+            if let Some(ticket) = ticket.as_mut() {
+                ticket.progress();
+            }
+        }
+        for event in events {
+            account_event(&mut count)?;
+            if parser.is_completion_event(&event) {
+                if event.len() > MAX_AGGREGATED_OUTPUT_BYTES {
+                    return Err(AggregateError::OutputLimit);
+                }
+                let data = event
+                    .split(|b| *b == b'\n')
+                    .find_map(|line| line.strip_prefix(b"data: "))
+                    .ok_or(AggregateError::InvalidStream)?;
+                let mut value: Value =
+                    serde_json::from_slice(data).map_err(|_| AggregateError::InvalidStream)?;
+                return Ok(value["response"].take());
+            }
+        }
+    }
+}
 // A long prompt can leave a reasoning model silent for more than 15 seconds.
 // The separate 100-second absolute lifetime and shared walk budget still bound
 // resource use and total request latency.

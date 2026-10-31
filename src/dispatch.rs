@@ -34,12 +34,14 @@ pub(super) enum Endpoint {
     Chat,
     Responses,
     Embeddings,
+    InputTokens,
 }
 impl Endpoint {
     fn path(self) -> &'static str {
         match self {
             Self::Chat | Self::Responses => "/chat/completions",
             Self::Embeddings => "/embeddings",
+            Self::InputTokens => "/responses/input_tokens",
         }
     }
     fn is_chat(self) -> bool {
@@ -141,6 +143,7 @@ pub(super) async fn dispatch_responses_parsed(
     native_only: bool,
     original_large_payload: bool,
     admission: OwnedSemaphorePermit,
+    context: super::response_routes::Context,
 ) -> Response {
     dispatch_request(
         state,
@@ -149,8 +152,33 @@ pub(super) async fn dispatch_responses_parsed(
             native_request,
             native_only,
             original_large_payload,
+            context,
         },
         Endpoint::Responses,
+        admission,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn dispatch_input_tokens(
+    state: Arc<AppState>,
+    raw: Value,
+    admission: OwnedSemaphorePermit,
+    context: super::response_routes::Context,
+    large: bool,
+) -> Response {
+    let chat_request = json!({"model":raw["model"],"messages":[]});
+    dispatch_request(
+        state,
+        DispatchInput::ParsedResponses {
+            chat_request,
+            native_request: Some(raw),
+            native_only: true,
+            original_large_payload: large,
+            context,
+        },
+        Endpoint::InputTokens,
         admission,
         None,
     )
@@ -168,6 +196,7 @@ enum DispatchInput {
         native_request: Option<Value>,
         native_only: bool,
         original_large_payload: bool,
+        context: super::response_routes::Context,
     },
 }
 
@@ -219,6 +248,7 @@ async fn dispatch_request(
             Endpoint::Chat => "chat",
             Endpoint::Responses => "responses",
             Endpoint::Embeddings => "embeddings",
+            Endpoint::InputTokens => "input_tokens",
         };
         let mut context = telemetry_context
             .unwrap_or_else(|| TelemetryContext::local(response.status().as_u16(), sse_headers));
@@ -374,7 +404,7 @@ pub(super) fn hold_buffered_response(
 }
 
 #[derive(Debug)]
-enum JsonReadFailure {
+pub(super) enum JsonReadFailure {
     Invalid,
     MemoryBusy,
     Transport,
@@ -395,6 +425,7 @@ fn telemetry_endpoint(endpoint: Endpoint) -> &'static str {
         Endpoint::Chat => "chat",
         Endpoint::Responses => "responses",
         Endpoint::Embeddings => "embeddings",
+        Endpoint::InputTokens => "input_tokens",
     }
 }
 
@@ -469,6 +500,10 @@ async fn dispatch_inner(
     started: tokio::time::Instant,
     request_id: &str,
 ) -> Response {
+    let response_context = match &input {
+        DispatchInput::ParsedResponses { context, .. } => Some(context.clone()),
+        _ => None,
+    };
     let (mut request, large_payload, mut native_request, native_only): (
         Value,
         bool,
@@ -499,6 +534,7 @@ async fn dispatch_inner(
             native_request,
             native_only,
             original_large_payload,
+            ..
         } => (
             chat_request,
             original_large_payload,
@@ -522,6 +558,20 @@ async fn dispatch_inner(
             "Expected JSON object",
         );
     }
+    let native_files = match native_request
+        .as_ref()
+        .map(super::native_files::references)
+        .transpose()
+    {
+        Ok(ids) => ids.unwrap_or_default(),
+        Err(()) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_file_reference",
+                "Expected at most 16 bounded file IDs",
+            );
+        }
+    };
     if matches!(endpoint, Endpoint::Embeddings) {
         let input_valid = match request.get("input") {
             Some(Value::String(s)) => !s.is_empty(),
@@ -766,6 +816,32 @@ async fn dispatch_inner(
         }
     };
 
+    let before_capabilities = steps.len();
+    steps.retain(|step| {
+        routing::provider_request_eligible(
+            &state.config.providers[step.provider_index],
+            &step.model,
+            &step.params,
+            routing_request,
+        )
+    });
+    if before_capabilities > 0 && steps.is_empty() {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "model_capability_unsupported",
+            "No candidate satisfies declared model capabilities",
+        );
+    }
+    if let Some(pin) = response_context.as_ref().and_then(|c| c.pin.as_ref()) {
+        steps.retain(|step| step.provider_index == pin.provider && step.model == pin.model);
+        if steps.is_empty() {
+            return error(
+                StatusCode::CONFLICT,
+                "response_route_changed",
+                "The response owner is no longer in the selected route",
+            );
+        }
+    }
     if auto_enabled && steps.is_empty() {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -932,6 +1008,9 @@ async fn dispatch_inner(
     let mut buffered_response_busy = false;
     let mut unsupported_aggregate_logprobs = false;
     let mut unsupported_aggregate_n = false;
+    let mut protocol_mismatch = false;
+    let mut file_verification_failed = false;
+    let file_deadline = started + Duration::from_secs(8);
     // Propagate a useful downstream Retry-After only when *all* eligible
     // provider candidates are unavailable solely due to 429 credential
     // cooldown. A 5xx, invalid body, transport error, open breaker, missing
@@ -944,13 +1023,10 @@ async fn dispatch_inner(
     // Retry distinct models on the same provider, but never reattempt the
     // exact failed SSE-only provider/model during a single candidate walk.
     let mut failed_aggregation_routes = HashSet::new();
-    // Stateful Responses ids are provider-local. Keep their retries pinned
-    // to the first native provider, never another vendor's state store.
-    let stateful_native = native_only
-        && native_request.as_ref().is_some_and(|value| {
-            value.get("previous_response_id").is_some() || value.get("conversation").is_some()
-        });
-    let mut pinned_native_provider: Option<usize> = None;
+    if auto_enabled && let Some(raw) = native_request.as_mut().and_then(Value::as_object_mut) {
+        raw.remove("min_context");
+        raw.remove("max_context");
+    }
     // Exactly ONE candidate loop for chat + embedding. Key failover is confined to this loop.
     for step in steps {
         if let Some(previous) = telemetry_context.take() {
@@ -974,24 +1050,25 @@ async fn dispatch_inner(
             return attach_telemetry_context(walk_timeout(&state.metrics), context);
         }
         let provider = &state.config.providers[step.provider_index];
-        let native_responses =
-            matches!(endpoint, Endpoint::Responses) && provider.responses_protocol == "native";
+        let bridge_chat =
+            matches!(endpoint, Endpoint::Chat) && provider.chat_via_responses(&step.model);
+        let native_responses = bridge_chat
+            || (matches!(endpoint, Endpoint::Responses | Endpoint::InputTokens)
+                && provider.native_responses(&step.model));
         if native_only && !native_responses {
             // Native-only tools and state references cannot be degraded to
             // Chat messages without changing the caller's requested behavior.
             all_candidates_rate_limited = false;
             continue;
         }
-        if stateful_native && native_responses {
-            if pinned_native_provider.is_some_and(|index| index != step.provider_index) {
-                all_candidates_rate_limited = false;
-                continue;
-            }
-            pinned_native_provider.get_or_insert(step.provider_index);
-        }
-        if native_responses && provider.stream_only && !streaming {
-            // Native JSON cannot be manufactured from Responses SSE with the
-            // Chat aggregator. Prefer a different candidate instead.
+        if native_responses
+            && provider.stream_only
+            && !streaming
+            && native_request
+                .as_ref()
+                .is_some_and(|v| v["background"] == true)
+        {
+            protocol_mismatch = true;
             all_candidates_rate_limited = false;
             continue;
         }
@@ -1003,7 +1080,11 @@ async fn dispatch_inner(
             all_candidates_rate_limited = false;
             continue;
         }
-        if provider.stream_only && !streaming && !endpoint.is_chat() {
+        if provider.stream_only
+            && !streaming
+            && !endpoint.is_chat()
+            && !matches!(endpoint, Endpoint::InputTokens)
+        {
             all_candidates_rate_limited = false;
             continue; // Only Chat has a validated SSE-to-JSON adapter.
         }
@@ -1037,7 +1118,7 @@ async fn dispatch_inner(
         // Four permits bound at most 8 MiB of buffered JSON output globally.
         // After two seconds, try the next candidate without consuming any
         // provider key or altering circuit state.
-        let _aggregate_budget = if provider.stream_only && !streaming {
+        let _aggregate_budget = if provider.stream_only && !streaming && endpoint.is_chat() {
             let slot_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             let slot_deadline =
                 walk_deadline.map_or(slot_deadline, |until| until.min(slot_deadline));
@@ -1135,7 +1216,7 @@ async fn dispatch_inner(
         // Apply candidate-only overrides in place, serialize once for this
         // candidate, then restore the original request before any await. This
         // avoids cloning a potentially multi-megabyte JSON tree for each step.
-        let wire_request = if native_responses {
+        let wire_request = if native_responses && !bridge_chat {
             native_request.as_mut().expect("native request retained")
         } else {
             &mut request
@@ -1148,22 +1229,11 @@ async fn dispatch_inner(
         } else {
             None
         };
-        let original_stream_options = override_stream.then(|| force_sse_usage(object));
+        let original_stream_options =
+            (override_stream && !native_responses).then(|| force_sse_usage(object));
         let mut injected_params = Vec::new();
         for (name, value) in &step.params {
-            if native_responses
-                && !matches!(
-                    name.as_str(),
-                    "temperature"
-                        | "top_p"
-                        | "max_output_tokens"
-                        | "service_tier"
-                        | "parallel_tool_calls"
-                        | "safety_identifier"
-                        | "prompt_cache_key"
-                )
-            {
-                // Chat chain defaults cannot be blindly sent to Responses.
+            if native_responses && !bridge_chat {
                 continue;
             }
             if matches!(endpoint, Endpoint::Embeddings)
@@ -1198,16 +1268,36 @@ async fn dispatch_inner(
                 injected_params.push(name.clone());
             }
         }
-        let payload_json = Bytes::from(wire_request.to_string());
+        let native_defaults =
+            if native_responses && !bridge_chat && !matches!(endpoint, Endpoint::InputTokens) {
+                super::chat_responses::native_defaults(wire_request, &step.params)
+            } else {
+                Ok(Vec::new())
+            };
+        let serialized = if native_defaults.is_err() {
+            Err(())
+        } else if bridge_chat {
+            super::chat_responses::request(wire_request).map(|value| Bytes::from(value.to_string()))
+        } else {
+            Ok(Bytes::from(wire_request.to_string()))
+        };
         let object = wire_request.as_object_mut().expect("checked above");
         for name in injected_params {
             object.remove(&name);
         }
+        if let Ok(changes) = native_defaults {
+            for (name, previous) in changes {
+                if let Some(value) = previous {
+                    object.insert(name, value);
+                } else {
+                    object.remove(&name);
+                }
+            }
+        }
         if override_stream {
-            restore_sse_usage(
-                object,
-                original_stream_options.expect("SSE usage override saved"),
-            );
+            if let Some(options) = original_stream_options {
+                restore_sse_usage(object, options);
+            }
             if let Some(original) = original_stream {
                 object.insert("stream".into(), original);
             } else {
@@ -1217,12 +1307,26 @@ async fn dispatch_inner(
         if let Some(original) = original_model {
             object.insert("model".into(), original);
         }
+        let payload_json = match serialized {
+            Ok(payload) => payload,
+            Err(()) => {
+                protocol_mismatch = true;
+                all_candidates_rate_limited = false;
+                continue;
+            }
+        };
         let mut tried = HashSet::new();
         // Several credentials can independently return 429 for one logical
         // candidate. Rate-limit the keys individually, but count one health
         // observation rather than demoting Auto from one client request.
         let mut saw_new_rate_limit = false;
-        while let Some(lease) = state.pools[step.provider_index].acquire(&tried) {
+        while let Some(lease) = state.pools[step.provider_index].acquire_pinned(
+            &tried,
+            response_context
+                .as_ref()
+                .and_then(|c| c.pin.as_ref())
+                .map(|b| b.credential.as_str()),
+        ) {
             if walk_expired(walk_deadline) {
                 let mut context = telemetry_context.take();
                 if let Some(context) = context.as_mut() {
@@ -1232,7 +1336,24 @@ async fn dispatch_inner(
                 return attach_telemetry_context(walk_timeout(&state.metrics), context);
             }
             tried.insert(lease.env.clone());
-            let url = provider.endpoint(if native_responses {
+            if native_responses
+                && !native_files.is_empty()
+                && !super::native_files::verified(
+                    &state,
+                    provider,
+                    &lease,
+                    &native_files,
+                    walk_deadline.map_or(file_deadline, |until| until.min(file_deadline)),
+                )
+                .await
+            {
+                file_verification_failed = true;
+                all_candidates_rate_limited = false;
+                continue;
+            }
+            let url = provider.endpoint(if matches!(endpoint, Endpoint::InputTokens) {
+                "/responses/input_tokens"
+            } else if native_responses {
                 "/responses"
             } else {
                 endpoint.path()
@@ -1365,8 +1486,42 @@ async fn dispatch_inner(
                             .to_owned(),
                         request_id: request_id.to_owned(),
                         attempt_index: u16::try_from(candidates_visited).unwrap_or(u16::MAX),
+                        response_owner: response_context
+                            .as_ref()
+                            .filter(|_| matches!(endpoint, Endpoint::Responses) && native_responses)
+                            .map(|context| super::response_routes::NativeOwner {
+                                owner: context.owner,
+                                logical_model: model.clone(),
+                                background: native_request
+                                    .as_ref()
+                                    .is_some_and(|v| v["background"] == true),
+                                stored: native_request
+                                    .as_ref()
+                                    .is_some_and(|v| v.get("store") != Some(&Value::Bool(false))),
+                            }),
+                        logical_model: model.clone(),
                     };
-                    let stream_result = if native_responses {
+                    let stream_result = if bridge_chat {
+                        let mut validation = json!({"model":model,"n":1});
+                        for key in ["tool_choice", "response_format", "stream_options"] {
+                            if let Some(value) = request.get(key).or_else(|| step.params.get(key)) {
+                                validation[key] = value.clone();
+                            }
+                        }
+                        chat_stream::start_bridge(
+                            upstream,
+                            super::chat_responses_stream::ChatResponsesStream::new(
+                                validation,
+                                model.clone(),
+                            ),
+                            state.clone(),
+                            route,
+                            lease.clone(),
+                            &mut permit,
+                            &mut circuit_ticket,
+                        )
+                        .await
+                    } else if native_responses {
                         chat_stream::start_native(
                             upstream,
                             state.clone(),
@@ -1452,7 +1607,7 @@ async fn dispatch_inner(
                 }
                 let mut aggregation_transient_failure = false;
                 let mut aggregation_upstream_transport = false;
-                let result = if upstream_stream && !streaming {
+                let mut result = if upstream_stream && !streaming {
                     // JSON-capable providers retain a bounded body read.
                     // SSE-only generations have both a 60s idle limit and a
                     // 100s absolute cap. The shared non-streaming walk
@@ -1461,18 +1616,23 @@ async fn dispatch_inner(
                     let lifetime =
                         tokio::time::Instant::now() + chat_aggregate::MAX_AGGREGATION_LIFETIME;
                     let lifetime = walk_deadline.map_or(lifetime, |until| until.min(lifetime));
-                    let aggregated = tokio::time::timeout_at(
-                        lifetime,
-                        chat_aggregate::aggregate(
-                            upstream,
-                            effective_n,
-                            &step.model,
-                            request
-                                .get("tool_choice")
-                                .or_else(|| step.params.get("tool_choice")),
-                            circuit_ticket.as_mut(),
-                        ),
-                    )
+                    let aggregated = tokio::time::timeout_at(lifetime, async {
+                        if native_responses {
+                            chat_aggregate::aggregate_native(upstream, circuit_ticket.as_mut())
+                                .await
+                        } else {
+                            chat_aggregate::aggregate(
+                                upstream,
+                                effective_n,
+                                &step.model,
+                                request
+                                    .get("tool_choice")
+                                    .or_else(|| step.params.get("tool_choice")),
+                                circuit_ticket.as_mut(),
+                            )
+                            .await
+                        }
+                    })
                     .await;
                     if aggregated.is_err() {
                         aggregation_transient_failure = true;
@@ -1504,6 +1664,24 @@ async fn dispatch_inner(
                     )
                     .await
                 };
+                if let Ok(Ok((value, reservation))) = &mut result
+                    && reservation.is_none()
+                    && routing::auto_input_bytes(Some(value)) > super::LARGE_RESPONSE_BODY_BYTES
+                {
+                    match tokio::time::timeout(
+                        Duration::from_secs(1),
+                        state.large_response_slots.clone().acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => {
+                            *reservation = Some(BufferedResponseLease {
+                                _permit: Arc::new(permit),
+                            })
+                        }
+                        _ => result = Ok(Err(JsonReadFailure::MemoryBusy)),
+                    }
+                }
                 if walk_expired(walk_deadline) {
                     if upstream_stream && !streaming {
                         Metrics::inc(&state.metrics.aggregation_failures);
@@ -1515,16 +1693,31 @@ async fn dispatch_inner(
                     }
                     return attach_telemetry_context(walk_timeout(&state.metrics), context);
                 }
+                let result = if bridge_chat {
+                    result.map(|value| {
+                        value.and_then(|(value, lease)| {
+                            super::chat_responses::result(&value, &model)
+                                .map(|chat| (chat, lease))
+                                .map_err(|_| JsonReadFailure::Invalid)
+                        })
+                    })
+                } else {
+                    result
+                };
                 match result {
                     Ok(Ok((value, response_reservation)))
                         if (native_responses
+                            && !bridge_chat
+                            && !matches!(endpoint, Endpoint::InputTokens)
                             && response_validation::valid_native_responses_with_background(
                                 &value,
                                 native_request.as_ref().is_some_and(|request| {
                                     request.get("background") == Some(&Value::Bool(true))
                                 }),
                             ))
-                            || (!native_responses
+                            || ((!native_responses
+                                || bridge_chat
+                                || matches!(endpoint, Endpoint::InputTokens))
                                 && response_validation::valid_result_with_params(
                                     endpoint,
                                     &request,
@@ -1532,6 +1725,37 @@ async fn dispatch_inner(
                                     &value,
                                 )) =>
                     {
+                        if matches!(endpoint, Endpoint::Responses)
+                            && native_responses
+                            && let Some(context) = response_context.as_ref()
+                        {
+                            let binding = super::response_routes::Binding {
+                                provider: step.provider_index,
+                                credential: lease.env.clone(),
+                                model: step.model.clone(),
+                                logical_model: model.clone(),
+                                background: native_request
+                                    .as_ref()
+                                    .is_some_and(|v| v["background"] == true),
+                            };
+                            if super::responses_lifecycle::remember(
+                                &state,
+                                context.owner,
+                                &value,
+                                binding,
+                                native_request
+                                    .as_ref()
+                                    .is_some_and(|v| v.get("store") != Some(&Value::Bool(false))),
+                            )
+                            .is_err()
+                            {
+                                return error(
+                                    StatusCode::CONFLICT,
+                                    "response_id_collision",
+                                    "Upstream response identity is ambiguous",
+                                );
+                            }
+                        }
                         state.pools[step.provider_index].record_success(&lease);
                         record_circuit_success(&mut circuit_ticket, &state.metrics);
                         state.mark_auto_success_in(&live, step.provider_index, &step.model);
@@ -1769,6 +1993,20 @@ async fn dispatch_inner(
         ops_log::warn("rate_limit_exhausted");
         return attach_telemetry_context(response, telemetry_context.take());
     }
+    if !attempted_network && file_verification_failed {
+        return error(
+            StatusCode::NOT_IMPLEMENTED,
+            "file_ownership_unverified",
+            "No selected native account could verify all file IDs through the Files API",
+        );
+    }
+    if !attempted_network && (protocol_mismatch || native_only) {
+        return error(
+            StatusCode::NOT_IMPLEMENTED,
+            "protocol_capability_unsupported",
+            "No candidate in the selected route supports this protocol feature or stream mode",
+        );
+    }
     if buffered_response_busy {
         let mut response = error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1890,7 +2128,7 @@ fn reserve_declared_json_capacity(
     Ok(())
 }
 
-async fn bounded_json(
+pub(super) async fn bounded_json(
     response: reqwest::Response,
     large_slots: Arc<tokio::sync::Semaphore>,
     mut circuit_ticket: Option<&mut crate::circuit::Ticket>,
