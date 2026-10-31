@@ -330,6 +330,7 @@ pub(super) struct BufferedResponseLease {
 pub(super) struct ParsedChatResponse(pub(super) Value);
 
 /// Native Responses JSON, validated before it contributes to provider health.
+#[derive(Clone)]
 pub(super) struct ParsedNativeResponse(pub(super) Value);
 
 pub(super) fn hold_buffered_response(
