@@ -1288,11 +1288,47 @@ pub(super) fn parse_chat_usage(chat: &Value) -> Result<Option<(u64, u64, u64)>, 
     Ok(Some((input, output, total)))
 }
 
+/// Preserve upstream Chat token breakdowns in the Responses usage envelope.
+/// Missing details stay missing; malformed details invalidate the candidate.
+pub(super) fn translated_chat_usage(chat: &Value) -> Result<Value, ()> {
+    let Some((input, output, total)) = parse_chat_usage(chat)? else {
+        return Ok(Value::Null);
+    };
+    let usage = &chat["usage"];
+    let mut translated = json!({
+        "input_tokens":input,"output_tokens":output,"total_tokens":total
+    });
+    if let Some(details) = usage.get("prompt_tokens_details").filter(|v| !v.is_null()) {
+        let map = details.as_object().ok_or(())?;
+        if let Some(cached) = map.get("cached_tokens") {
+            let tokens = cached
+                .as_u64()
+                .filter(|&tokens| tokens <= input)
+                .ok_or(())?;
+            translated["input_tokens_details"] = json!({"cached_tokens":tokens});
+        }
+    }
+    if let Some(details) = usage
+        .get("completion_tokens_details")
+        .filter(|v| !v.is_null())
+    {
+        let map = details.as_object().ok_or(())?;
+        if let Some(reasoning) = map.get("reasoning_tokens") {
+            let tokens = reasoning
+                .as_u64()
+                .filter(|&tokens| tokens <= output)
+                .ok_or(())?;
+            translated["output_tokens_details"] = json!({"reasoning_tokens":tokens});
+        }
+    }
+    Ok(translated)
+}
+
 /// Validate the endpoint-specific conversion contract *before* the shared
 /// candidate walker commits its success, health and key-lease accounting.
 /// This does not route/retry; it only rejects unusable Chat responses.
 pub(super) fn translatable_chat_result(chat: &Value) -> bool {
-    if parse_chat_usage(chat).is_err() {
+    if translated_chat_usage(chat).is_err() {
         return false;
     }
     let Some(choices) = chat.get("choices").and_then(Value::as_array) else {
@@ -1370,11 +1406,8 @@ pub(super) fn translatable_chat_result(chat: &Value) -> bool {
 
 fn translate_chat_result(chat: Value, logical_model: String, metadata: Value) -> Response {
     // Validate and translate usage once for both text and function-call responses.
-    let translated_usage = match parse_chat_usage(&chat) {
-        Ok(Some((input, output, total))) => {
-            json!({"input_tokens":input,"output_tokens":output,"total_tokens":total})
-        }
-        Ok(None) => Value::Null,
+    let translated_usage = match translated_chat_usage(&chat) {
+        Ok(usage) => usage,
         Err(()) => {
             return error(
                 StatusCode::BAD_GATEWAY,
@@ -1908,6 +1941,45 @@ mod reasoning_tests {
         assert_eq!(forwarded.len(), 1024 * 1024);
         assert_eq!(output["status"], "completed");
         assert_eq!(output["type"], "reasoning");
+    }
+
+    #[test]
+    fn responses_usage_keeps_cache_and_reasoning_breakdown() {
+        let chat = json!({"usage":{
+            "prompt_tokens":12,"completion_tokens":8,"total_tokens":20,
+            "prompt_tokens_details":{"cached_tokens":9,"audio_tokens":2},
+            "completion_tokens_details":{"reasoning_tokens":5}
+        }});
+        assert_eq!(
+            translated_chat_usage(&chat).unwrap(),
+            json!({
+                "input_tokens":12,"output_tokens":8,"total_tokens":20,
+                "input_tokens_details":{"cached_tokens":9},
+                "output_tokens_details":{"reasoning_tokens":5}
+            })
+        );
+        assert_eq!(translated_chat_usage(&json!({})).unwrap(), Value::Null);
+        let no_details = json!({"usage":{
+            "prompt_tokens":12,"completion_tokens":8,"total_tokens":20
+        }});
+        assert_eq!(
+            translated_chat_usage(&no_details).unwrap(),
+            json!({"input_tokens":12,"output_tokens":8,"total_tokens":20})
+        );
+        for invalid in [
+            json!({"prompt_tokens_details":{"cached_tokens":13}}),
+            json!({"completion_tokens_details":{"reasoning_tokens":9}}),
+            json!({"prompt_tokens_details":{"cached_tokens":-1}}),
+            json!({"completion_tokens_details":{"reasoning_tokens":"5"}}),
+            json!({"prompt_tokens_details":[]}),
+        ] {
+            let mut malformed = no_details.clone();
+            malformed["usage"]
+                .as_object_mut()
+                .unwrap()
+                .extend(invalid.as_object().unwrap().clone());
+            assert!(translated_chat_usage(&malformed).is_err());
+        }
     }
 
     #[tokio::test]

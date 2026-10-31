@@ -519,18 +519,8 @@ impl ResponsesSse {
         if choices.is_empty() && (self.usage_seen || self.finish_reason.is_none()) {
             return Err(());
         }
-        if let Some(usage) = event.get("usage").filter(|value| !value.is_null()) {
-            let (Some(input), Some(output), Some(total)) = (
-                usage["prompt_tokens"].as_u64(),
-                usage["completion_tokens"].as_u64(),
-                usage["total_tokens"].as_u64(),
-            ) else {
-                return Err(());
-            };
-            if input.checked_add(output) != Some(total) {
-                return Err(());
-            }
-            self.usage = json!({"input_tokens":input,"output_tokens":output,"total_tokens":total});
+        if event.get("usage").is_some_and(|usage| !usage.is_null()) {
+            self.usage = crate::gateway::translated_responses_usage(&event)?;
         }
         if choices.is_empty() {
             if event.get("usage").is_none_or(Value::is_null) {
@@ -1084,6 +1074,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ambiguous.reasoning_text, "ab");
+    }
+
+    #[test]
+    fn chat_token_breakdown_survives_inline_then_final_sse_usage() {
+        let mut translator = ResponsesSse::new("logical".into(), Value::Null);
+        let mut events = VecDeque::new();
+        translator
+            .feed(
+                &frame(json!({"id":"usage-details","created":123,
+                "choices":[{"index":0,"delta":{"content":"answer"},
+                    "finish_reason":"stop"}],
+                "usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,
+                    "prompt_tokens_details":{"cached_tokens":9},
+                    "completion_tokens_details":{"reasoning_tokens":5}}})),
+                &mut events,
+            )
+            .unwrap();
+        assert_eq!(translator.usage["input_tokens_details"]["cached_tokens"], 9);
+        translator
+            .feed(
+                &frame(json!({"choices":[],"usage":{
+                "prompt_tokens":12,"completion_tokens":8,"total_tokens":20,
+                "prompt_tokens_details":{"cached_tokens":7},
+                "completion_tokens_details":{"reasoning_tokens":6}}})),
+                &mut events,
+            )
+            .unwrap();
+        translator.feed(b"data: [DONE]\n\n", &mut events).unwrap();
+        let done = String::from_utf8_lossy(events.back().unwrap());
+        assert!(done.contains("event: response.completed"));
+        assert!(done.contains("\"cached_tokens\":7"), "{done}");
+        assert!(done.contains("\"reasoning_tokens\":6"), "{done}");
     }
 
     #[test]

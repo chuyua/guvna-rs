@@ -47,6 +47,12 @@ mod responses;
 #[path = "responses_format.rs"]
 mod responses_format;
 
+// Share the exact usage conversion with the crate-level SSE wrapper without
+// making the private Responses adapter module visible outside this gateway.
+pub(crate) fn translated_responses_usage(chat: &Value) -> Result<Value, ()> {
+    responses::translated_chat_usage(chat)
+}
+
 const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_INFLIGHT_REQUESTS: usize = 128;
