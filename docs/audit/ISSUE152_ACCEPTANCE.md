@@ -36,7 +36,7 @@
 | B07 | automated | `tests/responses_protocol.rs`：已登记 conversation 字符串/单 id 对象，previous/conversation 冲突、未知状态与 null 边界。 |
 | B08 | contract | `src/response_routes.rs`；`docs/RESPONSES_COMPATIBILITY.md`：1024 条、1h、按需清理；不持久化敏感内容，重启/过期明确 404；不宣称重启连续托管态。 |
 | B09 | automated | `src/response_routes.rs`；`tests/responses_protocol.rs`：ID 冲突原子检查、客户端隔离、未知 ID 无网络、外部加密 item 拒绝。 |
-| B10 | automated | `scripts/sdk_smoke.py`；`scripts/sdk_smoke.cjs`；`tests/responses_protocol.rs`：background queued→retrieve→cancel→delete 原生工作流；不从非终态伪造完成。 |
+| B10 | automated | `scripts/sdk_smoke.py`；`scripts/sdk_smoke.cjs`；`tests/responses_protocol.rs`：background queued→retrieve→cancel→delete 原生工作流；不从非终态伪造完成；查询中新返回的加密 item 验证后登记并固定原账号回放。 |
 | B11 | automated | `tests/responses_protocol.rs`：Chat-only store/background/托管工具无法满足时 501。 |
 | B12 | automated | `tests/responses_protocol.rs`：有效终态后才登记；SSE 失败、EOF、客户端取消不产生成功索引。 |
 | B13 | contract | `docs/RESPONSES_COMPATIBILITY.md`；`tests/responses_protocol.rs`：SSE created/terminal ID 一致；流终态前管理长任务使用非流式 background 创建取得已验证 ID。 |

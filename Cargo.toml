@@ -27,3 +27,11 @@ tokio = { version = "1.53.1", features = ["full"] }
 tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1"
 tokio = { version = "1.53.1", features = ["test-util"] }
+
+# The gateway targets small single-user hosts. Keep resident executable pages
+# bounded as protocol/schema support grows; measure latency in the Release A/B
+# gate rather than relying on the compiler's throughput-oriented defaults.
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1

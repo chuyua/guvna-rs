@@ -115,7 +115,21 @@ async fn retrieve(
     req: Request<Body>,
 ) -> Response {
     mock.requests.lock().unwrap().push(json!({"_method":"get","_id":id,"_query":req.uri().query(),"_auth":req.headers()["authorization"].to_str().unwrap()}));
-    Json(native(&id, "physical", "hello")).into_response()
+    let mut result = native(&id, "physical", "hello");
+    if req
+        .uri()
+        .query()
+        .is_some_and(|q| q.contains("encrypted_content"))
+    {
+        result["output"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "id": format!("rs_retrieved_{id}"), "type": "reasoning", "summary": [],
+                "encrypted_content": "retrieved-provider-state"
+            }),
+        );
+    }
+    Json(result).into_response()
 }
 async fn delete(Path(id): Path<String>, State(mock): State<Mock>) -> Response {
     mock.requests
@@ -340,6 +354,58 @@ async fn state_lifecycle_is_authenticated_pinned_to_account_and_deleted_on_real_
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(mock.requests.lock().unwrap().len(), count);
+}
+
+#[tokio::test]
+async fn background_retrieval_registers_new_encrypted_items_on_the_original_account() {
+    let (url, mock) = server().await;
+    let app = configured(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_envs: [K1, K2]\n    responses_protocol: native\nchains:\n  - name: demo\n    steps:\n      - provider: p\n        model: physical\n"
+    ));
+    let created = json_body(
+        app.clone()
+            .oneshot(req(
+                "/v1/responses",
+                json!({
+                    "model":"demo", "input":"hi", "store":true, "background":true
+                }),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(created["status"], "queued");
+    let id = created["id"].as_str().unwrap();
+    let retrieved = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/responses/{id}?include%5B%5D=reasoning.encrypted_content"
+                ))
+                .header("authorization", "Bearer client")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retrieved.status(), StatusCode::OK);
+    let retrieved = json_body(retrieved).await;
+    let replay = app
+        .oneshot(req(
+            "/v1/responses",
+            json!({
+                "model":"demo", "store":false, "input":[retrieved["output"][0].clone()]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for request in requests.iter() {
+        assert_eq!(request["_auth"], "Bearer first");
+    }
 }
 
 #[tokio::test]

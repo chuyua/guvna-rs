@@ -291,6 +291,16 @@ async fn forward(
         if method == Method::DELETE {
             state.response_routes.remove(owner, &id);
         } else if suffix != "input_items" {
+            // Background creation may return no output. Register ownership of
+            // encrypted items that first appear in a later verified snapshot.
+            // Use the recorded binding, never infer an account from the body.
+            if remember(&state, owner, &value, binding.clone(), true).is_err() {
+                return Ok(error(
+                    StatusCode::CONFLICT,
+                    "response_id_collision",
+                    "Upstream response identity is ambiguous",
+                ));
+            }
             value["model"] = json!(binding.logical_model);
         }
         Ok(dispatch::hold_buffered_response(

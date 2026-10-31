@@ -252,7 +252,7 @@
         "scripts/sdk_smoke.cjs",
         "tests/responses_protocol.rs"
       ],
-      "result": "background queued→retrieve→cancel→delete 原生工作流；不从非终态伪造完成。"
+      "result": "background queued→retrieve→cancel→delete 原生工作流；不从非终态伪造完成。；后台查询新返回的加密 item 在验证后登记，回放固定原账号。"
     },
     {
       "id": "B11",

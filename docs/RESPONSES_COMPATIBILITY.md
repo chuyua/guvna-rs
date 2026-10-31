@@ -69,7 +69,7 @@ JSON Schema 使用标准 `jsonschema` 引擎，关闭默认网络/文件解析�
 | 路由 | 契约 |
 | --- | --- |
 | `POST /v1/responses` | 原生 JSON / SSE 或受控 Chat 桥接 |
-| `GET /v1/responses/{id}` | 只查询登记的原上游账号；默认 JSON |
+| `GET /v1/responses/{id}` | 只查询登记的原上游账号；默认 JSON；验证后登记查询中新出现的加密 item，后台任务完成后可按原账号回放 |
 | `DELETE /v1/responses/{id}` | 上游真实确认删除后才移除本地响应索引；支持 204 或真实删除对象 |
 | `POST /v1/responses/{id}/cancel` | 仅允许网关创建时 `background:true` 的响应；由原生上游决定当前状态能否取消 |
 | `GET /v1/responses/{id}/input_items` | 分页查询交给原上游；返回真实 list，不构造假历史 |
