@@ -12,6 +12,9 @@ async function main() {
   const continued = await client.responses.create({ model: 'demo', input: 'next', previous_response_id: created.id });
   assert.equal(continued.output_text, 'hello');
   assert.equal((await client.responses.inputTokens.count({ model: 'demo', input: 'sdk' })).input_tokens, 17);
+  const compacted = await client.responses.compact({ model: 'demo', input: [{ role: 'user', content: 'sdk' }] });
+  assert.equal(compacted.object, 'response.compaction');
+  assert.equal((await client.responses.create({ model: 'demo', input: compacted.output })).status, 'completed');
   const stream = await client.responses.create({ model: 'demo', input: 'sdk', stream: true, store: false });
   const events = [];
   for await (const event of stream) events.push(event);

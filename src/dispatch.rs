@@ -35,6 +35,7 @@ pub(super) enum Endpoint {
     Responses,
     Embeddings,
     InputTokens,
+    Compact,
 }
 impl Endpoint {
     fn path(self) -> &'static str {
@@ -42,6 +43,7 @@ impl Endpoint {
             Self::Chat | Self::Responses => "/chat/completions",
             Self::Embeddings => "/embeddings",
             Self::InputTokens => "/responses/input_tokens",
+            Self::Compact => "/responses/compact",
         }
     }
     fn is_chat(self) -> bool {
@@ -161,12 +163,13 @@ pub(super) async fn dispatch_responses_parsed(
     .await
 }
 
-pub(super) async fn dispatch_input_tokens(
+pub(super) async fn dispatch_native_operation(
     state: Arc<AppState>,
     raw: Value,
     admission: OwnedSemaphorePermit,
     context: super::response_routes::Context,
     large: bool,
+    endpoint: Endpoint,
 ) -> Response {
     let chat_request = json!({"model":raw["model"],"messages":[]});
     dispatch_request(
@@ -178,7 +181,7 @@ pub(super) async fn dispatch_input_tokens(
             original_large_payload: large,
             context,
         },
-        Endpoint::InputTokens,
+        endpoint,
         admission,
         None,
     )
@@ -249,6 +252,7 @@ async fn dispatch_request(
             Endpoint::Responses => "responses",
             Endpoint::Embeddings => "embeddings",
             Endpoint::InputTokens => "input_tokens",
+            Endpoint::Compact => "compact",
         };
         let mut context = telemetry_context
             .unwrap_or_else(|| TelemetryContext::local(response.status().as_u16(), sse_headers));
@@ -405,6 +409,7 @@ pub(super) fn hold_buffered_response(
 
 #[derive(Debug)]
 pub(super) enum JsonReadFailure {
+    UnsupportedProtocol,
     Invalid,
     MemoryBusy,
     Transport,
@@ -426,6 +431,7 @@ fn telemetry_endpoint(endpoint: Endpoint) -> &'static str {
         Endpoint::Responses => "responses",
         Endpoint::Embeddings => "embeddings",
         Endpoint::InputTokens => "input_tokens",
+        Endpoint::Compact => "compact",
     }
 }
 
@@ -1009,6 +1015,8 @@ async fn dispatch_inner(
     let mut unsupported_aggregate_logprobs = false;
     let mut unsupported_aggregate_n = false;
     let mut protocol_mismatch = false;
+    let mut untranslatable_native = false;
+    let mut other_network_failure = false;
     let mut file_verification_failed = false;
     let file_deadline = started + Duration::from_secs(8);
     // Propagate a useful downstream Retry-After only when *all* eligible
@@ -1053,8 +1061,68 @@ async fn dispatch_inner(
         let bridge_chat =
             matches!(endpoint, Endpoint::Chat) && provider.chat_via_responses(&step.model);
         let native_responses = bridge_chat
-            || (matches!(endpoint, Endpoint::Responses | Endpoint::InputTokens)
-                && provider.native_responses(&step.model));
+            || (matches!(
+                endpoint,
+                Endpoint::Responses | Endpoint::InputTokens | Endpoint::Compact
+            ) && provider.native_responses(&step.model));
+        let chat_format = request
+            .get("response_format")
+            .or_else(|| step.params.get("response_format"));
+        let native_format = native_request
+            .as_ref()
+            .and_then(|raw| raw.pointer("/text/format"));
+        let selected_format = if !endpoint.is_chat() {
+            None
+        } else if native_responses && !bridge_chat {
+            native_format.or_else(|| step.params.get("response_format"))
+        } else {
+            chat_format
+        };
+        let schema_permit = if selected_format.is_some_and(|f| f["type"] == "json_schema") {
+            match state.schema_slots.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "schema_capacity_busy",
+                        "Compiled schema capacity is temporarily exhausted",
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        let output_format = if !endpoint.is_chat() {
+            Ok(None)
+        } else if native_responses && !bridge_chat {
+            crate::structured_output::OutputFormat::native(
+                native_format,
+                step.params.get("response_format"),
+            )
+        } else {
+            crate::structured_output::OutputFormat::chat(chat_format)
+        };
+        let output_format = match output_format {
+            Ok(contract) => contract.map(|contract| {
+                if let Some(permit) = schema_permit {
+                    contract.with_lease(permit)
+                } else {
+                    contract
+                }
+            }),
+            Err(()) => {
+                if native_format.is_some() || request.get("response_format").is_some() {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_output_schema",
+                        "Output schema is invalid, externally referenced or exceeds local validation limits",
+                    );
+                }
+                protocol_mismatch = true;
+                all_candidates_rate_limited = false;
+                continue;
+            }
+        };
         if native_only && !native_responses {
             // Native-only tools and state references cannot be degraded to
             // Chat messages without changing the caller's requested behavior.
@@ -1083,7 +1151,7 @@ async fn dispatch_inner(
         if provider.stream_only
             && !streaming
             && !endpoint.is_chat()
-            && !matches!(endpoint, Endpoint::InputTokens)
+            && !matches!(endpoint, Endpoint::InputTokens | Endpoint::Compact)
         {
             all_candidates_rate_limited = false;
             continue; // Only Chat has a validated SSE-to-JSON adapter.
@@ -1216,6 +1284,7 @@ async fn dispatch_inner(
         // Apply candidate-only overrides in place, serialize once for this
         // candidate, then restore the original request before any await. This
         // avoids cloning a potentially multi-megabyte JSON tree for each step.
+        let caller_token_budget = routing::has_output_token_field(&request);
         let wire_request = if native_responses && !bridge_chat {
             native_request.as_mut().expect("native request retained")
         } else {
@@ -1234,6 +1303,9 @@ async fn dispatch_inner(
         let mut injected_params = Vec::new();
         for (name, value) in &step.params {
             if native_responses && !bridge_chat {
+                continue;
+            }
+            if routing::is_output_token_field(name) && caller_token_budget {
                 continue;
             }
             if matches!(endpoint, Endpoint::Embeddings)
@@ -1268,12 +1340,14 @@ async fn dispatch_inner(
                 injected_params.push(name.clone());
             }
         }
-        let native_defaults =
-            if native_responses && !bridge_chat && !matches!(endpoint, Endpoint::InputTokens) {
-                super::chat_responses::native_defaults(wire_request, &step.params)
-            } else {
-                Ok(Vec::new())
-            };
+        let native_defaults = if native_responses
+            && !bridge_chat
+            && !matches!(endpoint, Endpoint::InputTokens | Endpoint::Compact)
+        {
+            super::chat_responses::native_defaults(wire_request, &step.params)
+        } else {
+            Ok(Vec::new())
+        };
         let serialized = if native_defaults.is_err() {
             Err(())
         } else if bridge_chat {
@@ -1351,13 +1425,15 @@ async fn dispatch_inner(
                 all_candidates_rate_limited = false;
                 continue;
             }
-            let url = provider.endpoint(if matches!(endpoint, Endpoint::InputTokens) {
-                "/responses/input_tokens"
-            } else if native_responses {
-                "/responses"
-            } else {
-                endpoint.path()
-            });
+            let url = provider.endpoint(
+                if matches!(endpoint, Endpoint::InputTokens | Endpoint::Compact) {
+                    endpoint.path()
+                } else if native_responses {
+                    "/responses"
+                } else {
+                    endpoint.path()
+                },
+            );
             if let Some(context) = telemetry_context.as_mut() {
                 context.set_upstream_status(None);
             }
@@ -1381,6 +1457,7 @@ async fn dispatch_inner(
                 Ok(result) => result,
                 Err(_) => {
                     saw_non_client_network_result = true;
+                    other_network_failure = true;
                     if walk_expired(walk_deadline) {
                         let mut context = telemetry_context.take();
                         if let Some(context) = context.as_mut() {
@@ -1406,6 +1483,7 @@ async fn dispatch_inner(
                 Ok(response) => response,
                 Err(_) => {
                     saw_non_client_network_result = true;
+                    other_network_failure = true;
                     Metrics::inc(&state.metrics.upstream_transport_failures);
                     ops_log::warn("transport_failure");
                     if state.pools[step.provider_index].record(&lease, Outcome::TransportFailure) {
@@ -1420,6 +1498,9 @@ async fn dispatch_inner(
                 } // key-neutral
             };
             let status = upstream.status().as_u16();
+            if !upstream.status().is_success() {
+                other_network_failure = true;
+            }
             let outcome = classify(Some(status));
             // A key-local 429 is not a model validation result. Other keys
             // may still establish a true caller 4xx; preserve that historical
@@ -1500,12 +1581,17 @@ async fn dispatch_inner(
                                     .is_some_and(|v| v.get("store") != Some(&Value::Bool(false))),
                             }),
                         logical_model: model.clone(),
+                        output_format: output_format.clone(),
                     };
                     let stream_result = if bridge_chat {
                         let mut validation = json!({"model":model,"n":1});
                         for key in ["tool_choice", "response_format", "stream_options"] {
                             if let Some(value) = request.get(key).or_else(|| step.params.get(key)) {
-                                validation[key] = value.clone();
+                                validation[key] = if key == "response_format" {
+                                    json!({"type":value["type"]})
+                                } else {
+                                    value.clone()
+                                };
                             }
                         }
                         chat_stream::start_bridge(
@@ -1513,6 +1599,7 @@ async fn dispatch_inner(
                             super::chat_responses_stream::ChatResponsesStream::new(
                                 validation,
                                 model.clone(),
+                                output_format.clone(),
                             ),
                             state.clone(),
                             route,
@@ -1541,11 +1628,7 @@ async fn dispatch_inner(
                                         .get("tool_choice")
                                         .or_else(|| step.params.get("tool_choice")),
                                 )
-                                .with_json_format(
-                                    request
-                                        .get("response_format")
-                                        .or_else(|| step.params.get("response_format")),
-                                )
+                                .with_output_contract(output_format.clone())
                                 .with_logprobs(
                                     request
                                         .get("logprobs")
@@ -1588,7 +1671,13 @@ async fn dispatch_inner(
                                     Metrics::inc(&state.metrics.upstream_invalid_responses);
                                 }
                                 chat_stream::PreflightError::Timeout
-                                | chat_stream::PreflightError::LocalLimit => {}
+                                | chat_stream::PreflightError::LocalLimit
+                                | chat_stream::PreflightError::UnsupportedProtocol => {}
+                            }
+                            if matches!(error, chat_stream::PreflightError::UnsupportedProtocol) {
+                                untranslatable_native = true;
+                            } else {
+                                other_network_failure = true;
                             }
                             if error.blame_provider() {
                                 record_circuit_failure(&mut circuit_ticket, &state.metrics);
@@ -1618,8 +1707,12 @@ async fn dispatch_inner(
                     let lifetime = walk_deadline.map_or(lifetime, |until| until.min(lifetime));
                     let aggregated = tokio::time::timeout_at(lifetime, async {
                         if native_responses {
-                            chat_aggregate::aggregate_native(upstream, circuit_ticket.as_mut())
-                                .await
+                            chat_aggregate::aggregate_native(
+                                upstream,
+                                circuit_ticket.as_mut(),
+                                output_format.clone(),
+                            )
+                            .await
                         } else {
                             chat_aggregate::aggregate(
                                 upstream,
@@ -1696,36 +1789,76 @@ async fn dispatch_inner(
                 let result = if bridge_chat {
                     result.map(|value| {
                         value.and_then(|(value, lease)| {
+                            let native_valid = response_validation::valid_native_responses(&value);
                             super::chat_responses::result(&value, &model)
                                 .map(|chat| (chat, lease))
-                                .map_err(|_| JsonReadFailure::Invalid)
+                                .map_err(|_| {
+                                    if native_valid {
+                                        JsonReadFailure::UnsupportedProtocol
+                                    } else {
+                                        JsonReadFailure::Invalid
+                                    }
+                                })
                         })
                     })
                 } else {
                     result
                 };
                 match result {
+                    Ok(Ok((value, reservation)))
+                        if matches!(endpoint, Endpoint::Responses)
+                            && native_responses
+                            && response_validation::valid_native_terminal_failure(&value) =>
+                    {
+                        if let Some(context) = telemetry_context.as_mut() {
+                            context.set_failure_type("upstream_failed");
+                            context.set_health_observation(false);
+                        }
+                        let mut response = Response::new(Body::empty());
+                        response
+                            .extensions_mut()
+                            .insert(ParsedNativeResponse(value));
+                        return attach_telemetry_context(
+                            hold_buffered_response(response, reservation),
+                            telemetry_context.take(),
+                        );
+                    }
+                    Ok(Err(JsonReadFailure::UnsupportedProtocol)) => {
+                        untranslatable_native = true;
+                        if let Some(context) = telemetry_context.as_mut() {
+                            context.set_failure_type("capability_mismatch");
+                            context.set_health_observation(false);
+                        }
+                        break;
+                    }
                     Ok(Ok((value, response_reservation)))
                         if (native_responses
                             && !bridge_chat
-                            && !matches!(endpoint, Endpoint::InputTokens)
+                            && !matches!(endpoint, Endpoint::InputTokens | Endpoint::Compact)
                             && response_validation::valid_native_responses_with_background(
                                 &value,
                                 native_request.as_ref().is_some_and(|request| {
                                     request.get("background") == Some(&Value::Bool(true))
                                 }),
-                            ))
+                            )
+                            && output_format
+                                .as_ref()
+                                .is_none_or(|format| format.accepts_native(&value)))
                             || ((!native_responses
                                 || bridge_chat
-                                || matches!(endpoint, Endpoint::InputTokens))
-                                && response_validation::valid_result_with_params(
+                                || matches!(
+                                    endpoint,
+                                    Endpoint::InputTokens | Endpoint::Compact
+                                ))
+                                && response_validation::valid_result_with_contract(
                                     endpoint,
                                     &request,
                                     &step.params,
                                     &value,
+                                    output_format.as_ref(),
                                 )) =>
                     {
-                        if matches!(endpoint, Endpoint::Responses)
+                        if matches!(endpoint, Endpoint::Responses | Endpoint::Compact)
                             && native_responses
                             && let Some(context) = response_context.as_ref()
                         {
@@ -1743,9 +1876,10 @@ async fn dispatch_inner(
                                 context.owner,
                                 &value,
                                 binding,
-                                native_request
-                                    .as_ref()
-                                    .is_some_and(|v| v.get("store") != Some(&Value::Bool(false))),
+                                matches!(endpoint, Endpoint::Responses)
+                                    && native_request.as_ref().is_some_and(|v| {
+                                        v.get("store") != Some(&Value::Bool(false))
+                                    }),
                             )
                             .is_err()
                             {
@@ -1798,6 +1932,7 @@ async fn dispatch_inner(
                         break;
                     }
                     Ok(Err(JsonReadFailure::Transport)) => {
+                        other_network_failure = true;
                         // A reset while reading a valid HTTP 200 body is a
                         // network failure, not malformed model JSON. Apply
                         // the same bounded key/circuit recovery as send().
@@ -1816,6 +1951,7 @@ async fn dispatch_inner(
                         break;
                     }
                     Err(_) => {
+                        other_network_failure = true;
                         if upstream_stream && !streaming {
                             Metrics::inc(&state.metrics.aggregation_failures);
                             failed_aggregation_routes
@@ -1846,6 +1982,7 @@ async fn dispatch_inner(
                         break;
                     }
                     _ => {
+                        other_network_failure = true;
                         if upstream_stream && !streaming {
                             Metrics::inc(&state.metrics.aggregation_failures);
                             failed_aggregation_routes
@@ -2000,7 +2137,9 @@ async fn dispatch_inner(
             "No selected native account could verify all file IDs through the Files API",
         );
     }
-    if !attempted_network && (protocol_mismatch || native_only) {
+    if (!attempted_network && (protocol_mismatch || native_only))
+        || (untranslatable_native && !other_network_failure)
+    {
         return error(
             StatusCode::NOT_IMPLEMENTED,
             "protocol_capability_unsupported",

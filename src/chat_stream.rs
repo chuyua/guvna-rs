@@ -29,6 +29,7 @@ pub(super) enum PreflightError {
     TransportFailure,
     Timeout,
     LocalLimit,
+    UnsupportedProtocol,
 }
 impl PreflightError {
     pub(super) fn failure_type(self) -> &'static str {
@@ -37,6 +38,7 @@ impl PreflightError {
             Self::TransportFailure => "transport_error",
             Self::Timeout => "timeout",
             Self::LocalLimit => "local_error",
+            Self::UnsupportedProtocol => "capability_mismatch",
         }
     }
 
@@ -55,6 +57,7 @@ pub(super) struct StreamRoute {
     pub(super) attempt_index: u16,
     pub(super) response_owner: Option<super::response_routes::NativeOwner>,
     pub(super) logical_model: String,
+    pub(super) output_format: Option<crate::structured_output::OutputFormat>,
 }
 
 #[derive(Clone)]
@@ -113,6 +116,9 @@ impl StreamParser {
     }
     fn is_failure_event(&self, event: &Bytes) -> bool {
         matches!(self,Self::Native(parser) if parser.is_failure_event(event))
+    }
+    fn incompatible(&self) -> bool {
+        matches!(self,Self::Bridge(parser) if parser.incompatible())
     }
 }
 struct ChatStreamState {
@@ -196,7 +202,9 @@ pub(super) async fn start_native(
     permit: &mut Option<OwnedSemaphorePermit>,
     circuit_ticket: &mut Option<Ticket>,
 ) -> Result<Response, PreflightError> {
-    let parser = NativeResponsesSse::new().with_logical_model(route.logical_model.clone());
+    let parser = NativeResponsesSse::new()
+        .with_logical_model(route.logical_model.clone())
+        .with_output_contract(route.output_format.clone());
     let mut response = start_with_parser(
         upstream,
         StreamParser::Native(parser),
@@ -302,6 +310,8 @@ async fn preflight_stream(state: &mut ChatStreamState) -> Result<(), PreflightEr
             let events = state.parser.push(&chunk).map_err(|_| {
                 if state.parser.hit_resource_limit() {
                     PreflightError::LocalLimit
+                } else if state.parser.incompatible() {
+                    PreflightError::UnsupportedProtocol
                 } else {
                     PreflightError::InvalidStream
                 }
@@ -429,6 +439,8 @@ fn stream_response(state: ChatStreamState) -> Response {
                             Err(_) => {
                                 if state.parser.hit_resource_limit() {
                                     state.failure_type = "local_error";
+                                } else if state.parser.incompatible() {
+                                    state.failure_type = "capability_mismatch";
                                 }
                                 state.terminated = true;
                             }

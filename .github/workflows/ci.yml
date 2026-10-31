@@ -71,3 +71,28 @@ jobs:
           name: guvna-linux-resource-gate
           path: quality-results.json
           if-no-files-found: warn
+
+  lowload-protocol-gate:
+    name: Serial dual-protocol and Release A/B
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build candidate and locked PR151 baseline in the same environment
+        run: |
+          cargo build --release --locked
+          cp target/release/guvna candidate-guvna
+          git fetch --no-tags --depth=1 origin 1936b53a4eb4c356cb47aa8d734a6063c1973ca8
+          git worktree add --detach .ci-baseline 1936b53a4eb4c356cb47aa8d734a6063c1973ca8
+          cargo build --release --locked --manifest-path .ci-baseline/Cargo.toml --target-dir target
+          sha256sum candidate-guvna target/release/guvna > lowload-binaries.sha256
+      - name: Measure serial traffic, concurrency ladder, state flood and aging
+        run: python3 scripts/lowload_gate.py --binary candidate-guvna --baseline target/release/guvna --out lowload-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: guvna-linux-lowload-ab
+          path: |
+            lowload-results.json
+            lowload-binaries.sha256

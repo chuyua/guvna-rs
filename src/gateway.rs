@@ -107,6 +107,7 @@ pub struct AppState {
     payload_slots: Arc<Semaphore>,
     large_response_slots: Arc<Semaphore>,
     aggregation_slots: Arc<Semaphore>,
+    schema_slots: Arc<Semaphore>,
     auto_background_slots: Arc<Semaphore>,
     metrics: Arc<Metrics>,
     telemetry: Option<Telemetry>,
@@ -287,6 +288,7 @@ impl AppState {
             payload_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_PAYLOADS)),
             large_response_slots: Arc::new(Semaphore::new(MAX_LARGE_RESPONSE_BODIES)),
             aggregation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_AGGREGATIONS)),
+            schema_slots: Arc::new(Semaphore::new(4)),
             auto_background_slots: Arc::new(Semaphore::new(MAX_BACKGROUND_DECIDERS)),
             metrics: Arc::new(Metrics::default()),
             telemetry: None,
@@ -741,7 +743,11 @@ pub fn app_with_state(state: AppState) -> (Router, Arc<AppState>) {
         .route("/v1/chat/completions", post(chat))
         .route("/v1/auto", post(auto))
         .route("/v1/embeddings", post(embeddings))
-        .route("/v1/responses", post(responses::handle))
+        .route(
+            "/v1/responses",
+            post(responses::handle).get(responses_lifecycle::unsupported_transport),
+        )
+        .route("/v1/responses/compact", post(responses_lifecycle::compact))
         .route(
             "/v1/responses/input_tokens",
             post(responses_lifecycle::input_tokens),

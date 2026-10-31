@@ -20,6 +20,7 @@ pub(crate) struct NativeResponsesSse {
     limit_hit: bool,
     last_sequence: Option<u64>,
     logical_model: Option<String>,
+    output_format: Option<crate::structured_output::OutputFormat>,
 }
 
 impl NativeResponsesSse {
@@ -31,6 +32,13 @@ impl NativeResponsesSse {
         self
     }
 
+    pub(crate) fn with_output_contract(
+        mut self,
+        format: Option<crate::structured_output::OutputFormat>,
+    ) -> Self {
+        self.output_format = format;
+        self
+    }
     pub fn is_done(&self) -> bool {
         self.done
     }
@@ -119,7 +127,11 @@ impl NativeResponsesSse {
                 return Err(SseError);
             } else if kind == "response.completed" || kind == "response.incomplete" {
                 let response = value.get("response").ok_or(SseError)?;
-                if !crate::gateway::valid_native_responses(response)
+                if self
+                    .output_format
+                    .as_ref()
+                    .is_some_and(|format| !format.accepts_native(response))
+                    || !crate::gateway::valid_native_responses(response)
                     || response.get("status").and_then(Value::as_str)
                         != Some(if kind == "response.completed" {
                             "completed"

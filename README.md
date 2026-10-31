@@ -38,62 +38,46 @@ gateway cannot replay a partially delivered response on another provider.
 Disconnecting the client drops the upstream stream. The first event must
 arrive within 15 seconds; a stream event is limited to 1 MiB.
 
-Responses now supports bounded non-streaming text and function-call translation,
-and incremental text/function-call SSE translation via POST /v1/responses
-with stream:true. The streaming bridge emits response lifecycle, text delta,
-function-call argument delta/done and terminal events. It preserves stateless
-metadata and honors stop versus length finish reasons. Invalid or truncated
-upstream streams fail closed with response.failed or an error event; there is
-no silent provider replay after streaming begins.
+Responses supports the validated Chat bridge and native upstreams in the same
+candidate walk. Set `responses_protocol: native` for a provider implementing
+Responses. Set `chat_protocol: responses` as well for a RE-only supplier;
+Chat clients then use the bounded reverse bridge. Physical models can override
+protocols and declare tools/images/audio/schema/reasoning/context capabilities.
+Known incompatible candidates are filtered before generating requests.
 
-Responses streaming limits: 512 KiB combined generated text and function
-arguments, 256 KiB per function's arguments, 32 parallel function calls,
-1 MiB maximum framed SSE chunk, and 15 seconds of upstream idle time.
-Responses now also maps text.format to the equivalent Chat Completions
-response_format for plain text, JSON-object and strict JSON-schema requests,
-including streaming. JSON-schema names, field types, and unsupported options
-are checked before contacting providers, and nested schemas retain integer
-precision. The gateway validates parseable JSON before reporting completion
-(non-streaming: failover; streaming: response.failed, never replay after data
-has been sent). JSON-schema adherence beyond JSON syntax remains the
-responsibility of the upstream model/provider.
+The bridges preserve supported text, function calls/results, refusal, input
+images/audio/inline PDF and actual usage. Unknown or non-equivalent controls
+and output items fail closed; they are never silently removed to manufacture
+success. Native Responses keeps the original input and output extensions,
+including hosted tools, images and encrypted reasoning. Native SSE-only
+providers can also serve JSON clients through validated terminal snapshots.
 
-Responses user-image URL and base64 data-URI input are translated to Chat
-vision parts, preserving image order, text, and detail. User input_audio
-(mp3/wav base64) is also forwarded to Chat providers. File-ID images,
-image-generation tools, audio output and streaming, advanced reasoning controls, stateful
-continuation, and other advanced Responses modes remain unsupported.
-Inline input_file PDF data URLs (without PDF-specific detail) map to Chat file
-parts. Non-PDF files, file_url, and file_id are not portable to Chat chains and
-are explicitly rejected.
-The supported reasoning.effort values are translated to Chat reasoning_effort;
-reasoning summaries, context modes and other reasoning options remain unsupported.
-Responses text.verbosity is mapped to the equivalent Chat verbosity field.
-Request-level service_tier, safety_identifier and prompt_cache_key are
-validated and forwarded to Chat providers without inventing response metadata.
-Successful JSON and SSE Responses envelopes declare the actual stateless mode:
-store=false, background=false, previous_response_id=null, truncation=disabled,
-and error=null.
-The gateway is not a full OpenAI Responses implementation or a production
-drop-in replacement.
+Structured output uses real JSON Schema validation, including local references
+and exact large numbers. HTTP/file schema retrieval is disabled. Compiled
+schemas have byte/depth/node limits and four admission slots retained until
+JSON validation or stream cancellation, independently of ordinary request slots.
+Invalid schemas are rejected before generation. A schema-mismatching upstream
+cannot become a successful JSON or SSE response.
 
-Mixed Responses upstreams: set `responses_protocol: native` on a provider
-whose OpenAI-compatible upstream implements `POST /v1/responses`. The
-default is `chat`, which keeps the validated Chat Completions bridge for
-Chat-only providers. Native responses preserve provider output items,
-including native-only item types. Native SSE events pass through a bounded
-Responses event validator; Chat-only providers retain the Chat SSE bridge.
-Both paths share candidate/key fallback, preflight, cancellation accounting
-and circuit health, without spawning a second candidate walk.
-Native advanced request options remain subject to the bridge's current input
-validation limits only on Chat fallback candidates. Built-in tool declarations,
-stateful references and unsupported Chat input types are forwarded unchanged
-only to native-capable providers; they never silently fall back to Chat. An
-existing conversation or previous-response reference is pinned to its first
-native provider in a single request walk to prevent cross-provider replay.
-Do not claim full official Responses parity yet.
+Native retrieve/delete/cancel/input_items/input_tokens/compact routes use the
+real supplier. Cross-request state, conversation references and encrypted replay
+are bound to the original provider, physical model, credential and client.
+The metadata-only ownership index is capped at 1,024 entries and one hour;
+restart/expiry/eviction produces an explicit 404. It does not replace OpenAI
+hosted storage or create a Conversations service. File IDs require same-account
+Files metadata verification before generation. WebSocket transport is explicitly
+unsupported; creation uses HTTP POST and SSE.
 
-Not yet shipped: learned Auto scoring, complete Go protocol parity and full multi-modal streaming.
+After downstream streaming begins, faults never replay the request on another
+supplier. Genuine native failed/cancelled events are forwarded without false
+success. Client cancellation and valid but untranslatable native results do not
+quarantine credentials or count as provider protocol failures.
+
+See the full [protocol capability and limitation contract](docs/RESPONSES_COMPATIBILITY.md)
+and the [101-item acceptance ledger](docs/audit/ISSUE152_ACCEPTANCE.md).
+This is a bounded pre-release compatibility surface, not full official OpenAI
+service parity. Real VPS/supplier canary and manual release remain required.
+
 The current Auto cache stores only route metadata (128 entries, 30s TTL); it does not learn from or retain prompts.
 
 POST /v1/chat/completions, /v1/embeddings and /v1/responses authenticate

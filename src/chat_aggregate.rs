@@ -26,6 +26,7 @@ const MAX_EVENTS: usize = 262_144;
 pub(super) async fn aggregate_native(
     mut upstream: reqwest::Response,
     mut ticket: Option<&mut Ticket>,
+    output_format: Option<crate::structured_output::OutputFormat>,
 ) -> Result<Value, AggregateError> {
     if !upstream
         .headers()
@@ -39,7 +40,8 @@ pub(super) async fn aggregate_native(
     {
         return Err(AggregateError::InvalidStream);
     }
-    let mut parser = crate::native_responses_sse::NativeResponsesSse::new();
+    let mut parser =
+        crate::native_responses_sse::NativeResponsesSse::new().with_output_contract(output_format);
     let mut bytes = 0usize;
     let mut count = 0usize;
     let mut progress = tokio::time::Instant::now();

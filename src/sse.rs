@@ -64,6 +64,9 @@ pub struct ChatSse {
     usage_seen: bool,
     tool_choice: Option<ToolChoice>,
     json_mode: Option<bool>,
+    json_schema: Option<crate::structured_output::Schema>,
+    invalid_schema: bool,
+    output_contract: Option<crate::structured_output::OutputFormat>,
     json_text: Vec<String>,
     json_text_bytes: usize,
     refusal_mask: u64,
@@ -127,6 +130,10 @@ impl ChatSse {
 
     /// Direct SSE JSON mode is an actual provider output contract.
     pub fn with_json_format(mut self, format: Option<&Value>) -> Self {
+        match crate::structured_output::Schema::compile(format) {
+            Ok(schema) => self.json_schema = schema,
+            Err(()) => self.invalid_schema = true,
+        }
         self.json_mode = format
             .and_then(|format| format.get("type"))
             .and_then(Value::as_str)
@@ -141,8 +148,19 @@ impl ChatSse {
         self
     }
 
-    /// Match native JSON Chat: requested token logprobs must actually be
-    /// present in every completed choice. Retain only one bit per choice.
+    /// Reuse one admission-bounded compiled output contract across the stream.
+    pub(crate) fn with_output_contract(
+        mut self,
+        contract: Option<crate::structured_output::OutputFormat>,
+    ) -> Self {
+        if contract.is_some() {
+            self.json_mode = Some(false);
+            self.json_text = vec![String::new(); self.expected as usize];
+        }
+        self.output_contract = contract;
+        self
+    }
+    /// Requested token probabilities must be present in every completed choice.
     pub fn with_logprobs(mut self, required: bool) -> Self {
         self.logprobs_required = required;
         self
@@ -425,7 +443,16 @@ impl ChatSse {
                 && !has_tools
                 && self.refusal_mask & choice_bit == 0
                 && let Some(object_only) = self.json_mode
-                && !valid_json_output(&self.json_text[index as usize], object_only)
+                && (self.invalid_schema
+                    || self.output_contract.as_ref().map_or_else(
+                        || {
+                            !valid_json_output(&self.json_text[index as usize], object_only)
+                                || self.json_schema.as_ref().is_some_and(|schema| {
+                                    !schema.accepts(&self.json_text[index as usize])
+                                })
+                        },
+                        |contract| !contract.accepts(&self.json_text[index as usize]),
+                    ))
             {
                 return Err(SseError);
             }
@@ -749,7 +776,7 @@ mod tests {
         ] {
             let mut parser = ChatSse::new(1)
                 .unwrap()
-                .with_json_format(Some(&json!({"type":format})));
+                .with_json_format(Some(&json!({"type":format,"json_schema":{"schema":{}}})));
             let mut failed = false;
             for (i, part) in fragments.iter().enumerate() {
                 let reason = if i + 1 == fragments.len() {

@@ -22,6 +22,7 @@ use tower::ServiceExt;
 
 #[derive(Clone, Default)]
 struct Mock {
+    answer: Arc<Mutex<Option<String>>>,
     requests: Arc<Mutex<Vec<Value>>>,
     next: Arc<AtomicUsize>,
     fail: Arc<AtomicBool>,
@@ -52,7 +53,14 @@ async fn create_native(State(mock): State<Mock>, req: Request<Body>) -> Response
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let id = format!("resp_{}", mock.next.fetch_add(1, Ordering::SeqCst));
-    let mut result = native(&id, value["model"].as_str().unwrap(), "hello");
+    let answer = mock.answer.lock().unwrap().clone().unwrap_or_else(|| {
+        if value["model"] == "selector" {
+            r#"{"order":[1,0]}"#.into()
+        } else {
+            "hello".into()
+        }
+    });
+    let mut result = native(&id, value["model"].as_str().unwrap(), &answer);
     if value["input"] == "encrypted" {
         result["output"].as_array_mut().unwrap().insert(0,json!({"id":"rs_1","type":"reasoning","summary":[],"encrypted_content":"opaque-provider-state"}));
     }
@@ -75,7 +83,7 @@ async fn create_native(State(mock): State<Mock>, req: Request<Body>) -> Response
         ) + &frame(
             "response.output_text.delta",
             2,
-            json!({"output_index":0,"content_index":0,"delta":"hello"}),
+            json!({"output_index":0,"content_index":0,"delta":answer}),
         ) + &frame("response.completed", 3, json!({"response":result}));
         return ([("content-type", "text/event-stream")], frames).into_response();
     }
@@ -88,12 +96,18 @@ async fn chat(State(mock): State<Mock>, req: Request<Body>) -> Response {
     if mock.fail.load(Ordering::SeqCst) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    let answer = mock
+        .answer
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "hello".into());
     if value["stream"] == true {
         return ([("content-type","text/event-stream")],format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-        json!({"id":"chat1","created":123,"model":value["model"],"choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}),
+        json!({"id":"chat1","created":123,"model":value["model"],"choices":[{"index":0,"delta":{"role":"assistant","content":answer},"finish_reason":null}]}),
         json!({"id":"chat1","created":123,"model":value["model"],"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}))).into_response();
     }
-    Json(json!({"id":"chat1","created":123,"object":"chat.completion","model":value["model"],"choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}})).into_response()
+    Json(json!({"id":"chat1","created":123,"object":"chat.completion","model":value["model"],"choices":[{"index":0,"message":{"role":"assistant","content":answer},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}})).into_response()
 }
 async fn retrieve(
     Path(id): Path<String>,
@@ -118,6 +132,10 @@ async fn cancel(Path(id): Path<String>) -> Response {
 async fn items(Path(_id): Path<String>, req: Request<Body>) -> Response {
     Json(json!({"object":"list","data":[{"id":"item_1","type":"message","role":"user","content":[]}],"has_more":false,"first_id":"item_1","last_id":"item_1","query":req.uri().query()})).into_response()
 }
+async fn compact_mock(State(mock): State<Mock>, Json(_raw): Json<Value>) -> Response {
+    let id = mock.next.fetch_add(1, Ordering::SeqCst);
+    Json(json!({"id":format!("compact_{id}"),"object":"response.compaction","created_at":123,"output":[{"id":format!("cmp_{id}"),"type":"compaction","encrypted_content":"compacted-provider-state"}]})).into_response()
+}
 async fn tokens(State(mock): State<Mock>, req: Request<Body>) -> Response {
     let value: Value =
         serde_json::from_slice(&to_bytes(req.into_body(), 1024 * 1024).await.unwrap()).unwrap();
@@ -129,6 +147,7 @@ async fn server() -> (String, Mock) {
     let routes = Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/responses", post(create_native))
+        .route("/v1/responses/compact", post(compact_mock))
         .route("/v1/responses/input_tokens", post(tokens))
         .route("/v1/responses/{id}", get(retrieve).delete(delete))
         .route("/v1/responses/{id}/cancel", post(cancel))
@@ -932,4 +951,342 @@ async fn files_are_verified_on_same_account_before_native_generation() {
             .collect::<Vec<_>>(),
         vec![&"generate:Bearer second".to_owned()]
     );
+}
+
+#[tokio::test]
+async fn optional_auto_decider_can_use_re_only_provider_without_chat_dependency() {
+    let (url, mock) = server().await;
+    let app = configured(&format!(
+        "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_env: K1\n    responses_protocol: native\n    chat_protocol: responses\nauto:\n  enabled: true\n  candidates:\n    - provider: p\n      model: first\n    - provider: p\n      model: second\n  decider:\n    enabled: true\n    provider: p\n    model: selector\n    timeout_ms: 1000\n"
+    ));
+    let response=app.oneshot(req("/v1/chat/completions",json!({"model":"auto","messages":[{"role":"user","content":"private text never sent to selector"}]}))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["model"], "selector");
+    assert!(!requests[0].to_string().contains("private text"));
+    assert_eq!(requests[1]["model"], "second");
+    assert!(requests.iter().all(|v| v.get("messages").is_none()));
+}
+
+#[tokio::test]
+async fn caller_token_alias_prevents_larger_chain_default_on_both_wire_protocols() {
+    for native in [false, true] {
+        let (url, mock) = server().await;
+        let protocol = if native {
+            "responses_protocol: native\n    chat_protocol: responses"
+        } else {
+            "responses_protocol: chat"
+        };
+        let app = configured(&format!(
+            "providers:\n  - name: p\n    type: openai\n    base_url: {url}\n    key_env: K1\n    {protocol}\nchains:\n  - name: demo\n    steps:\n      - provider: p\n        model: physical\n        params:\n          max_completion_tokens: 64000\n"
+        ));
+        let response = app
+            .oneshot(req(
+                "/v1/chat/completions",
+                json!({"model":"demo","messages":[{"role":"user","content":"hi"}],"max_tokens":32}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = mock.requests.lock().unwrap();
+        assert!(requests[0].get("max_completion_tokens").is_none());
+        assert_eq!(
+            requests[0][if native {
+                "max_output_tokens"
+            } else {
+                "max_tokens"
+            }],
+            32
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_json_failed_status_is_forwarded_without_success_or_retry() {
+    let mut failed = native("resp_failed_json", "physical", "");
+    failed["status"] = json!("failed");
+    failed["error"] = json!({"code":"server_error","message":"upstream failed"});
+    let (url, calls) = fixed_native(failed, String::new()).await;
+    let app = gateway(&url, "native", false);
+    let response = app
+        .clone()
+        .oneshot(req("/v1/responses", json!({"model":"demo","input":"hi"})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = json_body(response).await;
+    assert_eq!(value["status"], "failed");
+    assert_eq!(value["error"]["code"], "server_error");
+    assert_eq!(value["model"], "demo");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let metrics = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .header("authorization", "Bearer client")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&to_bytes(metrics.into_body(), 1024 * 1024).await.unwrap())
+            .contains("guvna_upstream_success_total 0")
+    );
+}
+
+#[tokio::test]
+async fn valid_native_output_without_chat_equivalent_is_not_a_provider_failure() {
+    let mut value = native("resp_image", "physical", "");
+    value["output"] = json!([{"id":"img1","type":"image_generation_call","result":"YQ=="}]);
+    let (url, calls) = fixed_native(value, String::new()).await;
+    let app = gateway(&url, "native", false);
+    let response = app
+        .clone()
+        .oneshot(req(
+            "/v1/chat/completions",
+            json!({"model":"demo","messages":[{"role":"user","content":"hi"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let metrics = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .header("authorization", "Bearer client")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let metrics = String::from_utf8(
+        to_bytes(metrics.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        metrics.contains("guvna_upstream_invalid_responses_total 0"),
+        "{metrics}"
+    );
+    assert!(metrics.contains("guvna_upstream_success_total 0"));
+}
+
+#[tokio::test]
+async fn all_responses_auxiliary_routes_require_auth_and_unknown_ids_never_probe_upstream() {
+    let (url, mock) = server().await;
+    let app = gateway(&url, "native", false);
+    for (method, path) in [
+        ("GET", "/v1/responses/unknown"),
+        ("DELETE", "/v1/responses/unknown"),
+        ("POST", "/v1/responses/unknown/cancel"),
+        ("GET", "/v1/responses/unknown/input_items"),
+        ("POST", "/v1/responses/input_tokens"),
+        ("POST", "/v1/responses/compact"),
+        ("GET", "/v1/responses"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/responses/unknown")
+                .header("authorization", "Bearer client")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn native_extensions_are_forwarded_as_one_original_payload() {
+    let (url, mock) = server().await;
+    let app = gateway(&url, "native", false);
+    let original = json!({"model":"demo","input":"hi","store":false,"include":["reasoning.encrypted_content"],
+        "prompt":{"id":"prompt_external","version":"1","variables":{"x":"y"}},
+        "context_management":[{"type":"compaction","compact_threshold":2048}],
+        "reasoning":{"effort":"high","context":"all_turns","summary":"auto"},
+        "tools":[{"type":"mcp","server_label":"local_test","server_url":"https://example.org/mcp","require_approval":"always"}],
+        "provider_extension":{"nested":[true,1,"kept"]}});
+    let response = app
+        .oneshot(req("/v1/responses", original.clone()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut wire = mock.requests.lock().unwrap()[0].clone();
+    wire["model"] = json!("demo");
+    wire.as_object_mut().unwrap().remove("_auth");
+    assert_eq!(wire, original);
+}
+
+#[tokio::test]
+async fn native_sse_identity_is_registered_after_terminal_and_cancelled_body_leaves_no_binding() {
+    let (url, _mock) = server().await;
+    let app = gateway(&url, "native", false);
+    let response = app
+        .clone()
+        .oneshot(req(
+            "/v1/responses",
+            json!({"model":"demo","input":"hi","store":true,"stream":true}),
+        ))
+        .await
+        .unwrap();
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(text.contains("\"model\":\"demo\""));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/responses/resp_0")
+                .header("authorization", "Bearer client")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let created = frame(
+        "response.created",
+        0,
+        json!({"response":{"id":"resp_cancelled","object":"response","created_at":123}}),
+    );
+    let (url, _) = fixed_native(Value::Null, created).await;
+    let app = gateway(&url, "native", false);
+    let response = app
+        .clone()
+        .oneshot(req(
+            "/v1/responses",
+            json!({"model":"demo","input":"hi","store":true,"stream":true}),
+        ))
+        .await
+        .unwrap();
+    drop(response);
+    let response = app
+        .oneshot(req(
+            "/v1/responses",
+            json!({"model":"demo","input":"next","previous_response_id":"resp_cancelled"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn real_schema_mismatch_falls_back_for_all_json_and_stream_protocols() {
+    for native in [false, true] {
+        for stream in [false, true] {
+            for endpoint in ["chat/completions", "responses"] {
+                let (bad_url, bad) = server().await;
+                let (good_url, good) = server().await;
+                *bad.answer.lock().unwrap() = Some(r#"{"n":"2"}"#.into());
+                *good.answer.lock().unwrap() = Some(r#"{"n":2}"#.into());
+                let protocols = if native {
+                    "responses_protocol: native\n    chat_protocol: responses"
+                } else {
+                    "responses_protocol: chat"
+                };
+                let app = configured(&format!(
+                    "providers:\n  - name: a\n    type: openai\n    base_url: {bad_url}\n    key_env: K1\n    {protocols}\n  - name: b\n    type: openai\n    base_url: {good_url}\n    key_env: K2\n    {protocols}\nchains:\n  - name: demo\n    steps:\n      - provider: a\n        model: physical-a\n      - provider: b\n        model: physical-b\n"
+                ));
+                let schema = json!({"type":"object","properties":{"n":{"type":"integer","minimum":2}},"required":["n"],"additionalProperties":false});
+                let value = if endpoint == "responses" {
+                    json!({"model":"demo","input":"hi","store":false,"stream":stream,"text":{"format":{"type":"json_schema","name":"result","strict":true,"schema":schema}}})
+                } else {
+                    json!({"model":"demo","messages":[{"role":"user","content":"hi"}],"stream":stream,"response_format":{"type":"json_schema","json_schema":{"name":"result","strict":true,"schema":schema}}})
+                };
+                let response = app
+                    .oneshot(req(&format!("/v1/{endpoint}"), value))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{native} {stream} {endpoint}"
+                );
+                let text = String::from_utf8(
+                    to_bytes(response.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap();
+                assert!(!text.contains("upstream_stream_incomplete"), "{text}");
+                assert_eq!(bad.requests.lock().unwrap().len(), 1);
+                assert_eq!(good.requests.lock().unwrap().len(), 1);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_or_external_output_schema_is_rejected_before_upstream() {
+    let (url, mock) = server().await;
+    let app = gateway(&url, "native", false);
+    for schema in [
+        json!({"type":42}),
+        json!({"$ref":"https://example.org/schema.json"}),
+        json!({"$ref":"file:///etc/passwd"}),
+    ] {
+        let response=app.clone().oneshot(req("/v1/responses",json!({"model":"demo","input":"hi","text":{"format":{"type":"json_schema","name":"x","strict":true,"schema":schema}}}))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn schema_slots_are_held_by_live_streams_and_released_on_cancel() {
+    for protocol in ["chat", "native"] {
+        let (url, mock) = server().await;
+        *mock.answer.lock().unwrap() = Some(r#"{"n":2}"#.into());
+        let app = gateway(&url, protocol, false);
+        let value = json!({"model":"demo","messages":[{"role":"user","content":"hi"}],"stream":true,
+            "response_format":{"type":"json_schema","json_schema":{"name":"result","strict":true,"schema":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]}}}});
+        let mut responses = Vec::new();
+        for _ in 0..4 {
+            let response = app
+                .clone()
+                .oneshot(req("/v1/chat/completions", value.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            responses.push(response);
+        }
+        let busy = app
+            .clone()
+            .oneshot(req("/v1/chat/completions", value.clone()))
+            .await
+            .unwrap();
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mock.requests.lock().unwrap().len(), 4);
+        drop(responses.pop());
+        let recovered = app
+            .oneshot(req("/v1/chat/completions", value))
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert_eq!(mock.requests.lock().unwrap().len(), 5);
+    }
 }

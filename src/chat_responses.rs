@@ -8,6 +8,32 @@ pub(super) fn native_defaults(
     raw: &mut Value,
     params: &std::collections::BTreeMap<String, Value>,
 ) -> Result<Vec<(String, Option<Value>)>, ()> {
+    for key in params.keys() {
+        if ![
+            "max_output_tokens",
+            "max_completion_tokens",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "service_tier",
+            "parallel_tool_calls",
+            "safety_identifier",
+            "prompt_cache_key",
+            "user",
+            "metadata",
+            "reasoning_effort",
+            "verbosity",
+            "response_format",
+            "tools",
+            "tool_choice",
+            "n",
+        ]
+        .contains(&key.as_str())
+            && raw.get(key).is_none()
+        {
+            return Err(());
+        }
+    }
     // Validate translations before mutating the request, so a rejected
     // candidate cannot leak partially-injected defaults to its fallback.
     let mut chat = json!({"model":"defaults","messages":[{"role":"user","content":"defaults"}]});
@@ -290,11 +316,16 @@ pub(super) fn result(native: &Value, model: &str) -> Result<Value, ()> {
     let mut refusal = String::new();
     let mut reasoning = String::new();
     let mut calls = Vec::new();
+    let mut messages = 0usize;
     for item in native["output"].as_array().ok_or(())? {
         match item["type"].as_str() {
-            Some("message") if item["role"]=="assistant" => for part in item["content"].as_array().ok_or(())? {
+            Some("message") if item["role"]=="assistant" => {
+                messages+=1;
+                if messages>1 || item.as_object().is_none_or(|m|m.keys().any(|k|!["id","type","role","status","content"].contains(&k.as_str()))) {return Err(());}
+                for part in item["content"].as_array().ok_or(())? {
                 match part["type"].as_str() {
                     Some("output_text") => {
+                        if part.as_object().is_none_or(|m|m.keys().any(|k|!["type","text","annotations","logprobs"].contains(&k.as_str()))) {return Err(());}
                         // Annotations/logprobs have no equivalent in this bridge.
                         if part.get("annotations").is_some_and(|v|v.as_array().is_none_or(|v|!v.is_empty()))
                             || part.get("logprobs").is_some_and(|v|!v.is_null() && v.as_array().is_none_or(|v|!v.is_empty())) { return Err(()); }
@@ -303,10 +334,12 @@ pub(super) fn result(native: &Value, model: &str) -> Result<Value, ()> {
                     Some("refusal") => refusal.push_str(part["refusal"].as_str().ok_or(())?),
                     _=>return Err(()),
                 }
+                }
             },
             Some("function_call") => calls.push(json!({"id":item["call_id"].as_str().ok_or(())?,"type":"function",
                 "function":{"name":item["name"].as_str().ok_or(())?,"arguments":item["arguments"].as_str().ok_or(())?}})),
-            Some("reasoning") if item.get("encrypted_content").is_none_or(Value::is_null) => {
+            Some("reasoning") if item.get("encrypted_content").is_none_or(Value::is_null)
+                && item.get("content").is_none_or(|v|v.is_null()||v.as_array().is_some_and(Vec::is_empty)) => {
                 for part in item["summary"].as_array().ok_or(())? { if part["type"]!="summary_text" { return Err(()); } reasoning.push_str(part["text"].as_str().ok_or(())?); }
             }
             _=>return Err(()),

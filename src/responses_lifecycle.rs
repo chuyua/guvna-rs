@@ -13,6 +13,20 @@ use axum::{
 use serde_json::{Value, json};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
+pub(super) async fn unsupported_transport(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+) -> Response {
+    if !state.allowed(request.headers()) {
+        return super::unauthorized();
+    }
+    error(
+        StatusCode::NOT_IMPLEMENTED,
+        "responses_transport_unsupported",
+        "Responses supports HTTP POST and SSE; WebSocket transport is not implemented",
+    )
+}
+
 fn state_error(status: StatusCode, code: &str, message: &str) -> Box<Response> {
     Box::new(error(status, code, message))
 }
@@ -303,6 +317,19 @@ pub(super) async fn input_tokens(
     State(state): State<Arc<AppState>>,
     request: Request<Body>,
 ) -> Response {
+    operation(state, request, dispatch::Endpoint::InputTokens).await
+}
+pub(super) async fn compact(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+) -> Response {
+    operation(state, request, dispatch::Endpoint::Compact).await
+}
+async fn operation(
+    state: Arc<AppState>,
+    request: Request<Body>,
+    endpoint: dispatch::Endpoint,
+) -> Response {
     let Some(owner) = state.client_identity(request.headers()) else {
         return super::unauthorized();
     };
@@ -311,7 +338,7 @@ pub(super) async fn input_tokens(
         Err(e) => return e.into_response(),
     };
     let large = body.len() >= super::LARGE_REQUEST_BODY_BYTES;
-    let raw: Value = match serde_json::from_slice(&body) {
+    let mut raw: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
             return error(
@@ -332,19 +359,22 @@ pub(super) async fn input_tokens(
         return error(
             StatusCode::BAD_REQUEST,
             "missing_model",
-            "model is required for native token routing",
+            "model is required for native routing",
         );
     }
     if raw.get("stream").is_some_and(|v| v != &Value::Bool(false)) {
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_stream",
-            "Input token counting is nonstreaming",
+            "This native operation is nonstreaming",
         );
     }
     let context = match context(&state, owner, &raw) {
         Ok(v) => v,
         Err(e) => return *e,
     };
-    dispatch::dispatch_input_tokens(state, raw, admission, context, large).await
+    raw.as_object_mut()
+        .expect("validated object")
+        .remove("stream");
+    dispatch::dispatch_native_operation(state, raw, admission, context, large, endpoint).await
 }

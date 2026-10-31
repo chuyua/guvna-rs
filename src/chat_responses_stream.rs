@@ -21,12 +21,20 @@ pub(super) struct ChatResponsesStream {
     tools: BTreeMap<u64, Value>,
     bytes: usize,
     limit: bool,
+    incompatible: bool,
+    output_format: Option<crate::structured_output::OutputFormat>,
 }
 impl ChatResponsesStream {
-    pub(super) fn new(request: Value, model: String) -> Self {
+    pub(super) fn new(
+        request: Value,
+        model: String,
+        output_format: Option<crate::structured_output::OutputFormat>,
+    ) -> Self {
         Self {
             native: NativeResponsesSse::new(),
-            chat: ChatSse::new(1).expect("one choice"),
+            chat: ChatSse::new(1)
+                .expect("one choice")
+                .with_output_contract(output_format.clone()),
             request,
             model,
             id: String::new(),
@@ -37,6 +45,8 @@ impl ChatResponsesStream {
             tools: BTreeMap::new(),
             bytes: 0,
             limit: false,
+            incompatible: false,
+            output_format,
         }
     }
     pub(super) fn is_done(&self) -> bool {
@@ -47,6 +57,13 @@ impl ChatResponsesStream {
     }
     pub(super) fn hit_resource_limit(&self) -> bool {
         self.limit || self.native.hit_resource_limit() || self.chat.hit_resource_limit()
+    }
+    pub(super) fn incompatible(&self) -> bool {
+        self.incompatible
+    }
+    fn unsupported(&mut self) -> SseError {
+        self.incompatible = true;
+        SseError
     }
     pub(super) fn push(&mut self, bytes: &[u8]) -> Result<Vec<Bytes>, SseError> {
         let events = self.native.push(bytes)?;
@@ -82,7 +99,7 @@ impl ChatResponsesStream {
                         Some("message") if item["role"] == "assistant" => {}
                         Some("reasoning")
                             if item.get("encrypted_content").is_none_or(Value::is_null) => {}
-                        _ => return Err(SseError),
+                        _ => return Err(self.unsupported()),
                     }
                 }
                 "response.output_text.delta"
@@ -124,12 +141,13 @@ impl ChatResponsesStream {
                 }
                 "response.completed" | "response.incomplete" => {
                     let final_chat = chat_responses::result(&event["response"], &self.model)
-                        .map_err(|_| SseError)?;
-                    if !response_validation::valid_result_with_params(
+                        .map_err(|_| self.unsupported())?;
+                    if !response_validation::valid_result_with_contract(
                         Endpoint::Chat,
                         &self.request,
                         &BTreeMap::new(),
                         &final_chat,
+                        self.output_format.as_ref(),
                     ) {
                         return Err(SseError);
                     }
@@ -174,7 +192,7 @@ impl ChatResponsesStream {
                 | "response.reasoning_summary_part.added"
                 | "response.reasoning_summary_part.done"
                 | "response.reasoning_summary_text.done" => {}
-                _ => return Err(SseError),
+                _ => return Err(self.unsupported()),
             }
             if let Some(delta) = delta {
                 self.emit(self.chunk(delta, Value::Null), &mut output)?;

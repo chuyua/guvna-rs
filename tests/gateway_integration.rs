@@ -5552,7 +5552,7 @@ async fn sse_only_fallback_restores_original_large_stream_options_before_backup(
 
 #[tokio::test]
 async fn responses_text_format_maps_all_supported_types_to_real_upstream_payloads() {
-    let (url, seen) = start_format_probe(r#"{"ok":true}"#).await;
+    let (url, seen) = start_format_probe(r#"{"large":12345678901234567890}"#).await;
     let app = make_app(&url, &url);
     let schema = json!({
         "type":"json_schema",
@@ -5589,7 +5589,7 @@ async fn responses_text_format_maps_all_supported_types_to_real_upstream_payload
         extras["input"] = json!("hello");
         let (status, value) = call(app.clone(), responses_stream_req(extras)).await;
         assert_eq!(status, StatusCode::OK, "{value}");
-        assert_eq!(value["output_text"], r#"{"ok":true}"#);
+        assert_eq!(value["output_text"], r#"{"large":12345678901234567890}"#);
         let latest = seen.lock().await.last().unwrap().clone();
         assert_eq!(latest["response_format"], expected);
         assert!(
@@ -7248,17 +7248,18 @@ async fn auto_candidate_default_override_cache_never_routes_oversized_alias() {
             auto_request(path, "client", implicit.clone()),
         )
         .await;
-        assert_eq!(
-            status,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "{path}: {response}"
-        );
+        assert_eq!(status, StatusCode::OK, "{path}: {response}");
+        let mut oversized = implicit.clone();
+        oversized["max_completion_tokens"] = json!(64000);
+        let (status, response) =
+            call(router.clone(), auto_request(path, "client", oversized)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
         assert_eq!(response["error"]["code"], "auto_no_eligible_candidate");
     }
     assert_eq!(
         hits.load(Ordering::SeqCst),
-        2,
-        "two oversized max_completion_tokens requests must be rejected before networking"
+        4,
+        "only the actual oversized caller budgets must be rejected before networking"
     );
 }
 

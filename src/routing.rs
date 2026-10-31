@@ -15,6 +15,18 @@ const AUTO_CACHE_CAPACITY: usize = 128;
 const AUTO_CACHE_TTL: Duration = Duration::from_secs(30);
 const CONTEXT_SAFETY_MARGIN_PERCENT: usize = 20;
 
+pub(crate) fn is_output_token_field(name: &str) -> bool {
+    matches!(
+        name,
+        "max_tokens" | "max_completion_tokens" | "max_output_tokens"
+    )
+}
+pub(crate) fn has_output_token_field(request: &Value) -> bool {
+    ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+        .iter()
+        .any(|name| request.get(name).is_some())
+}
+
 /// Only well-known Chat request features are examined; no text or image bytes are retained.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AutoRequirements {
@@ -730,6 +742,7 @@ fn auto_candidate_eligible_for_request(
         return false;
     }
     let effective = |name: &str| request.get(name).or_else(|| candidate.params.get(name));
+    let caller_tokens = has_output_token_field(request);
     // Dispatch always writes the physical model, even when /v1/auto callers
     // omit model entirely. Account for that replacement in the same pass.
     let physical_model_bytes = encoded_json_bytes_of(candidate.model.as_str());
@@ -761,6 +774,7 @@ fn auto_candidate_eligible_for_request(
             .is_some_and(|provider| provider.stream_only);
     for (name, value) in &candidate.params {
         if name != "model"
+            && !(caller_tokens && is_output_token_field(name))
             && !(force_upstream_stream && name == "stream_options")
             && request.get(name).is_none()
         {
@@ -817,13 +831,18 @@ fn auto_candidate_eligible_for_request(
             }
         }
     }
-    // Both aliases can be present when the caller uses one and a candidate
-    // default supplies the other. They are sent upstream as distinct fields;
-    // take the larger bound rather than assuming one silently overrides the
-    // other, which could admit a candidate far beyond its context window.
+    // Caller output limits override every configured token alias. If the
+    // caller sends several aliases itself, reserve the largest explicit one.
     let budgets = ["max_completion_tokens", "max_tokens", "max_output_tokens"]
         .iter()
-        .filter_map(|name| effective(name).and_then(Value::as_u64))
+        .filter_map(|name| {
+            if caller_tokens {
+                request.get(*name)
+            } else {
+                effective(name)
+            }
+            .and_then(Value::as_u64)
+        })
         .map(|tokens| tokens.min(usize::MAX as u64) as usize);
     let output_budget = budgets.max().unwrap_or(1024);
     let context_estimate =
@@ -901,9 +920,10 @@ pub(crate) fn provider_request_eligible(
         return false;
     }
     if let Some(window) = cap.context_tokens {
+        let caller_tokens = has_output_token_field(request);
         let mut bytes = encoded_json_bytes(Some(request));
         for (key, value) in params {
-            if request.get(key).is_none() {
+            if request.get(key).is_none() && !(caller_tokens && is_output_token_field(key)) {
                 bytes = bytes
                     .saturating_add(encoded_json_bytes_of(key.as_str()))
                     .saturating_add(encoded_json_bytes(Some(value)))
@@ -913,7 +933,14 @@ pub(crate) fn provider_request_eligible(
         bytes = bytes.saturating_add(encoded_json_bytes_of(model));
         let output = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
             .iter()
-            .filter_map(|k| effective(k).and_then(Value::as_u64))
+            .filter_map(|k| {
+                if caller_tokens {
+                    request.get(*k)
+                } else {
+                    effective(k)
+                }
+                .and_then(Value::as_u64)
+            })
             .max()
             .unwrap_or(1024);
         if with_context_safety_margin(bytes)
@@ -1333,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_cache_distinguishes_equal_size_requests_overriding_different_defaults() {
+    fn auto_cache_preserves_caller_token_alias_overrides() {
         let explicit = json!({
             "model":"auto",
             "messages":[{"role":"user","content":"hi"}],
@@ -1362,7 +1389,7 @@ mod tests {
         assert_ne!(
             candidate_default_presence(&cfg, &explicit),
             candidate_default_presence(&cfg, &implicit),
-            "only explicit max_tokens must suppress the candidate default"
+            "legacy cache entries may distinguish aliases, while both override the budget"
         );
         assert!(
             cacheable_auto_defaults(&cfg),
@@ -1386,12 +1413,13 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(choose(&explicit)[0].model, "short");
-        assert!(
-            choose(&implicit).is_empty(),
-            "the default max_tokens=1000 makes this otherwise identical request oversized"
+        assert_eq!(
+            choose(&implicit)[0].model,
+            "short",
+            "the other caller alias also overrides configured output defaults"
         );
         assert_eq!(choose(&explicit)[0].model, "short");
-        assert!(choose(&implicit).is_empty());
+        assert_eq!(choose(&implicit)[0].model, "short");
         assert_eq!(cache.state.lock().unwrap().entries.len(), 2);
     }
 
@@ -1685,10 +1713,9 @@ auto:
         let caller_budget =
             json!({"model":"auto","messages":[{"role":"user","content":"hi"}],"max_tokens":64});
         assert_eq!(choose(&cfg, &caller_budget)[0].model, "default-large");
-        // An explicit *other* alias does not replace the candidate's
-        // max_tokens default on the wire; conservative eligibility counts both.
+        // The other caller alias also replaces configured defaults on wire.
         let other_alias = json!({"model":"auto","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":64});
-        assert_eq!(choose(&cfg, &other_alias)[0].model, "fallback");
+        assert_eq!(choose(&cfg, &other_alias)[0].model, "default-large");
 
         cfg.auto.candidates[0].params.remove("max_tokens");
         cfg.auto.candidates[0].supports_tools = Some(false);

@@ -1,0 +1,1014 @@
+{
+  "issue": 152,
+  "pr": 153,
+  "go_baseline": "a640b182cd63e27627c38f9bf6f6e26734158377",
+  "rust_baseline": "1936b53a4eb4c356cb47aa8d734a6063c1973ca8",
+  "counts": {
+    "automated": 59,
+    "contract": 16,
+    "ci": 17,
+    "external": 9
+  },
+  "items": [
+    {
+      "id": "A01",
+      "task": "A01 [已确认缺口] Chat 客户端 → RE-only 供应商：当前 `Endpoint::Chat` 仍使用 `/chat/completions`，没有完整 Chat→Responses 反向桥接。按供应商声明和实际能力实现受控转换，或显式不可用，不得误报兼容。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs"
+      ],
+      "result": "24 格矩阵；Chat→RE 的文本、函数、图片与 JSON/SSE；不支持的控制明确拒绝。"
+    },
+    {
+      "id": "A02",
+      "task": "A02 [已有能力/回归] RE 客户端 → Chat-only 供应商：复测 `input`→`messages`，text output→Responses、`stream:true/false`、函数往返、finish reason、usage 和逻辑 model 字段。",
+      "status": "automated",
+      "evidence": [
+        "tests/gateway_integration.rs"
+      ],
+      "result": "既有 RE→Chat 的 input、函数往返、usage、finish、图像/音频/文件和流式回归。"
+    },
+    {
+      "id": "A03",
+      "task": "A03 [已有能力/回归] RE 客户端 → RE-native 供应商：保留原始 payload、原生 JSON 与 SSE、状态、工具、扩展字段；不得误经 Chat 翻译。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs"
+      ],
+      "result": "native_extensions_are_forwarded_as_one_original_payload；原生失败状态不误记成功。"
+    },
+    {
+      "id": "A04",
+      "task": "A04 [需验证] Chat→RE 与 RE→Chat 的互相 fallback：能力不足、429/5xx、坏 JSON、坏 SSE 时能按语义切候选；绝不可在流式首字节发送后切换。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "混合协议 503 回退、SSE preflight 与首帧后不重放；合法但不可转换输出归因中立。"
+    },
+    {
+      "id": "A05",
+      "task": "A05 [需验证] 支持 Chat-only、RE-only、dual 两种协议都支持的提供商分别建模；同名模型不能因为拥有一个接口便假设另一个接口可用。",
+      "status": "automated",
+      "evidence": [
+        "src/config.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "同一供应商不同物理模型可独立声明 chat_protocol / responses_protocol。"
+    },
+    {
+      "id": "A06",
+      "task": "A06 [需验证] `responses_protocol` 目前偏向“配置项”而非每个模型每个端点能力；制定向后兼容、明确可测的最小能力声明/探测/失败策略，避免运行时盲试产生误惩罚。",
+      "status": "contract",
+      "evidence": [
+        "docs/RESPONSES_COMPATIBILITY.md"
+      ],
+      "result": "声明驱动，不自动盲探测协议；缺省保留旧行为，已知不兼容提前过滤或 501。"
+    },
+    {
+      "id": "A07",
+      "task": "A07 [已确认行为，需测试] `has_native` 当前扫描全局所有供应商，而不是请求链/Auto 候选；测试“全局存在 native、当前目标链全为 Chat”的 native-only 请求能给正确错误而非越链路由/模糊 502。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs"
+      ],
+      "result": "全局存在 native 但选中 chat_only 链时，原生功能 501，双方均无生成 HTTP。"
+    },
+    {
+      "id": "A08",
+      "task": "A08 [需验证] 请求工具、图像、音频、JSON schema、reasoning、长上下文、输出 token 预算等要求，应在发 HTTP 前过滤不兼容供应商（含 Chat→RE、RE→Chat、Auto/命名链）。",
+      "status": "automated",
+      "evidence": [
+        "src/routing.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "Auto/命名链/前缀执行模型能力过滤；未知能力仍由供应商验证，不伪称已探测全部模型。"
+    },
+    {
+      "id": "A09",
+      "task": "A09 [需验证] `model:auto`、`/v1/auto`、前缀模型、命名链在 Chat 与 RE 两个客户端协议下保持完全一致的路由优先级与错误处理。",
+      "status": "automated",
+      "evidence": [
+        "tests/gateway_integration.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "Auto 别名、前缀、命名链与原生模型回归；RE-only Decider 真正改变业务候选顺序。"
+    },
+    {
+      "id": "A10",
+      "task": "A10 [需验证] 分别测试有/无 provider native 能力、有/无 `stream_only`、双向桥接的所有 `stream=true/false` 组合，特别是 native SSE→非流式 JSON 的能力缺口/明确拒绝。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs"
+      ],
+      "result": "2 客户端 × 3 供应商协议 × 2 stream_only × 2 stream = 24 种组合。"
+    },
+    {
+      "id": "A11",
+      "task": "A11 [需验证] Chain step 默认参数不能跨协议污染；`max_tokens` / `max_completion_tokens` / `max_output_tokens`、`response_format` / `text.format` 的优先级、转换和资源预算正确。",
+      "status": "automated",
+      "evidence": [
+        "src/dispatch.rs",
+        "src/routing.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "调用者 token 别名覆盖较大链默认值；预算与实际注入一致；native 默认格式/推理正确映射。"
+    },
+    {
+      "id": "A12",
+      "task": "A12 [需验证] 各转换路径保留并归一化恰当的错误码、上游 request id、finish status、refusal、incomplete、usage、输出结构；不接受“有文字即成功”。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "failed/incomplete/refusal、usage 和工具结构回归；HTTP 错误消息继续脱敏，不透传任意供应商错误文本。"
+    },
+    {
+      "id": "A13",
+      "task": "A13 [需验证] 不能等价转换的托管工具、服务端状态、加密推理项、部分多模态输出应选 native 或明确 4xx/501；不允许安静删掉参数继续调用。",
+      "status": "contract",
+      "evidence": [
+        "docs/RESPONSES_COMPATIBILITY.md"
+      ],
+      "result": "托管工具/状态/加密项选择 native；Chat 无等价表示则明确错误，未新增伪造本地托管服务。"
+    },
+    {
+      "id": "A14",
+      "task": "A14 [需验证] 反向桥接只选可保证协议语义的功能子集，列明禁止映射项；不可把 Chat 的多 choices 假称 RE 多输出，也不可伪造模型 token/usage。",
+      "status": "automated",
+      "evidence": [
+        "src/chat_responses.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "单 choice、实际 usage、不兼容输出 501 且不惩罚供应商；原生 phase/多 message/加密输出不静默降级。"
+    },
+    {
+      "id": "A15",
+      "task": "A15 [需验证] 按客户端端点 × 供应商协议 × stream 模式 × 工具/多模态 × 正常/失败建立可执行兼容矩阵和服务端 mock；证据应落在 CI。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs",
+        ".github/workflows/ci.yml"
+      ],
+      "result": "协议矩阵、真实 HTTP mock、SDK 与故障回归均接入 CI。"
+    },
+    {
+      "id": "B01",
+      "task": "B01 [已确认缺口] `GET /v1/responses/{response_id}`：按响应 ID 查回真实归属的上游响应；不存在/过期/上游不支持时明确错误。",
+      "status": "automated",
+      "evidence": [
+        "src/responses_lifecycle.rs",
+        "scripts/sdk_smoke.py",
+        "scripts/sdk_smoke.cjs"
+      ],
+      "result": "GET retrieve 仅访问已绑定账号并归一化逻辑 model。"
+    },
+    {
+      "id": "B02",
+      "task": "B02 [已确认缺口] `DELETE /v1/responses/{response_id}`：遵守上游删除语义与返回契约；不能凭空宣布删除成功。",
+      "status": "automated",
+      "evidence": [
+        "src/responses_lifecycle.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "真实 DELETE 204 或删除对象验证成功后才移除响应索引。"
+    },
+    {
+      "id": "B03",
+      "task": "B03 [已确认缺口] `POST /v1/responses/{response_id}/cancel`：仅可取消符合上游语义的后台任务，保留状态及幂等/错误处理。",
+      "status": "automated",
+      "evidence": [
+        "src/responses_lifecycle.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "只有 background:true 创建的响应可取消；供应商最终决定状态语义。"
+    },
+    {
+      "id": "B04",
+      "task": "B04 [已确认缺口] `GET /v1/responses/{response_id}/input_items`：分页、limit/order/after/before 等支持/不支持边界与错误语义可测试。",
+      "status": "automated",
+      "evidence": [
+        "scripts/sdk_smoke.py",
+        "scripts/sdk_smoke.cjs"
+      ],
+      "result": "真实 input_items 分页参数和 list 解析；不合成历史输入。"
+    },
+    {
+      "id": "B05",
+      "task": "B05 [已确认缺口] `POST /v1/responses/input_tokens`：选择对应原生上游；无法精确计数时显式拒绝，不要伪造 tokenizer 精确值。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs"
+      ],
+      "result": "原生 input_tokens 精确转发；Chat-only 501，不返回估算冒充精确值。"
+    },
+    {
+      "id": "B06",
+      "task": "B06 [已确认缺口] `previous_response_id` 和 `conversation` 跨不同 HTTP 请求绑定原始供应商/逻辑模型，当前 `pinned_native_provider` 仅在单次候选遍历内有效；防止下一轮路由去另一个厂商的状态库。",
+      "status": "automated",
+      "evidence": [
+        "src/response_routes.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "跨 HTTP 请求绑定 provider/model/credential/client；失败不越供应商或换账号。"
+    },
+    {
+      "id": "B07",
+      "task": "B07 [需验证] `conversation` 字符串/对象 ID、`previous_response_id` 冲突与空值正确按官方 schema 处理。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs"
+      ],
+      "result": "已登记 conversation 字符串/单 id 对象，previous/conversation 冲突、未知状态与 null 边界。"
+    },
+    {
+      "id": "B08",
+      "task": "B08 [需验证] 路由绑定可使用有限大小、TTL、有清理机制的映射；若要求重启后连续支持则设计小型 SQLite 持久化，先核实需求，不存敏感 token、不无限增长。",
+      "status": "contract",
+      "evidence": [
+        "src/response_routes.rs",
+        "docs/RESPONSES_COMPATIBILITY.md"
+      ],
+      "result": "1024 条、1h、按需清理；不持久化敏感内容，重启/过期明确 404；不宣称重启连续托管态。"
+    },
+    {
+      "id": "B09",
+      "task": "B09 [需验证] 多厂商原生响应 ID 冲突、外部伪造 ID、用户传入未登记 ID、错误 provider 命中、防越权/泄露路由，均有对抗测试。",
+      "status": "automated",
+      "evidence": [
+        "src/response_routes.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "ID 冲突原子检查、客户端隔离、未知 ID 无网络、外部加密 item 拒绝。"
+    },
+    {
+      "id": "B10",
+      "task": "B10 [需验证] 原生 `store:true`、`background:true`、`queued/in_progress/completed/failed/cancelled` 的创建→查询→取消/删除全流程。",
+      "status": "automated",
+      "evidence": [
+        "scripts/sdk_smoke.py",
+        "scripts/sdk_smoke.cjs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "background queued→retrieve→cancel→delete 原生工作流；不从非终态伪造完成。"
+    },
+    {
+      "id": "B11",
+      "task": "B11 [需验证] Chat-only `store:true`、后台托管、会话 ID 不可假装由 Chat 代理实现；无等效持久态则 501 或路由 native。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs"
+      ],
+      "result": "Chat-only store/background/托管工具无法满足时 501。"
+    },
+    {
+      "id": "B12",
+      "task": "B12 [需验证] Native JSON/SSE 输出的 response id/状态绑定只在验证成功后写入，失败/客户端取消不能污染索引。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs"
+      ],
+      "result": "有效终态后才登记；SSE 失败、EOF、客户端取消不产生成功索引。"
+    },
+    {
+      "id": "B13",
+      "task": "B13 [需验证] 流式响应 ID、`response.created` 与终态事件一致性，以及超时后的状态查询与取消行为。",
+      "status": "contract",
+      "evidence": [
+        "docs/RESPONSES_COMPATIBILITY.md",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "SSE created/terminal ID 一致；流终态前管理长任务使用非流式 background 创建取得已验证 ID。"
+    },
+    {
+      "id": "B14",
+      "task": "B14 [需验证] `include`、`prompt`、`context_management` 等原生字段直通；未支持或不兼容的供应商必须拒绝。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs"
+      ],
+      "result": "include/prompt/context_management/reasoning 扩展和 MCP 参数深度相等直通测试。"
+    },
+    {
+      "id": "B15",
+      "task": "B15 [需验证] Chat 桥接的 stateless `store:false`、不依赖服务端状态的多轮 output replay 仍然可用；前一轮响应不能因跨供应商切换而丢掉工具结果。",
+      "status": "automated",
+      "evidence": [
+        "tests/gateway_integration.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "stateless output replay、函数结果与原生加密/compaction 回放；原账号不可用时不跨厂商重放。"
+    },
+    {
+      "id": "C01",
+      "task": "C01 [需验证] `input` 字符串、简化 message、完整 message、assistant replay、混排多个 item 的次序与所有角色。",
+      "status": "automated",
+      "evidence": [
+        "src/responses.rs",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "字符串、简化/完整 message、角色与混排 item 的既有解析/回放测试。"
+    },
+    {
+      "id": "C02",
+      "task": "C02 [需验证] `input_text`、`output_text`、refusal、reasoning/summary/encrypted content；不吞隐藏非文本项。",
+      "status": "automated",
+      "evidence": [
+        "tests/gateway_integration.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "文本/refusal/推理摘要/加密 item；未知非文本内容不以空串成功。"
+    },
+    {
+      "id": "C03",
+      "task": "C03 [已有能力/回归] 图片 URL、base64 data URI、`detail=auto/low/high/original`、多图多段交错、超大图内存与非法字段 fail closed。",
+      "status": "automated",
+      "evidence": [
+        "tests/gateway_integration.rs"
+      ],
+      "result": "图片 URL/data URI、四种 detail、交错多段和非法输入回归。"
+    },
+    {
+      "id": "C04",
+      "task": "C04 [需验证] 图片 `file_id` 仅在目标原生上游确实拥有该文件时转发；跨厂商 ID 禁止盲发；Chat-only 不能空替代。",
+      "status": "automated",
+      "evidence": [
+        "src/native_files.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "Files 元数据同凭据验证；foreign ID 无生成请求，owned ID 才发给该账号。"
+    },
+    {
+      "id": "C05",
+      "task": "C05 [已有能力/回归] 音频输入 wav/mp3、坏 base64、流/非流、供应商能力过滤；音频输出/实时特性无法实现时明确拒绝。",
+      "status": "contract",
+      "evidence": [
+        "tests/gateway_integration.rs",
+        "docs/RESPONSES_COMPATIBILITY.md"
+      ],
+      "result": "wav/mp3 输入回归；音频输出由 native 供应商处理，Chat 桥接不能等价则拒绝。"
+    },
+    {
+      "id": "C06",
+      "task": "C06 [已有能力/回归] PDF/file_data 内联；补测 `file_url`、`file_id`、`filename`、`detail`、大文件及跨厂商所有权。",
+      "status": "contract",
+      "evidence": [
+        "src/native_files.rs",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "内联 PDF/file_data 已测；file_url 走原生；file_id 按账号验证；超限沿用体积门禁。"
+    },
+    {
+      "id": "C07",
+      "task": "C07 [需验证] 视频帧、图像生成、音频生成及其他原生 output item 类型：原样直通 native，桥接无法等价时不伪装。",
+      "status": "contract",
+      "evidence": [
+        "docs/RESPONSES_COMPATIBILITY.md",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "原生图像生成/视频等 item 原样转发；非等价 Chat 输出明确拒绝。真实供应商能力仍需 G06。"
+    },
+    {
+      "id": "C08",
+      "task": "C08 [已有能力/回归] 函数声明 `strict/parameters`、工具选择 `auto/none/required`、指定函数、并行工具调用，JSON 参数准确性。",
+      "status": "automated",
+      "evidence": [
+        "tests/gateway_integration.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "strict/parameters、指定和并行函数、工具分片与参数 JSON 回归。"
+    },
+    {
+      "id": "C09",
+      "task": "C09 [需验证] 内建工具（web_search/file_search/code_interpreter/computer/image_generation/MCP 等）及 `tool_choice.allowed_tools`：仅给真实支持的原生上游。",
+      "status": "contract",
+      "evidence": [
+        "docs/RESPONSES_COMPATIBILITY.md",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "内建工具/allowed_tools 只走声明的原生接口，网关不自行执行。具体模型托管工具由上游验证。"
+    },
+    {
+      "id": "C10",
+      "task": "C10 [已有能力/回归] 函数工具输出 `function_call_output` 和上一轮 `function_call` 能回放；重复 call_id、待完成调用、非法参数拒绝。",
+      "status": "automated",
+      "evidence": [
+        "tests/gateway_integration.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "完整 function_call/output 回放，重复 call_id/非法参数与截断工具结果回归。"
+    },
+    {
+      "id": "C11",
+      "task": "C11 [需验证] Response status `completed/incomplete/failed`、`incomplete_details.reason`、refusal 与安全过滤，不把被截断的工具调用当作完成。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "JSON/SSE failed/incomplete/refusal 不伪装 completed；截断参数保持 incomplete。"
+    },
+    {
+      "id": "C12",
+      "task": "C12 [需验证] `text.format` 的 `text/json_object/json_schema`、严格模式与拒绝的真实行为；不能只检测 JSON 外形。",
+      "status": "automated",
+      "evidence": [
+        "src/structured_output.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "标准 JSON Schema 校验 required/type/enum/refs/大整数；八条协议/stream 路径的真实类型错配回退。"
+    },
+    {
+      "id": "C13",
+      "task": "C13 [已有能力/回归] `temperature/top_p/max_output_tokens>=16/parallel_tool_calls`、null/省略差异、`top_logprobs` 约束与上游处理。",
+      "status": "automated",
+      "evidence": [
+        "src/responses.rs",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "nullable 控制、max_output_tokens>=16、采样范围、parallel_tool_calls、top_logprobs 范围。"
+    },
+    {
+      "id": "C14",
+      "task": "C14 [需验证] `service_tier`、`safety_identifier`、`prompt_cache_key`、缓存保留、metadata、`reasoning.effort` 的取值、保真和模型限制。",
+      "status": "contract",
+      "evidence": [
+        "src/responses.rs",
+        "docs/RESPONSES_COMPATIBILITY.md"
+      ],
+      "result": "可映射的安全/缓存/service_tier/effort 保留；原生扩展直通；模型特定限制由供应商验证。"
+    },
+    {
+      "id": "C15",
+      "task": "C15 [需验证] `stream_options`、`include`、usage 细分、logprobs、缓存/音频 token、logical model ID 及原生对象扩展字段。",
+      "status": "automated",
+      "evidence": [
+        "src/response_validation.rs",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "usage 细分/总量一致性、logprobs 不静默丢失、logical model JSON/SSE 一致。"
+    },
+    {
+      "id": "C16",
+      "task": "C16 [需验证] API schema 如有新增/弃用项，采用官方最新文档建逐字段“native透传/Chat映射/明确不支持”表，不把所有字段硬编码入转换器。",
+      "status": "contract",
+      "evidence": [
+        "docs/RESPONSES_COMPATIBILITY.md"
+      ],
+      "result": "当前官方字段采用 native 原样透传/受控 Chat 映射/明确不支持表；新增 compact，WebSocket 鉴权后 501。"
+    },
+    {
+      "id": "C17",
+      "task": "C17 [需验证] OpenAI 官方 Python/JS SDK 使用 `responses.create/retrieve/cancel/input_items` 端到端验收；SDK 的重试/错误对象/stream 解析都符合预期。",
+      "status": "ci",
+      "evidence": [
+        "scripts/sdk_smoke.py",
+        "scripts/sdk_smoke.cjs",
+        ".github/workflows/ci.yml"
+      ],
+      "result": "官方 Python3.42/Node7.47 SDK create/retrieve/cancel/delete/list/tokens/compact/双协议 stream，归档 sdk-results.json。"
+    },
+    {
+      "id": "D01",
+      "task": "D01 [需验证] SSE 帧跨 chunk 截断、CRLF、空 delta、null、注释/心跳、Unicode 分割、duplicate key、事件越序/重复。",
+      "status": "contract",
+      "evidence": [
+        "src/sse.rs",
+        "src/native_responses_sse.rs"
+      ],
+      "result": "跨 chunk、CRLF、心跳、Unicode、事件顺序已有测试；重复 response.created 已拒绝。JSON 对象重复键遵循 serde_json 的最后值语义，不宣称全输入重复键拒绝。"
+    },
+    {
+      "id": "D02",
+      "task": "D02 [需验证] 流式 `[DONE]` 先于 finish、缺终帧、额外终帧、部分 tool args、response.failed/incomplete/refusal 终态不可误报成功。",
+      "status": "automated",
+      "evidence": [
+        "tests/gateway_integration.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "缺终帧、重复终帧、提前 DONE、截断工具、failed/incomplete/refusal 回归。"
+    },
+    {
+      "id": "D03",
+      "task": "D03 [需验证] 首个下游输出前可安全回退；首帧后网络中断绝不重放到另一供应商；不会重复计费/重复工具执行。",
+      "status": "automated",
+      "evidence": [
+        "tests/gateway_integration.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "首事件 preflight 可回退；下游开始后不再调用备用供应商。"
+    },
+    {
+      "id": "D04",
+      "task": "D04 [需验证] SSE-only→JSON 聚合边界，choice 数、tool index、预算溢出、输出格式、JSON 拒绝、坏流回退。",
+      "status": "automated",
+      "evidence": [
+        "src/chat_aggregate.rs",
+        "tests/gateway_integration.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "Chat/原生聚合上限、choices/tool index、JSON/schema、坏流回退与合法终态。"
+    },
+    {
+      "id": "D05",
+      "task": "D05 [需验证] 单请求/单步/流 idle/流总时长/上传超时同时到期，优先级、断连与资源归还。",
+      "status": "automated",
+      "evidence": [
+        "tests/gateway_integration.rs"
+      ],
+      "result": "请求体、总 walk、聚合 idle/lifetime、SSE progress 和准入取消已有对抗回归。"
+    },
+    {
+      "id": "D06",
+      "task": "D06 [需验证] 慢上游持续输出时熔断器 probe 占用与恢复；回归 #142，不再有永久恢复饥饿。",
+      "status": "automated",
+      "evidence": [
+        "tests/gateway_integration.rs",
+        "src/circuit.rs"
+      ],
+      "result": "#142 慢 native JSON / 长流的 probe 续租和恢复回归。"
+    },
+    {
+      "id": "D07",
+      "task": "D07 [需验证] 401/403/429/5xx/DNS/TLS/连接超时/读超时/无效 2xx 分类正确，钥匙隔离与模型降权不串。",
+      "status": "automated",
+      "evidence": [
+        "src/outcome.rs",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "401/403/429/5xx、坏2xx、transport/timeout 分类；密钥隔离和健康粒度保持分离。"
+    },
+    {
+      "id": "D08",
+      "task": "D08 [需验证] 多密钥轮换、租约、并发用尽、熔断恢复、退避抖动与 retry budget，防止重试风暴与透支免费供应商额度。",
+      "status": "automated",
+      "evidence": [
+        "src/keypool.rs",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "多密钥各尝试一次、429 Retry-After、租约 epoch、有限候选预算；不进行无界重试。"
+    },
+    {
+      "id": "D09",
+      "task": "D09 [需验证] client disconnect、超时取消、早关 SSE、服务进程退出、半开连接均释放任务、凭据和信号量，归因中立。",
+      "status": "automated",
+      "evidence": [
+        "src/chat_stream.rs",
+        "tests/gateway_integration.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "客户端取消、早关/坏流、负载额度释放、凭据健康中立回归。"
+    },
+    {
+      "id": "D10",
+      "task": "D10 [需验证] 复查 #143–#149 关闭事项在跨协议/Auto/大响应组合下的防回归测试，而不是重开已修复功能。",
+      "status": "automated",
+      "evidence": [
+        "tests/gateway_integration.rs",
+        "src/telemetry.rs"
+      ],
+      "result": "已关闭 #143–#149 对应跨模块/SSE/聚合/SQLite/回放回归继续保留。"
+    },
+    {
+      "id": "D11",
+      "task": "D11 [需验证] 非法 Content-Length、chunked 超限、巨型 JSON/嵌套、base64 体积膨胀、SSE 行长度上限及压缩体积差异。",
+      "status": "ci",
+      "evidence": [
+        "scripts/quality_gate.py",
+        "src/gateway.rs"
+      ],
+      "result": "伪造Content-Length、chunk和body上限、嵌套与大payload；压缩传输未启用，8MiB入站/32MiB JSON出站不扩大。"
+    },
+    {
+      "id": "D12",
+      "task": "D12 [需验证] 供应商返回 HTTP 200 但 JSON/SSE 损坏、状态不合法、空 body、异常 content-type、无限心跳，不得记成功。",
+      "status": "automated",
+      "evidence": [
+        "src/response_validation.rs",
+        "src/native_responses_sse.rs",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "空/坏JSON、坏SSE、无限心跳、非终态和失败状态不计成功。"
+    },
+    {
+      "id": "D13",
+      "task": "D13 [需验证] 上游慢且频繁打断时，锁竞争、排队上限、背景任务数量、缓冲区保留、通道关闭和 backpressure。",
+      "status": "ci",
+      "evidence": [
+        "scripts/quality_gate.py",
+        "scripts/lowload_gate.py"
+      ],
+      "result": "128准入、8大payload、4聚合、2大回复、4schema、1后台selector；压力/取消/背压归档。"
+    },
+    {
+      "id": "D14",
+      "task": "D14 [需验证] auth 保护覆盖所有新增 Responses GET/DELETE/cancel/list/tokens 路由，错误消息不暴露 provider key、请求内容或私有 URL。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "全部新增路由鉴权、客户端身份隔离、未知ID无探测；供应商HTTP错误文本脱敏。"
+    },
+    {
+      "id": "D15",
+      "task": "D15 [需验证] 出站 URL 拼接、重定向/SSRF/loopback/host 混淆、TLS 校验及不可信供应商输出透传，按现有受信配置边界审计。",
+      "status": "contract",
+      "evidence": [
+        "src/gateway.rs",
+        "src/native_files.rs",
+        "docs/RESPONSES_COMPATIBILITY.md"
+      ],
+      "result": "供应商URL为受信配置；禁重定向，rustls默认校验，文件ID按URL path segment编码；真实TLS/IPv6见G06。"
+    },
+    {
+      "id": "D16",
+      "task": "D16 [需验证] 流式终态后恰好一次指标/遥测/health 记账，取消不得算供应商故障，坏响应不能重置失败计数。",
+      "status": "automated",
+      "evidence": [
+        "src/chat_stream.rs",
+        "src/telemetry.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "终态恰好一次；native failed 与不可转换输出不重置成功计数或错误隔离凭据。"
+    },
+    {
+      "id": "D17",
+      "task": "D17 [需验证] 重启中断、异常退出、kill 后再次启动：本地 Socket、chain 文件、SQLite 锁/事务恢复无损且无悬挂进程。",
+      "status": "ci",
+      "evidence": [
+        "src/control_socket.rs",
+        "src/chain_store.rs",
+        "src/telemetry.rs",
+        "scripts/quality_gate.py"
+      ],
+      "result": "Ubuntu本机Socket、重启链恢复、SQLite锁/事务和CLI门禁；真实systemd/kill重启另见G06。"
+    },
+    {
+      "id": "D18",
+      "task": "D18 [需验证] 高并发热路径中遍历候选、序列化 JSON、重复 clone/分配、同步 SQLite/锁调用不得阻塞 Tokio reactor。",
+      "status": "ci",
+      "evidence": [
+        "scripts/lowload_gate.py",
+        "src/dispatch.rs",
+        "src/structured_output.rs"
+      ],
+      "result": "同环境A/B及CPU/RSS/fd/线程数据；无同步SQL热路径；schema结构和并发受限，无网络/文件引用。"
+    },
+    {
+      "id": "E01",
+      "task": "E01 [已有能力/回归] 配置 providers/chains、前缀直通、模型列表、未知模型、命名链、链默认参数 caller-wins。",
+      "status": "automated",
+      "evidence": [
+        "src/routing.rs",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "模型列表、未知模型、前缀namespace、命名链与caller-wins；Go逐文件对照见下表。"
+    },
+    {
+      "id": "E02",
+      "task": "E02 [已有能力/回归] 本机 CLI `serve/status/logs/chains`、本地 Socket 权限、认证和 JSON 输出，不重新引入远程管理。",
+      "status": "ci",
+      "evidence": [
+        "src/main.rs",
+        "src/control_socket.rs",
+        "scripts/quality_gate.py"
+      ],
+      "result": "serve/status/logs/chains、本机Socket权限和JSON输出；不新增远程管理。"
+    },
+    {
+      "id": "E03",
+      "task": "E03 [已有能力/回归] SQLite 异步批量遥测、请求结果和供应商质量统计，写入压力下绝不能拖慢请求处理。",
+      "status": "automated",
+      "evidence": [
+        "src/telemetry.rs",
+        "scripts/quality_gate.py"
+      ],
+      "result": "SQLite有界异步批量写、失败与健康记录、压满/锁/配额回归。"
+    },
+    {
+      "id": "E04",
+      "task": "E04 [已有能力/回归] Auto Decider、静态回退、cache TTL、Shadow/Telemetry 模式及显式批准后切换；对照 Go 行为与可回滚性。",
+      "status": "automated",
+      "evidence": [
+        "src/auto_decider.rs",
+        "src/telemetry_rank.rs",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "静态回退、TTL缓存、Shadow、显式批准Telemetry模式；原生Decider也复用业务walk。"
+    },
+    {
+      "id": "E05",
+      "task": "E05 [需验证] Go `ctxsize` 注册与 Rust 模型能力表差异，缺省估计、图片/音频 token 预算和输出预留。",
+      "status": "automated",
+      "evidence": [
+        "src/model_capabilities.rs",
+        "src/routing.rs"
+      ],
+      "result": "Go a640b18 的ctxsize/vision内置表与Rust对应；unknown=8192；显式配置可覆盖，不把估计伪装精确token计数。"
+    },
+    {
+      "id": "E06",
+      "task": "E06 [需验证] Auto 候选排序和熔断/隔离/缺配额/恢复优先级；`/v1/auto`、`model:auto`、RE-native 的功能能力过滤。",
+      "status": "automated",
+      "evidence": [
+        "src/routing.rs",
+        "tests/gateway_integration.rs",
+        "tests/responses_protocol.rs"
+      ],
+      "result": "能力/上下文前置过滤，Auto排序/熔断/恢复和缓存回归。"
+    },
+    {
+      "id": "E07",
+      "task": "E07 [需验证] 分组密钥轮换、least-used/sequential、不同失败类别及惩罚时长与 Go 兼容。",
+      "status": "contract",
+      "evidence": [
+        "src/keypool.rs",
+        "docs/RESPONSES_COMPATIBILITY.md"
+      ],
+      "result": "轮换策略/故障类别对应；不承诺所有Go配置和冷却常数逐字一致，延续既有Rust显式配置契约。"
+    },
+    {
+      "id": "E08",
+      "task": "E08 [需验证] Go Responses renderer/translator 对照 Rust RE 正反向桥接、工具分片、refusal、截断、usage；以官方 API 为正确性主标准。",
+      "status": "automated",
+      "evidence": [
+        "src/responses.rs",
+        "src/chat_responses.rs",
+        "src/sse.rs"
+      ],
+      "result": "正反向转换、函数分片/refusal/截断/usage回归；官方协议优先于Go旧桥接限制。"
+    },
+    {
+      "id": "E09",
+      "task": "E09 [需验证] Go Embeddings 支持的字符串/批量/token 输入及 `dimensions`/`encoding_format`，流式供应商的边界。",
+      "status": "automated",
+      "evidence": [
+        "src/response_validation.rs",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "Embeddings文本、批量、token数组、维度、float/base64及异常向量回归；不启用流式Embedding。"
+    },
+    {
+      "id": "E10",
+      "task": "E10 [需验证] Chain 原子修改/落盘/重启恢复、并发修改和错误回滚，不产生半写入配置。",
+      "status": "ci",
+      "evidence": [
+        "src/chain_store.rs",
+        "src/control_socket.rs",
+        "scripts/quality_gate.py"
+      ],
+      "result": "原子落盘、并发在线修改、错误回滚、重启恢复，由Ubuntu文件系统验证。"
+    },
+    {
+      "id": "E11",
+      "task": "E11 [需验证] 运行时指标、日志环形缓存、低资源部署和故障观察；不为了“表面对齐”引入 Go 历史冗余功能。",
+      "status": "ci",
+      "evidence": [
+        "src/metrics.rs",
+        "src/ops_log.rs",
+        "scripts/quality_gate.py"
+      ],
+      "result": "有界日志与无标签指标、低资源/压力观测；不引入Go远程管理历史表面功能。"
+    },
+    {
+      "id": "E12",
+      "task": "E12 [需验证] 逐文件建立 Go SHA→Rust SHA 的功能证据表：已等价/有意不做/确实缺失/需要真实供应商验证。",
+      "status": "contract",
+      "evidence": [
+        "docs/audit/ISSUE152_ACCEPTANCE.md"
+      ],
+      "result": "固定 Go a640b18 → Rust PR151 1936b53 → PR153最终测试SHA；下面列目录/文件责任对照，不声称Go每条分支逐字等价。"
+    },
+    {
+      "id": "F01",
+      "task": "F01 [已有能力/回归] 保持 Ubuntu 24.04 Release 质量门禁：2000 请求、64 clients、idle RSS ≤16 MiB、peak RSS ≤48 MiB、RSS growth ≤6 MiB；不能因新功能放松阈值。",
+      "status": "ci",
+      "evidence": [
+        ".github/workflows/ci.yml",
+        "scripts/quality_gate.py"
+      ],
+      "result": "原16/48/6MiB、2000请求64clients门禁不变；近限大payload独立256/128MiB门禁也不放宽。"
+    },
+    {
+      "id": "F02",
+      "task": "F02 [需验证] 真实单用户低负载：启动、闲置、串行 Chat、串行 RE、串行混合 Auto、长连接闲置，实测 CPU/RSS/fd 与 p50/p95 延迟。",
+      "status": "ci",
+      "evidence": [
+        "scripts/lowload_gate.py"
+      ],
+      "result": "串行Chat/RE-bridge/RE-native/Auto，启动和前后闲置CPU/RSS/fd/线程，100请求每通道。"
+    },
+    {
+      "id": "F03",
+      "task": "F03 [需验证] 1/2/4/8/16/64 并发阶梯 + 2000/更长老化轮次，报告稳定期 RSS 斜率、峰值和 429/5xx/超时构成。",
+      "status": "ci",
+      "evidence": [
+        "scripts/lowload_gate.py"
+      ],
+      "result": "1/2/4/8/16/64各200混合请求、2000老化；状态码/延迟/RSS均归档。"
+    },
+    {
+      "id": "F04",
+      "task": "F04 [需验证] 1MiB/8MiB/32MiB 级 text/image/audio/file JSON 与大型 SSE，内存防复制、吞吐、chunk 上限、总体背压。",
+      "status": "contract",
+      "evidence": [
+        "scripts/quality_gate.py",
+        "scripts/lowload_gate.py"
+      ],
+      "result": "1MiB原生输入、7MiB近限8并发、12MiB回复与伪32MiB长度；入站8MiB硬上限，超限不承诺接收。"
+    },
+    {
+      "id": "F05",
+      "task": "F05 [需验证] 供应商大量 429/5xx、慢首 token、慢不断流、断网恢复、DNS 抖动、不可用全部候选情况下内存和重试次数有界。",
+      "status": "ci",
+      "evidence": [
+        "scripts/quality_gate.py",
+        "tests/gateway_integration.rs"
+      ],
+      "result": "429/5xx/坏2xx/慢流/断流/全候选不可用的有限尝试与内存门禁。真实DNS故障恢复另见G06。"
+    },
+    {
+      "id": "F06",
+      "task": "F06 [需验证] SQLite 高写入量、库大小配额、聚合表满、磁盘满/只读、数据库损坏/繁忙、反复重启后的恢复与不阻塞。",
+      "status": "automated",
+      "evidence": [
+        "src/telemetry.rs",
+        "scripts/quality_gate.py"
+      ],
+      "result": "配额、聚合表满、只读/锁/损坏与批量失败单元回归；实际VPS磁盘故障不以mock替代。"
+    },
+    {
+      "id": "F07",
+      "task": "F07 [需验证] Telemetry/Auto 排序缓存 TTL、淘汰、后台任务上界；无业务时 CPU 不自旋。",
+      "status": "automated",
+      "evidence": [
+        "src/auto_decider.rs",
+        "src/routing.rs",
+        "scripts/quality_gate.py"
+      ],
+      "result": "TTL/LRU容量与后台selector上界、失败冷却、idle CPU门禁。"
+    },
+    {
+      "id": "F08",
+      "task": "F08 [需验证] 大 payload 与响应并发时 admission semaphore、四个聚合槽、请求取消和队列超时，避免内存突增。",
+      "status": "ci",
+      "evidence": [
+        "src/dispatch.rs",
+        "scripts/quality_gate.py"
+      ],
+      "result": "四聚合名额、大payload/回复准入、schema独立四槽和取消回收；低资源门禁真实进程执行。"
+    },
+    {
+      "id": "F09",
+      "task": "F09 [需验证] 新状态路由映射必须有容量/TTL 约束，压测长会话/随机 ID 洪泛时不可线性无限增长。",
+      "status": "automated",
+      "evidence": [
+        "src/response_routes.rs",
+        "scripts/lowload_gate.py"
+      ],
+      "result": "1024条索引/ID长度/TTL/冲突单元回归，1200状态ID洪泛测有界增长。"
+    },
+    {
+      "id": "F10",
+      "task": "F10 [需验证] 以本 PR 基准与新提交 Release 二进制进行同环境 A/B 对比；若性能显著退化，定位并修复原因，不凭感觉断言“和 Go 差不多”。",
+      "status": "ci",
+      "evidence": [
+        ".github/workflows/ci.yml",
+        "scripts/lowload_gate.py"
+      ],
+      "result": "同Ubuntu环境构建1936b53与候选Release，保留双方二进制SHA和逐通道p95比值；不是Go性能对比。"
+    },
+    {
+      "id": "F11",
+      "task": "F11 [需验证] 以 p95/p99、任务数、fd 数、错误率、RSS 升幅和 CPU 基线给出数值证据，不做无基准“性能良好”的宣称。",
+      "status": "ci",
+      "evidence": [
+        "scripts/lowload_gate.py",
+        "scripts/quality_gate.py"
+      ],
+      "result": "p50/p95/p99、CPU/RSS/fd/线程与状态码数值报告；线程数不是未测量的Tokio任务数。"
+    },
+    {
+      "id": "G01",
+      "task": "G01 所有 P0 缺口修复；P1 每项必须附明确的“通过证据/确认为不适用并说明兼容契约/保留限制”，发现会影响已宣称功能的缺陷必须修复；P2 可发布后跟踪。",
+      "status": "external",
+      "evidence": [
+        "https://github.com/chuyua/guvna-rs/issues/152"
+      ],
+      "result": "技术回归与有限兼容契约逐项记录；最终发布封板仍受G06–G10外部真实证据约束。"
+    },
+    {
+      "id": "G02",
+      "task": "G02 对每个修复新增最小真实失败复现 + 正常/异常/取消/并发回归测试，删除重复胶水，评审跨模块耦合和遗留分支；不接受只让 CI 变绿的临时绕过。",
+      "status": "automated",
+      "evidence": [
+        "tests/responses_protocol.rs",
+        "src/dispatch.rs"
+      ],
+      "result": "新增真实HTTP失败复现/正常/异常/取消/跨账号测试；翻译模块不拥有独立业务重试循环。"
+    },
+    {
+      "id": "G03",
+      "task": "G03 与最新 `main` 和其余 PR 冲突复核；在唯一 PR #151 分支整合，避免多分支各补同一类 Bug。",
+      "status": "external",
+      "evidence": [
+        "https://github.com/chuyua/guvna-rs/pull/153"
+      ],
+      "result": "用户授权独立PR，目标#151；最终集成到#151和main仍待评审，不自动合并。"
+    },
+    {
+      "id": "G04",
+      "task": "G04 `cargo fmt --all -- --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked`、Release 构建、`guvna --version` 均在 Ubuntu 24.04 的最终发布候选提交上通过。",
+      "status": "ci",
+      "evidence": [
+        ".github/workflows/ci.yml"
+      ],
+      "result": "Ubuntu最终候选fmt/Clippy/test/Release/version必须同SHA通过；tested-source.json记录实际merge checkout。"
+    },
+    {
+      "id": "G05",
+      "task": "G05 Adversarial Linux gate + 双协议交叉/长会话+故障注入 + 资源与老化报告通过，并归档 CI artifact；阈值不得为过 CI 而降低。",
+      "status": "ci",
+      "evidence": [
+        ".github/workflows/ci.yml"
+      ],
+      "result": "质量、协议SDK、低负载A/B三类artifact及故障测试；以最终HEAD对应CI为准。"
+    },
+    {
+      "id": "G06",
+      "task": "G06 真实 Linux x86_64 VPS canary：含 IPv6-only 环境可达性、TLS、反代、systemd/CLI、重启、持久化、有限真实 Chat/RE 供应商；不把本地 mock 当生产验收。",
+      "status": "external",
+      "evidence": [
+        "docs/RESPONSES_COMPATIBILITY.md"
+      ],
+      "result": "真实Linux VPS节点离线，未测试实际供应商/IPv6/TLS/反代/systemd；不得把CI mock勾成VPS canary。"
+    },
+    {
+      "id": "G07",
+      "task": "G07 逐一核对 CI 实际构建 SHA、PR HEAD、合入 main 的 SHA；CI 测试对象与准备发布的源码/产物必须一致。",
+      "status": "external",
+      "evidence": [
+        "tested-source.json (CI artifact)"
+      ],
+      "result": "候选HEAD与CI实际checkout可核验；main合入SHA/发布源码产物需合入后再次核验，当前不存在。"
+    },
+    {
+      "id": "G08",
+      "task": "G08 依据 `.github/workflows/manual-linux-build.yml` 的 main-only 约束，在通过评审后才合并 PR #151；若不能合并则不要虚称可直接从 Draft PR 触发 Release。",
+      "status": "external",
+      "evidence": [
+        ".github/workflows/manual-linux-build.yml"
+      ],
+      "result": "main-only发布约束保留；Draft开发PR未合入main，不能虚称可直接Release。"
+    },
+    {
+      "id": "G09",
+      "task": "G09 手动 `workflow_dispatch`、保持 `stable_release=false`，核对 ELF x86_64、动态库/glibc 依赖、SHA256、版本信息、quality-results.json。",
+      "status": "external",
+      "evidence": [
+        ".github/workflows/manual-linux-build.yml"
+      ],
+      "result": "手动workflow_dispatch、stable_release=false及ELF/glibc/SHA256/quality核对尚未执行。"
+    },
+    {
+      "id": "G10",
+      "task": "G10 手动发布 GitHub pre-release 测试版（不用自动发布，禁止先宣称 stable），下载产物在目标 VPS 做端到端 smoke + 能回滚。",
+      "status": "external",
+      "evidence": [
+        "https://github.com/chuyua/guvna-rs/releases"
+      ],
+      "result": "未发布pre-release；需手动发布后在目标VPS下载、smoke和验证回滚。"
+    },
+    {
+      "id": "G11",
+      "task": "G11 Release notes 列出 Chat→RE / RE→Chat 对应的能力矩阵、明确 fail-closed 场景、已知供应商限制及尚未覆盖的高阶官方 OpenAI 功能。",
+      "status": "contract",
+      "evidence": [
+        "docs/RESPONSES_COMPATIBILITY.md"
+      ],
+      "result": "已准备能力矩阵/限制作为发布说明来源；发布时须随实际tag/产物填写，不预先宣称发布成功。"
+    },
+    {
+      "id": "G12",
+      "task": "G12 仅在合入主线、Linux 验收与发布证据齐全时关闭 #129 与本 Issue；PR 评论链接对应测试、SHA、产物，禁止“关单即代表上线”。",
+      "status": "external",
+      "evidence": [
+        "https://github.com/chuyua/guvna-rs/issues/129",
+        "https://github.com/chuyua/guvna-rs/issues/152"
+      ],
+      "result": "保持开放；仅在main合入、Linux验收与发布证据完整时关闭。"
+    },
+    {
+      "id": "G13",
+      "task": "G13 稳定正式版须另行获得真实 VPS 运行和稳定性证据；本单完成目标为可发布 pre-release，不是无条件宣布生产稳定。",
+      "status": "external",
+      "evidence": [
+        "docs/RESPONSES_COMPATIBILITY.md"
+      ],
+      "result": "稳定版需要另行真实运行证据；本轮交付开发修复和pre-release验收基础，不宣称生产稳定。"
+    }
+  ]
+}

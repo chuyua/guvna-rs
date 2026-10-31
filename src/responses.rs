@@ -173,28 +173,62 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
         "min_context",
         "max_context",
     ];
-    let native_only = value
-        .as_object()
-        .expect("object")
-        .iter()
-        .any(|(key, value)| !value.is_null() && !bridge_fields.contains(&key.as_str()))
-        || value.get("background") == Some(&Value::Bool(true))
-        || value.get("store") == Some(&Value::Bool(true))
-        || value
-            .get("truncation")
-            .is_some_and(|v| !v.is_null() && v != "disabled")
-        || value
-            .get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|tools| tools.iter().any(|tool| tool["type"] != "function"))
-        || value
-            .get("tool_choice")
-            .and_then(Value::as_object)
-            .is_some_and(|choice| choice.get("type").is_some_and(|v| v != "function"))
-        || value
-            .get("reasoning")
-            .and_then(Value::as_object)
-            .is_some_and(|options| options.keys().any(|key| key != "effort"));
+    let native_only =
+        value
+            .as_object()
+            .expect("object")
+            .iter()
+            .any(|(key, value)| !value.is_null() && !bridge_fields.contains(&key.as_str()))
+            || value.get("background") == Some(&Value::Bool(true))
+            || value.get("store") == Some(&Value::Bool(true))
+            || value
+                .get("truncation")
+                .is_some_and(|v| !v.is_null() && v != "disabled")
+            || value
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| tools.iter().any(|tool| tool["type"] != "function"))
+            || value
+                .get("tool_choice")
+                .and_then(Value::as_object)
+                .is_some_and(|choice| choice.get("type").is_some_and(|v| v != "function"))
+            || value
+                .get("reasoning")
+                .and_then(Value::as_object)
+                .is_some_and(|options| options.keys().any(|key| key != "effort"))
+            || value
+                .get("text")
+                .and_then(Value::as_object)
+                .is_some_and(|text| {
+                    text.keys()
+                        .any(|key| !matches!(key.as_str(), "format" | "verbosity"))
+                        || text
+                            .get("format")
+                            .and_then(Value::as_object)
+                            .is_some_and(|format| {
+                                format.keys().any(|key| {
+                                    !["type", "name", "schema", "strict", "description"]
+                                        .contains(&key.as_str())
+                                }) || format.get("type").and_then(Value::as_str).is_some_and(
+                                    |kind| !matches!(kind, "text" | "json_object" | "json_schema"),
+                                )
+                            })
+                })
+                && has_native
+            || has_native
+                && value
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| {
+                        tools.iter().any(|tool| {
+                            tool.as_object().is_some_and(|fields| {
+                                fields.keys().any(|key| {
+                                    !["type", "name", "description", "parameters", "strict"]
+                                        .contains(&key.as_str())
+                                })
+                            })
+                        })
+                    });
     if native_only {
         return handle_native_only(state, value, logical_model, large_payload, permit, context)
             .await;

@@ -32,6 +32,9 @@ def main():
             continuation = client.responses.create(model="demo", input="next", previous_response_id=created.id)
             assert continuation.status == "completed" and continuation.output_text == "hello"
             assert client.responses.input_tokens.count(model="demo", input="sdk").input_tokens == 17
+            compacted = client.responses.compact(model="demo", input=[{"role":"user","content":"sdk"}])
+            assert compacted.object == "response.compaction"
+            assert client.responses.create(model="demo", input=[item.model_dump() for item in compacted.output]).status == "completed"
             with client.responses.create(model="demo", input="sdk", stream=True, store=False) as stream:
                 events = list(stream)
             assert events[0].type == "response.created" and events[-1].type == "response.completed"
