@@ -131,6 +131,7 @@ impl Default for TelemetryRankingConfig {
 pub struct ModelCapabilityOverride {
     pub context_tokens: Option<usize>,
     pub supports_images: Option<bool>,
+    pub supports_audio: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -148,6 +149,7 @@ pub struct AutoCandidate {
     /// None means unknown and preserves legacy routing behavior.
     pub supports_tools: Option<bool>,
     pub supports_images: Option<bool>,
+    pub supports_audio: Option<bool>,
     pub supports_json_schema: Option<bool>,
     /// Go-style candidate defaults: caller fields always take precedence.
     #[serde(default)]
@@ -594,6 +596,7 @@ impl Config {
                     max_context_tokens: None,
                     supports_tools: None,
                     supports_images: None,
+                    supports_audio: None,
                     supports_json_schema: None,
                     params: step.params.clone(),
                 });

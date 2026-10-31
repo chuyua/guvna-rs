@@ -20,6 +20,7 @@ const CONTEXT_SAFETY_MARGIN_PERCENT: usize = 20;
 pub struct AutoRequirements {
     tools: bool,
     images: bool,
+    audio: bool,
     json_schema: bool,
     min_context: usize,
     max_context: Option<usize>,
@@ -43,6 +44,10 @@ impl AutoRequirements {
 
     fn requires_images(self) -> bool {
         self.images
+    }
+
+    fn requires_audio(self) -> bool {
+        self.audio
     }
 }
 
@@ -108,12 +113,30 @@ pub fn auto_requirements(request: &Value) -> AutoRequirements {
                     })
             })
         });
+    let audio = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("type").and_then(Value::as_str) == Some("input_audio")
+                        })
+                    })
+            })
+        });
     let json_schema = request
         .get("response_format")
         .and_then(|value| value.get("type"))
         .and_then(Value::as_str)
         == Some("json_schema");
-    AutoRequirements::from_signals(tools, images, json_schema)
+    AutoRequirements {
+        audio,
+        ..AutoRequirements::from_signals(tools, images, json_schema)
+    }
 }
 
 /// Go-compatible Auto-only window filters. Zero/negative values mean
@@ -600,6 +623,11 @@ fn auto_candidate_eligible(
             .and_then(|entry| entry.supports_images)
             .or_else(|| registry.then_some(!model_capabilities::known_text_only(&candidate.model)))
     });
+    // An explicit negative capability prevents wasting attempts on an
+    // audio-only Responses request. Unknown models remain eligible.
+    let audio_support = candidate
+        .supports_audio
+        .or_else(|| overrides.and_then(|entry| entry.supports_audio));
     let meets_window_bounds = if requirements.min_context > 0 || requirements.max_context.is_some()
     {
         context_limit.is_some_and(|window| {
@@ -613,6 +641,7 @@ fn auto_candidate_eligible(
         && meets_window_bounds
         && (!requirements.tools || candidate.supports_tools != Some(false))
         && (!requirements.requires_images() || image_support != Some(false))
+        && (!requirements.requires_audio() || audio_support != Some(false))
         && (!requirements.json_schema || candidate.supports_json_schema != Some(false))
         && context_limit.is_none_or(|max| context_estimate <= max)
         && input_bytes >= candidate.min_input_bytes
@@ -2075,12 +2104,14 @@ auto:
       priority: 1
       supports_tools: false
       supports_images: false
+      supports_audio: false
       supports_json_schema: false
     - provider: shared
       model: rich
       priority: 2
       supports_tools: true
       supports_images: true
+      supports_audio: true
       supports_json_schema: true
 "#,
         )
@@ -2099,6 +2130,17 @@ auto:
             ]}]
         });
         assert!(auto_requirements(&pdf_request).requires_images());
+        let audio_request = serde_json::json!({
+            "messages":[{"role":"user","content":[
+                {"type":"input_audio","input_audio":{"data":"YQ==","format":"wav"}}
+            ]}]
+        });
+        let audio_requirements = auto_requirements(&audio_request);
+        assert!(audio_requirements.requires_audio());
+        assert!(!audio_requirements.requires_images());
+        let audio_route =
+            resolve_auto_with_requirements(&cfg, 80, 128, audio_requirements, &[]).unwrap();
+        assert_eq!(audio_route[0].model, "rich");
         assert_eq!(
             features,
             AutoRequirements {

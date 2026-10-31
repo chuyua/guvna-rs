@@ -3259,6 +3259,39 @@ async fn responses_input_audio_preserves_chat_wire_for_json_and_sse() {
 }
 
 #[tokio::test]
+async fn responses_auto_audio_skips_explicitly_incompatible_candidate() {
+    let (text_url, text_hits) = start_upstream(StatusCode::OK).await;
+    let (audio_url, audio_hits) = start_upstream(StatusCode::OK).await;
+    let config: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: text\n    type: openai\n    base_url: {text_url}\n    key_env: TEXT\n    models: [plain]\n  - name: audio\n    type: openai\n    base_url: {audio_url}\n    key_env: AUDIO\n    models: [hearing]\nauto:\n  enabled: true\n  candidates:\n    - provider: text\n      model: plain\n      priority: 1\n      supports_audio: false\n    - provider: audio\n      model: hearing\n      priority: 2\n      supports_audio: true\n"
+    )).unwrap();
+    let router = app(AppState::new(
+        config,
+        HashMap::from([
+            ("TEXT".into(), "good".into()),
+            ("AUDIO".into(), "good".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let body = json!({"model":"auto","input":[{"role":"user","content":[
+        {"type":"input_audio","input_audio":{"data":"YQ==","format":"wav"}}
+    ]}]});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("authorization", "Bearer client")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, output) = call(router, request).await;
+    assert_eq!(status, StatusCode::OK, "{output}");
+    assert_eq!(output["output_text"], "success");
+    assert_eq!(text_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(audio_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn responses_vision_url_and_base64_reach_upstream_in_json_and_sse() {
     let recorded = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
     let captured = Arc::clone(&recorded);
