@@ -3259,6 +3259,74 @@ async fn responses_input_audio_preserves_chat_wire_for_json_and_sse() {
 }
 
 #[tokio::test]
+async fn native_only_responses_features_are_never_downgraded_to_chat() {
+    let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let seen = Arc::clone(&captured);
+    let native = Router::new().route(
+        "/v1/responses",
+        post(move |axum::Json(request): axum::Json<Value>| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().await.push(request);
+                axum::Json(json!({
+                    "id":"resp_native_only","object":"response","model":"native-physical",
+                    "status":"completed","created_at":123,"error":null,
+                    "output":[{"type":"image_generation_call","status":"completed",
+                        "result":"YQ=="}]
+                }))
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(socket, native).await.unwrap();
+    });
+    let (chat_url, chat_hits) = start_upstream(StatusCode::OK).await;
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: native\n    type: openai\n    base_url: http://{addr}\n    key_env: NATIVE\n    responses_protocol: native\n  - name: text\n    type: openai\n    base_url: {chat_url}\n    key_env: TEXT\nchains:\n  - name: mixed\n    steps:\n      - provider: native\n        model: native-physical\n      - provider: text\n        model: chat-physical\n"
+    )).unwrap();
+    let gateway = app(AppState::new(
+        cfg,
+        HashMap::from([
+            ("NATIVE".into(), "native-key".into()),
+            ("TEXT".into(), "chat-key".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let requests = [
+        json!({"model":"mixed","input":"draw a landscape",
+            "tools":[{"type":"image_generation","size":"1024x1024"}]}),
+        json!({"model":"mixed","input":"continue","previous_response_id":"resp_previous"}),
+        json!({"model":"mixed","input":[{"type":"message","role":"user",
+            "content":[{"type":"input_video","video_url":"https://example.test/movie.mp4"}]}]}),
+    ];
+    for request in &requests {
+        let http = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(request.to_string()))
+            .unwrap();
+        let (status, result) = call(gateway.clone(), http).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["model"], "mixed");
+        assert_eq!(result["output"][0]["type"], "image_generation_call");
+    }
+    assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
+    let native_requests = captured.lock().await;
+    assert_eq!(native_requests.len(), requests.len());
+    for (native, original) in native_requests.iter().zip(requests.iter()) {
+        assert_eq!(native["input"], original["input"]);
+        assert!(native.get("messages").is_none());
+    }
+    assert_eq!(native_requests[0]["tools"], requests[0]["tools"]);
+    assert_eq!(native_requests[1]["previous_response_id"], "resp_previous");
+}
+
+#[tokio::test]
 async fn native_responses_sse_is_not_downgraded_and_can_preflight_fallback() {
     let calls = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&calls);

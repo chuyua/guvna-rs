@@ -4,7 +4,9 @@ use crate::sse::SseError;
 use bytes::Bytes;
 use serde_json::Value;
 
-const MAX_FRAME_BYTES: usize = 1024 * 1024;
+// Native image/audio result frames can exceed a Chat text delta. Keep this
+// bounded, while permitting moderate inline image-generation results.
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
 pub(crate) struct NativeResponsesSse {
@@ -68,6 +70,10 @@ impl NativeResponsesSse {
                 return Ok(());
             }
             let data = std::mem::take(&mut self.data);
+            if self.done && data == b"[DONE]" {
+                self.event = None;
+                return Ok(());
+            }
             let kind = self.event.take().ok_or(SseError)?;
             if self.done {
                 if data == b"[DONE]" {

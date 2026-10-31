@@ -138,6 +138,7 @@ pub(super) async fn dispatch_responses_parsed(
     state: Arc<AppState>,
     chat_request: Value,
     native_request: Option<Value>,
+    native_only: bool,
     original_large_payload: bool,
     admission: OwnedSemaphorePermit,
 ) -> Response {
@@ -146,6 +147,7 @@ pub(super) async fn dispatch_responses_parsed(
         DispatchInput::ParsedResponses {
             chat_request,
             native_request,
+            native_only,
             original_large_payload,
         },
         Endpoint::Responses,
@@ -164,6 +166,7 @@ enum DispatchInput {
     ParsedResponses {
         chat_request: Value,
         native_request: Option<Value>,
+        native_only: bool,
         original_large_payload: bool,
     },
 }
@@ -466,8 +469,12 @@ async fn dispatch_inner(
     started: tokio::time::Instant,
     request_id: &str,
 ) -> Response {
-    let (mut request, large_payload, mut native_request): (Value, bool, Option<Value>) = match input
-    {
+    let (mut request, large_payload, mut native_request, native_only): (
+        Value,
+        bool,
+        Option<Value>,
+        bool,
+    ) = match input {
         DispatchInput::Raw(body) => {
             let large_payload = body.len() >= super::LARGE_REQUEST_BODY_BYTES;
             let request = match serde_json::from_slice(&body) {
@@ -481,17 +488,23 @@ async fn dispatch_inner(
                 }
             };
             // Drop the raw body as soon as the parsed tree owns its strings.
-            (request, large_payload, None)
+            (request, large_payload, None, false)
         }
         DispatchInput::Parsed {
             request,
             original_large_payload,
-        } => (request, original_large_payload, None),
+        } => (request, original_large_payload, None, false),
         DispatchInput::ParsedResponses {
             chat_request,
             native_request,
+            native_only,
             original_large_payload,
-        } => (chat_request, original_large_payload, native_request),
+        } => (
+            chat_request,
+            original_large_payload,
+            native_request,
+            native_only,
+        ),
     };
     // F02: hold a reservation until the parsed, possibly multi-megabyte JSON
     // Value is actually dropped. Small requests release their slot after
@@ -914,6 +927,13 @@ async fn dispatch_inner(
     // Retry distinct models on the same provider, but never reattempt the
     // exact failed SSE-only provider/model during a single candidate walk.
     let mut failed_aggregation_routes = HashSet::new();
+    // Stateful Responses ids are provider-local. Keep their retries pinned
+    // to the first native provider, never another vendor's state store.
+    let stateful_native = native_only
+        && native_request.as_ref().is_some_and(|value| {
+            value.get("previous_response_id").is_some() || value.get("conversation").is_some()
+        });
+    let mut pinned_native_provider: Option<usize> = None;
     // Exactly ONE candidate loop for chat + embedding. Key failover is confined to this loop.
     for step in steps {
         if let Some(previous) = telemetry_context.take() {
@@ -939,6 +959,19 @@ async fn dispatch_inner(
         let provider = &state.config.providers[step.provider_index];
         let native_responses =
             matches!(endpoint, Endpoint::Responses) && provider.responses_protocol == "native";
+        if native_only && !native_responses {
+            // Native-only tools and state references cannot be degraded to
+            // Chat messages without changing the caller's requested behavior.
+            all_candidates_rate_limited = false;
+            continue;
+        }
+        if stateful_native && native_responses {
+            if pinned_native_provider.is_some_and(|index| index != step.provider_index) {
+                all_candidates_rate_limited = false;
+                continue;
+            }
+            pinned_native_provider.get_or_insert(step.provider_index);
+        }
         if native_responses && provider.stream_only && !streaming {
             // Native JSON cannot be manufactured from Responses SSE with the
             // Chat aggregator. Prefer a different candidate instead.

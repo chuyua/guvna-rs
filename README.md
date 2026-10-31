@@ -86,7 +86,12 @@ Responses event validator; Chat-only providers retain the Chat SSE bridge.
 Both paths share candidate/key fallback, preflight, cancellation accounting
 and circuit health, without spawning a second candidate walk.
 Native advanced request options remain subject to the bridge's current input
-validation limits. Do not claim full official Responses parity yet.
+validation limits only on Chat fallback candidates. Built-in tool declarations,
+stateful references and unsupported Chat input types are forwarded unchanged
+only to native-capable providers; they never silently fall back to Chat. An
+existing conversation or previous-response reference is pinned to its first
+native provider in a single request walk to prevent cross-provider replay.
+Do not claim full official Responses parity yet.
 
 Not yet shipped: learned Auto scoring, complete Go protocol parity and full multi-modal streaming.
 The current Auto cache stores only route metadata (128 entries, 30s TTL); it does not learn from or retain prompts.

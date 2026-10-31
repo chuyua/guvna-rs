@@ -71,14 +71,42 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             "model must be a nonempty string",
         );
     };
-    // Only duplicate the original wire tree for explicitly native suppliers.
-    // Chat-only installations keep their existing allocation profile.
-    let native_request = state
+    // A native supplier may support tools, conversation state, and input item
+    // kinds that cannot be represented safely by Chat Completions.
+    let has_native = state
         .config
         .providers
         .iter()
-        .any(|p| p.responses_protocol == "native")
-        .then(|| value.clone());
+        .any(|p| p.responses_protocol == "native");
+    let native_only = has_native
+        && ([
+            "previous_response_id",
+            "conversation",
+            "prompt",
+            "include",
+            "modalities",
+        ]
+        .iter()
+        .any(|key| value.get(*key).is_some())
+            || value.get("background") == Some(&Value::Bool(true))
+            || value.get("store") == Some(&Value::Bool(true))
+            || value
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| {
+                    tools
+                        .iter()
+                        .any(|tool| tool.get("type").and_then(Value::as_str) != Some("function"))
+                })
+            || value
+                .get("reasoning")
+                .and_then(Value::as_object)
+                .is_some_and(|options| options.keys().any(|key| key != "effort")));
+    if native_only {
+        return handle_native_only(state, value, logical_model, large_payload, permit).await;
+    }
+    // Only clone the original wire tree when a native supplier exists.
+    let native_request = has_native.then(|| value.clone());
     // Input can be a multi-megabyte conversation. Move its JSON tree into the
     // translator instead of cloning the entire tree while the parsed request
     // still owns the original. The field is removed before upstream dispatch
@@ -96,7 +124,13 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     };
     let messages = match translate_input(input) {
         Ok(messages) => messages,
-        Err(response) => return *response,
+        Err(response) => {
+            if let Some(native) = native_request {
+                return handle_native_only(state, native, logical_model, large_payload, permit)
+                    .await;
+            }
+            return *response;
+        }
     };
     for (name, min, max) in [("temperature", 0.0, 2.0), ("top_p", 0.0, 1.0)] {
         if value.get(name).is_some_and(|parameter| {
@@ -504,7 +538,7 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     object.insert("n".into(), Value::from(1));
     let response_metrics = state.metrics.clone();
     let response =
-        dispatch_responses_parsed(state, value, native_request, large_payload, permit).await;
+        dispatch_responses_parsed(state, value, native_request, false, large_payload, permit).await;
     if response.status() != StatusCode::OK {
         return response;
     }
@@ -553,6 +587,59 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     hold_buffered_response(
         translate_chat_result(chat, logical_model, metadata),
         memory_lease,
+    )
+}
+
+/// Native-only capabilities keep their original request body. The minimal
+/// Chat envelope is routing metadata only and is never sent to any supplier.
+async fn handle_native_only(
+    state: Arc<AppState>,
+    raw: Value,
+    logical_model: String,
+    large_payload: bool,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    let streaming = raw.get("stream") == Some(&Value::Bool(true));
+    let route = json!({
+        "model":logical_model,
+        "messages":[{"role":"user","content":""}],
+        "n":1,
+        "stream":streaming,
+    });
+    let response =
+        dispatch_responses_parsed(state, route, Some(raw), true, large_payload, permit).await;
+    if response.status() != StatusCode::OK {
+        return response;
+    }
+    if streaming {
+        if response
+            .extensions()
+            .get::<NativeResponseStream>()
+            .is_some()
+        {
+            return response;
+        }
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "invalid_native_stream",
+            "Native-only request did not return a native Responses stream",
+        );
+    }
+    let mut response = response;
+    let lease = response
+        .extensions()
+        .get::<BufferedResponseLease>()
+        .cloned();
+    if let Some(ParsedNativeResponse(mut result)) =
+        response.extensions_mut().remove::<ParsedNativeResponse>()
+    {
+        result["model"] = Value::String(logical_model);
+        return hold_buffered_response((StatusCode::OK, Json(result)).into_response(), lease);
+    }
+    error(
+        StatusCode::BAD_GATEWAY,
+        "invalid_native_response",
+        "Native-only request did not return a native Responses result",
     )
 }
 
