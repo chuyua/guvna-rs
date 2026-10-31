@@ -286,6 +286,7 @@ mod tests {
             max_context_tokens: None,
             supports_tools: None,
             supports_images: None,
+            supports_audio: None,
             supports_json_schema: None,
             params: Default::default(),
         };
