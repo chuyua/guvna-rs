@@ -3259,6 +3259,85 @@ async fn responses_input_audio_preserves_chat_wire_for_json_and_sse() {
 }
 
 #[tokio::test]
+async fn mixed_responses_native_and_chat_share_one_fallback_walk() {
+    let native_calls = Arc::new(AtomicUsize::new(0));
+    let native_payloads = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let calls = Arc::clone(&native_calls);
+    let payloads = Arc::clone(&native_payloads);
+    let native = Router::new().route(
+        "/v1/responses",
+        post(move |axum::Json(body): axum::Json<Value>| {
+            let calls = Arc::clone(&calls);
+            let payloads = Arc::clone(&payloads);
+            async move {
+                payloads.lock().await.push(body);
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    axum::Json(json!({
+                        "id":"resp-native","object":"response","model":"real-native",
+                        "created_at":123,"status":"completed","error":null,
+                        "output":[{"type":"image_generation_call","id":"ig_1",
+                            "status":"completed","result":"YQ=="}],
+                        "output_text":"","usage":{
+                            "input_tokens":3,"output_tokens":2,"total_tokens":5}
+                    }))
+                } else {
+                    // A broken HTTP 200 must not prevent Chat-only failover.
+                    axum::Json(json!({"object":"chat.completion","choices":[]}))
+                }
+            }
+        }),
+    );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(socket, native).await.unwrap() });
+    let (chat_url, chat_calls) = start_upstream(StatusCode::OK).await;
+    let cfg: Config = serde_yaml::from_str(&format!(
+        "providers:\n  - name: native\n    type: openai\n    base_url: http://{addr}\n    key_env: NATIVE\n    responses_protocol: native\n  - name: text\n    type: openai\n    base_url: {chat_url}\n    key_env: TEXT\nchains:\n  - name: mixed\n    steps:\n      - provider: native\n        model: real-native\n      - provider: text\n        model: real-chat\n"
+    )).unwrap();
+    let app = app(AppState::new(
+        cfg,
+        HashMap::from([
+            ("NATIVE".into(), "native-secret".into()),
+            ("TEXT".into(), "chat-secret".into()),
+        ]),
+        vec!["client".into()],
+    )
+    .unwrap());
+    let send = |input: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model":"mixed","input":input,"stream":false
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    let (status, first) = call(app.clone(), send(json!("describe the scene"))).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["id"], "resp-native");
+    assert_eq!(first["model"], "mixed");
+    assert_eq!(first["output"][0]["type"], "image_generation_call");
+    assert_eq!(first["output"][0]["result"], "YQ==");
+    assert_eq!(chat_calls.load(Ordering::SeqCst), 0);
+    let payloads = native_payloads.lock().await;
+    assert_eq!(payloads[0]["model"], "real-native");
+    assert_eq!(payloads[0]["input"], "describe the scene");
+    assert!(payloads[0].get("messages").is_none());
+    assert!(payloads[0].get("n").is_none());
+    drop(payloads);
+    let (status, second) = call(app, send(json!("hello again"))).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["output_text"], "success");
+    assert_eq!(native_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(chat_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn responses_empty_tools_matches_official_no_tools_semantics() {
     let (url, hits) = start_upstream(StatusCode::OK).await;
     let gateway = make_app(&url, &url);

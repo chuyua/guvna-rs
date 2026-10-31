@@ -131,10 +131,39 @@ pub(super) async fn dispatch_parsed(
     .await
 }
 
+/// Keep both wire representations for one candidate walk. Native suppliers
+/// receive the original Responses body; Chat-only suppliers get the existing
+/// validated bridge. Credential/timeout/failover logic stays shared.
+pub(super) async fn dispatch_responses_parsed(
+    state: Arc<AppState>,
+    chat_request: Value,
+    native_request: Option<Value>,
+    original_large_payload: bool,
+    admission: OwnedSemaphorePermit,
+) -> Response {
+    dispatch_request(
+        state,
+        DispatchInput::ParsedResponses {
+            chat_request,
+            native_request,
+            original_large_payload,
+        },
+        Endpoint::Responses,
+        admission,
+        None,
+    )
+    .await
+}
+
 enum DispatchInput {
     Raw(Bytes),
     Parsed {
         request: Value,
+        original_large_payload: bool,
+    },
+    ParsedResponses {
+        chat_request: Value,
+        native_request: Option<Value>,
         original_large_payload: bool,
     },
 }
@@ -300,6 +329,9 @@ pub(super) struct BufferedResponseLease {
 #[derive(Clone)]
 pub(super) struct ParsedChatResponse(pub(super) Value);
 
+/// Native Responses JSON, validated before it contributes to provider health.
+pub(super) struct ParsedNativeResponse(pub(super) Value);
+
 pub(super) fn hold_buffered_response(
     response: Response,
     reservation: Option<BufferedResponseLease>,
@@ -433,7 +465,8 @@ async fn dispatch_inner(
     started: tokio::time::Instant,
     request_id: &str,
 ) -> Response {
-    let (mut request, large_payload): (Value, bool) = match input {
+    let (mut request, large_payload, mut native_request): (Value, bool, Option<Value>) = match input
+    {
         DispatchInput::Raw(body) => {
             let large_payload = body.len() >= super::LARGE_REQUEST_BODY_BYTES;
             let request = match serde_json::from_slice(&body) {
@@ -447,12 +480,17 @@ async fn dispatch_inner(
                 }
             };
             // Drop the raw body as soon as the parsed tree owns its strings.
-            (request, large_payload)
+            (request, large_payload, None)
         }
         DispatchInput::Parsed {
             request,
             original_large_payload,
-        } => (request, original_large_payload),
+        } => (request, original_large_payload, None),
+        DispatchInput::ParsedResponses {
+            chat_request,
+            native_request,
+            original_large_payload,
+        } => (chat_request, original_large_payload, native_request),
     };
     // F02: hold a reservation until the parsed, possibly multi-megabyte JSON
     // Value is actually dropped. Small requests release their slot after
@@ -898,6 +936,20 @@ async fn dispatch_inner(
             return attach_telemetry_context(walk_timeout(&state.metrics), context);
         }
         let provider = &state.config.providers[step.provider_index];
+        let native_responses =
+            matches!(endpoint, Endpoint::Responses) && provider.responses_protocol == "native";
+        if native_responses && provider.stream_only && !streaming {
+            // Native JSON cannot be manufactured from Responses SSE with the
+            // Chat aggregator. Prefer a different candidate instead.
+            all_candidates_rate_limited = false;
+            continue;
+        }
+        // Native SSE needs its own lifecycle validator, never the Chat parser.
+        // Other Chat-capable candidates may still satisfy streaming requests.
+        if native_responses && streaming {
+            all_candidates_rate_limited = false;
+            continue;
+        }
         if !streaming
             && endpoint.is_chat()
             && provider.stream_only
@@ -1038,7 +1090,12 @@ async fn dispatch_inner(
         // Apply candidate-only overrides in place, serialize once for this
         // candidate, then restore the original request before any await. This
         // avoids cloning a potentially multi-megabyte JSON tree for each step.
-        let object = request.as_object_mut().expect("checked above");
+        let wire_request = if native_responses {
+            native_request.as_mut().expect("native request retained")
+        } else {
+            &mut request
+        };
+        let object = wire_request.as_object_mut().expect("checked above");
         let original_model = object.insert("model".into(), Value::String(step.model.clone()));
         let override_stream = upstream_stream && !streaming;
         let original_stream = if override_stream {
@@ -1049,6 +1106,21 @@ async fn dispatch_inner(
         let original_stream_options = override_stream.then(|| force_sse_usage(object));
         let mut injected_params = Vec::new();
         for (name, value) in &step.params {
+            if native_responses
+                && !matches!(
+                    name.as_str(),
+                    "temperature"
+                        | "top_p"
+                        | "max_output_tokens"
+                        | "service_tier"
+                        | "parallel_tool_calls"
+                        | "safety_identifier"
+                        | "prompt_cache_key"
+                )
+            {
+                // Chat chain defaults cannot be blindly sent to Responses.
+                continue;
+            }
             if matches!(endpoint, Endpoint::Embeddings)
                 && matches!(
                     name.as_str(),
@@ -1081,8 +1153,8 @@ async fn dispatch_inner(
                 injected_params.push(name.clone());
             }
         }
-        let payload_json = Bytes::from(request.to_string());
-        let object = request.as_object_mut().expect("checked above");
+        let payload_json = Bytes::from(wire_request.to_string());
+        let object = wire_request.as_object_mut().expect("checked above");
         for name in injected_params {
             object.remove(&name);
         }
@@ -1115,7 +1187,11 @@ async fn dispatch_inner(
                 return attach_telemetry_context(walk_timeout(&state.metrics), context);
             }
             tried.insert(lease.env.clone());
-            let url = provider.endpoint(endpoint.path());
+            let url = provider.endpoint(if native_responses {
+                "/responses"
+            } else {
+                endpoint.path()
+            });
             if let Some(context) = telemetry_context.as_mut() {
                 context.set_upstream_status(None);
             }
@@ -1383,12 +1459,15 @@ async fn dispatch_inner(
                 }
                 match result {
                     Ok(Ok((value, response_reservation)))
-                        if response_validation::valid_result_with_params(
-                            endpoint,
-                            &request,
-                            &step.params,
-                            &value,
-                        ) =>
+                        if (native_responses
+                            && response_validation::valid_native_responses(&value))
+                            || (!native_responses
+                                && response_validation::valid_result_with_params(
+                                    endpoint,
+                                    &request,
+                                    &step.params,
+                                    &value,
+                                )) =>
                     {
                         state.pools[step.provider_index].record_success(&lease);
                         record_circuit_success(&mut circuit_ticket, &state.metrics);
@@ -1404,7 +1483,13 @@ async fn dispatch_inner(
                         let response = if matches!(endpoint, Endpoint::Responses) {
                             let mut response = Response::new(Body::empty());
                             *response.status_mut() = StatusCode::OK;
-                            response.extensions_mut().insert(ParsedChatResponse(value));
+                            if native_responses {
+                                response
+                                    .extensions_mut()
+                                    .insert(ParsedNativeResponse(value));
+                            } else {
+                                response.extensions_mut().insert(ParsedChatResponse(value));
+                            }
                             response
                         } else {
                             (StatusCode::OK, Json(value)).into_response()

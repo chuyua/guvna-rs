@@ -3,7 +3,8 @@
 //! Responses SSE wrapping live here. Dispatch still uses one shared
 //! candidate/failover loop in dispatch.rs; this module never retries upstream.
 use super::dispatch::{
-    BufferedResponseLease, Endpoint, ParsedChatResponse, dispatch_parsed, hold_buffered_response,
+    BufferedResponseLease, ParsedChatResponse, ParsedNativeResponse, dispatch_responses_parsed,
+    hold_buffered_response,
 };
 use super::responses_format;
 use super::{AppState, authenticated_body, error};
@@ -69,6 +70,14 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
             "model must be a nonempty string",
         );
     };
+    // Only duplicate the original wire tree for explicitly native suppliers.
+    // Chat-only installations keep their existing allocation profile.
+    let native_request = state
+        .config
+        .providers
+        .iter()
+        .any(|p| p.responses_protocol == "native")
+        .then(|| value.clone());
     // Input can be a multi-megabyte conversation. Move its JSON tree into the
     // translator instead of cloning the entire tree while the parsed request
     // still owns the original. The field is removed before upstream dispatch
@@ -493,15 +502,8 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
     // routing-chain default injects n > 1 for ordinary Chat requests.
     object.insert("n".into(), Value::from(1));
     let response_metrics = state.metrics.clone();
-    let response = dispatch_parsed(
-        state,
-        value,
-        large_payload,
-        Endpoint::Responses,
-        permit,
-        None,
-    )
-    .await;
+    let response =
+        dispatch_responses_parsed(state, value, native_request, large_payload, permit).await;
     if response.status() != StatusCode::OK {
         return response;
     }
@@ -519,6 +521,15 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
         .extensions()
         .get::<BufferedResponseLease>()
         .cloned();
+    if let Some(ParsedNativeResponse(mut native)) =
+        response.extensions_mut().remove::<ParsedNativeResponse>()
+    {
+        native["model"] = Value::String(logical_model);
+        return hold_buffered_response(
+            (StatusCode::OK, Json(native)).into_response(),
+            memory_lease,
+        );
+    }
     let Some(ParsedChatResponse(chat)) = response.extensions_mut().remove::<ParsedChatResponse>()
     else {
         return error(

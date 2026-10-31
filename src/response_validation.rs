@@ -6,6 +6,33 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::{BTreeMap, HashSet};
 
+/// Accept only complete, structurally plausible native Responses JSON.
+/// Native output items are not downgraded into Chat choices.
+pub(super) fn valid_native_responses(value: &Value) -> bool {
+    value.get("object").and_then(Value::as_str) == Some("response")
+        && value
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+        && value
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|model| !model.is_empty())
+        && value.get("created_at").and_then(Value::as_u64).is_some()
+        && matches!(
+            value.get("status").and_then(Value::as_str),
+            Some("completed" | "incomplete")
+        )
+        && value.get("output").and_then(Value::as_array).is_some()
+        && value.get("error").is_none_or(Value::is_null)
+        && value.get("usage").is_none_or(|usage| {
+            usage.is_null()
+                || (usage.get("input_tokens").and_then(Value::as_u64).is_some()
+                    && usage.get("output_tokens").and_then(Value::as_u64).is_some()
+                    && usage.get("total_tokens").and_then(Value::as_u64).is_some())
+        })
+}
+
 #[cfg(test)]
 pub(super) fn valid_result(endpoint: Endpoint, request: &Value, response: &Value) -> bool {
     valid_result_with_params(endpoint, request, &BTreeMap::new(), response)

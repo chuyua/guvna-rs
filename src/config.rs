@@ -185,6 +185,9 @@ pub struct Provider {
     pub namespace_on_wire: bool,
     #[serde(default)]
     pub stream_only: bool,
+    /// Default chat bridges Responses to Chat. Native routes target /v1/responses.
+    #[serde(default)]
+    pub responses_protocol: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -391,6 +394,12 @@ impl Config {
             }
             if p.kind != "openai" && p.kind != "gemini" {
                 return Err(format!("unsupported provider type {:?}", p.kind));
+            }
+            if !matches!(p.responses_protocol.as_str(), "" | "chat" | "native") {
+                return Err(format!(
+                    "provider {}: responses_protocol must be chat or native",
+                    p.name
+                ));
             }
             let url = reqwest::Url::parse(&p.base_url)
                 .map_err(|e| format!("provider {} invalid URL: {e}", p.name))?;
