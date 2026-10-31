@@ -325,6 +325,15 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
         });
     // Map the supported Responses function-tool declaration to Chat Completions.
     let mut declared_functions = std::collections::HashSet::<String>::new();
+    // An empty tools list is a valid official Responses request. Do not
+    // forward it to providers that reject an otherwise unused Chat tools: [].
+    if object
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        object.remove("tools");
+    }
     if let Some(tools) = object.get_mut("tools") {
         let Some(items) = tools.as_array_mut() else {
             return error(
@@ -333,13 +342,6 @@ pub(super) async fn handle(State(state): State<Arc<AppState>>, request: Request<
                 "tools must be an array",
             );
         };
-        if items.is_empty() {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "invalid_tools",
-                "tools must not be empty",
-            );
-        }
         for tool in items {
             let Some(map) = tool.as_object_mut() else {
                 return error(

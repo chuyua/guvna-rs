@@ -3259,6 +3259,44 @@ async fn responses_input_audio_preserves_chat_wire_for_json_and_sse() {
 }
 
 #[tokio::test]
+async fn responses_empty_tools_matches_official_no_tools_semantics() {
+    let (url, hits) = start_upstream(StatusCode::OK).await;
+    let gateway = make_app(&url, &url);
+    let request = |payload: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer client")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    };
+    let (status, _) = call(
+        gateway.clone(),
+        request(json!({
+            "model":"demo","input":"hello","tools":[],"tool_choice":"required"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    for extra in [
+        json!({"tools":[]}),
+        json!({"tools":[],"tool_choice":"auto"}),
+    ] {
+        let mut payload = json!({"model":"demo","input":"hello"});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (status, output) = call(gateway.clone(), request(payload)).await;
+        assert_eq!(status, StatusCode::OK, "{output}");
+        assert_eq!(output["output_text"], "success");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn responses_auto_audio_skips_explicitly_incompatible_candidate() {
     let (text_url, text_hits) = start_upstream(StatusCode::OK).await;
     let (audio_url, audio_hits) = start_upstream(StatusCode::OK).await;
